@@ -153,8 +153,10 @@ def main():
                 if now>=next_event and (drain_deadline is None or drain_deadline-time.monotonic()>=8):
                     try:
                         with (root/'console.log').open('rb') as stream:stream.seek(offset);chunk=stream.read(16000)
+                        # Do not let the observer finish before the last console chunk.
+                        status['ended']=child.poll() is not None and offset+len(chunk)>=(root/'console.log').stat().st_size
                         api.call('/events',{'seq':seq,'logs':chunk.decode('utf-8',errors='replace'),'status':status},attempts=1,timeout=8)
-                        offset+=len(chunk);seq+=1;event_failures=0;next_event=time.monotonic()+args.poll_seconds
+                        offset+=len(chunk);seq+=1;event_failures=0;next_event=time.monotonic()+(0.25 if drain_deadline is not None else args.poll_seconds)
                         if isinstance(last_error,dict) and last_error.get('route')=='events':last_error=None
                         sent_ended|=status['ended']
                         atomic(root/'relay-cursor.json',{'session':api.session,'seq':seq,'offset':offset})

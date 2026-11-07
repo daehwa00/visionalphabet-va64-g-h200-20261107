@@ -343,7 +343,7 @@
     "h200/va64/preflight.py": "a9938c95d426c0e1d803ea7e8b81de1bfd121148e5d6e9ed13f83844e015536a",
     "scripts/va64_h200_transport.py": "43f4448bf54e1b1a7a2e3b4c37cb72b6f09564db4e9b17192c02ad2a39ea156b",
     "scripts/va64_control_transport.py": "50d7318c5aad56086087269aafdbc52603f4183548c4830ab097b64c919f1788",
-    "scripts/va64_h200_guard.py": "d8753a894edfdc8ac7b33e74058e86cefe343fdec59c640336eb970b06eb2170",
+    "scripts/va64_h200_guard.py": "a94316e31c4b1c127bd1f0f045d902d14e68a9cda7032b2f6bdd160d8f414c4c",
     "scripts/va64_h200_observer.py": "add9a23dc51be457f060625d306a92bf7a1ef811d5f1375aa180c65713e7a566",
     "scripts/va64_h200_control.py": "cf2af034844bb1725fb4c4aa2af234c3ae29c7f212ca2f5417a324c09b9d0f6c",
     "scripts/va64_runtime_operations.py": "0c12de261f71d41c5b7ce6de2dda4c577d0c0f69d61141c663de85a872885c2e",
