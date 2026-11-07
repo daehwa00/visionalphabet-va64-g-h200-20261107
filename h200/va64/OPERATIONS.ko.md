@@ -1,3 +1,15 @@
+# 현재 운영 정책: 결과만 외부 보존
+
+- G seed0,100epoch,physical128×accumulation2(global256),기존recipe유지.
+- `bash h200/va64/run.sh resume`: 검증된epoch13/step65065를시작시에한번다운로드해epoch14부터계속한다. 속도비교는이미완료했으므로반복하지않는다.
+- 학습중과종료시전체checkpoint의외부전송·검증·ACK대기를하지않는다. latest/best는컨테이너로컬에만남으며컨테이너삭제시사라질수있다.
+- 지표·epoch곡선·최종정확도/loss·시간·메모리·로그만외부수집기로보낸다. W&B장애나수집기/relay연결오류는학습을중단시키지않는다. 원격kill switch의명시적stop/force와실제학습stall감시는유지한다.
+- 최종요약은W&B지표/작은결과artifact,owner의JSON/JSONL에보존한다. 연결장애가끝까지계속되면W&B전달을보장할수없으므로 `VA64_FINAL_SUMMARY=` 표식으로H200서비스결과로그에도출력한다.
+- 중단요청시validation·새checkpoint·외부백업없이optimizer경계에서종료한다.
+- 아래내용은이전checkpoint백업정책의운영이력이다. 현재학습경로에는적용하지않는다.
+
+---
+
 # G 원격 운영: Cloudflare + 외부 W&B observer
 
 ## 데이터 경로

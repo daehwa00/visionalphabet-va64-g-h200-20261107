@@ -3,7 +3,10 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 MODE="${1:-preflight}"
-[[ "$MODE" == preflight || "$MODE" == train || "$MODE" == tune-resume ]] || { echo 'Expected preflight, train or tune-resume'; exit 2; }
+[[ "$MODE" == preflight || "$MODE" == train || "$MODE" == tune-resume || "$MODE" == resume ]] || { echo 'Expected preflight, train, tune-resume or resume'; exit 2; }
+if [[ "$MODE" != preflight ]]; then export VA64_G_CHECKPOINT_POLICY=local_only; fi
+GUARD_OPTIONS=()
+[[ "$MODE" != preflight ]] && GUARD_OPTIONS+=(--metrics-optional)
 RUN_ID="${VA64_RUN_ID:-va64-g-seed0-preflight-20261107}"
 [[ "$RUN_ID" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid run ID'; exit 2; }
 RUN_ROOT="/app/output/$RUN_ID"
@@ -17,7 +20,7 @@ if [[ "${2:-}" != --inside-guard ]]; then
   export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/scripts"
   exec python3 -u scripts/va64_h200_guard.py --root "$RUN_ROOT" --code-sha "$VA64_G_CODE_SHA" \
     --relay-url https://visionalphabet-va64-g-20261107.gpupulse-monitor.workers.dev/va64g \
-    --share-token-with-child --enroll-wait-seconds 900 --compact-results \
+    --share-token-with-child --enroll-wait-seconds 900 --compact-results "${GUARD_OPTIONS[@]}" \
     --grace-seconds 1200 --stall-seconds 1800 -- bash h200/va64/run.sh "$MODE" --inside-guard
 fi
 mkdir -p "$RUN_ROOT"
@@ -56,10 +59,12 @@ check_stop
 check_stop
 # Tests use tiny fields. The smoke below checks the full 224px path separately.
 "$PY" -m pytest -q tests/test_va64_g.py
-if [[ "$MODE" == tune-resume ]]; then
+if [[ "$MODE" == tune-resume || "$MODE" == resume ]]; then
   export VA64_G_RESUME_PLAN="$PROJECT_ROOT/h200/va64/resume-plan.json"
   "$PY" scripts/va64_h200_resume.py --root "$RUN_ROOT" --plan "$VA64_G_RESUME_PLAN"
   export VA64_G_RECOVERY="$RUN_ROOT/recovery"
+  BATCH=128
+  if [[ "$MODE" == tune-resume ]]; then
   "$PY" - "$RUN_ROOT" "$JOB" <<'BENCHSTATE'
 import sys
 from pathlib import Path
@@ -69,8 +74,10 @@ BENCHSTATE
   "$PY" h200/va64/benchmark_g.py --data-root "$DATA_ROOT" --output "$RUN_ROOT/benchmark" --checkpoint "$VA64_G_RECOVERY/checkpoint.pt" --workers 8 --warmup-updates 30 --measure-updates 100 --stop-file "$RUN_ROOT/STOP"
   check_stop
   BATCH=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_batch_size"])' "$RUN_ROOT/benchmark/selection.json")
+  fi
   [[ "$BATCH" == 128 || "$BATCH" == 256 ]] || exit 2
-  exec "$PY" scripts/run_va64_g_h200.py --variant G --seed 0 --data-root "$DATA_ROOT" --data-manifest "$VA64_G_RECOVERY/dataset.json" --output-root "$RUN_ROOT/runs" --batch-size "$BATCH" --workers 8 --gpu-mixup --stop-file "$RUN_ROOT/STOP"
+  check_stop
+  exec "$PY" scripts/run_va64_g_h200.py --variant G --seed 0 --data-root "$DATA_ROOT" --data-manifest "$VA64_G_RECOVERY/resume-dataset-manifest.json" --output-root "$RUN_ROOT/runs" --batch-size "$BATCH" --workers 8 --gpu-mixup --stop-file "$RUN_ROOT/STOP"
 fi
 if [[ "$MODE" == train ]]; then
   # Full training is a separate issue after retrieval and stop access are verified.

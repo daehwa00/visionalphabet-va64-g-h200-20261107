@@ -254,7 +254,7 @@
     "tests/test_imagenet100_baseline_models.py": "c5e5e37770bbd560e376f35125d167c59034a12c43668f497446e4b2f53205d4",
     "tests/test_imagenet100_global_step_checkpoint.py": "37d0c383794c141c414c91ab25dff3360322c9cabd20dd4eb0ee2a045babdc65",
     "tests/test_imagenet1k_cuda.py": "7baf2bb797f82ebed77e33a2257f61da60c0f3dfb72fa1f027041d37febc1e74",
-    "tests/test_imagenet1k_runtime.py": "c5217300ea797dbea9e7964ab0ab7d91ae017448deb9046228fb2ae2d1a5df91",
+    "tests/test_imagenet1k_runtime.py": "d41e1a070e3a6d64b61ffa25bd6339d7f3b88426c558411a1095f12d531b178e",
     "tests/test_k128_h200_observer.py": "f9195aaa9251cf9d052182f7ead074b8e1c8cc1c393a40938076fff70a80fe1c",
     "tests/test_k128_h200_preflight.py": "7ee1eb16ed58868cfe30ad69a6a913b1c82faba39df5f88ea50b38cae7bdf11d",
     "tests/test_k128_h200_transport.py": "4eaf3a1a52ee1edd080b39fc64ef5df71ab7c086e99a00281fa4f2f993070f2e",
@@ -337,9 +337,11 @@
     "src/lnet/pac_feature_pool_readout.py": "8e0be3001b594553a374c3415a556b433395f085c53f50951ee18a92c42d3c38",
     "tests/test_va64_g.py": "c82816dd494de1e2f9278261797b90bbb021dd0de265c4fa0ec5f621ac1b03a4",
     "scripts/validate_va64_roundtrip.py": "9a628a51c9807a0438a56a641378083a01b8323ac7cb3fe1b15e6d6ce579f692",
-    "scripts/va64_h200_resume.py": "86c399fca38b53788ae6b3b61242c3d3eb7028d28dca90ee8a3e2bb2dcdfea5f",
+    "scripts/va64_h200_resume.py": "af867634ba6c24d3f5ce047e6f5078126efa3b6983f7c92728b0aacc805403f1",
     "h200/va64/benchmark_g.py": "924ce5b109f0626c68f6e1b2f1b4765e0070ae8fbc2917dd04c0050c5ef6f3ca",
-    "tests/test_va64_h200_resume.py": "f1ddabd201094f295065f3917225cff6137843bba8ecfd152590b02edb7dc416",
-    "tests/test_h200_va64_benchmark.py": "c4879ac4db5607383966ed0a2c926909a144e7e42ea2e1cda3585fbb4245fb97"
+    "tests/test_va64_h200_resume.py": "5df1cd0c8330c4836907793a71a2afdfb791161bc5ab53db135c5b2e4c6e8718",
+    "tests/test_h200_va64_benchmark.py": "c4879ac4db5607383966ed0a2c926909a144e7e42ea2e1cda3585fbb4245fb97",
+    "tests/test_va64_metrics_observer.py": "98d736036a99ec495484e1ec637e4a327d1f75e24ff725c4a29e44c9ed624f90",
+    "tests/test_va64_metrics_guard.py": "dafff9010d6a3d38c9a74ee53665fe570f5d790f1ab2f8839efb1ae1af588ed0"
   }
 }

@@ -26,6 +26,7 @@ def main():
     p.add_argument('--share-token-with-child',action='store_true')
     p.add_argument('--enroll-wait-seconds',type=int,default=0)
     p.add_argument('--compact-results',action='store_true')
+    p.add_argument('--metrics-optional',action='store_true')
     p.add_argument('--grace-seconds',type=int,default=900);p.add_argument('--stall-seconds',type=int,default=1200)
     p.add_argument('--poll-seconds',type=float,default=15)
     p.add_argument('command',nargs=argparse.REMAINDER);args=p.parse_args()
@@ -50,7 +51,7 @@ def main():
     api.session=response['session_id'];atomic(root/'session.json',{'id':api.session,'code_sha':args.code_sha})
     print('VA64_SESSION='+api.session,flush=True)
     if not (root/'current.json').exists():
-        atomic(root/'current.json',{'job':os.environ.get('VA64_G_JOB','va64-g-preflight'),'campaign_id':root.name,'stage':'bootstrap','output':str(root)})
+        atomic(root/'current.json',{'job':os.environ.get('VA64_G_JOB','va64-g-preflight'),'campaign_id':root.name,'stage':'bootstrap','output':str(root),'checkpoint_policy':os.environ.get('VA64_G_CHECKPOINT_POLICY','external')})
     stopped=False;stop_reasons=[]
     def record(kind,reason):
         entry={'time':time.time(),'kind':kind,'reason':reason}
@@ -99,7 +100,7 @@ def main():
                          'observer_stale' if now-started>600 and time.time()-seen>600 else None)
                 if warning and warning!=last_warning:record('warning',warning)
                 last_warning=warning
-                if warning: request_stop(warning)
+                if warning and not args.metrics_optional: request_stop(warning)
                 output=Path(current['output']) if current.get('output') else None
                 progress=read(output/'step-progress.json') if output else {}
                 if output and (output/'steps.jsonl').exists():
@@ -120,7 +121,7 @@ def main():
                 if child.poll() is None and now-last_progress>args.stall_seconds:request_stop('progress_stalled')
                 if stopped and deadline is None:
                     (root/'STOP').touch();deadline=now+args.grace_seconds
-                    # Signal only the supervisor. It lets the current epoch finish;
+                    # Signal only the supervisor. It stops at an optimizer boundary;
                     # DataLoader workers must not receive an early SIGTERM.
                     try:os.kill(child.pid,signal.SIGTERM)
                     except ProcessLookupError:pass
@@ -130,7 +131,7 @@ def main():
                     try:os.killpg(child.pid,signal.SIGKILL)
                     except ProcessLookupError:pass
                 status={'time':time.time(),'current':current,'progress':progress,'checkpoint':checkpoint,
-                        'result':{k:result.get(k) for k in ('status','completed_epochs','global_step','final_validation')},
+                        'result':result,'summary':read(output/'final-summary.json') if output else {},
                         'exit_code':child.poll(),'stop_requested':stopped,'forced':forced,'error':last_error,
                         'stop_reasons':stop_reasons,'connectivity_warning':warning,
                         'ended':child.poll() is not None}

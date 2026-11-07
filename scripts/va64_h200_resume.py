@@ -90,6 +90,16 @@ def recover(root: Path, plan_path: Path) -> Path:
  fresh=json.loads((root/'environment-check/dataset-manifest.json').read_text())
  for value in (old,fresh): value.pop('file_list',None)
  if old!=fresh: raise ValueError('dataset/class mapping/membership changed')
+ # Historical backups changed the manifest's file-list location but the source
+ # contract still binds the original bytes. Reconstruct that metadata field only,
+ # then prove the exact historical SHA before using it for the new task.
+ canonical=json.loads((recovery/'dataset.json').read_text())
+ if 'canonical_dataset_file_list' in plan:
+  canonical['file_list']=plan['canonical_dataset_file_list']
+ manifest=recovery/'resume-dataset-manifest.json'
+ runtime._atomic_json(manifest,canonical)
+ if digest(manifest)!=plan['canonical_dataset_sha256']:
+  raise ValueError('canonical dataset manifest hash differs from parent contract')
  print('VA64_PARENT_RECOVERED='+json.dumps({'epoch':plan['completed_epochs'],'global_step':plan['global_step'],'checkpoint_sha256':plan['checkpoint_sha256']}),flush=True)
  return recovery
 

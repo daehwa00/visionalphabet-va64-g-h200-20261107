@@ -1,4 +1,4 @@
-"""Managed G control, per-epoch external backups, and observer acknowledgement."""
+"""Managed G control and optional telemetry; training checkpoints stay local."""
 from __future__ import annotations
 import json,os,signal,shutil,time
 from pathlib import Path
@@ -9,10 +9,12 @@ def _agent_api():
 
 
 def current(root: Path, job: str, stage: str, output: Path) -> None:
- atomic_json(root/'current.json',{'job':job,'campaign_id':root.name,'stage':stage,'output':str(output)})
+ atomic_json(root/'current.json',{'job':job,'campaign_id':root.name,'stage':stage,'output':str(output),'checkpoint_policy':os.environ.get('VA64_G_CHECKPOINT_POLICY','external')})
 
 
 def wait_ready(root: Path,job: str,seconds: float=900) -> None:
+ if os.environ.get('VA64_G_CHECKPOINT_POLICY')=='local_only':
+  current(root,job,'bootstrap',root); return
  current(root,job,'waiting_wandb',root)
  api=_agent_api(); deadline=time.monotonic()+seconds
  while time.monotonic()<deadline:
@@ -62,12 +64,13 @@ def backup_and_wait(root: Path,job: str,output: Path,epoch: int,step: int,row: d
 
 
 def install_training(runtime,root: Path) -> None:
+ os.environ['VA64_G_CHECKPOINT_POLICY']='local_only'
  original=runtime.run_task
  def managed(task,**kwargs):
   old_callback=kwargs.get('epoch_callback')
   def epoch_callback(model,row):
    if old_callback: old_callback(model,row)
-   backup_and_wait(root,'va64-g-seed0',task.output_dir,row['epoch'],row['global_step'],row)
+   atomic_json(task.output_dir/'checkpoint-meta.json',{**row,'status':'local_checkpoint','checkpoint_policy':'local_only'})
    current(root,'va64-g-seed0','training',task.output_dir)
   kwargs['epoch_callback']=epoch_callback
   kwargs['stop_without_checkpoint']=True
@@ -79,9 +82,17 @@ def install_training(runtime,root: Path) -> None:
 
 
 def complete_run(root: Path, output: Path, status: str) -> None:
- row=json.loads((output/'latest-epoch.json').read_text())
- # The runner writes result/cost after its last epoch callback. Preserve those too.
- backup_and_wait(root,'va64-g-seed0',output,row['epoch'],row['global_step'],row)
+ # Only small local results are collected by the independent telemetry guard.
+ # There is no network request, checkpoint upload, or acknowledgement wait here.
+ summary={'status':status}
+ for name in ('result','cost','latest-epoch'):
+  path=output/(name+'.json')
+  if path.is_file():
+   value=json.loads(path.read_text())
+   if name=='result': value={k:v for k,v in value.items() if k!='history'}
+   summary[name]=value
+ atomic_json(output/'final-summary.json',summary)
+ print('VA64_FINAL_SUMMARY='+json.dumps(summary),flush=True)
  current(root,'va64-g-seed0',status,output)
 
 

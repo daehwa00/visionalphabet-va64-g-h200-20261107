@@ -31,7 +31,8 @@ def test_ack_requires_wandb_confirmation(tmp_path,monkeypatch,wandb_ok):
   assert events==['download','validate','wandb']
 
 
-def test_training_backup_runs_after_checkpoint_callback(tmp_path,monkeypatch):
+def test_training_keeps_checkpoint_local_without_network(tmp_path,monkeypatch):
+ monkeypatch.setenv('VA64_G_CHECKPOINT_POLICY','external')
  events=[]; output=tmp_path/'output'; output.mkdir()
  task=SimpleNamespace(output_dir=output)
  def base(task,**kwargs):
@@ -41,12 +42,13 @@ def test_training_backup_runs_after_checkpoint_callback(tmp_path,monkeypatch):
  runtime=SimpleNamespace(run_task=base)
  def callback(_model,_row): events.append('derived_files')
  def backup(*args):
-  assert (output/'checkpoint.pt').read_bytes()==b'committed'; events.append('external_backup')
+  pytest.fail('training must never upload checkpoints')
  monkeypatch.setattr(operations,'backup_and_wait',backup)
  monkeypatch.setattr(operations.signal,'signal',lambda *_:None)
  operations.install_training(runtime,tmp_path)
  assert runtime.run_task(task,epoch_callback=callback)['status']=='paused'
- assert events==['derived_files','external_backup']
+ assert events==['derived_files']
+ assert __import__('json').loads((output/'checkpoint-meta.json').read_text())['status']=='local_checkpoint'
 
 
 def test_backup_filename_allowlist_keeps_secrets_out():
@@ -71,7 +73,7 @@ def test_relay_disables_corruptible_response_compression(monkeypatch):
  assert captured[0]['accept-encoding']=='identity'
 
 
-def test_final_backup_keeps_best_and_cost_before_completion(tmp_path,monkeypatch):
+def test_final_results_keep_cost_and_leave_checkpoints_local(tmp_path,monkeypatch):
  import json
  from scripts import va64_h200_transport as transport
  output=tmp_path/'output'; output.mkdir()
@@ -84,11 +86,14 @@ def test_final_backup_keeps_best_and_cost_before_completion(tmp_path,monkeypatch
  def backup(*args):
   files={name for name,_,_ in transport._source_files(output)}
   assert {'checkpoint.pt','best.pt','cost.json','result.json'}<=files
-  events.append('backed_up')
+  pytest.fail('final checkpoint upload must not run')
  monkeypatch.setattr(operations,'backup_and_wait',backup)
  monkeypatch.setattr(operations,'current',lambda *args:events.append(args[2]))
  operations.complete_run(tmp_path,output,'completed')
- assert events==['backed_up','completed']
+ assert events==['completed']
+ saved=json.loads((output/'final-summary.json').read_text())
+ assert saved['cost']['status']=='completed'
+ assert (output/'best.pt').read_bytes()==b'best'
 
 
 def test_observer_waits_for_retry_after_completed_session(tmp_path, monkeypatch):
@@ -186,3 +191,20 @@ def test_final_backup_stop_uses_normal_stop_classification(tmp_path,monkeypatch)
  assert result.value.code==130
  import json
  assert json.loads((tmp_path/'current.json').read_text())['stage']=='stopped_without_backup'
+
+
+def test_local_only_start_and_final_results_need_no_network(tmp_path,monkeypatch):
+ import json
+ monkeypatch.setenv('VA64_G_CHECKPOINT_POLICY','local_only')
+ monkeypatch.setattr(operations,'_agent_api',lambda:pytest.fail('no network gate allowed'))
+ monkeypatch.setattr(operations,'backup_and_wait',lambda *args:pytest.fail('no final checkpoint backup'))
+ operations.wait_ready(tmp_path,'va64-g-seed0')
+ output=tmp_path/'output';output.mkdir()
+ (output/'result.json').write_text(json.dumps({'status':'completed','completed_epochs':100,'final_validation':{'accuracy':.5},'history':[{'epoch':1}]}))
+ (output/'cost.json').write_text(json.dumps({'training_seconds':1}))
+ operations.complete_run(tmp_path,output,'completed')
+ saved=json.loads((output/'final-summary.json').read_text())
+ assert saved['result']['completed_epochs']==100
+ assert 'history' not in saved['result']
+ assert saved['cost']['training_seconds']==1
+ assert json.loads((tmp_path/'current.json').read_text())['checkpoint_policy']=='local_only'

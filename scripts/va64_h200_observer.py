@@ -23,6 +23,7 @@ from va64_h200_transport import (
 STATE_NAME = "observer-state.json"
 EVENTS_NAME = "events.jsonl"
 BACKUP_ROOT = "backups"
+RESULT_ROOT = "results"
 WANDB_PROJECT_ENV = "VA64_G_WANDB_PROJECT"
 _SENSITIVE = re.compile(
     r"(?i)([\"']?(?:authorization|token|access_token|api[_-]?key|password|secret|x-session-id)"
@@ -65,6 +66,32 @@ def _append_event(path: Path, event: dict[str, Any], owner_token: str) -> None:
         os.fsync(stream.fileno())
 
 
+def _result_directory(root: Path, campaign: str, job: str) -> Path:
+    # Campaign names originate outside the observer; never use them as path components.
+    campaign_id = hashlib.sha256(campaign.encode("utf-8")).hexdigest()[:20]
+    return root / RESULT_ROOT / campaign_id / job
+
+
+def _persist_results(root: Path, campaign: str, job: str, status: dict[str, Any]) -> None:
+    directory = _result_directory(root, campaign, job)
+    directory.mkdir(parents=True, exist_ok=True)
+    atomic_json(directory / "context.json", {"campaign_id": campaign, "job": job})
+    atomic_json(directory / "status.json", _redact(status))
+    result = status.get("result")
+    if isinstance(result, dict) and any(value is not None for value in result.values()):
+        atomic_json(directory / "result.json", _redact(result))
+    summary = status.get("summary")
+    if isinstance(summary, dict) and summary:
+        atomic_json(directory / "final-summary.json", _redact(summary))
+    checkpoint = status.get("checkpoint")
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("epoch"), int):
+        row_path = directory / ("epoch-" + str(checkpoint["epoch"]) + ".json")
+        safe_row = _redact(checkpoint)
+        if _read_json(row_path) != safe_row:
+            _append_event(directory / "epochs.jsonl", safe_row, "")
+            atomic_json(row_path, safe_row)
+
+
 def _metrics(status: dict[str, Any]) -> dict[str, float | int]:
     progress = status.get("progress") or {}
     checkpoint = status.get("checkpoint") or {}
@@ -100,6 +127,9 @@ def _metrics(status: dict[str, Any]) -> dict[str, float | int]:
         value = train.get(source)
         if isinstance(value, (int, float)):
             result[target] = float(value)
+    validation_loss = validation.get("cross_entropy")
+    if isinstance(validation_loss, (int, float)):
+        result["validation/loss"] = float(validation_loss)
     for source, target in (
         ("accuracy", "validation/top1_percent"),
         ("top5_accuracy", "validation/top5_percent"),
@@ -168,7 +198,6 @@ class _WandbMirror:
             run.define_metric("validation/*", step_metric="optimizer_updates")
             run.define_metric("timing/*", step_metric="optimizer_updates")
         except Exception:  # noqa: BLE001 - W&B initialization must not block backups.
-            self.enabled = False
             return None
         self.runs[job] = run
         self.campaign_by_job[job] = campaign
@@ -187,9 +216,8 @@ class _WandbMirror:
             try:
                 run.log(payload)
             except Exception:  # noqa: BLE001 - W&B is an optional best-effort mirror.
-                self.enabled = False
-                self.finish_all()
-                return
+                self.finish(job)
+                raise
         result = status.get("result") or {}
         if result.get("status") == "completed":
             run.summary["completed_epochs"] = result.get("completed_epochs")
@@ -197,7 +225,7 @@ class _WandbMirror:
             final = (result.get("final_validation") or {}).get("accuracy")
             if isinstance(final, (int, float)):
                 run.summary["final/top1_percent"] = 100.0 * float(final)
-            # Finish only after the final external checkpoint is confirmed.
+            # The observer finishes after the final logs/result artifact is confirmed.
 
     def save_backup(self, campaign: str, job: str, metadata: dict, archive: Path) -> dict:
         run = self._run(campaign, job)
@@ -225,6 +253,11 @@ class _WandbMirror:
         artifact = self.module.Artifact(name=job + "-logs", type="logs")
         events = self.root / EVENTS_NAME
         if events.is_file(): artifact.add_file(str(events), name="events.jsonl")
+        result_directory = _result_directory(self.root, campaign, job)
+        if result_directory.is_dir():
+            for path in sorted(result_directory.iterdir()):
+                if path.is_file() and path.suffix in {".json", ".jsonl"}:
+                    artifact.add_file(str(path), name="results/" + path.name)
         logged = run.log_artifact(artifact, aliases=["latest"])
         logged.wait(timeout=180)
 
@@ -235,7 +268,7 @@ class _WandbMirror:
             try:
                 run.finish()
             except Exception:  # noqa: BLE001 - W&B shutdown failure must not affect backups.
-                self.enabled = False
+                pass
 
     def finish_all(self) -> None:
         for job in list(self.runs):
@@ -396,27 +429,36 @@ def observe(
     cursor = int(state.get("cursor", 0))
     latest_sha = dict(state.get("latest_sha", {}))
     mirror = _WandbMirror(output, enabled=wandb_enabled)
-    if not mirror.enabled: raise RuntimeError("online W&B is required for the G observer")
     active_jobs = set(state.get("active_jobs", []))
     campaigns = dict(state.get("campaigns", {}))
     child_failed = bool(state.get("child_failed", False))
     stopped_without_backup = bool(state.get("stopped_without_backup", False))
     completed_session_id = state.get("completed_session_id")
     session_id = state.get("session_id")
+    terminal_event_seen = bool(state.get("terminal_event_seen", False))
+    local_only = bool(state.get("local_only", False))
+    pending_status = dict(state.get("pending_status", {}))
     last_heartbeat = 0.0
     pending_warned: set[str] = set()
 
     while True:
-        view = api.call("/snapshot?after=" + str(cursor))
-        if not _is_json_object(view):
-            raise ValueError("relay returned an invalid snapshot")
+        try:
+            view = api.call("/snapshot?after=" + str(cursor))
+            if not _is_json_object(view):
+                raise ValueError("relay returned an invalid snapshot")
+        except Exception as error:  # noqa: BLE001 - transient relay errors must not kill collection.
+            print("VA64_OBSERVER_SNAPSHOT_RETRY error=" + type(error).__name__, flush=True)
+            if once:
+                return
+            time.sleep(poll_seconds)
+            continue
         session = view.get("session") or {}
         incoming_id = session.get("id")
-        # Older observer states already finalized this session before exiting.
-        if session_id is None and state.get("session_ended") and session.get("ended"):
-            completed_session_id = incoming_id
         if incoming_id and incoming_id == completed_session_id:
-            api.call("/command", {"action": "heartbeat"})
+            try:
+                api.call("/command", {"action": "heartbeat"})
+            except Exception as error:  # noqa: BLE001 - retry on the next poll.
+                print("VA64_OBSERVER_HEARTBEAT_RETRY error=" + type(error).__name__, flush=True)
             if once:
                 return
             time.sleep(poll_seconds)
@@ -428,10 +470,14 @@ def observe(
             latest_sha.clear()
             child_failed = False
             stopped_without_backup = False
+            local_only = False
+            pending_status.clear()
             pending_warned.clear()
             session_id = incoming_id
+            terminal_event_seen = False
         code_sha = session.get("code")
-        for event in view.get("events", []):
+        events = view.get("events", [])
+        for event in events:
             if not isinstance(event, dict):
                 continue
             try:
@@ -439,6 +485,8 @@ def observe(
                 payload = json.loads(value) if isinstance(value, str) else value
                 if not isinstance(payload, dict):
                     continue
+                # Save raw events before any optional W&B/network operation.
+                _append_event(output / EVENTS_NAME, payload, api.token)
                 status = payload.get("status") or {}
                 current = status.get("current") or {}
                 stopped_without_backup = current.get("stage") == "stopped_without_backup"
@@ -447,23 +495,37 @@ def observe(
                 if job in JOBS and isinstance(campaign, str) and isinstance(status, dict):
                     active_jobs.add(job); campaigns[job] = campaign
                     child_failed = bool(status.get("ended") and status.get("exit_code") not in (None, 0))
-                    if mirror._run(campaign, job) is None: raise RuntimeError("W&B initialization failed")
-                    if current.get("stage") == "waiting_wandb":
-                        api.call("/command", {"action": "ready", "job": job})
-                    mirror.consume(campaign, job, status)
+                    local_only = current.get("checkpoint_policy") == "local_only"
+                    terminal_event_seen = bool(status.get("ended"))
+                    _persist_results(output, campaign, job, status)
+                    pending_status[job] = _redact(status)
                 event_id = event.get("id")
                 if isinstance(event_id, int):
                     cursor = max(cursor, event_id)
-                _append_event(output / EVENTS_NAME, payload, api.token)
             except (ValueError, TypeError):
                 continue
 
+        for job, status in list(pending_status.items()):
+            try:
+                campaign = campaigns[job]
+                if mirror._run(campaign, job) is None:
+                    raise RuntimeError("W&B initialization unavailable")
+                if not local_only and (status.get("current") or {}).get("stage") == "waiting_wandb":
+                    api.call("/command", {"action": "ready", "job": job})
+                mirror.consume(campaign, job, status)
+                pending_status.pop(job, None)
+            except Exception as error:  # noqa: BLE001 - local results survive optional mirror failures.
+                print("VA64_OBSERVER_WANDB_RETRY job=" + job + " error=" + type(error).__name__, flush=True)
+
         if time.monotonic() - last_heartbeat >= 60:
-            api.call("/command", {"action": "heartbeat"})
-            last_heartbeat = time.monotonic()
+            try:
+                api.call("/command", {"action": "heartbeat"})
+                last_heartbeat = time.monotonic()
+            except Exception as error:  # noqa: BLE001 - retry on the next poll.
+                print("VA64_OBSERVER_HEARTBEAT_RETRY error=" + type(error).__name__, flush=True)
 
         backups_ready = True
-        for job in (() if stopped_without_backup else active_jobs):
+        for job in (() if stopped_without_backup or local_only else active_jobs):
             try:
                 observed_sha = _backup_latest(
                     api,
@@ -490,6 +552,8 @@ def observe(
             state_path,
             {
                 "session_id": session_id,
+                "local_only": local_only,
+                "pending_status": pending_status,
                 "completed_session_id": completed_session_id,
                 "child_failed": child_failed,
                 "stopped_without_backup": stopped_without_backup,
@@ -498,17 +562,29 @@ def observe(
                 "cursor": cursor,
                 "latest_sha": latest_sha,
                 "session_ended": bool(session.get("ended")),
+                "terminal_event_seen": terminal_event_seen,
                 "heartbeat": time.time(),
             },
         )
         ended = bool(session.get("ended"))
-        if ended and backups_ready:
-            for job in active_jobs: mirror.save_logs(campaigns[job], job)
-            mirror.finish_all()
-            completed_session_id = session_id
-            saved = _read_json(state_path)
-            saved["completed_session_id"] = completed_session_id
-            atomic_json(state_path, saved)
+        # The relay session flag reflects the latest event, whereas snapshot pages
+        # contain only the first 100 unread events. Drain to the terminal event and
+        # beyond any full page before finalizing logs/results.
+        page_drained = len(events) < 100
+        if ended and terminal_event_seen and page_drained and backups_ready and not pending_status:
+            try:
+                for job in active_jobs:
+                    mirror.save_logs(campaigns[job], job)
+            except Exception as error:  # noqa: BLE001 - retry preservation after the child has exited.
+                print("VA64_OBSERVER_LOGS_RETRY error=" + type(error).__name__, flush=True)
+            else:
+                mirror.finish_all()
+                completed_session_id = session_id
+                saved = _read_json(state_path)
+                saved["completed_session_id"] = completed_session_id
+                atomic_json(state_path, saved)
+        if ended and events and (not terminal_event_seen or not page_drained):
+            continue
         if once:
             return
         time.sleep(poll_seconds)

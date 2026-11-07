@@ -57,3 +57,24 @@ def test_rng_restore_and_epoch_sampler_order_independent_of_physical_batch():
  changed=bundle(256);runtime._restore_rng(state,changed,torch.device('cpu'))
  actual=torch.cat([x[0] for x in changed.train])
  assert torch.equal(expected,actual)
+
+
+def test_recover_restores_manifest_metadata_only_after_hash_validation(tmp_path,monkeypatch):
+ import va64_h200_transport as transport
+ root=tmp_path/'run';(root/'environment-check').mkdir(parents=True)
+ dataset={'root':'/app/data/ImageNet-2012','counts':{'train':1,'val':1},'classes':['a'],'file_list':'/new/files.jsonl'}
+ runtime._atomic_json(root/'environment-check/dataset-manifest.json',dataset)
+ canonical={**dataset,'file_list':'/original/files.jsonl'}
+ expected=hashlib.sha256(runtime._canonical_json(canonical)+b'\n').hexdigest()
+ cp=b'parent-checkpoint'
+ plan={'artifact_metadata':{'verified':True},'checkpoint_sha256':hashlib.sha256(cp).hexdigest(),'completed_epochs':13,'global_step':65065,'canonical_dataset_file_list':canonical['file_list'],'canonical_dataset_sha256':expected}
+ pp=tmp_path/'plan.json';pp.write_text(json.dumps(plan))
+ monkeypatch.setattr(transport,'_agent_api',lambda:None)
+ monkeypatch.setattr(transport,'download_artifact',lambda *args:None)
+ def extract(archive,path):
+  path.mkdir();(path/'checkpoint.pt').write_bytes(cp);runtime._atomic_json(path/'dataset.json',dataset);return True
+ monkeypatch.setattr(transport,'_safe_extract',extract)
+ recovery=migration.recover(root,pp)
+ manifest=recovery/'resume-dataset-manifest.json'
+ assert migration.digest(manifest)==expected
+ assert json.loads(manifest.read_text())['file_list']==canonical['file_list']

@@ -642,3 +642,19 @@ def test_stop_without_checkpoint_before_first_update(tmp_path):
             loader_builder=_loader, mixup_factory=lambda task: IdentityMixup(task.num_classes),
             stop_requested=lambda: True, stop_without_checkpoint=True)
     assert not _task(tmp_path).checkpoint_path.exists()
+
+
+def test_managed_training_finishes_with_all_network_access_unavailable(tmp_path,monkeypatch):
+    from scripts import va64_runtime_operations as operations
+    monkeypatch.setenv('VA64_G_CHECKPOINT_POLICY','external')
+    monkeypatch.setattr(runtime,'run_task',runtime.run_task)
+    monkeypatch.setattr(operations,'_agent_api',lambda:pytest.fail('network access must not happen'))
+    monkeypatch.setattr(operations,'backup_and_wait',lambda *args:pytest.fail('external backup must not happen'))
+    monkeypatch.setattr(operations.signal,'signal',lambda *args:None)
+    operations.install_training(runtime,tmp_path)
+    result=runtime.run_task(_task(tmp_path),device=torch.device('cpu'),model_builder=_builder,
+        loader_builder=_loader,mixup_factory=lambda task:IdentityMixup(task.num_classes))
+    assert result['status']=='completed' and result['completed_epochs']==2
+    assert _task(tmp_path).checkpoint_path.is_file()
+    operations.complete_run(tmp_path,tmp_path,'completed')
+    assert (tmp_path/'final-summary.json').is_file()
