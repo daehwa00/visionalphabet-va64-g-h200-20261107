@@ -1,0 +1,11 @@
+{
+  "mode": "preflight_only",
+  "request_username": "daehwa00",
+  "variant": "G",
+  "seed": 0,
+  "physical_batch": 128,
+  "gradient_accumulation": 2,
+  "gpu_mixup": true,
+  "execution_repository": "https://github.com/daehwa00/visionalphabet-va64-g-h200-20261107",
+  "full_training_started": false
+}
