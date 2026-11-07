@@ -89,3 +89,39 @@ def test_final_backup_keeps_best_and_cost_before_completion(tmp_path,monkeypatch
  monkeypatch.setattr(operations,'current',lambda *args:events.append(args[2]))
  operations.complete_run(tmp_path,output,'completed')
  assert events==['backed_up','completed']
+
+
+def test_observer_waits_for_retry_after_completed_session(tmp_path, monkeypatch):
+ import json
+ states = [
+  {'session': {'id': 'old', 'ended': True}, 'events': []},
+  {'session': {'id': 'new', 'ended': False, 'code': 'b'*40}, 'events': [
+   {'id': 5, 'value': {'status': {'current': {'job': 'va64-g-preflight', 'campaign_id': 'retry', 'stage': 'waiting_wandb'}}}}
+  ]},
+ ]
+ (tmp_path/observer.STATE_NAME).write_text(json.dumps({'session_ended': True, 'cursor': 4, 'active_jobs': ['va64-g-preflight'], 'campaigns': {'va64-g-preflight': 'old'}}))
+ calls=[]
+ class Relay:
+  token='test'
+  def call(self,path,value=None):
+   if path.startswith('/snapshot'): return states.pop(0)
+   calls.append(value); return {}
+ class Mirror:
+  enabled=True
+  def __init__(self,*args,**kwargs): pass
+  def finish_all(self): pass
+  def _run(self,campaign,job): assert campaign=='retry'; return True
+  def consume(self,*args): pass
+ monkeypatch.setattr(observer,'owner_api_from_secrets',lambda _:Relay())
+ monkeypatch.setattr(observer,'_WandbMirror',Mirror)
+ monkeypatch.setattr(observer,'_backup_latest',lambda *args:None)
+ class Done(Exception): pass
+ def sleep(_):
+  if not states: raise Done
+ monkeypatch.setattr(observer.time,'sleep',sleep)
+ with pytest.raises(Done): observer.observe(tmp_path,'unused',poll_seconds=0.01)
+ state=json.loads((tmp_path/observer.STATE_NAME).read_text())
+ assert state['session_id']=='new'
+ assert state['campaigns']=={'va64-g-preflight':'retry'}
+ assert state['child_failed'] is False
+ assert {'action':'ready','job':'va64-g-preflight'} in calls

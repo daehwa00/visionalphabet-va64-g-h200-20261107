@@ -44,3 +44,7 @@ observer/relay연락이10분이상없으면guard가중단을요청한다. 완료
 - 라이브회수에서자동Brotli응답이ContentDecodingError/ChunkedEncodingError를발생시켜Accept-Encoding: identity로고정했다. 같은256KiB조각이비압축응답에서는정상수신됐고전체19,874,323bytebundle의해시가일치했다. 실패시도는operations/live,수정후성공은operations/live-v2에별도보존했다.
 
 H200에제출할수있는것은먼저20step preflight다. 실제H200에서등록·데이터·학습·중단·외부회수까지확인한후100epoch본학습으로진행한다. 저장소최신commit을허용하는worker재배포와observer동작을제출직전에대조한다.
+
+
+## 2026-11-07 재시도
+첫 H200 요청 #663은 uv의 CUDA 인덱스 우선 탐색으로 requests 설치 전에 실패했고 자원이 반납됐다. 패키지 버전은 유지하고 torch/torchvision만 공식 CUDA wheel URL과 SHA256으로 지정한다. 나머지는 PyPI에서 설치한다. 외부 observer는 종료된 세션 저장 후 다음 세션을 기다리며 재시도별 상태를 분리한다. 새 요청은 별도 RUN_ID attempt2로 실행한다.

@@ -400,6 +400,8 @@ def observe(
     active_jobs = set(state.get("active_jobs", []))
     campaigns = dict(state.get("campaigns", {}))
     child_failed = bool(state.get("child_failed", False))
+    completed_session_id = state.get("completed_session_id")
+    session_id = state.get("session_id")
     last_heartbeat = 0.0
     pending_warned: set[str] = set()
 
@@ -408,6 +410,24 @@ def observe(
         if not _is_json_object(view):
             raise ValueError("relay returned an invalid snapshot")
         session = view.get("session") or {}
+        incoming_id = session.get("id")
+        # Older observer states already finalized this session before exiting.
+        if session_id is None and state.get("session_ended") and session.get("ended"):
+            completed_session_id = incoming_id
+        if incoming_id and incoming_id == completed_session_id:
+            api.call("/command", {"action": "heartbeat"})
+            if once:
+                return
+            time.sleep(poll_seconds)
+            continue
+        if incoming_id and incoming_id != session_id:
+            mirror.finish_all()
+            active_jobs.clear()
+            campaigns.clear()
+            latest_sha.clear()
+            child_failed = False
+            pending_warned.clear()
+            session_id = incoming_id
         code_sha = session.get("code")
         for event in view.get("events", []):
             if not isinstance(event, dict):
@@ -466,6 +486,8 @@ def observe(
         atomic_json(
             state_path,
             {
+                "session_id": session_id,
+                "completed_session_id": completed_session_id,
                 "child_failed": child_failed,
                 "active_jobs": sorted(active_jobs),
                 "campaigns": campaigns,
@@ -479,7 +501,11 @@ def observe(
         if ended and backups_ready:
             for job in active_jobs: mirror.save_logs(campaigns[job], job)
             mirror.finish_all()
-        if once or (ended and backups_ready):
+            completed_session_id = session_id
+            saved = _read_json(state_path)
+            saved["completed_session_id"] = completed_session_id
+            atomic_json(state_path, saved)
+        if once:
             return
         time.sleep(poll_seconds)
 
