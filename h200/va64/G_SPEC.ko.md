@@ -1,6 +1,6 @@
 # 제안: 리버탈용 G — terminal complex feature GAP
 
-상태: 설계 제안. 아직 구현·GPU 검증·학습하지 않았으며 사용자가 이 문서를 승인한 것으로 취급하지 않는다.
+상태: 구현 및 CPU/RTX4090 검증 완료. 224px compiled BF16 20-step·새 프로세스 checkpoint 복원 통과. H200 실행 및 100 epoch 학습은 아직 미시작이다.
 
 ## 직접 답할 리뷰 질문
 
