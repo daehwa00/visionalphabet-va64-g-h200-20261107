@@ -3,7 +3,7 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 MODE="${1:-preflight}"
-[[ "$MODE" == preflight || "$MODE" == train ]] || { echo 'Expected preflight or train'; exit 2; }
+[[ "$MODE" == preflight || "$MODE" == train || "$MODE" == tune-resume ]] || { echo 'Expected preflight, train or tune-resume'; exit 2; }
 RUN_ID="${VA64_RUN_ID:-va64-g-seed0-preflight-20261107}"
 [[ "$RUN_ID" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo 'Invalid run ID'; exit 2; }
 RUN_ROOT="/app/output/$RUN_ID"
@@ -13,7 +13,7 @@ if [[ "${2:-}" != --inside-guard ]]; then
   export VA64_G_CODE_SHA="$(git rev-parse HEAD)"
   export VA64_G_MANAGED_ROOT="$RUN_ROOT"
   export VA64_G_JOB=va64-g-preflight
-  [[ "$MODE" == train ]] && export VA64_G_JOB=va64-g-seed0
+  [[ "$MODE" != preflight ]] && export VA64_G_JOB=va64-g-seed0
   export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/scripts"
   exec python3 -u scripts/va64_h200_guard.py --root "$RUN_ROOT" --code-sha "$VA64_G_CODE_SHA" \
     --relay-url https://visionalphabet-va64-g-20261107.gpupulse-monitor.workers.dev/va64g \
@@ -27,11 +27,24 @@ export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/scripts"
 export TRITON_CACHE_DIR="$RUN_ROOT/cache/triton" TORCHINDUCTOR_CACHE_DIR="$RUN_ROOT/cache/inductor"
 trap 'touch "$RUN_ROOT/STOP"' TERM INT
 JOB=va64-g-preflight
-[[ "$MODE" == train ]] && JOB=va64-g-seed0
+[[ "$MODE" != preflight ]] && JOB=va64-g-seed0
 check_stop() { [[ ! -e "$RUN_ROOT/STOP" ]] || { echo "VA64_STOP_REQUESTED"; exit 130; }; }
 python3 scripts/va64_runtime_operations.py ready --root "$RUN_ROOT" --job "$JOB"
 check_stop
-trap 'rc=$?; echo "VA64_JOB_EXIT=$rc"; exit "$rc"' EXIT
+job_exit() {
+  rc=$?
+  if [[ -e "$RUN_ROOT/STOP" ]]; then
+    python3 - "$RUN_ROOT" "$JOB" <<'STOPSTATE'
+import sys
+from pathlib import Path
+from va64_runtime_operations import current
+root=Path(sys.argv[1]);current(root,sys.argv[2],'stopped_without_backup',root)
+STOPSTATE
+  fi
+  echo "VA64_JOB_EXIT=$rc"
+  exit "$rc"
+}
+trap job_exit EXIT
 python3 -m pip install --disable-pip-version-check --target "$RUN_ROOT/bootstrap" uv==0.11.26
 UV_PYTHON_INSTALL_DIR="$RUN_ROOT/python" PYTHONPATH="$RUN_ROOT/bootstrap" python3 -m uv python install 3.13.11
 UV_PYTHON_INSTALL_DIR="$RUN_ROOT/python" PYTHONPATH="$RUN_ROOT/bootstrap" python3 -m uv venv --python 3.13.11 "$RUN_ROOT/environment"
@@ -43,6 +56,22 @@ check_stop
 check_stop
 # Tests use tiny fields. The smoke below checks the full 224px path separately.
 "$PY" -m pytest -q tests/test_va64_g.py
+if [[ "$MODE" == tune-resume ]]; then
+  export VA64_G_RESUME_PLAN="$PROJECT_ROOT/h200/va64/resume-plan.json"
+  "$PY" scripts/va64_h200_resume.py --root "$RUN_ROOT" --plan "$VA64_G_RESUME_PLAN"
+  export VA64_G_RECOVERY="$RUN_ROOT/recovery"
+  "$PY" - "$RUN_ROOT" "$JOB" <<'BENCHSTATE'
+import sys
+from pathlib import Path
+from va64_runtime_operations import current
+root=Path(sys.argv[1]);current(root,sys.argv[2],'benchmark',root/'benchmark')
+BENCHSTATE
+  "$PY" h200/va64/benchmark_g.py --data-root "$DATA_ROOT" --output "$RUN_ROOT/benchmark" --checkpoint "$VA64_G_RECOVERY/checkpoint.pt" --workers 8 --warmup-updates 30 --measure-updates 100 --stop-file "$RUN_ROOT/STOP"
+  check_stop
+  BATCH=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["selected_batch_size"])' "$RUN_ROOT/benchmark/selection.json")
+  [[ "$BATCH" == 128 || "$BATCH" == 256 ]] || exit 2
+  exec "$PY" scripts/run_va64_g_h200.py --variant G --seed 0 --data-root "$DATA_ROOT" --data-manifest "$VA64_G_RECOVERY/dataset.json" --output-root "$RUN_ROOT/runs" --batch-size "$BATCH" --workers 8 --gpu-mixup --stop-file "$RUN_ROOT/STOP"
+fi
 if [[ "$MODE" == train ]]; then
   # Full training is a separate issue after retrieval and stop access are verified.
   [[ "${VA64_OPERATIONS_VERIFIED:-}" == yes ]] || { echo 'Verify checkpoint retrieval and remote stopping before full training'; exit 2; }

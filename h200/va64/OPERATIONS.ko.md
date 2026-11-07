@@ -48,3 +48,15 @@ H200에제출할수있는것은먼저20step preflight다. 실제H200에서등록
 
 ## 2026-11-07 재시도
 첫 H200 요청 #663은 uv의 CUDA 인덱스 우선 탐색으로 requests 설치 전에 실패했고 자원이 반납됐다. 패키지 버전은 유지하고 torch/torchvision만 공식 CUDA wheel URL과 SHA256으로 지정한다. 나머지는 PyPI에서 설치한다. 외부 observer는 종료된 세션 저장 후 다음 세션을 기다리며 재시도별 상태를 분리한다. 새 요청은 별도 RUN_ID attempt2로 실행한다.
+
+
+## Batch 비교 후 epoch 경계 resume 및 즉시 중단
+`run.sh tune-resume`은 외부 검증된 부모 checkpoint의 archive/hash/계약을 고정해 복구하고 실제 ImageNet으로 128×2와256×1을 각각 별도 프로세스에서 측정한다. Compile warmup30 update 뒤100 update의 전처리·전송·GPU Mixup·학습 전체 처리량과peak memory로 선택한다. 256 OOM이면128을 사용하며, 다른 실패는 중단한다. 선택 결과는 telemetry/batch-comparison.json으로 다음 checkpoint와 함께 외부 보존된다. 실제 H200 비교는 이슈 실행 시 수행한다.
+
+정상 resume 계약은 엄격하게 유지한다. 이번 전환만 명시적 resume-plan으로 원본 hash와 계약, 허용된 대상 소스 hash,동일 recipe를 확인한 뒤 모델·optimizer·RNG·완료 epoch·global_step을 보존한다. global256,LR,AdamW,스케줄,증강 설정은 유지한다. Epoch 경계 sampler 순서는 유지하지만 worker의 증강 RNG, Mixup 짝/난수,BN 통계와 마지막143장 가중치는 physical batch에 따라 달라지므로 수치적으로 동일한 trajectory를 보장하지 않는다. 새 run의 parent lineage와기존 best를 보존한다.
+
+사용자 요청에 따라 새 실행의 STOP/SIGTERM은 현재 optimizer update 경계에서 validation·새 checkpoint·최종 외부 backup 없이 exit130한다. 이미 validation 중이면 다음 validation batch 전에 멈춘다. Backup 중 SIGTERM은 동기 전송/재시도를 취소하며 background upload thread를 기다리지 않는다. 기존 외부 checkpoint와 수집된 로그는 유지한다. 따라서 다음 resume는 마지막으로 외부 저장된 epoch부터이며 중단한 epoch의 미저장 update는 잃는다. 이전 commit으로 이미 실행 중인 job에는 이 변경이 소급 적용되지 않는다.
+
+
+### 기존 #665 중단과 복구 결과
+기존327a9a2 guard가20분 grace_expired로자동강제종료했다. 수동force명령은없었다. 자원반납확인. 원본archive는160chunk중146개만전송됐지만 완전한epoch1 best.pt를복구했다. ZIPCRC검사,원래계약의hash재현/일치,원래datasetmanifesthash일치,G strict모델과AdamW load를통과했다. 복구모델/optimizer/RNG/history를보존한정규화archive는W&B와relay에완전저장됐고 W&B 독립다운로드SHA도일치했다. 원본부분전송본과복구증거를private W&B recovery artifact로보존했다. resume-plan은이복구archive를명시적으로고정한다.

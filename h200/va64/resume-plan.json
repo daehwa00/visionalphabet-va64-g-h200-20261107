@@ -1,0 +1,27 @@
+{
+  "schema": "va64.explicit-epoch-migration.v1",
+  "artifact_metadata": {
+    "sha": "d868fa11ebc6de22912a7275c414c5166b5fe3b3c1b26a8ec8488097c57fbffe",
+    "bytes": 41768941,
+    "chunks": 160,
+    "epoch": 1,
+    "workers": 0,
+    "chunk_bytes": 262144,
+    "global_step": 5005,
+    "code_sha": "327a9a216d8b0cc577eef18e0867c813880ac5cb",
+    "complete": true,
+    "verified": true,
+    "created": 1794041646016
+  },
+  "checkpoint_sha256": "17daf02f8cd64a5fd7b2a07403f54eaa9598c1421035e56489e8b769040686d9",
+  "contract_relative_path": "contracts/va_k64_retrain_G__full__seed0__lr0p003.json",
+  "contract_sha256": "8b31edd673aa3e55ffd4aa56cea3667174c5f9ee920b0003af755c5c5ed05fdb",
+  "completed_epochs": 1,
+  "global_step": 5005,
+  "allowed_new_sources": {
+    "source_closure": "11ca90dd41a6f56b107736d61d827a29a5f54a6e9fc20e34884a419140cf3e4f",
+    "h200_g_entrypoint": "a9941d3b448fcda29a85edc380548590a0a5f56ca4bcab570ae461acaf645976",
+    "imagenet1k_runtime": "106363b45e69a8b0167b84ca0e9de2b3088f4157c2752bccd3b15293bfc68e01"
+  },
+  "parent_recovery": "Epoch1 best.pt recovered intact from uploaded prefix; ZIP CRC, exact original contract and dataset hashes validated; complete normalized bundle uploaded to private W&B and relay."
+}

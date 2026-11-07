@@ -474,6 +474,10 @@ def _step_callback_for_epoch(
     return report_step
 
 
+class TrainingInterrupted(RuntimeError):
+    """Stop at an optimizer boundary without validation or a new recovery point."""
+
+
 def _train_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
@@ -484,7 +488,10 @@ def _train_epoch(
     global_step: int,
     step_callback: Callable[[dict[str, Any]], None] | None = None,
     epoch: int = 1,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, float], int]:
+    if stop_requested is not None and stop_requested():
+        raise TrainingInterrupted("stop requested before optimizer update")
     model.train()
     optimizer.zero_grad(set_to_none=True)
     accumulation = task.gradient_accumulation_steps
@@ -552,6 +559,8 @@ def _train_epoch(
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
             window_start = index + 1
+            if stop_requested is not None and stop_requested():
+                raise TrainingInterrupted("stop requested after optimizer update; no validation/checkpoint")
 
         # Queue the complete update before a loader wait. Copying the next batch
         # still overlaps GPU work and precedes periodic CPU metric reads.
@@ -593,7 +602,8 @@ def _train_epoch(
 
 
 def _evaluate(
-    model: nn.Module, loader: DataLoader[Any], task: BaselineTask, device: torch.device
+    model: nn.Module, loader: DataLoader[Any], task: BaselineTask, device: torch.device,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> dict[str, float]:
     model.eval()
     metric_loss = torch.zeros((), device=device, dtype=torch.float64)
@@ -613,6 +623,8 @@ def _evaluate(
     prepared = next_batch() if batch_count and transfer is not None else None
     with torch.inference_mode():
         for index in range(batch_count):
+            if stop_requested is not None and stop_requested():
+                raise TrainingInterrupted("stop requested during validation")
             if transfer is None:
                 prepared = next_batch()
             if prepared is None:
@@ -764,6 +776,7 @@ def _run_task(
     epoch_callback: Callable[[nn.Module, dict[str, Any]], None] | None = None,
     step_callback: Callable[[dict[str, Any]], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    stop_without_checkpoint: bool = False,
 ) -> dict[str, Any]:
     """Run or exact-contract resume a local, authoritative LNet task."""
     _validate_task(task)
@@ -844,8 +857,16 @@ def _run_task(
             global_step,
             active_step_callback,
             epoch=epoch,
+            stop_requested=stop_requested if stop_without_checkpoint else None,
         )
-        validation = _evaluate(model, loaders.validation, task, resolved_device)
+        if stop_without_checkpoint and stop_requested is not None and stop_requested():
+            raise TrainingInterrupted("stop requested before validation; no new checkpoint")
+        if stop_without_checkpoint:
+            validation = _evaluate(model, loaders.validation, task, resolved_device, stop_requested=stop_requested)
+        else:
+            validation = _evaluate(model, loaders.validation, task, resolved_device)
+        if stop_without_checkpoint and stop_requested is not None and stop_requested():
+            raise TrainingInterrupted("stop requested before checkpoint")
         training_seconds = elapsed_before_resume + time.monotonic() - started
         row = {
             "epoch": epoch,
@@ -956,6 +977,7 @@ def run_task(
     epoch_callback: Callable[[nn.Module, dict[str, Any]], None] | None = None,
     step_callback: Callable[[dict[str, Any]], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    stop_without_checkpoint: bool = False,
 ) -> dict[str, Any]:
     """Run a task and close its logger on successful, failed, or interrupted execution."""
     active_logger: Logger | None = None
@@ -977,11 +999,12 @@ def run_task(
             epoch_callback=epoch_callback,
             step_callback=step_callback,
             stop_requested=stop_requested,
+            stop_without_checkpoint=stop_without_checkpoint,
         )
     except BaseException as error:
         if active_logger is not None:
             status = (
-                "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+                "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit, TrainingInterrupted)) else "failed"
             )
             with suppress(BaseException):
                 active_logger.finish(

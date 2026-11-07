@@ -246,6 +246,9 @@ def train(args: argparse.Namespace) -> dict:
         if args.variant == "P":
             assert_zero_phases(model)
         accuracy = row["validation"]["accuracy"]
+        # A managed migration may restore historical best after this closure was built.
+        if best_path.exists():
+            best = max(best, json.loads(best_path.read_text())["accuracy"])
         # Runtime calls this after committing its latest checkpoint, including
         # on resume to repair derived files after interrupted writes.
         if accuracy > best:
@@ -298,7 +301,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--data-manifest", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, choices=(64, 128), default=128)
+    parser.add_argument("--batch-size", type=int, choices=(64, 128, 256), default=128)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--gpu-mixup", action="store_true")

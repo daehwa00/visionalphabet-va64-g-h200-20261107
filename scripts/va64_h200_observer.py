@@ -400,6 +400,7 @@ def observe(
     active_jobs = set(state.get("active_jobs", []))
     campaigns = dict(state.get("campaigns", {}))
     child_failed = bool(state.get("child_failed", False))
+    stopped_without_backup = bool(state.get("stopped_without_backup", False))
     completed_session_id = state.get("completed_session_id")
     session_id = state.get("session_id")
     last_heartbeat = 0.0
@@ -426,6 +427,7 @@ def observe(
             campaigns.clear()
             latest_sha.clear()
             child_failed = False
+            stopped_without_backup = False
             pending_warned.clear()
             session_id = incoming_id
         code_sha = session.get("code")
@@ -439,6 +441,7 @@ def observe(
                     continue
                 status = payload.get("status") or {}
                 current = status.get("current") or {}
+                stopped_without_backup = current.get("stage") == "stopped_without_backup"
                 job = current.get("job")
                 campaign = current.get("campaign_id")
                 if job in JOBS and isinstance(campaign, str) and isinstance(status, dict):
@@ -460,7 +463,7 @@ def observe(
             last_heartbeat = time.monotonic()
 
         backups_ready = True
-        for job in active_jobs:
+        for job in (() if stopped_without_backup else active_jobs):
             try:
                 observed_sha = _backup_latest(
                     api,
@@ -489,6 +492,7 @@ def observe(
                 "session_id": session_id,
                 "completed_session_id": completed_session_id,
                 "child_failed": child_failed,
+                "stopped_without_backup": stopped_without_backup,
                 "active_jobs": sorted(active_jobs),
                 "campaigns": campaigns,
                 "cursor": cursor,

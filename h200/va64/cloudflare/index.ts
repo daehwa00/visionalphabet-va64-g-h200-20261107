@@ -107,6 +107,8 @@ export class Va64Artifact extends DurableObject<Env> {
     if(r.n!==m.chunks||r.bytes!==m.bytes)throw Error('incomplete_artifact');
     m.complete=true;this.ctx.storage.sql.exec('UPDATE versions SET value=? WHERE sha=?',JSON.stringify(m),sha);return m;
   }
+  pending(){return this.ctx.storage.sql.exec<{sha:string,value:string}>('SELECT sha,value FROM versions').toArray().map(row=>({
+    ...JSON.parse(row.value),uploaded_chunks:this.ctx.storage.sql.exec<{n:number}>('SELECT COUNT(*) AS n FROM chunks WHERE sha=?',row.sha).one().n}));}
   latest():ArtifactMeta|null {const rows:ArtifactMeta[]=this.ctx.storage.sql.exec<{value:string}>('SELECT value FROM versions').toArray().map(r=>JSON.parse(r.value));
     return rows.filter(r=>r.complete).sort((a,b)=>b.epoch-a.epoch||(b.global_step??0)-(a.global_step??0)||b.created-a.created)[0]||null;}
   get(sha:string,part:number){const r=this.ctx.storage.sql.exec<{data:ArrayBuffer}>('SELECT data FROM chunks WHERE sha=? AND part=?',sha,part).toArray();return r.length?r[0].data:null;}
@@ -163,6 +165,7 @@ export default {
     if(parts[0]==='artifact'&&artifactJobs.has(parts[1]||'')){
       const artifactPrefix=k96?'k96coco/':va64g?'va64g/':'';
       const artifact=env.IN10_ARTIFACT.getByName(`${artifactPrefix}${test?'test':'v1'}/${parts[1]}`);
+      if(owner&&parts[2]==='pending'&&req.method==='GET')return reply(await artifact.pending());
       if(parts[2]==='latest'&&req.method==='GET')return reply(await artifact.latest());
       if(parts[2]==='begin'&&req.method==='POST'){
         const m=await body(req,4096);

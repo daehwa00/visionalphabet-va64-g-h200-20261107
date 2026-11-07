@@ -31,8 +31,23 @@ def main():
  if os.environ.get('VA64_G_MANAGED_ROOT'):
   from va64_runtime_operations import install_training
   install_training(experiment.runtime,Path(os.environ['VA64_G_MANAGED_ROOT']))
- result=experiment.train(args)
- if os.environ.get('VA64_G_MANAGED_ROOT'):
-  from va64_runtime_operations import complete_run
-  complete_run(Path(os.environ['VA64_G_MANAGED_ROOT']),experiment.make_task(args).output_dir,result['status'])
+ if os.environ.get('VA64_G_RECOVERY'):
+  from va64_h200_resume import migrate
+  original_run=experiment.runtime.run_task
+  def migrated_run(task,**kwargs):
+   migrate(task,Path(os.environ['VA64_G_RECOVERY']),Path(os.environ['VA64_G_RESUME_PLAN']),torch.device('cuda'))
+   return original_run(dataclasses.replace(task,resume=True),**kwargs)
+  experiment.runtime.run_task=migrated_run
+ try:
+  result=experiment.train(args)
+  if os.environ.get('VA64_G_MANAGED_ROOT'):
+   from va64_runtime_operations import complete_run
+   complete_run(Path(os.environ['VA64_G_MANAGED_ROOT']),experiment.make_task(args).output_dir,result['status'])
+ except experiment.runtime.TrainingInterrupted:
+  if os.environ.get('VA64_G_MANAGED_ROOT'):
+   from va64_runtime_operations import current
+   root=Path(os.environ['VA64_G_MANAGED_ROOT'])
+   current(root,'va64-g-seed0','stopped_without_backup',root/'runs'/'va_k64_retrain_G'/'seed_0')
+  print('VA64_STOPPED_WITHOUT_VALIDATION_OR_BACKUP',flush=True)
+  raise SystemExit(130)
 if __name__=='__main__': main()

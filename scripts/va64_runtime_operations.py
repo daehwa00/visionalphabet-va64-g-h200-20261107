@@ -26,6 +26,8 @@ def wait_ready(root: Path,job: str,seconds: float=900) -> None:
 
 def backup_and_wait(root: Path,job: str,output: Path,epoch: int,step: int,row: dict | None=None) -> dict:
  from va64_h200_transport import backup_run
+ from imagenet1k_runtime import TrainingInterrupted
+ if (root/'STOP').exists(): raise TrainingInterrupted('stop requested before backup')
  current(root,job,'wait_backup',output)
  telemetry=output/'telemetry'; telemetry.mkdir(exist_ok=True)
  contracts=output/'contracts'; contracts.mkdir(exist_ok=True)
@@ -33,11 +35,24 @@ def backup_and_wait(root: Path,job: str,output: Path,epoch: int,step: int,row: d
   if source.is_file(): shutil.copyfile(source,output/name)
  atomic_json(contracts/'source.json',{'code_sha':os.environ['VA64_G_CODE_SHA'],'variant':'G','job':job})
  if (root/'console.log').is_file(): shutil.copyfile(root/'console.log',telemetry/'console.txt')
+ if (root/'benchmark/selection.json').is_file():
+  shutil.copyfile(root/'benchmark/selection.json',telemetry/'batch-comparison.json')
  meta={**(row or {}),'epoch':epoch,'global_step':step,'status':'checkpoint_committed'}
  atomic_json(output/'checkpoint-meta.json',meta)
- receipt=backup_run(job,output,epoch,step,os.environ['VA64_G_CODE_SHA'],wait=True)
+ def cancel_check():
+  if (root/'STOP').exists(): raise TrainingInterrupted('stop requested; cancel backup')
+ def cancel_signal(*_):
+  (root/'STOP').touch()
+  raise TrainingInterrupted('stop signal; cancel backup without waiting')
+ previous={sig:signal.getsignal(sig) for sig in (signal.SIGTERM,signal.SIGINT)}
+ try:
+  for sig in previous: signal.signal(sig,cancel_signal)
+  receipt=backup_run(job,output,epoch,step,os.environ['VA64_G_CODE_SHA'],wait=True,cancel_check=cancel_check)
+ finally:
+  for sig,handler in previous.items(): signal.signal(sig,handler)
  api=_agent_api(); deadline=time.monotonic()+900
  while time.monotonic()<deadline:
+  if (root/'STOP').exists(): raise TrainingInterrupted('stop requested during backup acknowledgement')
   latest=api.call('/artifact/'+job+'/latest',attempts=1,timeout=15)
   if latest and latest.get('sha')==receipt['sha'] and latest.get('verified'):
    atomic_json(output/'external-backup-receipt.json',receipt)
@@ -55,6 +70,7 @@ def install_training(runtime,root: Path) -> None:
    backup_and_wait(root,'va64-g-seed0',task.output_dir,row['epoch'],row['global_step'],row)
    current(root,'va64-g-seed0','training',task.output_dir)
   kwargs['epoch_callback']=epoch_callback
+  kwargs['stop_without_checkpoint']=True
   for sig in (signal.SIGINT,signal.SIGTERM): signal.signal(sig,lambda *_:(root/'STOP').touch())
   current(root,'va64-g-seed0','training',task.output_dir)
   result=original(task,**kwargs)

@@ -217,6 +217,21 @@ class API:
         self._next_chunk = 0.0
         self._opener = _RequestsSessionOpener()
 
+    def _check_cancel(self):
+        check = getattr(self, 'cancel_check', None)
+        if check is not None:
+            check()
+
+    def _sleep(self, seconds):
+        if getattr(self, 'cancel_check', None) is None:
+            time.sleep(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self._check_cancel()
+            time.sleep(min(0.2, max(0.0, deadline-time.monotonic())))
+        self._check_cancel()
+
     @staticmethod
     def _retry_after(error: urllib.error.HTTPError) -> float:
         value = error.headers.get("Retry-After") if error.headers else None
@@ -281,12 +296,13 @@ class API:
         )
 
         for attempt in range(attempts):
+            self._check_cancel()
             remaining = deadline - time.monotonic() if deadline is not None else None
             if remaining is not None and remaining <= 0:
                 raise _retry_deadline_error(started, attempt)
             if binary or raw:
                 with self._lock:
-                    time.sleep(max(0.0, self._next_chunk - time.monotonic()))
+                    self._sleep(max(0.0, self._next_chunk - time.monotonic()))
                     self._next_chunk = time.monotonic() + 0.125
             remaining = deadline - time.monotonic() if deadline is not None else None
             if remaining is not None and remaining <= 0:
@@ -316,11 +332,11 @@ class API:
                         started, attempts_made, failure_type="HTTPError", http_status=error.code
                     ) from None
                 if remaining is not None and delay >= remaining:
-                    time.sleep(remaining)
+                    self._sleep(remaining)
                     raise _retry_deadline_error(
                         started, attempts_made, failure_type="HTTPError", http_status=error.code
                     ) from None
-                time.sleep(delay)
+                self._sleep(delay)
             except (urllib.error.URLError, TimeoutError, OSError, ConnectionError) as error:
                 failure_type, errno = _safe_network_details(error)
                 attempts_made = attempt + 1
@@ -339,11 +355,11 @@ class API:
                         started, attempts_made, failure_type=failure_type, errno=errno
                     ) from None
                 if remaining is not None and delay >= remaining:
-                    time.sleep(remaining)
+                    self._sleep(remaining)
                     raise _retry_deadline_error(
                         started, attempts_made, failure_type=failure_type, errno=errno
                     ) from None
-                time.sleep(delay)
+                self._sleep(delay)
             else:
                 if raw:
                     if not isinstance(result, dict) or not isinstance(result.get("base64"), str):
@@ -677,8 +693,11 @@ def _upload_archive(
     epoch: int,
     global_step: int,
     code_sha: str,
+    cancel_check=None,
 ) -> dict[str, Any]:
     api = _agent_api()
+    api.cancel_check = cancel_check
+    if cancel_check is not None: cancel_check()
     signature = _file_signature(archive_path)
     with archive_path.open("rb") as stream:
         info = os.fstat(stream.fileno())
@@ -839,6 +858,7 @@ def backup_run(
     code_sha: str,
     *,
     wait: bool = False,
+    cancel_check=None,
 ) -> dict[str, Any]:
     """Archive one recovery point and send it through the agent session.
 
@@ -853,9 +873,16 @@ def backup_run(
     if not isinstance(code_sha, str) or not _CODE_SHA.fullmatch(code_sha):
         raise ValueError("code_sha must be a 40-character lowercase commit hash")
 
+    if cancel_check is not None: cancel_check()
     root = Path(output_dir)
     archive_path = _make_archive(root, job_id, epoch, global_step)
     archive_bytes = archive_path.stat().st_size
+    if cancel_check is not None:
+        # Managed training uses synchronous upload so SIGTERM interrupts network I/O
+        # immediately and no executor thread keeps the stopped child alive.
+        if not wait: raise ValueError('cancellable backups must be synchronous')
+        cancel_check()
+        return _upload_archive(job_id, archive_path, epoch, global_step, code_sha, cancel_check)
     future = _UPLOAD_POOL.submit(
         _upload_archive, job_id, archive_path, epoch, global_step, code_sha
     )

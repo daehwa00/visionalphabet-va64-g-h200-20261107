@@ -613,3 +613,32 @@ def test_odd_tail_and_physical_batch_512_keep_all_examples_and_step_count(
     assert global_step == 50_052
     assert optimizer.param_groups[0]["lr"] == runtime._learning_rate(wide_task, 21, 2)
     assert optimizer.param_groups[0]["lr"] != runtime._learning_rate(wide_task, 50_051, 2)
+
+
+def test_stop_without_checkpoint_skips_validation_and_epoch_callback(tmp_path, monkeypatch):
+    calls = {'optimizer': 0, 'validation': 0, 'callback': 0}
+    def optimizer(model, lr, device):
+        value = runtime._build_optimizer(model, lr, device)
+        def after(*_): calls['optimizer'] += 1
+        value.register_step_post_hook(after)
+        return value
+    def evaluate(*args, **kwargs):
+        calls['validation'] += 1
+        raise AssertionError('validation must not run on stop')
+    def callback(*args): calls['callback'] += 1
+    monkeypatch.setattr(runtime, '_evaluate', evaluate)
+    with pytest.raises(runtime.TrainingInterrupted):
+        runtime.run_task(_task(tmp_path), device=torch.device('cpu'), model_builder=_builder,
+            loader_builder=_loader, mixup_factory=lambda task: IdentityMixup(task.num_classes),
+            optimizer_builder=optimizer, epoch_callback=callback,
+            stop_requested=lambda: calls['optimizer'] >= 1, stop_without_checkpoint=True)
+    assert calls == {'optimizer': 1, 'validation': 0, 'callback': 0}
+    assert not _task(tmp_path).checkpoint_path.exists()
+
+
+def test_stop_without_checkpoint_before_first_update(tmp_path):
+    with pytest.raises(runtime.TrainingInterrupted):
+        runtime.run_task(_task(tmp_path), device=torch.device('cpu'), model_builder=_builder,
+            loader_builder=_loader, mixup_factory=lambda task: IdentityMixup(task.num_classes),
+            stop_requested=lambda: True, stop_without_checkpoint=True)
+    assert not _task(tmp_path).checkpoint_path.exists()

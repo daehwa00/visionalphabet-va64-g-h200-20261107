@@ -125,3 +125,64 @@ def test_observer_waits_for_retry_after_completed_session(tmp_path, monkeypatch)
  assert state['campaigns']=={'va64-g-preflight':'retry'}
  assert state['child_failed'] is False
  assert {'action':'ready','job':'va64-g-preflight'} in calls
+
+
+def test_stop_signal_cancels_backup_without_waiting_for_upload(tmp_path,monkeypatch):
+ import os,signal
+ from imagenet1k_runtime import TrainingInterrupted
+ import va64_h200_transport as transport
+ monkeypatch.setenv('VA64_G_CODE_SHA','b'*40)
+ def upload(*args,**kwargs):
+  assert kwargs['wait'] and callable(kwargs['cancel_check'])
+  signal.raise_signal(signal.SIGTERM)
+  raise AssertionError('must not wait for backup completion')
+ monkeypatch.setattr(transport,'backup_run',upload)
+ previous=signal.getsignal(signal.SIGTERM)
+ (tmp_path/'output').mkdir()
+ with pytest.raises(TrainingInterrupted,match='cancel backup'):
+  operations.backup_and_wait(tmp_path,'va64-g-seed0',tmp_path/'output',1,5005)
+ assert (tmp_path/'STOP').is_file()
+ assert signal.getsignal(signal.SIGTERM)==previous
+
+
+def test_cancellable_backup_does_not_start_executor_thread(tmp_path,monkeypatch):
+ import threading
+ from scripts import va64_h200_transport as transport
+ from scripts.imagenet1k_runtime import TrainingInterrupted
+ archive=tmp_path/'archive.tar.gz';archive.write_bytes(b'archive')
+ monkeypatch.setattr(transport,'_make_archive',lambda *args:archive)
+ def upload(*args):
+  assert threading.current_thread() is threading.main_thread()
+  raise TrainingInterrupted('cancelled')
+ monkeypatch.setattr(transport,'_upload_archive',upload)
+ monkeypatch.setattr(transport._UPLOAD_POOL,'submit',lambda *args:pytest.fail('background upload must not start'))
+ with pytest.raises(TrainingInterrupted):
+  transport.backup_run('va64-g-seed0',tmp_path,1,5005,'b'*40,wait=True,cancel_check=lambda:None)
+
+
+def test_final_backup_stop_uses_normal_stop_classification(tmp_path,monkeypatch):
+ import run_va64_g_h200 as entry
+ import va64_runtime_operations as ops
+ from scripts.imagenet1k_runtime import TrainingInterrupted
+ from imagenet1k_runtime import ExecutionOptions
+ monkeypatch.setenv('VA64_G_MANAGED_ROOT',str(tmp_path))
+ monkeypatch.delenv('VA64_G_RECOVERY',raising=False)
+ monkeypatch.setattr(entry.experiment,'arguments',lambda:SimpleNamespace(variant='G',seed=0))
+ task=SimpleNamespace(execution=ExecutionOptions(),source_sha256={},output_dir=tmp_path/'run')
+ # The task wrapper requires a real dataclass for dataclasses.replace.
+ from dataclasses import dataclass
+ @dataclass
+ class Task:
+  execution:object
+  source_sha256:dict
+  output_dir:Path
+ monkeypatch.setattr(entry.experiment,'make_task',lambda _:Task(ExecutionOptions(),{},tmp_path/'run'))
+ monkeypatch.setattr(entry.experiment,'build_model',lambda *a,**k:None)
+ monkeypatch.setattr(entry.experiment,'train',lambda _:{'status':'completed'})
+ monkeypatch.setattr(ops,'install_training',lambda *a:None)
+ def stop(*a):raise entry.experiment.runtime.TrainingInterrupted('stop during final backup')
+ monkeypatch.setattr(ops,'complete_run',stop)
+ with pytest.raises(SystemExit) as result:entry.main()
+ assert result.value.code==130
+ import json
+ assert json.loads((tmp_path/'current.json').read_text())['stage']=='stopped_without_backup'
