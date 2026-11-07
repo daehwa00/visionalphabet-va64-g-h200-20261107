@@ -268,6 +268,9 @@ class API:
             "User-Agent": "visionalphabet-va64-transport/1.0",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            # Large Brotli responses were truncated/corrupted on the live relay path.
+            # Checkpoints are already gzip archives; request an uncompressed envelope.
+            "Accept-Encoding": "identity",
         }
         # The validated HTTPS namespace and no-redirect opener restrict this request.
         request = urllib.request.Request(  # noqa: S310

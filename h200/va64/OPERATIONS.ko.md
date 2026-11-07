@@ -39,7 +39,8 @@ observer/relay연락이10분이상없으면guard가중단을요청한다. 완료
 - W&B실제로그인사용자는daehwa이고프로젝트access=PRIVATE를확인했다.
 - 로컬Cloudflare실행환경→실제W&B에19,874,323byte checkpointbundle을업로드했다. 다시다운로드한SHA256이1911ba5a15c8c4bdcc09d424f6025a14bda9f3c2daa801177e814af072f0b195로일치했고G strictload를통과했다.
 - 로컬실제guard/자식프로세스에ownerstop을전달해강제종료없이exit130과기존checkpoint보존을확인했다. 실제H200에서의중단시험은아니다.
-- 전송/ACK순서/비밀파일제외/epochcallback검사21개를통과했다.
-- 새Cloudflare worker는아직실배포되지않았다. 기존wrangler의OAuth갱신이HTTP400으로실패했다. 배포로그인갱신이필요하다. 최신CLI확인은현재Node20환경요구조건과맞지않았으며글로벌Node환경은변경하지않았다. 로컬검증은기존4.86.0으로수행했다.
+- 전송/ACK순서/비밀파일제외/epochcallback검사22개를통과했다.
+- 사용자OAuth재로그인후G전용worker를실배포했고owner인증/health/상시observer heartbeat를확인했다. 라이브테스트영역에서동일checkpoint의전송·W&B확인ACK와실제guard중단을검증했다. 이는owner권한으로격리된테스트영역에서수행한검사이며실제H200pod/송신IP/agent등록검증은첫H200preflight에서수행한다.
+- 라이브회수에서자동Brotli응답이ContentDecodingError/ChunkedEncodingError를발생시켜Accept-Encoding: identity로고정했다. 같은256KiB조각이비압축응답에서는정상수신됐고전체19,874,323bytebundle의해시가일치했다. 실패시도는operations/live,수정후성공은operations/live-v2에별도보존했다.
 
-이상태에서H200이슈를제출해운영준비가끝났다고간주하면안된다. Cloudflare실배포와observer상시실행및실제H200검증이남아있다.
+H200에제출할수있는것은먼저20step preflight다. 실제H200에서등록·데이터·학습·중단·외부회수까지확인한후100epoch본학습으로진행한다. 저장소최신commit을허용하는worker재배포와observer동작을제출직전에대조한다.

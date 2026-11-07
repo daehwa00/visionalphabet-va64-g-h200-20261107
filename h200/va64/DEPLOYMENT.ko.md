@@ -33,4 +33,4 @@ H200 preflight와checkpoint회수·원격중단경로를실제확인한후별도
 
 ## 원격 운영 추가
 
-이전의로컬출력전용설명은초기버전이다. 현재는guard와Cloudflare외부전송/외부W&Bobserver/epoch별checkpointACK를통합했다. H200에W&B키를배포하지않는다. 세부정의와실제확인상태는OPERATIONS.ko.md를참조한다. 현재CloudflareOAuth갱신실패로새worker실배포및상시observer시작이보류됐으므로새이슈를아직제출하지않는다.
+이전의로컬출력전용설명은초기버전이다. 현재는guard와Cloudflare외부전송/외부W&Bobserver/epoch별checkpointACK를통합했다. H200에W&B키를배포하지않는다. 세부정의와실제확인상태는OPERATIONS.ko.md를참조한다. 사용자의OAuth로그인갱신후G전용worker배포와라이브운영검증을진행했다. 현재검증기록과20step preflight제출조건은OPERATIONS.ko.md및owner측실행영수증을참조한다.

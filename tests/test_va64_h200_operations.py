@@ -56,3 +56,16 @@ def test_backup_filename_allowlist_keeps_secrets_out():
  assert not transport._allowed_archive_path('owner-secrets.json')
  assert not transport._allowed_archive_path('contracts/private.key')
  with pytest.raises(ValueError): transport._allowed_archive_path('../checkpoint.pt')
+
+
+def test_relay_disables_corruptible_response_compression(monkeypatch):
+ import io
+ from scripts import va64_h200_transport as transport
+ captured=[]
+ def open_response(self,request,timeout):
+  captured.append({key.lower():value for key,value in request.header_items()})
+  return io.BytesIO(b'{"ok":true}')
+ monkeypatch.setattr(transport._RequestsSessionOpener,'open',open_response)
+ api=transport.API('fixture-only-token',base='https://example.workers.dev/va64g')
+ assert api.call('/health',attempts=1)=={'ok':True}
+ assert captured[0]['accept-encoding']=='identity'
