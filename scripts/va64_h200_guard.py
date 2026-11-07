@@ -77,7 +77,8 @@ def main():
         try:
             while True:
                 now=time.monotonic();current=read(root/'current.json');job=current.get('job')
-                if child.poll() is not None and drain_deadline is None:drain_deadline=now+60
+                if child.poll() is not None and drain_deadline is None:
+                    drain_deadline=now+60;next_event=min(next_event,now)
                 if now>=next_control and drain_deadline is None:
                     try:
                         fresh=api.call('/control',attempts=1,timeout=8)
@@ -123,7 +124,7 @@ def main():
                     # DataLoader workers must not receive an early SIGTERM.
                     try:os.kill(child.pid,signal.SIGTERM)
                     except ProcessLookupError:pass
-                if forced or (deadline is not None and now>=deadline):
+                if forced or (deadline is not None and now>=deadline and child.poll() is None):
                     if not forced:request_stop('grace_expired')
                     forced=True
                     try:os.killpg(child.pid,signal.SIGKILL)
