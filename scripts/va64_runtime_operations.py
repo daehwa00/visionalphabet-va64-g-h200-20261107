@@ -58,9 +58,15 @@ def install_training(runtime,root: Path) -> None:
   for sig in (signal.SIGINT,signal.SIGTERM): signal.signal(sig,lambda *_:(root/'STOP').touch())
   current(root,'va64-g-seed0','training',task.output_dir)
   result=original(task,**kwargs)
-  current(root,'va64-g-seed0',result['status'],task.output_dir)
   return result
  runtime.run_task=managed
+
+
+def complete_run(root: Path, output: Path, status: str) -> None:
+ row=json.loads((output/'latest-epoch.json').read_text())
+ # The runner writes result/cost after its last epoch callback. Preserve those too.
+ backup_and_wait(root,'va64-g-seed0',output,row['epoch'],row['global_step'],row)
+ current(root,'va64-g-seed0',status,output)
 
 
 def main():

@@ -69,3 +69,23 @@ def test_relay_disables_corruptible_response_compression(monkeypatch):
  api=transport.API('fixture-only-token',base='https://example.workers.dev/va64g')
  assert api.call('/health',attempts=1)=={'ok':True}
  assert captured[0]['accept-encoding']=='identity'
+
+
+def test_final_backup_keeps_best_and_cost_before_completion(tmp_path,monkeypatch):
+ import json
+ from scripts import va64_h200_transport as transport
+ output=tmp_path/'output'; output.mkdir()
+ (output/'checkpoint.pt').write_bytes(b'last')
+ (output/'best.pt').write_bytes(b'best')
+ (output/'cost.json').write_text('{"status":"completed"}')
+ (output/'result.json').write_text('{"status":"completed"}')
+ (output/'latest-epoch.json').write_text(json.dumps({'epoch':100,'global_step':500500}))
+ events=[]
+ def backup(*args):
+  files={name for name,_,_ in transport._source_files(output)}
+  assert {'checkpoint.pt','best.pt','cost.json','result.json'}<=files
+  events.append('backed_up')
+ monkeypatch.setattr(operations,'backup_and_wait',backup)
+ monkeypatch.setattr(operations,'current',lambda *args:events.append(args[2]))
+ operations.complete_run(tmp_path,output,'completed')
+ assert events==['backed_up','completed']

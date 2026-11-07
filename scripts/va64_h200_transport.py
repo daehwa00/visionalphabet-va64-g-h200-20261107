@@ -431,6 +431,7 @@ def _allowed_archive_path(name: str, *, directory: bool = False) -> bool:
     parts = path.parts
     if len(parts) == 1 and text in {
         "checkpoint.pt",
+        "best.pt",
         "result.json",
         "dataset.json",
         "checkpoint-meta.json",
@@ -471,6 +472,7 @@ def _source_files(output_dir: Path) -> list[tuple[str, Path, os.stat_result]]:
 
     for name in (
         "checkpoint.pt",
+        "best.pt",
         "result.json",
         "dataset.json",
         "checkpoint-meta.json",

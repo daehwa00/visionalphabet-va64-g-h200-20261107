@@ -31,5 +31,8 @@ def main():
  if os.environ.get('VA64_G_MANAGED_ROOT'):
   from va64_runtime_operations import install_training
   install_training(experiment.runtime,Path(os.environ['VA64_G_MANAGED_ROOT']))
- experiment.train(args)
+ result=experiment.train(args)
+ if os.environ.get('VA64_G_MANAGED_ROOT'):
+  from va64_runtime_operations import complete_run
+  complete_run(Path(os.environ['VA64_G_MANAGED_ROOT']),experiment.make_task(args).output_dir,result['status'])
 if __name__=='__main__': main()
