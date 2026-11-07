@@ -1,0 +1,58 @@
+from pathlib import Path
+from types import SimpleNamespace
+import pytest
+from scripts import va64_h200_observer as observer
+from scripts import va64_runtime_operations as operations
+
+class API:
+ def __init__(self,events): self.events=events
+ def call(self,path,*args):
+  if path.endswith('/latest'): return {'sha':'a'*64,'bytes':10,'chunks':1,'epoch':1,'global_step':5005,'code_sha':'b'*40,'complete':True}
+  if path.endswith('/ack'): self.events.append('ack'); return {}
+  raise AssertionError(path)
+
+@pytest.mark.parametrize('wandb_ok',[False,True])
+def test_ack_requires_wandb_confirmation(tmp_path,monkeypatch,wandb_ok):
+ events=[]; api=API(events)
+ def download(_api,_job,_metadata,target): target.parent.mkdir(parents=True); target.write_bytes(b'test-archive'); events.append('download')
+ monkeypatch.setattr(observer,'download_artifact',download)
+ monkeypatch.setattr(observer,'validate_checkpoint_bundle',lambda _:events.append('validate'))
+ class Mirror:
+  def save_backup(self,*args):
+   events.append('wandb')
+   if not wandb_ok: raise RuntimeError('W&B unavailable')
+   return {'uploaded':True}
+ call=lambda:observer._backup_latest(api,tmp_path,'va64-g-seed0','b'*40,None,Mirror(),'test')
+ if wandb_ok:
+  assert call()=='a'*64
+  assert events==['download','validate','wandb','ack']
+ else:
+  with pytest.raises(RuntimeError,match='W&B unavailable'): call()
+  assert events==['download','validate','wandb']
+
+
+def test_training_backup_runs_after_checkpoint_callback(tmp_path,monkeypatch):
+ events=[]; output=tmp_path/'output'; output.mkdir()
+ task=SimpleNamespace(output_dir=output)
+ def base(task,**kwargs):
+  (output/'checkpoint.pt').write_bytes(b'committed')
+  kwargs['epoch_callback'](None,{'epoch':1,'global_step':5005})
+  return {'status':'paused'}
+ runtime=SimpleNamespace(run_task=base)
+ def callback(_model,_row): events.append('derived_files')
+ def backup(*args):
+  assert (output/'checkpoint.pt').read_bytes()==b'committed'; events.append('external_backup')
+ monkeypatch.setattr(operations,'backup_and_wait',backup)
+ monkeypatch.setattr(operations.signal,'signal',lambda *_:None)
+ operations.install_training(runtime,tmp_path)
+ assert runtime.run_task(task,epoch_callback=callback)['status']=='paused'
+ assert events==['derived_files','external_backup']
+
+
+def test_backup_filename_allowlist_keeps_secrets_out():
+ from scripts import va64_h200_transport as transport
+ assert transport._allowed_archive_path('telemetry/console.txt')
+ assert transport._allowed_archive_path('smoke.json')
+ assert not transport._allowed_archive_path('owner-secrets.json')
+ assert not transport._allowed_archive_path('contracts/private.key')
+ with pytest.raises(ValueError): transport._allowed_archive_path('../checkpoint.pt')

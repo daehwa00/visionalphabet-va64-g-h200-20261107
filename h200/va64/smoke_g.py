@@ -42,10 +42,15 @@ def main():
   model.train(); loss=step()
   (a.output/'restore.json').write_text(json.dumps({'status':'passed','restored_steps':payload['steps'],'next_loss':loss,'new_process':True})+'\n')
   print('G_RESTORE_PASSED',flush=True); return
- losses=[step() for _ in range(a.steps)]
+ losses=[]
+ for index in range(a.steps):
+  if losses and (Path(__import__('os').environ.get('VA64_G_MANAGED_ROOT',str(a.output)))/'STOP').exists(): break
+  losses.append(step())
+  experiment.runtime._atomic_json(a.output/'step-progress.json',{'epoch':0,'global_step':index+1,'loss':losses[-1]})
+  if (index+1)%5==0: print('G_SMOKE_STEP='+json.dumps({'global_step':index+1,'loss':losses[-1]}),flush=True)
  model.eval()
  with torch.no_grad(),torch.autocast(device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'): logits=model(x).float().cpu()
- payload={'variant':'G','source':source,'definition':experiment.definition_digest('G'),'steps':a.steps,'model':model.state_dict(),'optimizer':opt.state_dict(),'rng':experiment.runtime._capture_rng(bundle,device),'logits':logits}
+ payload={'variant':'G','source':source,'definition':experiment.definition_digest('G'),'steps':len(losses),'model':model.state_dict(),'optimizer':opt.state_dict(),'rng':experiment.runtime._capture_rng(bundle,device),'logits':logits}
  experiment.runtime._atomic_torch(checkpoint,payload)
  # Reconstruct x identically in the child by restoring its saved input explicitly.
  torch.save(x.cpu(),a.output/'input.pt')
@@ -55,7 +60,7 @@ def main():
  del model,opt,payload; import gc; gc.collect()
  if a.device=='cuda': torch.cuda.empty_cache()
  subprocess.run(command,check=True)
- report={'status':'passed','variant':'G','steps':a.steps,'synthetic_input':True,'image_size':a.image_size,'batch':2,'parameters':1882760,'finite_losses':losses,'checkpoint_sha256':hashlib.sha256(checkpoint.read_bytes()).hexdigest(),'checkpoint_bytes':checkpoint.stat().st_size,'fresh_process_restore':True,'compiled':a.compile,'device':a.device}
+ report={'status':'passed','variant':'G','steps':len(losses),'synthetic_input':True,'image_size':a.image_size,'batch':2,'parameters':1882760,'finite_losses':losses,'checkpoint_sha256':hashlib.sha256(checkpoint.read_bytes()).hexdigest(),'checkpoint_bytes':checkpoint.stat().st_size,'fresh_process_restore':True,'compiled':a.compile,'device':a.device}
  (a.output/'smoke.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps({k:v for k,v in report.items() if k!='finite_losses'}),flush=True)
 
 if __name__=='__main__': main()

@@ -29,3 +29,8 @@ H200 preflight와checkpoint회수·원격중단경로를실제확인한후별도
 ## 저장소 접근
 
 저장소는기본비공개다. H200인프라의clone권한은이preflight요청전별도로확인해야한다. 브라우저에서저장소가보이는것만으로H200 clone가능성을보장하지않는다. 토큰을이슈본문이나명령에붙이지않는다.
+
+
+## 원격 운영 추가
+
+이전의로컬출력전용설명은초기버전이다. 현재는guard와Cloudflare외부전송/외부W&Bobserver/epoch별checkpointACK를통합했다. H200에W&B키를배포하지않는다. 세부정의와실제확인상태는OPERATIONS.ko.md를참조한다. 현재CloudflareOAuth갱신실패로새worker실배포및상시observer시작이보류됐으므로새이슈를아직제출하지않는다.

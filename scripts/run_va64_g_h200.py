@@ -1,6 +1,6 @@
 """G training with the same canonical backbone initialization as B0/P0/A0."""
 from __future__ import annotations
-import dataclasses,hashlib
+import dataclasses,hashlib,os
 from pathlib import Path
 import torch
 import run_va64_retrain_imagenet1k as experiment
@@ -28,5 +28,8 @@ def main():
   value=original_task(arguments)
   return dataclasses.replace(value,execution=dataclasses.replace(value.execution,gpu_mixup=True),source_sha256={**value.source_sha256,'canonical_backbone_initialization':INITIAL_SHA,'h200_g_entrypoint':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
  experiment.build_model=build; experiment.make_task=task
+ if os.environ.get('VA64_G_MANAGED_ROOT'):
+  from va64_runtime_operations import install_training
+  install_training(experiment.runtime,Path(os.environ['VA64_G_MANAGED_ROOT']))
  experiment.train(args)
 if __name__=='__main__': main()
