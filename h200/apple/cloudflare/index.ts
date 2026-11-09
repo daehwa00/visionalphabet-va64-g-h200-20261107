@@ -63,7 +63,7 @@ export class Va64Control extends DurableObject<Env> {
     return {ok:true,seq:value.seq};
   }
   snapshot(after:number){const s=this.read('session');return {session:s?{id:s.id,pod:s.pod,code:s.code,lastSeen:s.lastSeen,ended:s.ended}:null,
-    control:this.control(),events:this.ctx.storage.sql.exec('SELECT id,value FROM events WHERE id>? ORDER BY id LIMIT100'.replace('LIMIT100','LIMIT 100'),after).toArray()};}
+    control:this.control(),events:this.ctx.storage.sql.exec('SELECT id,session,value FROM events WHERE id>? AND session=? ORDER BY id LIMIT 100',after,s?.id||'').toArray()};}
 }
 
 export class Va64Artifact extends DurableObject<Env> {
@@ -130,7 +130,7 @@ export default {
     if(!url.pathname.startsWith('/va64g/'))return reply({error:'wrong_namespace'},404);
     const prefix='/va64g';
     const route=url.pathname.slice(prefix.length);
-    if(route==='/health')return reply({ok:true,campaign:k96?'k96-coco521-v1':va64g?'h200-va64-g-v1':'simclr-in1k10-v1',jobs:k96?1:va64g?4:15});
+    if(route==='/health')return reply({ok:true,campaign:'apple70m-h200-preflight-v1',jobs:2});
     const token=(req.headers.get('Authorization')||'').replace(/^Bearer /,'');
     const owner=!!env.IN10_OWNER_TOKEN&&token===env.IN10_OWNER_TOKEN;
     const test=url.searchParams.get('test')==='1';if(test&&!owner)return reply({error:'test_requires_owner'},403);

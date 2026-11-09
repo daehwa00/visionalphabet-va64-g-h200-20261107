@@ -23,8 +23,9 @@ def main():
     if run:run.finish();run=None
     session=sid
    if sid and sid!=ended_session and run is None:
-    run=wandb.init(entity='daehwa',project='apple70m-h200',id=hashlib.sha256(sid.encode()).hexdigest()[:16],resume='allow',name='APPLE70M-data-preflight',mode='online',dir=str(a.root),config={'phase':'data-preflight','training_started':False,'source_commit':s.get('code'),'session':sid},settings=wandb.Settings(init_timeout=60))
-    if run is None or run.offline:raise RuntimeError('W&B online run required')
+    candidate=wandb.init(entity='daehwa',project='apple70m-h200',id=hashlib.sha256(sid.encode()).hexdigest()[:16],resume='allow',name='APPLE70M-data-preflight',mode='online',dir=str(a.root),config={'phase':'data-preflight','training_started':False,'source_commit':s.get('code'),'session':sid},settings=wandb.Settings(init_timeout=60))
+    if candidate is None or candidate.offline:raise RuntimeError('W&B online run required')
+    run=candidate
     print('WANDB_URL='+run.url,flush=True)
    for event in v.get('events',[]):
     payload=event['value'];payload=json.loads(payload) if isinstance(payload,str) else payload
@@ -34,6 +35,10 @@ def main():
     atomic(a.root/'latest-status.json',status)
     if run:
      progress=status.get('progress') or {};metrics={f'probe/{k}':v for k,v in progress.items() if isinstance(v,(int,float)) and not isinstance(v,bool)}
+     for sample in ((status.get('result') or {}).get('data_probe') or {}).get('samples',[]):
+      region=sample.get('region','unknown')
+      for key in ('http_mib_per_second','http_elapsed_seconds','bytes'):
+       if isinstance(sample.get(key),(int,float)):metrics[f'download/{region}/{key}']=sample[key]
      run.log({**metrics,'observer/event_id':event['id'],'probe/ended':int(bool(status.get('ended')))},step=event['id'])
      if current.get('stage')=='waiting_wandb':api.call('/command',{'action':'ready','job':'apple70m-data-preflight'},attempts=1)
      if status.get('ended'):
