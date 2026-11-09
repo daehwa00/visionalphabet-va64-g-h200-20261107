@@ -1,0 +1,37 @@
+{
+  "name": "apple70m-h200-20261109",
+  "main": "index.ts",
+  "compatibility_date": "2026-04-01",
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "IN10_CONTROL",
+        "class_name": "Va64Control"
+      },
+      {
+        "name": "IN10_ARTIFACT",
+        "class_name": "Va64Artifact"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "va64-g-v1",
+      "new_sqlite_classes": [
+        "Va64Control",
+        "Va64Artifact"
+      ]
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "RELAY_RATE_LIMITER",
+      "namespace_id": "61109",
+      "simple": {
+        "limit": 600,
+        "period": 60
+      }
+    }
+  ]
+}
