@@ -208,3 +208,18 @@ def test_local_only_start_and_final_results_need_no_network(tmp_path,monkeypatch
  assert 'history' not in saved['result']
  assert saved['cost']['training_seconds']==1
  assert json.loads((tmp_path/'current.json').read_text())['checkpoint_policy']=='local_only'
+
+
+def test_two_seed_completion_results_survive_switch_without_model_upload(tmp_path,monkeypatch):
+ import json
+ monkeypatch.setenv('VA64_G_CHECKPOINT_POLICY','local_only')
+ monkeypatch.setattr(operations,'backup_and_wait',lambda *args:pytest.fail('no model upload'))
+ for seed in (1,2):
+  monkeypatch.setenv('VA64_G_JOB',f'va64-g-seed{seed}')
+  out=tmp_path/f'seed_{seed}';out.mkdir()
+  (out/'result.json').write_text(json.dumps({'status':'completed','seed':seed,'completed_epochs':100,'final_validation':{'accuracy':seed/10}}))
+  operations.complete_run(tmp_path,out,'completed')
+ records=json.loads((tmp_path/'completed-runs.json').read_text())
+ assert set(records)=={'va64-g-seed1','va64-g-seed2'}
+ assert records['va64-g-seed1']['result']['seed']==1
+ assert records['va64-g-seed2']['result']['seed']==2

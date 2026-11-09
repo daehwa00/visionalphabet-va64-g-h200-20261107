@@ -297,7 +297,7 @@ def train(args: argparse.Namespace) -> dict:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=DEFINITIONS, required=True)
-    parser.add_argument("--seed", type=int, choices=(0,), required=True)
+    parser.add_argument("--seed", type=int, choices=(0, 1, 2), required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--data-manifest", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)

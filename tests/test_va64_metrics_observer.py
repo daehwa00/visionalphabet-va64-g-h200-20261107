@@ -236,3 +236,71 @@ def test_new_session_resets_terminal_event_seen(tmp_path, monkeypatch):
 def test_validation_loss_uses_runtime_cross_entropy():
     metrics = observer._metrics({"checkpoint": {"validation": {"cross_entropy": 2.3}}})
     assert metrics["validation/loss"] == 2.3
+
+
+def completed_seed(seed, accuracy):
+    return {
+        "status": "completed",
+        "result": {"status": "completed", "seed": seed, "completed_epochs": 100,
+                   "global_step": 500500, "final_validation": {
+                       "accuracy": accuracy, "top5_accuracy": .93, "cross_entropy": 1.2}},
+        "cost": {"train_seconds": 1234 + seed},
+        "latest-epoch": {"epoch": 100, "global_step": 500500,
+                         "validation": {"accuracy": accuracy, "cross_entropy": 1.2}},
+    }
+
+
+def test_sticky_seed1_result_survives_current_seed2_and_is_not_replayed(tmp_path, monkeypatch):
+    monkeypatch.setattr(observer, "JOBS", (*observer.JOBS, "va64-g-seed1", "va64-g-seed2"))
+    seed1, seed2 = "va64-g-seed1", "va64-g-seed2"
+    first = snapshot()
+    status = first["events"][0]["value"]["status"]
+    status["current"]["job"] = seed2
+    status["completed_runs"] = {seed1: completed_seed(1, .72)}
+    mirror = Mirror()
+    install(monkeypatch, Relay([first]), mirror)
+    observer.observe(tmp_path, "unused", once=True)
+    result1 = observer._result_directory(tmp_path, CAMPAIGN, seed1) / "result.json"
+    result2 = observer._result_directory(tmp_path, CAMPAIGN, seed2) / "result.json"
+    assert json.loads(result1.read_text())["final_validation"]["accuracy"] == .72
+    assert not result2.exists()
+    assert sum(item["current"]["job"] == seed1 for item in mirror.consumed) == 1
+
+    last = snapshot(ended=True, event_id=2)
+    status = last["events"][0]["value"]["status"]
+    status["current"]["job"] = seed2
+    status["result"] = completed_seed(2, .73)["result"]
+    status["completed_runs"] = {seed1: completed_seed(1, .72), seed2: completed_seed(2, .73)}
+    install(monkeypatch, Relay([last]), mirror)
+    observer.observe(tmp_path, "unused", once=True)
+    assert json.loads(result1.read_text())["seed"] == 1
+    assert json.loads(result1.read_text())["final_validation"]["accuracy"] == .72
+    assert json.loads(result2.read_text())["seed"] == 2
+    assert json.loads(result2.read_text())["final_validation"]["accuracy"] == .73
+    assert set(mirror.saved) == {seed1, seed2}
+    assert sum(item["current"]["job"] == seed1 for item in mirror.consumed) == 1
+    state = observer._read_json(tmp_path / observer.STATE_NAME)
+    assert set(state["completed_run_digests"]) == {seed1, seed2}
+    assert set(state["active_jobs"]) == {seed1, seed2}
+    assert state["completed_session_id"] == "session"
+
+
+@pytest.mark.parametrize("job,seed", [("va64-g-preflight", 0), ("va64-g-seed0", 0),
+                                     ("va64-g-seed1", 1), ("va64-g-seed2", 2)])
+def test_wandb_seed_config_matches_job_and_final_summary(tmp_path, job, seed):
+    configs = []
+    run = SimpleNamespace(define_metric=lambda *a, **k: None, summary={}, log=lambda payload: None)
+    def init(**kwargs):
+        configs.append(kwargs["config"])
+        return run
+    mirror = observer._WandbMirror(tmp_path, enabled=False)
+    mirror.enabled = True
+    mirror.module = SimpleNamespace(init=init, Settings=lambda **kwargs: None)
+    assert mirror._run(CAMPAIGN, job) is run
+    assert configs[0]["seed"] == seed
+    mirror.consume(CAMPAIGN, job, {
+        "current": {"stage": "completed"}, "result": completed_seed(seed, .72)["result"],
+    })
+    assert run.summary["final/top1_percent"] == 72
+    assert run.summary["final/top5_percent"] == 93
+    assert run.summary["final/cross_entropy"] == 1.2

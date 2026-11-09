@@ -1,3 +1,13 @@
+# 현재 제출: G seed1 → seed2 fresh 100epoch 직렬
+
+`bash h200/va64/run.sh seeds12`은한H200에서Gseed1과seed2를처음부터각100epoch학습한다. 두seed는같은seed의P/A와동일한untrainedcanonical Bbackbone을사용하며Ghead만새로초기화한다. epoch100정상완료시에만다음seed로넘어가고실패·STOP이면중단한다.
+
+기존128×2(global256),BF16,compile,GPU Mixup,AdamW등recipe를유지한다. 전체checkpoint외부전송은없고지표·로그·최종결과만저장한다. completed-runs.json의작은완료summary는매이벤트에실려seed전환사이에관측을놓쳐도앞seed결과가보존된다. W&B도seed별run으로분리한다. 모델가중치는컨테이너로컬에만남는다.
+
+아래는이전seed0재개운영이력이다.
+
+---
+
 # 현재 운영 정책: 결과만 외부 보존
 
 - G seed0,100epoch,physical128×accumulation2(global256),기존recipe유지.

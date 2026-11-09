@@ -67,15 +67,16 @@ def install_training(runtime,root: Path) -> None:
  os.environ['VA64_G_CHECKPOINT_POLICY']='local_only'
  original=runtime.run_task
  def managed(task,**kwargs):
+  job=os.environ.get('VA64_G_JOB',f'va64-g-seed{getattr(task,"seed",0)}')
   old_callback=kwargs.get('epoch_callback')
   def epoch_callback(model,row):
    if old_callback: old_callback(model,row)
    atomic_json(task.output_dir/'checkpoint-meta.json',{**row,'status':'local_checkpoint','checkpoint_policy':'local_only'})
-   current(root,'va64-g-seed0','training',task.output_dir)
+   current(root,job,'training',task.output_dir)
   kwargs['epoch_callback']=epoch_callback
   kwargs['stop_without_checkpoint']=True
   for sig in (signal.SIGINT,signal.SIGTERM): signal.signal(sig,lambda *_:(root/'STOP').touch())
-  current(root,'va64-g-seed0','training',task.output_dir)
+  current(root,job,'training',task.output_dir)
   result=original(task,**kwargs)
   return result
  runtime.run_task=managed
@@ -93,12 +94,18 @@ def complete_run(root: Path, output: Path, status: str) -> None:
    summary[name]=value
  atomic_json(output/'final-summary.json',summary)
  print('VA64_FINAL_SUMMARY='+json.dumps(summary),flush=True)
- current(root,'va64-g-seed0',status,output)
+ job=os.environ.get('VA64_G_JOB','va64-g-seed0')
+ if status=='completed':
+  path=root/'completed-runs.json'
+  completed=json.loads(path.read_text()) if path.is_file() else {}
+  completed[job]=summary
+  atomic_json(path,completed)
+ current(root,job,status,output)
 
 
 def main():
  import argparse
- p=argparse.ArgumentParser(); p.add_argument('action',choices=('ready','backup-smoke')); p.add_argument('--root',type=Path,required=True); p.add_argument('--job',required=True,choices=('va64-g-preflight','va64-g-seed0')); p.add_argument('--output',type=Path); a=p.parse_args()
+ p=argparse.ArgumentParser(); p.add_argument('action',choices=('ready','backup-smoke')); p.add_argument('--root',type=Path,required=True); p.add_argument('--job',required=True,choices=('va64-g-preflight','va64-g-seed0','va64-g-seed1','va64-g-seed2')); p.add_argument('--output',type=Path); a=p.parse_args()
  if a.action=='ready': wait_ready(a.root,a.job)
  else:
   if a.output is None: p.error('--output required')

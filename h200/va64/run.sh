@@ -3,7 +3,7 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 MODE="${1:-preflight}"
-[[ "$MODE" == preflight || "$MODE" == train || "$MODE" == tune-resume || "$MODE" == resume ]] || { echo 'Expected preflight, train, tune-resume or resume'; exit 2; }
+[[ "$MODE" == preflight || "$MODE" == train || "$MODE" == tune-resume || "$MODE" == resume || "$MODE" == seeds12 ]] || { echo 'Expected preflight, train, tune-resume, resume or seeds12'; exit 2; }
 if [[ "$MODE" != preflight ]]; then export VA64_G_CHECKPOINT_POLICY=local_only; fi
 GUARD_OPTIONS=()
 [[ "$MODE" != preflight ]] && GUARD_OPTIONS+=(--metrics-optional)
@@ -17,6 +17,7 @@ if [[ "${2:-}" != --inside-guard ]]; then
   export VA64_G_MANAGED_ROOT="$RUN_ROOT"
   export VA64_G_JOB=va64-g-preflight
   [[ "$MODE" != preflight ]] && export VA64_G_JOB=va64-g-seed0
+  [[ "$MODE" == seeds12 ]] && export VA64_G_JOB=va64-g-seed1
   export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/scripts"
   exec python3 -u scripts/va64_h200_guard.py --root "$RUN_ROOT" --code-sha "$VA64_G_CODE_SHA" \
     --relay-url https://visionalphabet-va64-g-20261107.gpupulse-monitor.workers.dev/va64g \
@@ -31,6 +32,7 @@ export TRITON_CACHE_DIR="$RUN_ROOT/cache/triton" TORCHINDUCTOR_CACHE_DIR="$RUN_R
 trap 'touch "$RUN_ROOT/STOP"' TERM INT
 JOB=va64-g-preflight
 [[ "$MODE" != preflight ]] && JOB=va64-g-seed0
+[[ "$MODE" == seeds12 ]] && JOB=va64-g-seed1
 check_stop() { [[ ! -e "$RUN_ROOT/STOP" ]] || { echo "VA64_STOP_REQUESTED"; exit 130; }; }
 python3 scripts/va64_runtime_operations.py ready --root "$RUN_ROOT" --job "$JOB"
 check_stop
@@ -58,7 +60,19 @@ check_stop
 "$PY" h200/va64/preflight.py --source-root "$PROJECT_ROOT" --data-root "$DATA_ROOT" --output-root "$RUN_ROOT/environment-check"
 check_stop
 # Tests use tiny fields. The smoke below checks the full 224px path separately.
-"$PY" -m pytest -q tests/test_va64_g.py
+"$PY" -m pytest -q tests/test_va64_g.py tests/test_va64_g_replicates.py
+if [[ "$MODE" == seeds12 ]]; then
+  unset VA64_G_RECOVERY VA64_G_RESUME_PLAN
+  for SEED in 1 2; do
+    check_stop
+    JOB="va64-g-seed$SEED"
+    export VA64_G_JOB="$JOB"
+    "$PY" scripts/run_va64_g_h200.py --variant G --seed "$SEED" --data-root "$DATA_ROOT" --data-manifest "$RUN_ROOT/environment-check/dataset-manifest.json" --output-root "$RUN_ROOT/runs" --batch-size 128 --workers 8 --gpu-mixup --stop-file "$RUN_ROOT/STOP"
+    check_stop
+  done
+  echo 'VA64_SEEDS12_COMPLETE seed1_and_seed2_completed=true'
+  exit 0
+fi
 if [[ "$MODE" == tune-resume || "$MODE" == resume ]]; then
   export VA64_G_RESUME_PLAN="$PROJECT_ROOT/h200/va64/resume-plan.json"
   "$PY" scripts/va64_h200_resume.py --root "$RUN_ROOT" --plan "$VA64_G_RESUME_PLAN"

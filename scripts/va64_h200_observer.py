@@ -180,7 +180,7 @@ class _WandbMirror:
                 config={
                     "campaign_id": campaign,
                     "job": job,
-                    "seed": 0,
+                    "seed": int(job.rsplit("seed", 1)[1]) if re.search(r"seed\d+$", job) else 0,
                     "dataset": "ImageNet1K",
                     "epochs": 0 if job.endswith("preflight") else 100,
                     "synthetic_input": job.endswith("preflight"),
@@ -225,6 +225,13 @@ class _WandbMirror:
             final = (result.get("final_validation") or {}).get("accuracy")
             if isinstance(final, (int, float)):
                 run.summary["final/top1_percent"] = 100.0 * float(final)
+            validation = result.get("final_validation") or {}
+            top5 = validation.get("top5_accuracy")
+            if isinstance(top5, (int, float)):
+                run.summary["final/top5_percent"] = 100.0 * float(top5)
+            loss = validation.get("cross_entropy")
+            if isinstance(loss, (int, float)):
+                run.summary["final/cross_entropy"] = float(loss)
             # The observer finishes after the final logs/result artifact is confirmed.
 
     def save_backup(self, campaign: str, job: str, metadata: dict, archive: Path) -> dict:
@@ -438,6 +445,7 @@ def observe(
     terminal_event_seen = bool(state.get("terminal_event_seen", False))
     local_only = bool(state.get("local_only", False))
     pending_status = dict(state.get("pending_status", {}))
+    completed_run_digests = dict(state.get("completed_run_digests", {}))
     last_heartbeat = 0.0
     pending_warned: set[str] = set()
 
@@ -472,6 +480,7 @@ def observe(
             stopped_without_backup = False
             local_only = False
             pending_status.clear()
+            completed_run_digests.clear()
             pending_warned.clear()
             session_id = incoming_id
             terminal_event_seen = False
@@ -499,6 +508,30 @@ def observe(
                     terminal_event_seen = bool(status.get("ended"))
                     _persist_results(output, campaign, job, status)
                     pending_status[job] = _redact(status)
+                    # A completed seed can disappear from current.json before the
+                    # next guard poll. Sticky results retain its own job identity.
+                    completed_runs = status.get("completed_runs") or {}
+                    if isinstance(completed_runs, dict):
+                        for finished_job, summary in completed_runs.items():
+                            if finished_job not in JOBS or not isinstance(summary, dict):
+                                continue
+                            result = summary.get("result") or {}
+                            if not isinstance(result, dict) or result.get("status", summary.get("status")) != "completed":
+                                continue
+                            digest = hashlib.sha256(json.dumps(summary, sort_keys=True).encode("utf-8")).hexdigest()
+                            if completed_run_digests.get(finished_job) == digest:
+                                continue
+                            finished_status = {
+                                "current": {**current, "job": finished_job, "stage": "completed"},
+                                "checkpoint": summary.get("latest-epoch") or {},
+                                "result": result,
+                                "summary": summary,
+                            }
+                            active_jobs.add(finished_job)
+                            campaigns[finished_job] = campaign
+                            _persist_results(output, campaign, finished_job, finished_status)
+                            pending_status[finished_job] = _redact(finished_status)
+                            completed_run_digests[finished_job] = digest
                 event_id = event.get("id")
                 if isinstance(event_id, int):
                     cursor = max(cursor, event_id)
@@ -554,6 +587,7 @@ def observe(
                 "session_id": session_id,
                 "local_only": local_only,
                 "pending_status": pending_status,
+                "completed_run_digests": completed_run_digests,
                 "completed_session_id": completed_session_id,
                 "child_failed": child_failed,
                 "stopped_without_backup": stopped_without_backup,

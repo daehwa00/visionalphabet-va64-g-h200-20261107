@@ -169,7 +169,7 @@
     "scripts/run_r2k3_frozen_study_representations.py": "466b001688387fd29f089c041e3519fd0b621707491b463f595b7542d3f14d51",
     "scripts/run_r2k3_frozen_study_robustness.py": "8b322368d3b64b11709dc501c76e15d8de49717bbfb69dc4025eef6dd85c825b",
     "scripts/run_r2k3_scan_unification_gate.sh": "65f902dd838eaf29d3c5077a1813562ddd8f9e8c910833be5db742d965d48985",
-    "scripts/run_va64_retrain_imagenet1k.py": "cfa32d7b7c8417f9fa7c2d725d2dc479908c5f905fd79846a5ccf64682919adb",
+    "scripts/run_va64_retrain_imagenet1k.py": "3565a0ba044f4f1fd57154709ca8ac80720802fbc4de1a363d0d28ac97cdec15",
     "scripts/run_va_retrain_imagenet1k.py": "23b44bb1aceb4801d80efe4843b2f14a5120e36215d480b87d2940de83009f48",
     "scripts/smoke_a2d_r2k3_same_resolution_factorial.py": "7a829f31c10ffbf1c0f3c0974b5888961e092a3d25d89572474d301d0ee00bda",
     "scripts/smoke_h200_k_family_xl.py": "02c61047fe339bcedbd046b3d5db5e0b107e2e2381e340bfac4fd2f426639aa5",
@@ -341,7 +341,9 @@
     "h200/va64/benchmark_g.py": "924ce5b109f0626c68f6e1b2f1b4765e0070ae8fbc2917dd04c0050c5ef6f3ca",
     "tests/test_va64_h200_resume.py": "5df1cd0c8330c4836907793a71a2afdfb791161bc5ab53db135c5b2e4c6e8718",
     "tests/test_h200_va64_benchmark.py": "c4879ac4db5607383966ed0a2c926909a144e7e42ea2e1cda3585fbb4245fb97",
-    "tests/test_va64_metrics_observer.py": "98d736036a99ec495484e1ec637e4a327d1f75e24ff725c4a29e44c9ed624f90",
-    "tests/test_va64_metrics_guard.py": "dafff9010d6a3d38c9a74ee53665fe570f5d790f1ab2f8839efb1ae1af588ed0"
+    "tests/test_va64_metrics_observer.py": "0e7025e17ddef300b201411728c95506a19c30ba790f1a930838e23a1f758d3f",
+    "tests/test_va64_metrics_guard.py": "dafff9010d6a3d38c9a74ee53665fe570f5d790f1ab2f8839efb1ae1af588ed0",
+    "tests/test_va64_g_replicates.py": "fd4c41c6a7e7714387e4970006e801170c2295a7172ca6a87ebd8bf8a5256cf6",
+    "tests/test_va64_h200_seeds12.py": "cc868c61afc8f164846e9592fc4798fcd97f18c9b8e1784045e76273cdf95535"
   }
 }

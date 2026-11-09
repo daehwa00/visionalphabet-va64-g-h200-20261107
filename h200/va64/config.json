@@ -1,7 +1,7 @@
 {
-  "mode": "resume",
+  "mode": "seeds12",
   "variant": "G",
-  "seed": 0,
+  "seed": null,
   "epochs_if_separately_authorized": 100,
   "physical_batch": 128,
   "gradient_accumulation": 2,
@@ -20,9 +20,14 @@
   "submission_authorized": false,
   "request_username": "daehwa00",
   "epochs": 100,
-  "resume_completed_epochs": 13,
-  "resume_global_step": 65065,
+  "resume_completed_epochs": null,
+  "resume_global_step": null,
   "checkpoint_policy": "local_only",
   "telemetry_required": false,
-  "external_results": "W&B metrics/logs/results and service stdout"
+  "external_results": "W&B metrics/logs/results and service stdout",
+  "seeds": [
+    1,
+    2
+  ],
+  "epochs_per_seed": 100
 }

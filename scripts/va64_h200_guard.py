@@ -132,6 +132,7 @@ def main():
                     except ProcessLookupError:pass
                 status={'time':time.time(),'current':current,'progress':progress,'checkpoint':checkpoint,
                         'result':result,'summary':read(output/'final-summary.json') if output else {},
+                        'completed_runs':read(root/'completed-runs.json'),
                         'exit_code':child.poll(),'stop_requested':stopped,'forced':forced,'error':last_error,
                         'stop_reasons':stop_reasons,'connectivity_warning':warning,
                         'ended':child.poll() is not None}
