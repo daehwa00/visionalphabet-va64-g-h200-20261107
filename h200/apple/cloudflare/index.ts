@@ -26,6 +26,8 @@ export class Va64Control extends DurableObject<Env> {
   constructor(ctx:DurableObjectState,env:Env){super(ctx,env);
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT)');
     ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT, seq INTEGER, value TEXT, UNIQUE(session,seq))');
+    // Bound cursor polling reads: UNIQUE(session,seq) otherwise scans the full session.
+    ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS events_session_id ON events(session,id)');
   }
   read(key:string):Obj|null {const rows=this.ctx.storage.sql.exec<{value:string}>('SELECT value FROM meta WHERE key=?',key).toArray();return rows.length?JSON.parse(rows[0].value):null;}
   write(key:string,value:unknown){this.ctx.storage.sql.exec('INSERT OR REPLACE INTO meta VALUES (?,?)',key,JSON.stringify(value));}
