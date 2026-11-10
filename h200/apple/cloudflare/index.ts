@@ -3,7 +3,7 @@ import { DurableObject } from 'cloudflare:workers';
 const MODELS=['va_k96','va_k128','convnextv2_atto','tinyvim_s','parc_net_s'];
 export const JOBS=new Set(MODELS.flatMap(m=>[501,509,521].map(s=>`${m}-${s}`)));
 const K96_COCO_JOBS=new Set(['k96coco-521-8k']);
-const VA64_OPT_JOBS=new Set(['apple70m-data-preflight','apple70m-train']);
+const VA64_OPT_JOBS=new Set(['apple70m-data-preflight','apple70m-train','apple70m-vonly']);
 const CHUNK=256*1024;
 const VA64_MAX_ARTIFACT_BYTES=384*1024**2;
 const VA64_MAX_ARTIFACT_CHUNKS=Math.ceil(VA64_MAX_ARTIFACT_BYTES/CHUNK);
@@ -130,7 +130,7 @@ export default {
     if(!url.pathname.startsWith('/va64g/'))return reply({error:'wrong_namespace'},404);
     const prefix='/va64g';
     const route=url.pathname.slice(prefix.length);
-    if(route==='/health')return reply({ok:true,campaign:'apple70m-h200-preflight-v1',jobs:2});
+    if(route==='/health')return reply({ok:true,campaign:'apple70m-h200-vonly-v1',jobs:3});
     const token=(req.headers.get('Authorization')||'').replace(/^Bearer /,'');
     const owner=!!env.IN10_OWNER_TOKEN&&token===env.IN10_OWNER_TOKEN;
     const test=url.searchParams.get('test')==='1';if(test&&!owner)return reply({error:'test_requires_owner'},403);
