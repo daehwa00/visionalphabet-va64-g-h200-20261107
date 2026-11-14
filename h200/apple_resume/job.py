@@ -47,24 +47,24 @@ def main():
  run([py,HERE/'download_private.py',a.root/'recovery'],env=env)
  common=['--branch-source','residual','--steps','47684','--data-manifest',TRAINER/'train-data-manifest.json','--cache-root',a.scratch/'train-cache','--validation-manifest',a.root/'validation-manifest.json','--stop-file',stop_file]
  parent=a.root/'recovery/latest.pt';receipt=read(parent.with_suffix('.pt.json'));step=receipt['global_step']
- migrated=a.root/'migration';current('migration',migrated)
- run([py,HERE/'runtime.py','migrate',*common,'--microbatch',64,'--resume',parent,'--output-root',migrated],env=env)
  reference=a.root/'reference-b8';current('reference',reference)
  run([py,HERE/'runtime.py','train',*common,'--microbatch',8,'--resume',parent,'--output-root',reference,'--stop-after',step+2],env=env)
- candidate=a.root/'candidate-b64';current('candidate',candidate)
- run([py,HERE/'runtime.py','train',*common,'--microbatch',64,'--resume',migrated/'latest.pt','--output-root',candidate,'--stop-after',step+2],env=env)
- run([py,HERE/'compare.py',reference,candidate,a.root/'comparison.json'],env=env)
+ audit=read(reference/'restore-audit.json')
+ if not audit or not all(audit['matches'].values()):raise RuntimeError('Original recipe restore audit failed')
+ atomic(a.root/'comparison.json',{'recipe':'unchanged microbatch8 accumulation128 global1024','restores_match':True,'microbatch_migration':False,'note':'H200 GPU arithmetic may differ; checkpoint model/optimizer/scaler/RNG restore is exact.'})
  smoke=a.root/'speed-check';current('speed-check',smoke)
- run([py,HERE/'runtime.py','train',*common,'--microbatch',64,'--resume',candidate/'checkpoints/latest.pt','--output-root',smoke,'--stop-after',step+10],env=env)
+ run([py,HERE/'runtime.py','train',*common,'--microbatch',8,'--resume',reference/'checkpoints/latest.pt','--output-root',smoke,'--stop-after',step+10],env=env)
  rows=[json.loads(line) for line in (smoke/'steps.jsonl').read_text().splitlines()]
  rates=[r['tokens_per_second'] for r in rows if r.get('tokens_per_second') and r.get('global_step',0)>step+4]
  import statistics
  speed=statistics.median(rates)
+ audit=read(smoke/'restore-audit.json')
+ if not audit or not all(audit['matches'].values()):raise RuntimeError('Saved checkpoint re-restore audit failed')
  if not math.isfinite(speed) or speed<220000:raise RuntimeError('H200 throughput gate failed: '+str(speed))
  atomic(a.root/'handoff-ready.json',{'parent_step':step,'resume_step':step+10,'tokens_per_second':speed,'restore_verified':True,'comparison':read(a.root/'comparison.json')})
  print('H200_HANDOFF_READY='+json.dumps(read(a.root/'handoff-ready.json')),flush=True)
  train=a.root/'train';current('training',train)
- run([py,HERE/'runtime.py','train',*common,'--microbatch',64,'--resume',smoke/'checkpoints/latest.pt','--output-root',train],env=env)
+ run([py,HERE/'runtime.py','train',*common,'--microbatch',8,'--resume',smoke/'checkpoints/latest.pt','--output-root',train],env=env)
  result=read(train/'result.json')
  if result.get('status')!='completed':raise RuntimeError('Training did not complete')
  current('final-benchmarks',train)
