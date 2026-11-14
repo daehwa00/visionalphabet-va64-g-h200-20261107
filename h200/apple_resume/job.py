@@ -44,7 +44,7 @@ def main():
  current('data-validation')
  run([py,TRAINER/'validation.py','--cache-root',a.scratch/'validation','--output-root',a.root,'--stop-file',stop_file],env=env)
  current('checkpoint-download')
- run([py,HERE/'download.py',a.root/'recovery'],env=env)
+ run([py,HERE/'download_private.py',a.root/'recovery'],env=env)
  common=['--branch-source','residual','--steps','47684','--data-manifest',TRAINER/'train-data-manifest.json','--cache-root',a.scratch/'train-cache','--validation-manifest',a.root/'validation-manifest.json','--stop-file',stop_file]
  parent=a.root/'recovery/latest.pt';receipt=read(parent.with_suffix('.pt.json'));step=receipt['global_step']
  migrated=a.root/'migration';current('migration',migrated)
