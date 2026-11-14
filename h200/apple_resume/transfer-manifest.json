@@ -1,0 +1,33 @@
+{
+  "checkpoint": {
+    "bytes": 1127369355,
+    "sha256": "511207c2df6a6d4d48ea225991636ed16469b321bc735ac9c29bb6f54b6889f4",
+    "schema": 2,
+    "kind": "training",
+    "global_step": 27000
+  },
+  "parts": [
+    {
+      "job": "apple70m-data-preflight",
+      "sha": "f1e2b7f2319565c1f6763fb2d380906ba0890abbf7419d6b6b1b0074768fabc8",
+      "bytes": 402653184,
+      "chunks": 1536,
+      "chunk_bytes": 262144
+    },
+    {
+      "job": "apple70m-train",
+      "sha": "0311ce31aa9efb8c8a06e575a8d2e26ba06598be50a85e0aeeac51f4158fade1",
+      "bytes": 402653184,
+      "chunks": 1536,
+      "chunk_bytes": 262144
+    },
+    {
+      "job": "apple70m-vonly",
+      "sha": "1a6e848f632914adda5796ea8182605152cb369c443604d09cf044c4e6f23f4e",
+      "bytes": 322062987,
+      "chunks": 1229,
+      "chunk_bytes": 262144
+    }
+  ],
+  "base": "https://apple70m-h200-20261109.gpupulse-monitor.workers.dev/va64g"
+}
