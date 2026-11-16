@@ -7,3 +7,7 @@ Authorized run: seed0, 100epochs, effective batch1024, LR0.003. The established 
 Entry: `bash h200/terminal_rawg/run.sh`. It verifies the pinned environment, whole H200 allocation and the complete IN1K dataset; runs tests and a full224px two-update smoke plus checkpoint restore; then trains from scratch. Any non-OOM preflight failure stops the launch. The existing supervisor reports logs, epochs and metrics to a dedicated relay and honors a remote stop. Latest/best checkpoints are local during training. At normal completion, latest/best, contracts and results are uploaded for external hash verification and private W&B archival before completion is acknowledged.
 
 Source integrity: SOURCE_MANIFEST.json. Secrets are stored outside this repository and are never passed in the GitHub issue or public command. This branch uses a dedicated relay/observer, leaving previous H200 runs untouched.
+
+## v3 execution update
+
+Imports the four verified v3 kernels: skip absent descriptor-gradient work, output-only relaxed atomics, rank-contiguous Reader weight-gradient loads, and six-geometry coarse backward autotune. Enables VA_REAL_MEMORY_SCAN_BATCH_PARTIALS=1. Model/readout/optimizer/recipe are unchanged. Fresh seed0 restart authorized; no old checkpoint is loaded. RTX4090 timings and compiled cache speedups are not H200 performance guarantees.

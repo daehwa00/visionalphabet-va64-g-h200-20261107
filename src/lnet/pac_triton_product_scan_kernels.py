@@ -798,35 +798,54 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: C901, PLR0912
     r1, i1 = tl.where(active, pbr * inverse_pb, 0.0), tl.where(active, pbi * inverse_pb, 0.0)
     r2, i2 = tl.where(active, nar * inverse_na, 0.0), tl.where(active, nai * inverse_na, 0.0)
     r3, i3 = tl.where(active, nbr * inverse_nb, 0.0), tl.where(active, nbi * inverse_nb, 0.0)
-    descriptor_base = batch * (modes if MEAN_DESCRIPTOR_GRAD else 4 * modes) + mode
-    raw_factor0 = tl.load(
-        descriptor_gradient_factor + descriptor_base,
-        mask=valid_mode & HAS_DESCRIPTOR_GRAD,
-        other=0.0,
-    )
-    raw_factor1 = tl.load(
-        descriptor_gradient_factor + descriptor_base + (0 if MEAN_DESCRIPTOR_GRAD else 1 * modes),
-        mask=valid_mode & HAS_DESCRIPTOR_GRAD,
-        other=0.0,
-    )
-    raw_factor2 = tl.load(
-        descriptor_gradient_factor + descriptor_base + (0 if MEAN_DESCRIPTOR_GRAD else 2 * modes),
-        mask=valid_mode & HAS_DESCRIPTOR_GRAD,
-        other=0.0,
-    )
-    raw_factor3 = tl.load(
-        descriptor_gradient_factor + descriptor_base + (0 if MEAN_DESCRIPTOR_GRAD else 3 * modes),
-        mask=valid_mode & HAS_DESCRIPTOR_GRAD,
-        other=0.0,
-    )
-    grad_r0 = 2.0 * raw_factor0 * r0 * inverse_pa
-    grad_i0 = 2.0 * raw_factor0 * i0 * inverse_pa
-    grad_r1 = 2.0 * raw_factor1 * r1 * inverse_pb
-    grad_i1 = 2.0 * raw_factor1 * i1 * inverse_pb
-    grad_r2 = 2.0 * raw_factor2 * r2 * inverse_na
-    grad_i2 = 2.0 * raw_factor2 * i2 * inverse_na
-    grad_r3 = 2.0 * raw_factor3 * r3 * inverse_nb
-    grad_i3 = 2.0 * raw_factor3 * i3 * inverse_nb
+    if HAS_DESCRIPTOR_GRAD:
+        descriptor_base = batch * (modes if MEAN_DESCRIPTOR_GRAD else 4 * modes) + mode
+        raw_factor0 = tl.load(
+            descriptor_gradient_factor + descriptor_base,
+            mask=valid_mode & HAS_DESCRIPTOR_GRAD,
+            other=0.0,
+        )
+        raw_factor1 = tl.load(
+            descriptor_gradient_factor
+            + descriptor_base
+            + (0 if MEAN_DESCRIPTOR_GRAD else 1 * modes),
+            mask=valid_mode & HAS_DESCRIPTOR_GRAD,
+            other=0.0,
+        )
+        raw_factor2 = tl.load(
+            descriptor_gradient_factor
+            + descriptor_base
+            + (0 if MEAN_DESCRIPTOR_GRAD else 2 * modes),
+            mask=valid_mode & HAS_DESCRIPTOR_GRAD,
+            other=0.0,
+        )
+        raw_factor3 = tl.load(
+            descriptor_gradient_factor
+            + descriptor_base
+            + (0 if MEAN_DESCRIPTOR_GRAD else 3 * modes),
+            mask=valid_mode & HAS_DESCRIPTOR_GRAD,
+            other=0.0,
+        )
+        grad_r0 = 2.0 * raw_factor0 * r0 * inverse_pa
+        grad_i0 = 2.0 * raw_factor0 * i0 * inverse_pa
+        grad_r1 = 2.0 * raw_factor1 * r1 * inverse_pb
+        grad_i1 = 2.0 * raw_factor1 * i1 * inverse_pb
+        grad_r2 = 2.0 * raw_factor2 * r2 * inverse_na
+        grad_i2 = 2.0 * raw_factor2 * i2 * inverse_na
+        grad_r3 = 2.0 * raw_factor3 * r3 * inverse_nb
+        grad_i3 = 2.0 * raw_factor3 * i3 * inverse_nb
+
+    else:
+        # An absent descriptor contributes exactly zero. Avoid retaining
+        # zero-times-state expressions through the path MLP backward.
+        grad_r0 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
+        grad_i0 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
+        grad_r1 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
+        grad_i1 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
+        grad_r2 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
+        grad_i2 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
+        grad_r3 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
+        grad_i3 = tl.full((BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES), 0.0, tl.float32)
 
     if COLLAPSE_PATHS_GRAD:
         path_height: tl.constexpr = BLOCK_HEIGHT // 2 if COARSE_PATHS else BLOCK_HEIGHT
@@ -1073,28 +1092,33 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: C901, PLR0912
                 active_grad_imag.to(tl.float32)[:, :, None] * hidden.to(tl.float32), axis=1
             )
             tl.atomic_add(
-                grad_path_output_weight + output_offset, grad_weight_real, mask=output_mask
+                grad_path_output_weight + output_offset, grad_weight_real, mask=output_mask,
+                sem="relaxed",
             )
             tl.atomic_add(
                 grad_path_output_weight + output_offset + packed_path_hidden,
                 grad_weight_imag,
                 mask=output_mask,
+                sem="relaxed",
             )
             tl.atomic_add(
                 grad_path_output_bias + 2 * mode_vector,
                 tl.sum(active_grad_real.to(tl.float32), axis=1),
                 mask=mode_vector < modes,
+                sem="relaxed",
             )
             tl.atomic_add(
                 grad_path_output_bias + 2 * mode_vector + 1,
                 tl.sum(active_grad_imag.to(tl.float32), axis=1),
                 mask=mode_vector < modes,
+                sem="relaxed",
             )
         if PATH_SWIGLU:
             tl.atomic_add(
                 grad_path_output_weight + output_weight_offset,
                 path_output_weight_gradient,
                 mask=output_weight_mask,
+                sem="relaxed",
             )
             tl.atomic_add(
                 grad_path_output_bias
@@ -1103,6 +1127,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: C901, PLR0912
                 tl.sum(active_grad_output.to(tl.float32), axis=1),
                 mask=(mode_vector[:, None] < modes)
                 & (output_coordinate[None, :] < _PACKED_PATH_OUTPUTS_TL),
+                sem="relaxed",
             )
         if path_tokens >= 16:
             path_input_weight_gradient = tl.dot(
@@ -1123,6 +1148,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: C901, PLR0912
             mask=(mode_vector[:, None, None] < modes)
             & (hidden_coordinate[None, :, None] < packed_path_hidden)
             & (path_coordinate[None, None, :] < _PACKED_PATH_INPUTS_TL),
+            sem="relaxed",
         )
         tl.atomic_add(
             grad_path_input_bias
@@ -1130,6 +1156,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: C901, PLR0912
             + hidden_coordinate[None, :],
             tl.sum(grad_preactivation.to(tl.float32), axis=1),
             mask=(mode_vector[:, None] < modes) & (hidden_coordinate[None, :] < packed_path_hidden),
+            sem="relaxed",
         )
         grad_packed_path = tl.dot(
             grad_preactivation,
@@ -1544,21 +1571,25 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: C901, PLR0912
         grad_decay_real + coefficient_mode,
         grad_dr,
         mask=valid_coefficient_mode,
+        sem="relaxed",
     )
     tl.atomic_add(
         grad_decay_imag + coefficient_mode,
         grad_di,
         mask=valid_coefficient_mode,
+        sem="relaxed",
     )
     tl.atomic_add(
         grad_gamma_real + coefficient_mode,
         grad_gr,
         mask=valid_coefficient_mode,
+        sem="relaxed",
     )
     tl.atomic_add(
         grad_gamma_imag + coefficient_mode,
         grad_gi,
         mask=valid_coefficient_mode,
+        sem="relaxed",
     )
 
 

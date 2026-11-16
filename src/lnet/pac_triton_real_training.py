@@ -70,9 +70,13 @@ def _weight_backward_vector(
     poles = tl.program_id(0) * POLES + tl.arange(0, POLES)
     taps = tl.program_id(1) * TAPS + tl.arange(0, TAPS)
     split = tl.program_id(2)
-    rank = taps // (K * K)
-    ky = taps // K % K
-    kx = taps % K
+    # Tile neighboring rank coordinates of the same spatial tap together.
+    # NHW(PR) stores rank contiguously; the original rank-major tap ordering
+    # groups strided source coordinates when a tile spans only spatial taps.
+    spatial_tap = taps // R
+    rank = taps % R
+    ky = spatial_tap // K
+    kx = spatial_tap % K
     accum0 = tl.full((TAPS, POLES), 0, tl.float32)
     accum1 = tl.full((TAPS, POLES), 0, tl.float32)
     for start in range(split * ROWS, N * H * W, SPLITS * ROWS):
@@ -103,7 +107,9 @@ def _weight_backward_vector(
         g1 = tl.load(G + grad_offset + P, grad_mask, 0).to(tl.float32)
         accum0 += tl.sum(source * g0[:, None, :], axis=0)
         accum1 += tl.sum(source * g1[:, None, :], axis=0)
-    offset = split * (P * 2 * R * K * K) + poles[None, :] * (2 * R * K * K) + taps[:, None]
+    # Keep the public partial/weight layout P(2RKK) unchanged.
+    weight_tap = rank * (K * K) + spatial_tap
+    offset = split * (P * 2 * R * K * K) + poles[None, :] * (2 * R * K * K) + weight_tap[:, None]
     active = (poles[None, :] < P) & (taps[:, None] < R * K * K)
     tl.store(PARTIAL + offset, accum0, active)
     tl.store(PARTIAL + offset + R * K * K, accum1, active)

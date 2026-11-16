@@ -94,6 +94,7 @@ def main():
         stop_requested=args.stop_file.is_file,stop_without_checkpoint=True)
     if managed:
         from va64_runtime_operations import backup_and_wait,complete_run
+        os.environ['VA64_G_CHECKPOINT_POLICY']='external'
         backup_and_wait(managed,'va64-g-seed0',task.output_dir,100,result['global_step'],{'status':'completed'})
         complete_run(managed,task.output_dir,'completed')
     print('RAWG_FINAL='+json.dumps({k:v for k,v in result.items() if k!='history'}),flush=True)

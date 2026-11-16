@@ -84,10 +84,23 @@ COARSE_PATH_BACKWARD_LAUNCH_NAME = "product_scan_coarse_path_backward"
 _COARSE_PATH_GEOMETRY = LaunchGeometry.build(
     num_warps=4, blocks={"BLOCK_LINES": 1, "BLOCK_MODES": 8},
 )
-for _coarse_path_launch in (COARSE_PATH_FORWARD_LAUNCH_NAME, COARSE_PATH_BACKWARD_LAUNCH_NAME):
-    register_default(
-        _coarse_path_launch, _COARSE_PATH_GEOMETRY, candidates=(_COARSE_PATH_GEOMETRY,),
-    )
+register_default(
+    COARSE_PATH_FORWARD_LAUNCH_NAME,
+    _COARSE_PATH_GEOMETRY,
+    candidates=(_COARSE_PATH_GEOMETRY,),
+)
+register_default(
+    COARSE_PATH_BACKWARD_LAUNCH_NAME,
+    _COARSE_PATH_GEOMETRY,
+    candidates=tuple(
+        LaunchGeometry.build(
+            num_warps=warps,
+            blocks={"BLOCK_LINES": 1, "BLOCK_MODES": modes},
+        )
+        for modes in (4, 8, 16)
+        for warps in (4, 8)
+    ),
+)
 
 _SCAN_LAUNCH_CANDIDATES = tuple(
     LaunchGeometry.build(
@@ -336,7 +349,6 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
     backward_kernel = autotuned(
         _product_scan_coarse4_associative_backward_kernel,
         launch_name,
-        geometry=_COARSE_PATH_GEOMETRY if coarse_path else None,
         key=(
             "height",
             "width",

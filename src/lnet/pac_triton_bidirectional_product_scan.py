@@ -370,10 +370,10 @@ def _bidirectional_backward_kernel(
         tl.where(active, -plr * si + pli * sr + nlr * si - nli * sr, 0.0),
         axis=0,
     )
-    tl.atomic_add(grad_decay_real + mode, cdr[None, :], mask=valid_mode)
-    tl.atomic_add(grad_decay_imag + mode, cdi[None, :], mask=valid_mode)
-    tl.atomic_add(grad_gamma_real + mode, cgr[None, :], mask=valid_mode)
-    tl.atomic_add(grad_gamma_imag + mode, cgi[None, :], mask=valid_mode)
+    tl.atomic_add(grad_decay_real + mode, cdr[None, :], mask=valid_mode, sem="relaxed")
+    tl.atomic_add(grad_decay_imag + mode, cdi[None, :], mask=valid_mode, sem="relaxed")
+    tl.atomic_add(grad_gamma_real + mode, cgr[None, :], mask=valid_mode, sem="relaxed")
+    tl.atomic_add(grad_gamma_imag + mode, cgi[None, :], mask=valid_mode, sem="relaxed")
 
 
 @triton_op("lnet::pac_bidirectional_product_scan", mutates_args={})

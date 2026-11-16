@@ -1,5 +1,5 @@
 {
-  "name": "visionalphabet-terminal-rawg-20261116",
+  "name": "visionalphabet-terminal-rawg-v3-20261116",
   "main": "index.ts",
   "compatibility_date": "2026-04-01",
   "workers_dev": true,
@@ -27,7 +27,7 @@
   "ratelimits": [
     {
       "name": "RELAY_RATE_LIMITER",
-      "namespace_id": "6111601",
+      "namespace_id": "6111603",
       "simple": {
         "limit": 600,
         "period": 60
