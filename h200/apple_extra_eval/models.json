@@ -1,0 +1,34 @@
+[
+  {
+    "name": "value-final.pt",
+    "variant": "value",
+    "label": "final",
+    "sha256": "741aa47d81f0a81fe8c70b06098a5b4a2276d8750b96f899bf3453da1e5f5f7d",
+    "bytes": 281837211,
+    "global_step": 47684
+  },
+  {
+    "name": "value-best.pt",
+    "variant": "value",
+    "label": "best",
+    "sha256": "83dc164fefc8155828d4326ef2d467e3889c81adbce4a1f406f92cef6c56f3a9",
+    "bytes": 281837019,
+    "global_step": 47223
+  },
+  {
+    "name": "residual-final.pt",
+    "variant": "residual",
+    "label": "final",
+    "sha256": "e34ad565e316b01b45fbb25b2b463c1ec68687c7dfd929316013325a3faf20ca",
+    "bytes": 281837211,
+    "global_step": 47684
+  },
+  {
+    "name": "residual-best.pt",
+    "variant": "residual",
+    "label": "best",
+    "sha256": "89d550f711732e9d35f369409bce42245db1d50c3fd70cbbc8b0196e89490fc3",
+    "bytes": 281837019,
+    "global_step": 46746
+  }
+]

@@ -3,7 +3,7 @@ import { DurableObject } from 'cloudflare:workers';
 const MODELS=['va_k96','va_k128','convnextv2_atto','tinyvim_s','parc_net_s'];
 export const JOBS=new Set(MODELS.flatMap(m=>[501,509,521].map(s=>`${m}-${s}`)));
 const K96_COCO_JOBS=new Set(['k96coco-521-8k']);
-const VA64_OPT_JOBS=new Set(['apple70m-data-preflight','apple70m-train','apple70m-vonly','apple70m-vonly-checkpoint']);
+const VA64_OPT_JOBS=new Set(['apple70m-data-preflight','apple70m-train','apple70m-vonly','apple70m-vonly-checkpoint','apple70m-extra-input','apple70m-extra-eval']);
 const CHUNK=256*1024;
 const VA64_MAX_ARTIFACT_BYTES=384*1024**2;
 const VA64_MAX_ARTIFACT_CHUNKS=Math.ceil(VA64_MAX_ARTIFACT_BYTES/CHUNK);
