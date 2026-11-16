@@ -51,8 +51,8 @@ def main():
             return values
     manager=TaskManager()
     blimp=sorted(t for t in manager.all_tasks if t.startswith('blimp_') and not t.startswith('blimp_nl'))
-    xstory=sorted(t for t in manager.all_tasks if t.startswith('xstorycloze_'))
-    assert len(blimp)==67 and len(xstory)==11
+    xstory=['xstorycloze_'+language for language in ('ar','en','es','eu','hi','id','my','ru','sw','te','zh')]
+    assert len(blimp)==67 and set(xstory)<=set(manager.all_tasks)
     units=[('blimp',blimp[:1] if a.smoke_limit else blimp),('swag',['swag']),('hellaswag',['hellaswag']),('xstorycloze',['xstorycloze_en'] if a.smoke_limit else xstory),('wikitext',['wikitext'])]
     model,payload=benchmark.load_model(a.checkpoint,a.device)
     tokenizer=PreTrainedTokenizerFast(tokenizer_file=str(a.tokenizer),eos_token='<|endoftext|>',bos_token='<|endoftext|>',pad_token='<|endoftext|>')
@@ -68,7 +68,14 @@ def main():
         for name in names:
             entry=manager.task_index[name];spec=load_yaml(entry.yaml_path,resolve_func=True)
             assert spec['dataset_path'] in DATASETS
-            spec['dataset_kwargs']={**spec.get('dataset_kwargs',{}),'revision':DATASETS[spec['dataset_path']],'token':False}
+            if spec['dataset_path']=='juletxara/xstory_cloze':
+                language=spec['dataset_name']
+                assert language in {'ar','en','es','eu','hi','id','my','ru','sw','te','zh'}
+                base=f"https://huggingface.co/datasets/juletxara/xstory_cloze/resolve/{DATASETS['juletxara/xstory_cloze']}/{language}"
+                spec['dataset_path']='parquet';spec['dataset_name']=None
+                spec['dataset_kwargs']={'data_files':{'train':base+'/train/0000.parquet','eval':base+'/eval/0000.parquet'},'token':False}
+            else:
+                spec['dataset_kwargs']={**spec.get('dataset_kwargs',{}),'revision':DATASETS[spec['dataset_path']],'token':False}
             specs.append(spec)
         try:
             result=evaluator.simple_evaluate(model=lm,tasks=specs,num_fewshot=0,task_manager=manager,limit=a.smoke_limit,log_samples=False,bootstrap_iters=0 if a.smoke_limit else 1000,random_seed=0,numpy_random_seed=0,torch_random_seed=0,fewshot_random_seed=0)
