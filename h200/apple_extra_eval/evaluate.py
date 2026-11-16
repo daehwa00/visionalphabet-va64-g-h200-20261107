@@ -32,7 +32,7 @@ def validate(result,names,limit):
         if effective!=expected:raise ValueError(f'Incomplete {name}: {effective}/{expected}')
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--checkpoint',type=Path,required=True);p.add_argument('--tokenizer',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--current',type=Path);p.add_argument('--batch-size',type=int,default=16);p.add_argument('--smoke-limit',type=int);p.add_argument('--device',default='cuda');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--checkpoint',type=Path,required=True);p.add_argument('--tokenizer',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--current',type=Path);p.add_argument('--batch-size',type=int,default=16);p.add_argument('--smoke-limit',type=int);p.add_argument('--device',default='cuda');p.add_argument('--families',nargs='+',choices=['blimp','swag','hellaswag','xstorycloze','wikitext']);p.add_argument('--dataset-root',type=Path);a=p.parse_args()
     a.output.mkdir(parents=True,exist_ok=False)
     if importlib.metadata.version('lm_eval')!='0.4.13':raise RuntimeError('Expected lm_eval 0.4.13')
     assert digest_file(a.tokenizer)==benchmark.TOKENIZER_SHA
@@ -54,10 +54,14 @@ def main():
     xstory=['xstorycloze_'+language for language in ('ar','en','es','eu','hi','id','my','ru','sw','te','zh')]
     assert len(blimp)==67 and set(xstory)<=set(manager.all_tasks)
     units=[('blimp',blimp[:1] if a.smoke_limit else blimp),('swag',['swag']),('hellaswag',['hellaswag']),('xstorycloze',['xstorycloze_en'] if a.smoke_limit else xstory),('wikitext',['wikitext'])]
+    if a.families:units=[(family,names) for family,names in units if family in a.families]
+    assert units
     model,payload=benchmark.load_model(a.checkpoint,a.device)
     tokenizer=PreTrainedTokenizerFast(tokenizer_file=str(a.tokenizer),eos_token='<|endoftext|>',bos_token='<|endoftext|>',pad_token='<|endoftext|>')
     lm=AuditedLM(pretrained=model,tokenizer=tokenizer,backend='causal',batch_size=a.batch_size,device=a.device,dtype='float32',max_length=2048,prefix_token_id=0)
     protocol={'checkpoint_sha256':digest_file(a.checkpoint),'variant':payload['contract']['branch_source'],'checkpoint_step':payload['progress']['global_step'],'checkpoint_validation':payload['progress'],'lm_eval':'0.4.13','num_fewshot':0,'limit':a.smoke_limit,'diagnostic_only':a.smoke_limit is not None,'dataset_revisions':DATASETS,'tokenizer_sha256':benchmark.TOKENIZER_SHA,'dtype':'float32','max_length':2048,'batch_size':a.batch_size,'wikitext_config':'wikitext-2-raw-v1','xstory_languages':xstory,'source_files':{f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in (HERE/'evaluate.py',)}}
+    protocol['requested_families']=[family for family,_ in units]
+    if a.dataset_root:protocol['offline_dataset_manifest_sha256']=digest_file(a.dataset_root/'manifest.json')
     atomic_json(a.output/'protocol.json',protocol)
     summary={'formal_complete':False,'protocol':protocol,'families':{},'failures':{}}
     start=time.monotonic()
@@ -68,7 +72,12 @@ def main():
         for name in names:
             entry=manager.task_index[name];spec=load_yaml(entry.yaml_path,resolve_func=True)
             assert spec['dataset_path'] in DATASETS
-            if spec['dataset_path']=='juletxara/xstory_cloze':
+            if a.dataset_root and spec['dataset_path'] in ('nyu-mll/blimp','juletxara/xstory_cloze'):
+                config=spec['dataset_name']
+                files={'train':str(a.dataset_root/'blimp'/config/'train.parquet')} if family=='blimp' else {split:str(a.dataset_root/'xstorycloze'/config/(split+'.parquet')) for split in ('train','eval')}
+                assert all(Path(path).is_file() for path in files.values())
+                spec['dataset_path']='parquet';spec['dataset_name']=None;spec['dataset_kwargs']={'data_files':files,'token':False}
+            elif spec['dataset_path']=='juletxara/xstory_cloze':
                 language=spec['dataset_name']
                 assert language in {'ar','en','es','eu','hi','id','my','ru','sw','te','zh'}
                 base=f"https://huggingface.co/datasets/juletxara/xstory_cloze/resolve/{DATASETS['juletxara/xstory_cloze']}/{language}"
@@ -98,8 +107,8 @@ def main():
             print('EXTRA_EVAL_FAILURE='+json.dumps({'family':family,**summary['failures'][family]}),flush=True)
         summary['seconds']=time.monotonic()-start
         atomic_json(a.output/'summary.json',summary)
-    summary['formal_complete']=a.smoke_limit is None and not summary['failures'] and len(summary['families'])==5
-    summary['diagnostic_complete']=a.smoke_limit is not None and not summary['failures'] and len(summary['families'])==5
+    summary['formal_complete']=a.smoke_limit is None and not summary['failures'] and len(summary['families'])==len(units)
+    summary['diagnostic_complete']=a.smoke_limit is not None and not summary['failures'] and len(summary['families'])==len(units)
     atomic_json(a.output/'summary.json',summary)
     if summary['failures']:raise SystemExit(1)
     print('EXTRA_EVAL_COMPLETE='+json.dumps({'model':a.checkpoint.stem,'formal_complete':summary['formal_complete'],'seconds':summary['seconds']}),flush=True)

@@ -1,0 +1,24 @@
+[
+  {
+    "name": "residual-final.pt",
+    "variant": "residual",
+    "label": "final",
+    "sha256": "e34ad565e316b01b45fbb25b2b463c1ec68687c7dfd929316013325a3faf20ca",
+    "bytes": 281837211,
+    "global_step": 47684,
+    "families": [
+      "xstorycloze"
+    ]
+  },
+  {
+    "name": "residual-best.pt",
+    "variant": "residual",
+    "label": "best",
+    "sha256": "89d550f711732e9d35f369409bce42245db1d50c3fd70cbbc8b0196e89490fc3",
+    "bytes": 281837019,
+    "global_step": 46746,
+    "families": [
+      "blimp"
+    ]
+  }
+]
