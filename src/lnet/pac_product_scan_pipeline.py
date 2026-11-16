@@ -5,12 +5,14 @@ from __future__ import annotations
 # The composition boundary intentionally uses package-private primitive ops so
 # their intermediate autograd contexts do not retain horizontal scan states.
 # pyright: reportPrivateUsage=false
+# ruff: noqa: FBT001, FBT003
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import torch
 from torch import Tensor
 from torch.library import triton_op
 
+from .pac_mean_energy_readout import mean_energy_product_scan
 from .pac_product_scan_contracts import (
     DEFAULT_EPSILON,
     ProductGainNormalization,
@@ -20,9 +22,17 @@ from .pac_product_scan_contracts import (
 from .pac_product_scan_normalization import static_product_scan_auxiliary
 from .pac_product_scan_ops import (
     BACKWARD_LAUNCH_NAME,
+    COARSE_PATH_BACKWARD_LAUNCH_NAME,
+    COARSE_PATH_FORWARD_LAUNCH_NAME,
     DESCRIPTOR_BACKWARD_LAUNCH_NAME,
+    DESCRIPTOR_FORWARD_LAUNCH_NAME,
+    FORWARD_LAUNCH_NAME,
     FULL16_BACKWARD_LAUNCH_NAME,
+    FULL16_FORWARD_LAUNCH_NAME,
+    PATH_COLLAPSE_BACKWARD_LAUNCH_NAME,
+    PATH_COLLAPSE_FORWARD_LAUNCH_NAME,
     _launch_product_scan4_backward,
+    _launch_product_scan4_forward,
     _product_scan_coarse4_op,
     _product_scan_descriptor4_op,
     _product_scan_full16_op,
@@ -34,7 +44,19 @@ from .pac_product_scan_ops import (
 )
 from .pac_product_scan_reference import product_scan_full4_reference
 from .pac_triton_bidirectional_product_scan import (
+    BACKWARD_LAUNCH_NAME as HORIZONTAL_BACKWARD_LAUNCH_NAME,
+)
+from .pac_triton_bidirectional_product_scan import (
+    RECOMPUTE_BACKWARD_LAUNCH_NAME as HORIZONTAL_RECOMPUTE_BACKWARD_LAUNCH_NAME,
+)
+from .pac_triton_bidirectional_product_scan import (
     _forward_op as _horizontal_forward_op,
+)
+from .pac_triton_bidirectional_product_scan import (
+    _forward_planes_op as _horizontal_forward_planes_op,
+)
+from .pac_triton_bidirectional_product_scan import (
+    _launch_backward as _launch_horizontal_backward,
 )
 from .pac_triton_bidirectional_product_scan import (
     _recomputed_backward_op as _horizontal_recomputed_backward_op,
@@ -251,7 +273,7 @@ def _path_collapse_recompute_op(
     path_output_bias: Tensor,
     epsilon: float,
     gain_kind: int,
-    path_swiglu: bool,  # noqa: FBT001
+    path_swiglu: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
     pole_x = decay_x_real, decay_x_imag, gamma_x_real, gamma_x_imag
     pole_y = decay_y_real, decay_y_imag, gamma_y_real, gamma_y_imag
@@ -560,7 +582,7 @@ def _path_collapse_recompute_backward_cuda_op(
     grad_collapsed_imag: Tensor,
     epsilon: float,
     gain_kind: int,
-    path_swiglu: bool,  # noqa: FBT001
+    path_swiglu: bool,
 ) -> tuple[
     Tensor,
     Tensor,
@@ -966,9 +988,7 @@ def run_product_scan_path_collapse_pipeline(
             epsilon=epsilon,
         )
         collapse_reference = (
-            d4_grouped_path_swiglu_reference
-            if path_swiglu
-            else d4_grouped_path_collapse_reference
+            d4_grouped_path_swiglu_reference if path_swiglu else d4_grouped_path_collapse_reference
         )
         return collapse_reference(full[0], full[1], *path_collapse)
 
@@ -1020,6 +1040,438 @@ __all__ = [
     "ProductScanEpilogue",
     "ProductScanOutput",
     "ScanMemoryPolicy",
+    "run_product_scan_coarse_path_collapse_packed",
     "run_product_scan_path_collapse_pipeline",
+    "run_product_scan_path_collapse_pipeline_packed",
     "run_product_scan_pipeline",
+    "run_product_scan_pipeline_packed",
 ]
+
+
+class _PackedAutogradContext(Protocol):
+    saved_tensors: tuple[Tensor, ...]
+    epilogue: str
+    epsilon: float
+    kind: int
+    recompute: bool
+    path_swiglu: bool
+    path_count: int
+    planar_output: bool
+
+    def set_materialize_grads(self, value: bool) -> None: ...
+
+    def save_for_backward(self, *tensors: Tensor) -> None: ...
+
+
+def _packed_source_coordinates(source: Tensor) -> tuple[Tensor, Tensor]:
+    if source.ndim != 4 or source.shape[-1] == 0 or source.shape[-1] % 2:
+        raise ValueError("packed scan source must have shape NHW(2M)")
+    if not source.is_contiguous():
+        raise ValueError("packed scan source must be contiguous NHW(2M)")
+    modes = source.shape[-1] // 2
+    return source[..., :modes], source[..., modes:]
+
+
+def _packed_reference(
+    inputs: list[Tensor],
+    path: list[Tensor],
+    epilogue: str,
+    epsilon: float,
+    kind: int,
+    path_swiglu: bool,
+    planar_output: bool,
+) -> tuple[Tensor, Tensor]:
+    pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
+    pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
+    source = _packed_source_coordinates(inputs[8])
+    if epilogue == "mean_energy":
+        return inputs[8].new_empty((0,)), mean_energy_product_scan(
+            pole_x, pole_y, source, gain_normalization=gain_normalization(kind),
+            memory_policy="retain", epsilon=epsilon,
+        )
+    if path and epilogue == "coarse_path":
+        coarse_real, coarse_imag, _ = cast(
+            "tuple[Tensor, Tensor, Tensor]",
+            run_product_scan_pipeline(
+                pole_x, pole_y, source, epilogue="coarse",
+                gain_normalization=gain_normalization(kind),
+                memory_policy="retain", epsilon=epsilon,
+            ),
+        )
+        real, imag = d4_grouped_path_collapse_reference(coarse_real, coarse_imag, *path)
+        return (
+            torch.stack((real.squeeze(-2), imag.squeeze(-2)), dim=0)
+            if planar_output else torch.cat((real.squeeze(-2), imag.squeeze(-2)), dim=-1)
+        ), inputs[8].new_empty((0,))
+    if path:
+        real, imag = run_product_scan_path_collapse_pipeline(
+            pole_x,
+            pole_y,
+            source,
+            cast("PathCollapseParameters", tuple(path)),
+            gain_normalization=gain_normalization(kind),
+            memory_policy="retain",
+            path_swiglu=path_swiglu,
+            epsilon=epsilon,
+        )
+        return (
+            torch.stack((real.squeeze(-2), imag.squeeze(-2)), dim=0)
+            if planar_output else torch.cat((real.squeeze(-2), imag.squeeze(-2)), dim=-1)
+        ), inputs[8].new_empty((0,))
+    output = run_product_scan_pipeline(
+        pole_x,
+        pole_y,
+        source,
+        epilogue=cast(
+            "ProductScanEpilogue", "coarse" if epilogue == "coarse_no_descriptor" else epilogue
+        ),
+        gain_normalization=gain_normalization(kind),
+        memory_policy="retain",
+        epsilon=epsilon,
+    )
+    if isinstance(output, Tensor):
+        return inputs[8].new_empty((0,)), output
+    return torch.cat(output[:2], dim=-1), (
+        inputs[8].new_empty((0,)) if epilogue == "coarse_no_descriptor" else output[2]
+    )
+
+
+@triton_op("lnet::pac_product_scan_pipeline_storage_v2", mutates_args={})
+def _packed_pipeline_op(
+    inputs: list[Tensor],
+    path: list[Tensor],
+    epilogue: str,
+    epsilon: float,
+    kind: int,
+    recompute: bool,
+    path_swiglu: bool,
+    planar_output: bool,
+) -> list[Tensor]:
+    """Produce one packed output allocation; hidden outputs support retain policy."""
+    if not inputs[8].is_cuda:
+        return list(_packed_reference(
+            inputs, path, epilogue, epsilon, kind, path_swiglu, planar_output,
+        ))
+    pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
+    pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
+    source = _packed_source_coordinates(inputs[8])
+    horizontal_storage = _horizontal_forward_planes_op(*pole_x, *source)
+    horizontal = tuple(horizontal_storage.unbind(0))
+    auxiliary = static_product_scan_auxiliary(
+        pole_x,
+        pole_y,
+        source[0],
+        epsilon=epsilon,
+        gain_kind=kind,
+    )
+    packed, _, descriptor = _launch_product_scan4_forward(
+        *pole_y,
+        *horizontal,
+        *auxiliary,
+        epsilon,
+        kind,
+        emit_coarse=not path and epilogue not in ("descriptor", "mean_energy"),
+        full_coarse=epilogue == "full16",
+        path_collapse=cast("PathCollapseParameters", tuple(path)) if path else None,
+        path_swiglu=path_swiglu,
+        emit_descriptor=not path and epilogue != "coarse_no_descriptor",
+        packed_output=True,
+        planar_output=planar_output,
+        mean_direction_energy=epilogue == "mean_energy",
+        coarse_path=epilogue == "coarse_path",
+        launch_name=(
+            COARSE_PATH_FORWARD_LAUNCH_NAME
+            if epilogue == "coarse_path"
+            else PATH_COLLAPSE_FORWARD_LAUNCH_NAME
+            if path
+            else FULL16_FORWARD_LAUNCH_NAME
+            if epilogue == "full16"
+            else DESCRIPTOR_FORWARD_LAUNCH_NAME
+            if epilogue in ("descriptor", "mean_energy")
+            else FORWARD_LAUNCH_NAME
+        ),
+    )
+    return [packed, descriptor, *(() if recompute else (horizontal_storage,))]
+
+
+def _setup_packed_context(
+    ctx: _PackedAutogradContext,
+    inputs: tuple[list[Tensor], list[Tensor], str, float, int, bool, bool, bool],
+    output: list[Tensor],
+) -> None:
+    ctx.set_materialize_grads(False)
+    (
+        tensors, path, ctx.epilogue, ctx.epsilon, ctx.kind,
+        ctx.recompute, ctx.path_swiglu, ctx.planar_output,
+    ) = inputs
+    ctx.path_count = len(path)
+    ctx.save_for_backward(*tensors, *path, output[1], *output[2:])
+
+
+@triton_op("lnet::pac_product_scan_pipeline_storage_backward_v2", mutates_args={})
+def _packed_pipeline_backward_op(
+    inputs: list[Tensor],
+    path: list[Tensor],
+    horizontal_states: list[Tensor],
+    descriptor: Tensor,
+    grad_packed: Tensor,
+    grad_descriptor: Tensor,
+    epilogue: str,
+    epsilon: float,
+    kind: int,
+    path_swiglu: bool,
+    planar_output: bool,
+) -> list[Tensor]:
+    pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
+    pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
+    source = _packed_source_coordinates(inputs[8])
+    horizontal_storage = (
+        horizontal_states[0] if horizontal_states
+        else _horizontal_forward_planes_op(*pole_x, *source)
+    )
+    horizontal = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(horizontal_storage.unbind(0)))
+    auxiliary = static_product_scan_auxiliary(
+        pole_x,
+        pole_y,
+        source[0],
+        epsilon=epsilon,
+        gain_kind=kind,
+    )
+    modes = source[0].shape[-1]
+    # Incoming gradients may have zero strides (e.g. sum); materialize only those.
+    grad_packed = grad_packed.contiguous()
+    if planar_output:
+        grad_real, grad_imag = grad_packed[0], grad_packed[1]
+    else:
+        grad_real, grad_imag = grad_packed[..., :modes], grad_packed[..., modes:]
+    if path:
+        grad_real, grad_imag = grad_real.unsqueeze(-2), grad_imag.unsqueeze(-2)
+    factor = (
+        grad_descriptor * torch.exp(-descriptor) / (
+            (4 if epilogue == "mean_energy" else 1) * source[0].shape[1] * source[0].shape[2]
+        )
+        if not path and epilogue != "coarse_no_descriptor"
+        else descriptor
+    )
+    vertical = _launch_product_scan4_backward(
+        *pole_y,
+        *horizontal,
+        *auxiliary,
+        grad_real,
+        grad_imag,
+        factor,
+        epsilon,
+        kind,
+        emit_coarse=not path and epilogue not in ("descriptor", "mean_energy"),
+        full_coarse=epilogue == "full16",
+        path_collapse=cast("PathCollapseParameters", tuple(path)) if path else None,
+        path_swiglu=path_swiglu,
+        has_descriptor_grad=not path and epilogue != "coarse_no_descriptor",
+        packed_output=True,
+        planar_output=planar_output,
+        combined_state_gradients=True,
+        mean_direction_energy=epilogue == "mean_energy",
+        coarse_path=epilogue == "coarse_path",
+        launch_name=(
+            COARSE_PATH_BACKWARD_LAUNCH_NAME
+            if epilogue == "coarse_path"
+            else PATH_COLLAPSE_BACKWARD_LAUNCH_NAME
+            if path
+            else FULL16_BACKWARD_LAUNCH_NAME
+            if epilogue == "full16"
+            else DESCRIPTOR_BACKWARD_LAUNCH_NAME
+            if epilogue in ("descriptor", "mean_energy")
+            else BACKWARD_LAUNCH_NAME
+        ),
+        # AOT functionalization cannot preserve donation through separate read
+        # and write pointer arguments. Keep recomputed states and adjoints in
+        # independent allocations, just as the retained path does.
+        source_gradient_buffers=None,
+    )
+    packed_gradient = torch.empty_like(inputs[8])
+    horizontal_gradients = _launch_horizontal_backward(
+        pole_x,
+        source,
+        horizontal if horizontal_states else None,
+        cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(vertical[4:8])),
+        launch_name=(
+            HORIZONTAL_BACKWARD_LAUNCH_NAME
+            if horizontal_states
+            else HORIZONTAL_RECOMPUTE_BACKWARD_LAUNCH_NAME
+        ),
+        source_gradient_buffer=packed_gradient,
+    )
+    return [*horizontal_gradients[:4], *vertical[:4], packed_gradient, *vertical[8:]]
+
+
+def _packed_pipeline_backward(
+    ctx: _PackedAutogradContext,
+    output_gradients: list[Tensor | None],
+) -> tuple[list[Tensor], list[Tensor], None, None, None, None, None, None]:
+    saved = ctx.saved_tensors
+    inputs = list(saved[:9])
+    path = list(saved[9 : 9 + ctx.path_count])
+    descriptor = saved[9 + ctx.path_count]
+    horizontal = list(saved[10 + ctx.path_count :])
+    grad_packed, grad_descriptor = output_gradients[:2]
+    source = inputs[8]
+    modes = source.shape[-1] // 2
+    if grad_packed is None:
+        if path:
+            shape = (
+                (source.shape[0], source.shape[1] // 2, source.shape[2] // 2, 2 * modes)
+                if ctx.epilogue == "coarse_path" else source.shape
+            )
+            if ctx.planar_output:
+                shape = (2, *shape[:-1], modes)
+        elif ctx.epilogue in ("descriptor", "mean_energy"):
+            shape = (0,)
+        else:
+            shape = (
+                source.shape[0],
+                source.shape[1] // 2,
+                source.shape[2] // 2,
+                *((4, 4) if ctx.epilogue == "full16" else (4,)),
+                2 * modes,
+            )
+        grad_packed = source.new_zeros(shape)
+    if grad_descriptor is None:
+        grad_descriptor = torch.zeros_like(descriptor)
+    if not source.is_cuda:
+        differentiable = [value.detach().requires_grad_() for value in (*inputs, *path)]
+        with torch.enable_grad():
+            packed, desc = _packed_reference(
+                differentiable[:9],
+                differentiable[9:],
+                ctx.epilogue,
+                ctx.epsilon,
+                ctx.kind,
+                ctx.path_swiglu,
+                ctx.planar_output,
+            )
+            outputs, gradients = (
+                ((packed,), (grad_packed,))
+                if path or ctx.epilogue == "coarse_no_descriptor"
+                else (
+                    ((desc,), (grad_descriptor,))
+                    if ctx.epilogue in ("descriptor", "mean_energy")
+                    else ((packed, desc), (grad_packed, grad_descriptor))
+                )
+            )
+            computed = torch.autograd.grad(outputs, differentiable, gradients, allow_unused=True)
+        result = [
+            torch.zeros_like(value) if gradient is None else gradient
+            for value, gradient in zip(differentiable, computed, strict=True)
+        ]
+    else:
+        result = _packed_pipeline_backward_op(
+            inputs,
+            path,
+            horizontal,
+            descriptor,
+            grad_packed,
+            grad_descriptor,
+            ctx.epilogue,
+            ctx.epsilon,
+            ctx.kind,
+            ctx.path_swiglu,
+            ctx.planar_output,
+        )
+    return result[:9], result[9:], None, None, None, None, None, None
+
+
+torch.library.register_autograd(
+    "lnet::pac_product_scan_pipeline_storage_v2",
+    _packed_pipeline_backward,
+    setup_context=_setup_packed_context,
+)
+
+
+def run_product_scan_pipeline_packed(
+    pole_x: tuple[Tensor, Tensor, Tensor, Tensor],
+    pole_y: tuple[Tensor, Tensor, Tensor, Tensor],
+    source_packed: Tensor,
+    *,
+    epilogue: ProductScanEpilogue | Literal["mean_energy"],
+    gain_normalization: ProductGainNormalization,
+    memory_policy: ScanMemoryPolicy = "retain",
+    epsilon: float = DEFAULT_EPSILON,
+    emit_descriptor: bool = True,
+) -> tuple[Tensor, Tensor] | Tensor:
+    """Scan NHW(2M) storage directly into packed directional coarse states."""
+    _packed_source_coordinates(source_packed)
+    if epilogue not in {"coarse", "full16", "descriptor", "mean_energy"}:
+        raise ValueError(f"unsupported product scan epilogue: {epilogue}")
+    if memory_policy not in {"retain", "recompute"}:
+        raise ValueError(f"unsupported scan memory policy: {memory_policy}")
+    if not emit_descriptor and epilogue != "coarse":
+        raise ValueError("descriptor omission requires the coarse epilogue")
+    output = _packed_pipeline_op(
+        [*pole_x, *pole_y, source_packed],
+        [],
+        epilogue if emit_descriptor else "coarse_no_descriptor",
+        epsilon,
+        gain_kind(gain_normalization),
+        memory_policy == "recompute",
+        False,
+        False,
+    )
+    return output[1] if epilogue in ("descriptor", "mean_energy") else (output[0], output[1])
+
+
+def run_product_scan_path_collapse_pipeline_packed(
+    pole_x: tuple[Tensor, Tensor, Tensor, Tensor],
+    pole_y: tuple[Tensor, Tensor, Tensor, Tensor],
+    source_packed: Tensor,
+    parameters: PathCollapseParameters,
+    *,
+    gain_normalization: ProductGainNormalization,
+    memory_policy: ScanMemoryPolicy = "recompute",
+    path_swiglu: bool = False,
+    epsilon: float = DEFAULT_EPSILON,
+    planar_output: bool = False,
+) -> Tensor:
+    """Fuse scan and path collapse, writing a single NHW(2M) allocation."""
+    _packed_source_coordinates(source_packed)
+    if memory_policy not in {"retain", "recompute"}:
+        raise ValueError(f"unsupported scan memory policy: {memory_policy}")
+    return _packed_pipeline_op(
+        [*pole_x, *pole_y, source_packed],
+        list(parameters),
+        "full16",
+        epsilon,
+        gain_kind(gain_normalization),
+        memory_policy == "recompute",
+        path_swiglu,
+        planar_output,
+    )[0]
+
+
+def run_product_scan_coarse_path_collapse_packed(
+    pole_x: tuple[Tensor, Tensor, Tensor, Tensor],
+    pole_y: tuple[Tensor, Tensor, Tensor, Tensor],
+    source_packed: Tensor,
+    parameters: PathCollapseParameters,
+    *,
+    gain_normalization: ProductGainNormalization,
+    epsilon: float = DEFAULT_EPSILON,
+    planar_output: bool = False,
+    memory_policy: ScanMemoryPolicy = "retain",
+) -> Tensor:
+    """Fuse the four directional 2x2 endpoints and Path CFFN without a coarse buffer.
+
+    The canonical retained-state path keeps horizontal states for backward.
+    CUDA accepts the canonical BF16 drive. Endpoints and their adjoints
+    retain the standalone CFFN's BF16 rounding.
+    """
+    _packed_source_coordinates(source_packed)
+    if memory_policy not in {"retain", "recompute"}:
+        raise ValueError(f"unsupported scan memory policy: {memory_policy}")
+    if source_packed.is_cuda and source_packed.dtype is not torch.bfloat16:
+        raise TypeError("fused coarse path collapse requires a BF16 CUDA drive")
+    if source_packed.shape[1] % 2 or source_packed.shape[2] % 2:
+        raise ValueError("coarse path collapse requires even spatial dimensions")
+    return _packed_pipeline_op(
+        [*pole_x, *pole_y, source_packed], list(parameters), "coarse_path",
+        epsilon, gain_kind(gain_normalization), memory_policy == "recompute", False, planar_output,
+    )[0]

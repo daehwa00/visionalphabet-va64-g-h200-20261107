@@ -20,8 +20,8 @@ from .complex_scan_transitions import (
     ComplexRMSNorm,
 )
 from .pac_complex_layers import ComplexLinear, WidelyLinear
-from .pac_mean_energy_readout import mean_energy_product_scan
 from .pac_feature_pool_readout import feature_pool_product_scan
+from .pac_mean_energy_readout import mean_energy_product_scan
 from .pac_path_cffn import D4PathModeCombiner, FactorizedQuadrantPathModeCFFNCombiner
 from .pac_product_scan_contracts import (
     ProductGainNormalization,
@@ -246,6 +246,8 @@ class ComplexCCCNDownsample(nn.Module):
 
 class ComplexScanStage(nn.Module):
     """Reusable two-dimensional complex product-scan stage."""
+
+    _fuse_coarse_path: bool = False
 
     def __init__(
         self,
@@ -528,8 +530,14 @@ class ComplexScanStage(nn.Module):
     def forward(
         self,
         real: Tensor,
-        imag: Tensor,
-    ) -> tuple[ComplexField | None, Tensor]:
+        imag: Tensor | None = None,
+        *,
+        emit_descriptor: bool = True,
+    ) -> tuple[ComplexField | Tensor | None, Tensor]:
+        if imag is None:
+            from .pac_packed_execution import stage_packed  # noqa: PLC0415
+
+            return stage_packed(self, real, emit_descriptor=emit_descriptor)
         if real.shape != imag.shape or real.ndim != 4 or real.shape[-1] != self.input_modes:
             message = "complex scan stage inputs must be matching NHWM tensors"
             raise ValueError(message)

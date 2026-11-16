@@ -35,7 +35,7 @@ def backup_and_wait(root: Path,job: str,output: Path,epoch: int,step: int,row: d
  contracts=output/'contracts'; contracts.mkdir(exist_ok=True)
  for source,name in ((root/'environment-check/dataset-manifest.json','dataset.json'),(root/'environment-check/preflight.json','contracts/environment.json')):
   if source.is_file(): shutil.copyfile(source,output/name)
- atomic_json(contracts/'source.json',{'code_sha':os.environ['VA64_G_CODE_SHA'],'variant':'G','job':job})
+ atomic_json(contracts/'source.json',{'code_sha':os.environ['VA64_G_CODE_SHA'],'variant':'TerminalRawG-IN1K','job':job})
  if (root/'console.log').is_file(): shutil.copyfile(root/'console.log',telemetry/'console.txt')
  if (root/'benchmark/selection.json').is_file():
   shutil.copyfile(root/'benchmark/selection.json',telemetry/'batch-comparison.json')

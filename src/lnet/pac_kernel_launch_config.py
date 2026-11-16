@@ -236,14 +236,38 @@ def override_launch_geometry(
         _SCOPE_GEOMETRY_OVERRIDE.reset(token)
 
 
+_COMPILE_GEOMETRY_OVERRIDES: ContextVar[dict[str, LaunchGeometry] | None] = ContextVar(
+    "lnet_compile_geometry_overrides", default=None,
+)
+
+
+@contextmanager
+def temporary_launch_geometries(
+    geometries: Mapping[str, LaunchGeometry],
+) -> Generator[None]:
+    """Pin launches while compiling one fixed-shape workload, then restore context.
+
+    Unlike environment overrides this setting is local to the calling context.
+    Explicit per-scope overrides still take precedence. Nothing is persisted.
+    """
+    for name in geometries:
+        registered_default(name)
+    token = _COMPILE_GEOMETRY_OVERRIDES.set(dict(geometries))
+    try:
+        yield
+    finally:
+        _COMPILE_GEOMETRY_OVERRIDES.reset(token)
+
+
 def _scope_geometry_override(
     name: str,
     scope: LaunchScope | None,
 ) -> LaunchGeometry | None:
     active = _SCOPE_GEOMETRY_OVERRIDE.get()
-    if active is None or scope is None or active[0] != name or active[1] != scope:
-        return None
-    return active[2]
+    if active is not None and scope is not None and active[0] == name and active[1] == scope:
+        return active[2]
+    temporary = _COMPILE_GEOMETRY_OVERRIDES.get()
+    return None if temporary is None else temporary.get(name)
 
 
 def _record_launch_scope(name: str, scope: LaunchScope | None) -> None:

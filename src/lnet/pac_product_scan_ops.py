@@ -12,6 +12,7 @@ from __future__ import annotations
 # pyright: reportGeneralTypeIssues=false, reportMissingParameterType=false
 # pyright: reportPrivateUsage=false, reportUnknownLambdaType=false
 # ruff: noqa: FBT001
+import os
 from typing import Protocol, cast
 
 import torch
@@ -77,6 +78,16 @@ PathCollapseGradients = tuple[
     Tensor,
 ]
 DESCRIPTOR_BACKWARD_LAUNCH_NAME = "product_scan_descriptor4_backward"
+
+COARSE_PATH_FORWARD_LAUNCH_NAME = "product_scan_coarse_path_forward"
+COARSE_PATH_BACKWARD_LAUNCH_NAME = "product_scan_coarse_path_backward"
+_COARSE_PATH_GEOMETRY = LaunchGeometry.build(
+    num_warps=4, blocks={"BLOCK_LINES": 1, "BLOCK_MODES": 8},
+)
+for _coarse_path_launch in (COARSE_PATH_FORWARD_LAUNCH_NAME, COARSE_PATH_BACKWARD_LAUNCH_NAME):
+    register_default(
+        _coarse_path_launch, _COARSE_PATH_GEOMETRY, candidates=(_COARSE_PATH_GEOMETRY,),
+    )
 
 _SCAN_LAUNCH_CANDIDATES = tuple(
     LaunchGeometry.build(
@@ -175,6 +186,7 @@ def _scan_launch_scope(
     gain_kind: int,
     full_coarse: bool = False,
     path_collapse: bool = False,
+    batch_partial_gradients: bool = False,
 ) -> LaunchScope:
     batch, height, width, modes = source.shape
     return make_launch_scope(
@@ -188,6 +200,7 @@ def _scan_launch_scope(
             "gain_kind": gain_kind,
             "full_coarse": full_coarse,
             "path_collapse": path_collapse,
+            **({"batch_partial_gradients": True} if batch_partial_gradients else {}),
         },
     )
 
@@ -217,6 +230,11 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
     has_descriptor_grad: bool = True,
     launch_name: str,
     source_gradient_buffers: tuple[Tensor, Tensor, Tensor, Tensor] | None = None,
+    packed_output: bool = False,
+    coarse_path: bool = False,
+    planar_output: bool = False,
+    combined_state_gradients: bool = False,
+    mean_direction_energy: bool = False,
 ) -> tuple[Tensor, ...]:
     pole = (decay_real, decay_imag, gamma_real, gamma_imag)
     source_a = (source_real_a, source_imag_a)
@@ -240,6 +258,13 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
     if not decay_real.is_cuda:
         raise RuntimeError("the fused product adjoint kernel requires CUDA")
     batch, height, width, modes = source_real_a.shape
+    batch_partial_gradients = os.environ.get("VA_REAL_MEMORY_SCAN_BATCH_PARTIALS") == "1"
+    if coarse_path and (path_collapse is None or height % 2 or width % 2 or emit_coarse):
+        raise ValueError("coarse path collapse requires even dimensions and collapsed-only output")
+    if coarse_path and has_descriptor_grad:
+        raise ValueError("coarse path collapse has no descriptor gradient")
+    output_height = height // 2 if coarse_path else height
+    output_width = width // 2 if coarse_path else width
     if emit_coarse:
         expected_shape = (
             (batch, height // 2, width // 2, 4, 4, modes)
@@ -260,30 +285,40 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
         swiglu_hidden = 0
         swiglu_hidden = 0
     else:
-        expected_collapsed_shape = (batch, height, width, 1, modes)
+        expected_collapsed_shape = (batch, output_height, output_width, 1, modes)
         if grad_coarse_real.shape != expected_collapsed_shape:
             raise ValueError("fused scan-path adjoint received an invalid output gradient")
         if grad_coarse_imag.shape != grad_coarse_real.shape:
             raise ValueError("fused scan-path output gradients must match")
-        grad_collapsed_real = grad_coarse_real.contiguous()
-        grad_collapsed_imag = grad_coarse_imag.contiguous()
+        grad_collapsed_real = grad_coarse_real if packed_output else grad_coarse_real.contiguous()
+        grad_collapsed_imag = grad_coarse_imag if packed_output else grad_coarse_imag.contiguous()
         path_tensors = tuple(value.contiguous() for value in path_collapse)
         path_gradients = tuple(
-            torch.zeros_like(value, memory_format=torch.contiguous_format) for value in path_tensors
+            value.new_zeros((batch, *value.shape))
+            if batch_partial_gradients
+            else torch.zeros_like(value, memory_format=torch.contiguous_format)
+            for value in path_tensors
         )
         packed_path_hidden = path_tensors[0].shape[1]
         swiglu_hidden = packed_path_hidden // 3 if path_swiglu else 0
     if has_descriptor_grad:
-        if descriptor_gradient_factor.shape != (batch, 4 * modes):
+        descriptor_modes = modes if mean_direction_energy else 4 * modes
+        if descriptor_gradient_factor.shape != (batch, descriptor_modes):
             raise ValueError("fused product adjoint received an invalid descriptor-gradient factor")
     elif descriptor_gradient_factor.numel() != 0:
         raise ValueError("descriptor-free product adjoint requires an empty gradient factor")
     coefficients = tuple(value.contiguous() for value in pole)
     sources = tuple(value.contiguous() for value in (*source_a, *source_b))
     coefficient_gradients = tuple(
-        torch.zeros_like(value, memory_format=torch.contiguous_format) for value in coefficients
+        value.new_zeros((batch, *value.shape))
+        if batch_partial_gradients
+        else torch.zeros_like(value, memory_format=torch.contiguous_format)
+        for value in coefficients
     )
-    if source_gradient_buffers is None:
+    if combined_state_gradients:
+        gradient_storage = source_real_a.new_empty((4, *source_real_a.shape))
+        source_gradients = tuple(gradient_storage.unbind(0))
+    elif source_gradient_buffers is None:
         source_gradients = tuple(
             torch.empty_like(value, memory_format=torch.contiguous_format) for value in sources
         )
@@ -301,12 +336,21 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
     backward_kernel = autotuned(
         _product_scan_coarse4_associative_backward_kernel,
         launch_name,
+        geometry=_COARSE_PATH_GEOMETRY if coarse_path else None,
         key=(
             "height",
             "width",
             "line_count",
             "modes",
             "gain_kind",
+            "BATCH_PARTIAL_GRADS",
+        ),
+        # Donation overwrites the input states. Restore them between tuning
+        # candidates so every benchmark and the final launch sees the same scan.
+        restore_value=(
+            ("source_real_a", "source_imag_a", "source_real_b", "source_imag_b")
+            if source_gradient_buffers is not None
+            else ()
         ),
         reset_to_zero=(
             "grad_decay_real",
@@ -330,11 +374,12 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
             gain_kind=gain_kind,
             full_coarse=full_coarse,
             path_collapse=path_collapse is not None,
+            batch_partial_gradients=batch_partial_gradients,
         ),
     )
     wrap_triton(backward_kernel)[
         lambda metadata: (
-            batch * triton.cdiv(width, metadata["BLOCK_LINES"]),
+            batch * triton.cdiv(width // 2 if coarse_path else width, metadata["BLOCK_LINES"]),
             triton.cdiv(modes, metadata["BLOCK_MODES"]),
         )
     ](
@@ -343,15 +388,18 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
         variance_x.contiguous(),
         variance_y.contiguous(),
         global_inverse_gain.contiguous(),
-        grad_coarse_real.contiguous(),
-        grad_coarse_imag.contiguous(),
+        grad_coarse_real if packed_output else grad_coarse_real.contiguous(),
+        grad_coarse_imag if packed_output else grad_coarse_imag.contiguous(),
         grad_collapsed_real,
         grad_collapsed_imag,
         *path_tensors,
         *path_gradients,
         descriptor_gradient_factor.contiguous(),
         *coefficient_gradients,
-        *source_gradients,
+        *(
+            (gradient_storage, source_real_a, source_real_a, source_real_a)
+            if combined_state_gradients else source_gradients
+        ),
         height,
         width,
         line_count,
@@ -365,12 +413,26 @@ def _launch_product_scan4_backward(  # noqa: C901, PLR0912, PLR0915
         PATH_SWIGLU=path_swiglu,
         SWIGLU_HIDDEN=swiglu_hidden,
         HAS_DESCRIPTOR_GRAD=has_descriptor_grad,
-        BLOCK_HEIGHT=triton.next_power_of_2(height),
+        PACKED_OUTPUT=packed_output,
+        COARSE_PATHS=coarse_path,
+        PLANAR_PATH_OUTPUT=planar_output,
+        COMBINED_STATE_GRADS=combined_state_gradients,
+        MEAN_DESCRIPTOR_GRAD=mean_direction_energy,
+        BATCH_PARTIAL_GRADS=batch_partial_gradients,
+        BLOCK_HEIGHT=(
+            max(32, triton.next_power_of_2(height))
+            if coarse_path else triton.next_power_of_2(height)
+        ),
         BLOCK_PATH_HIDDEN=max(16, triton.next_power_of_2(packed_path_hidden)),
         BLOCK_SWIGLU_VALUE=(
             max(16, triton.next_power_of_2(2 * swiglu_hidden)) if path_swiglu else 16
         ),
     )
+    if batch_partial_gradients:
+        # Each CTA accumulates into its batch row; reduce rows only once.
+        coefficient_gradients = tuple(value.sum(dim=0) for value in coefficient_gradients)
+        if path_collapse is not None:
+            path_gradients = tuple(value.sum(dim=0) for value in path_gradients)
     base_gradients = (*coefficient_gradients, *source_gradients)
     if path_collapse is None:
         return base_gradients
@@ -581,7 +643,7 @@ def _product_scan_descriptor4_backward_op(
     )
 
 
-def _launch_product_scan4_forward(
+def _launch_product_scan4_forward(  # noqa: C901, PLR0912, PLR0915
     decay_real: Tensor,
     decay_imag: Tensor,
     gamma_real: Tensor,
@@ -602,6 +664,9 @@ def _launch_product_scan4_forward(
     path_swiglu: bool = False,
     emit_descriptor: bool = True,
     mean_direction_energy: bool = False,
+    packed_output: bool = False,
+    coarse_path: bool = False,
+    planar_output: bool = False,
     launch_name: str,
 ) -> FusedOutputs:
     pole = (decay_real, decay_imag, gamma_real, gamma_imag)
@@ -626,6 +691,12 @@ def _launch_product_scan4_forward(
     sources = tuple(value.contiguous() for value in (*source_a, *source_b))
     coefficients = tuple(value.contiguous() for value in pole)
     batch, height, width, modes = source_real_a.shape
+    if coarse_path and (path_collapse is None or height % 2 or width % 2 or emit_coarse):
+        raise ValueError("coarse path collapse requires even dimensions and collapsed-only output")
+    if coarse_path and emit_descriptor:
+        raise ValueError("coarse path collapse omits the full-grid descriptor")
+    output_height = height // 2 if coarse_path else height
+    output_width = width // 2 if coarse_path else width
     coarse_shape = (
         (
             (batch, height // 2, width // 2, 4, 4, modes)
@@ -635,8 +706,14 @@ def _launch_product_scan4_forward(
         if emit_coarse
         else (0,)
     )
-    coarse_real = torch.empty(coarse_shape, dtype=source_real_a.dtype, device=source_real_a.device)
-    coarse_imag = torch.empty_like(coarse_real)
+    packed_states = source_real_a.new_empty((0,))
+    if packed_output and emit_coarse:
+        packed_states = source_real_a.new_empty((*coarse_shape[:-1], 2 * modes))
+        coarse_real = packed_states
+        coarse_imag = source_real_a.new_empty((0,))
+    else:
+        coarse_real = source_real_a.new_empty(coarse_shape)
+        coarse_imag = torch.empty_like(coarse_real)
     if path_collapse is None:
         empty = torch.empty((0,), dtype=torch.float32, device=source_real_a.device)
         path_tensors = (empty, empty, empty, empty)
@@ -673,34 +750,44 @@ def _launch_product_scan4_forward(
             for value in path_tensors
         ):
             raise TypeError("scan-path collapse parameters must be contiguous FP32 CUDA tensors")
-        collapsed_shape = (batch, height, width, 1, modes)
-        collapsed_real = torch.empty(
-            collapsed_shape,
-            dtype=source_real_a.dtype,
-            device=source_real_a.device,
-        )
-        collapsed_imag = torch.empty_like(collapsed_real)
+        collapsed_shape = (batch, output_height, output_width, 1, modes)
+        if packed_output:
+            packed_states = source_real_a.new_empty(
+                (2, batch, output_height, output_width, modes)
+                if planar_output else (batch, output_height, output_width, 2 * modes)
+            )
+            collapsed_real = packed_states
+            collapsed_imag = source_real_a.new_empty((0,))
+        else:
+            collapsed_real = source_real_a.new_empty(collapsed_shape)
+            collapsed_imag = torch.empty_like(collapsed_real)
         packed_path_hidden = path_input_weight.shape[1]
+    deterministic_descriptor = emit_descriptor and torch.are_deterministic_algorithms_enabled()
     if emit_descriptor:
         descriptor_energy = torch.zeros(
-            (batch, 4 * modes),
+            (batch, width, 4 * modes) if deterministic_descriptor else (batch, 4 * modes),
             dtype=torch.float32,
             device=source_real_a.device,
         )
-        descriptor = torch.empty((batch, modes if mean_direction_energy else 4 * modes),
-                                 dtype=torch.float32, device=source_real_a.device)
+        descriptor = torch.empty(
+            (batch, modes if mean_direction_energy else 4 * modes),
+            dtype=torch.float32,
+            device=source_real_a.device,
+        )
     else:
         descriptor_energy = torch.empty((0,), dtype=torch.float32, device=source_real_a.device)
         descriptor = torch.empty_like(descriptor_energy)
     forward_kernel = autotuned(
         _product_scan_coarse4_associative_forward_kernel,
         launch_name,
+        geometry=_COARSE_PATH_GEOMETRY if coarse_path else None,
         key=(
             "height",
             "width",
             "line_count",
             "modes",
             "gain_kind",
+            "DETERMINISTIC_DESCRIPTOR",
         ),
         reset_to_zero=("descriptor_energy",),
         scope=_scan_launch_scope(
@@ -714,7 +801,7 @@ def _launch_product_scan4_forward(
     line_count = batch * width
     wrap_triton(forward_kernel)[
         lambda metadata: (
-            batch * triton.cdiv(width, metadata["BLOCK_LINES"]),
+            batch * triton.cdiv(width // 2 if coarse_path else width, metadata["BLOCK_LINES"]),
             triton.cdiv(modes, metadata["BLOCK_MODES"]),
         )
     ](
@@ -742,13 +829,22 @@ def _launch_product_scan4_forward(
         PATH_SWIGLU=path_swiglu,
         SWIGLU_HIDDEN=swiglu_hidden,
         EMIT_DESCRIPTOR=emit_descriptor,
-        BLOCK_HEIGHT=triton.next_power_of_2(height),
+        DETERMINISTIC_DESCRIPTOR=deterministic_descriptor,
+        PACKED_OUTPUT=packed_output,
+        COARSE_PATHS=coarse_path,
+        PLANAR_PATH_OUTPUT=planar_output,
+        BLOCK_HEIGHT=(
+            max(32, triton.next_power_of_2(height))
+            if coarse_path else triton.next_power_of_2(height)
+        ),
         BLOCK_PATH_HIDDEN=max(16, triton.next_power_of_2(packed_path_hidden)),
         BLOCK_SWIGLU_VALUE=(
             max(16, triton.next_power_of_2(2 * swiglu_hidden)) if path_swiglu else 16
         ),
     )
     if emit_descriptor:
+        if deterministic_descriptor:
+            descriptor_energy = descriptor_energy.sum(dim=1)
         finalize_kernel = autotuned(
             _finalize_descriptor_kernel,
             FINALIZE_LAUNCH_NAME,
@@ -773,6 +869,8 @@ def _launch_product_scan4_forward(
             modes,
             MEAN_DIRECTION_ENERGY=mean_direction_energy,
         )
+    if packed_output:
+        return packed_states, source_real_a.new_empty((0,)), descriptor
     if path_collapse is not None:
         return collapsed_real, collapsed_imag, descriptor
     return coarse_real, coarse_imag, descriptor

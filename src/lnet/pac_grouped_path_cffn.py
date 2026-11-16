@@ -13,6 +13,7 @@ from .pac_d4_path_cffn import (
     d4_grouped_cell_path_collapse,
     d4_grouped_cell_path_collapse_reference,
     d4_grouped_path_collapse,
+    d4_grouped_path_collapse_packed,
     supports_d4_grouped_cell_path_collapse,
     supports_d4_grouped_path_collapse,
 )
@@ -206,6 +207,43 @@ def grouped_cartesian_cffn(
     )
 
 
+def grouped_cartesian_cffn_packed(
+    source: Tensor,
+    *,
+    input_projection: GroupedWidelyLinear,
+    output_projection: GroupedWidelyLinear,
+) -> Tensor:
+    """Collapse D4 Cartesian packed paths while preserving parameter names."""
+    modes = input_projection.modes
+    if source.ndim != 5 or tuple(source.shape[-2:]) != (4, 2 * modes):
+        raise ValueError("packed grouped CFFN inputs must be NHW-path-2mode tensors")
+    if (
+        input_projection.input_paths != 4
+        or output_projection.output_paths != 1
+        or modes != output_projection.modes
+        or input_projection.output_paths != output_projection.input_paths
+    ):
+        raise ValueError("packed grouped CFFN projection dimensions are incompatible")
+    if not (
+        type(input_projection) is GroupedWidelyLinear
+        and type(output_projection) is GroupedWidelyLinear
+        and module_calls_are_transparent(input_projection, output_projection)
+    ):
+        raise RuntimeError("packed grouped CFFN requires transparent exact projections")
+    input_bias = input_projection.packed_bias()
+    output_bias = output_projection.packed_bias()
+    if input_bias is None or output_bias is None:
+        raise RuntimeError("packed grouped CFFN requires both projection biases")
+    packed_hidden = 2 * input_projection.output_paths
+    return d4_grouped_path_collapse_packed(
+        source,
+        input_projection.packed_weight().reshape(modes, packed_hidden, 8),
+        input_bias.reshape(modes, packed_hidden),
+        output_projection.packed_weight().reshape(modes, 2, packed_hidden),
+        output_bias.reshape(modes, 2),
+    )
+
+
 def grouped_cartesian_cell_cffn(
     real: Tensor,
     imag: Tensor,
@@ -337,5 +375,6 @@ __all__ = [
     "GroupedWidelyLinear",
     "grouped_cartesian_cell_cffn",
     "grouped_cartesian_cffn",
+    "grouped_cartesian_cffn_packed",
     "grouped_cartesian_cffn_reference",
 ]

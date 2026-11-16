@@ -110,8 +110,16 @@ class CapacityQ4OnlyAffineClassifier(A2DAffineQClassifier):
             raise ValueError(message)
         return descriptor[..., -self.q4_dim :]
 
-    def forward(self, descriptor: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        return super().forward(self.select_q4(descriptor))
+    def forward(
+        self, descriptor: Tensor, *, terminal_only: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        return self.forward_q4(descriptor if terminal_only else self.select_q4(descriptor))
+
+    def forward_q4(self, descriptor: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Consume terminal coordinates without computing unused stage readouts."""
+        if descriptor.shape[-1] != self.q4_dim:
+            raise ValueError("capacity Q4 head received an incompatible terminal descriptor")
+        return super().forward(descriptor)
 
 
 def resize_terminal_poles_(

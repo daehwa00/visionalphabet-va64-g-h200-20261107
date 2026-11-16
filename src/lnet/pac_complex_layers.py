@@ -86,6 +86,8 @@ def packed_widely_linear_bias(
 class ComplexLinear(nn.Module):
     """Bias-free complex linear map represented by two real matrices."""
 
+    _joint_coordinate_projection: bool = False
+
     def __init__(self, input_modes: int, output_modes: int) -> None:
         super().__init__()
         if input_modes <= 0 or output_modes <= 0:
@@ -105,7 +107,43 @@ class ComplexLinear(nn.Module):
         """Return the real matrix mapping ``[real | imag]`` rows to packed rows."""
         return packed_complex_linear_weight(self.weight_real, self.weight_imag)
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def forward_packed(self, packed: Tensor) -> Tensor:
+        """Keep packed storage while preserving the coordinate GEMM rounding order."""
+        if packed.ndim < 1 or packed.shape[-1] != 2 * self.input_modes:
+            raise ValueError("packed complex-linear inputs have incompatible shapes")
+        # These are views. A single block GEMM would remove intermediate BF16
+        # rounding and change the learned model's projection numerically.
+        real, imag = packed.chunk(2, dim=-1)
+        # Keep the GEMM leading dimensions of the reference path as well:
+        # cuBLAS can choose a different BF16 reduction for strided halves.
+        output_real, output_imag = self.forward(real.contiguous(), imag.contiguous())
+        return torch.cat((output_real, output_imag), dim=-1).reshape(
+            *packed.shape[:-1], 2 * self.output_modes
+        )
+
+    def forward_planes(self, planes: Tensor) -> Tensor:
+        """Consume contiguous coordinate planes without repacking GEMM inputs."""
+        if (
+            planes.ndim < 2 or planes.shape[0] != 2
+            or planes.shape[-1] != self.input_modes or not planes.is_contiguous()
+        ):
+            raise ValueError("complex projection requires contiguous [2, ..., modes] storage")
+        # One unbind keeps backward as one stack instead of two zero-filled
+        # select gradients followed by an addition.
+        real, imag = planes.unbind(0)
+        if self._joint_coordinate_projection:
+            weight = torch.cat((self.weight_real, self.weight_imag), dim=0)
+            rr, ir = functional.linear(real, weight).chunk(2, dim=-1)
+            ri, ii = functional.linear(imag, weight).chunk(2, dim=-1)
+            return torch.cat((rr - ii, ir + ri), dim=-1)
+        output_real, output_imag = self.forward(real, imag)
+        return torch.cat((output_real, output_imag), dim=-1)
+
+    def forward(
+        self, real: Tensor, imag: Tensor | None = None, *, planar: bool = False,
+    ) -> ComplexField | Tensor:
+        if imag is None:
+            return self.forward_planes(real) if planar else self.forward_packed(real)
         if real.shape != imag.shape or real.shape[-1] != self.input_modes:
             message = "complex linear inputs have incompatible shapes"
             raise ValueError(message)
@@ -118,7 +156,16 @@ class ComplexLinear(nn.Module):
 class PackedComplexLinear(ComplexLinear):
     """Evaluate a strict complex map as one packed real GEMM."""
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def forward_packed(self, packed: Tensor) -> Tensor:
+        if packed.ndim < 1 or packed.shape[-1] != 2 * self.input_modes:
+            raise ValueError("packed complex-linear inputs have incompatible shapes")
+        return functional.linear(packed, self.packed_weight())
+
+    def forward(
+        self, real: Tensor, imag: Tensor | None = None, *, planar: bool = False,
+    ) -> ComplexField | Tensor:
+        if imag is None:
+            return self.forward_planes(real) if planar else self.forward_packed(real)
         if real.shape != imag.shape or real.shape[-1] != self.input_modes:
             message = "packed complex-linear inputs have incompatible shapes"
             raise ValueError(message)
@@ -147,9 +194,10 @@ class ScaleStableComplexLinear(ComplexLinear):
         calculation_dtype = (
             torch.float64 if self.weight_real.dtype is torch.float64 else torch.float32
         )
-        energy = self.weight_real.to(calculation_dtype).square() + self.weight_imag.to(
-            calculation_dtype
-        ).square()
+        energy = (
+            self.weight_real.to(calculation_dtype).square()
+            + self.weight_imag.to(calculation_dtype).square()
+        )
         return energy.sum(dim=-1, keepdim=True).sqrt().to(self.weight_real.dtype)
 
     @torch.no_grad()
@@ -179,7 +227,11 @@ class ScaleStableComplexLinear(ComplexLinear):
         weight_real, weight_imag = self.normalized_weight()
         return packed_complex_linear_weight(weight_real, weight_imag)
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def forward(
+        self, real: Tensor, imag: Tensor | None = None, *, planar: bool = False,
+    ) -> ComplexField | Tensor:
+        if imag is None:
+            return self.forward_planes(real) if planar else self.forward_packed(real)
         if real.shape != imag.shape or real.shape[-1] != self.input_modes:
             raise ValueError("scale-stable complex linear inputs have incompatible shapes")
         weight_real, weight_imag = self.normalized_weight()
@@ -282,7 +334,19 @@ class WidelyLinear(nn.Module):
             self.conjugate_imag,
         )
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def forward_packed(self, packed: Tensor) -> Tensor:
+        """Apply Wz + V*conj(z) directly to packed Cartesian rows."""
+        if packed.ndim < 1 or packed.shape[-1] != 2 * self.input_modes:
+            raise ValueError("packed widely-linear inputs have incompatible shapes")
+        return functional.linear(
+            packed,
+            self.packed_weight(),
+            packed_widely_linear_bias(self.bias_real, self.bias_imag),
+        )
+
+    def forward(self, real: Tensor, imag: Tensor | None = None) -> ComplexField | Tensor:
+        if imag is None:
+            return self.forward_packed(real)
         if real.shape != imag.shape or real.shape[-1] != self.input_modes:
             message = "widely-linear inputs have incompatible shapes"
             raise ValueError(message)

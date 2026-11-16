@@ -14,6 +14,9 @@ import a2d_r2k3_runtime as runtime
 import imagenet1k_runtime as imagenet_runtime
 import run_a2d_r2k3_k128_depth_p_overnight_imagenet100 as anchor
 from torch import Tensor, nn
+from va128_packed_backbone import enable_packed_va128_
+
+from lnet.pac_factorized_complex_scan_reader import FactorizedComplexConv2dReader
 
 MODEL_KEY = "lnet_k128_p160_160_160_128_d2262"
 DISPLAY_NAME = "LNet-K128-P160-160-160-128-D2262"
@@ -67,6 +70,10 @@ def _build_model(
         raise RuntimeError(
             f"LNet ImageNet-1K parameter count changed: {parameters} != {EXPECTED_PARAMETERS}"
         )
+    for module in model.modules():
+        if isinstance(module, FactorizedComplexConv2dReader):
+            module.execution_mode = "factorized_triton"
+    enable_packed_va128_(model)
     prepared = model.prepare_for_compiled_training_()
     return PrimaryLogitsAdapter(prepared)
 

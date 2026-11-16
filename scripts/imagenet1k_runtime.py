@@ -420,12 +420,20 @@ def _logits(output: object, batch_size: int, num_classes: int) -> Tensor:
     return output
 
 
+_CUDA_COPY_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
 class _CudaBatchTransfer:
     """Queue pinned host batches on a copy stream and retain them until DMA completes."""
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
-        self.stream = torch.cuda.Stream(device=device)
+        # The CUDA caching allocator keeps separate pools for different streams.
+        # Recreating streams at every train/eval boundary strands reusable blocks.
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        if index not in _CUDA_COPY_STREAMS:
+            _CUDA_COPY_STREAMS[index] = torch.cuda.Stream(device=device)
+        self.stream = _CUDA_COPY_STREAMS[index]
         self.pending_hosts: list[tuple[torch.cuda.Event, tuple[Tensor, ...]]] = []
 
     def copy(self, batch: tuple[Tensor, ...]) -> tuple[Tensor, ...]:

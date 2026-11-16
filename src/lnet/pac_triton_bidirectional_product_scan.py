@@ -95,6 +95,19 @@ def _validate(
     coefficients = decay_real, decay_imag, gamma_real, gamma_imag
     if source_real.shape != source_imag.shape or source_real.ndim != 4:
         raise ValueError("bidirectional product scan requires matching NHWM sources")
+    for value in (source_real, source_imag):
+        if value.stride(-1) != 1 or value.stride(-2) not in (
+            source_real.shape[-1],
+            2 * source_real.shape[-1],
+        ):
+            raise ValueError("bidirectional sources require dense coordinate rows")
+        if not value.is_contiguous() and value.stride() != (
+            value.shape[1] * value.shape[2] * value.stride(-2),
+            value.shape[2] * value.stride(-2),
+            value.stride(-2),
+            1,
+        ):
+            raise ValueError("bidirectional sources require NHWM row-dense strides")
     if any(value.shape != (1, 1, 1, source_real.shape[-1]) for value in coefficients):
         raise ValueError("bidirectional product scan requires compact 111M poles")
     if any(value.device != source_real.device for value in (*coefficients, source_imag)):
@@ -140,8 +153,11 @@ def _bidirectional_forward_kernel(
     width: int,
     line_count: int,
     modes: int,
+    SOURCE_REAL_STRIDE: tl.constexpr,
+    SOURCE_IMAG_STRIDE: tl.constexpr,
     BLOCK_WIDTH: tl.constexpr,
     BLOCK_MODES: tl.constexpr,
+    COMBINED_STATES: tl.constexpr,
 ) -> None:
     line = tl.program_id(0)
     batch = line // height
@@ -155,8 +171,10 @@ def _bidirectional_forward_kernel(
     ai = tl.load(decay_imag + mode, mask=mode < modes, other=0.0).to(tl.float32)
     gr = tl.load(gamma_real + mode, mask=mode < modes, other=0.0).to(tl.float32)
     gi = tl.load(gamma_imag + mode, mask=mode < modes, other=0.0).to(tl.float32)
-    sr = tl.load(source_real + offset, mask=active, other=0.0).to(tl.float32)
-    si = tl.load(source_imag + offset, mask=active, other=0.0).to(tl.float32)
+    source_real_offset = (line * width + x) * SOURCE_REAL_STRIDE + mode
+    source_imag_offset = (line * width + x) * SOURCE_IMAG_STRIDE + mode
+    sr = tl.load(source_real + source_real_offset, mask=active, other=0.0).to(tl.float32)
+    si = tl.load(source_imag + source_imag_offset, mask=active, other=0.0).to(tl.float32)
     scan_ar = tl.where(active, ar, 1.0)
     scan_ai = tl.where(active, ai, 0.0)
     positive = tl.associative_scan(
@@ -171,9 +189,15 @@ def _bidirectional_forward_kernel(
         reverse=True,
     )
     tl.store(positive_real + offset, positive[2], mask=active)
-    tl.store(positive_imag + offset, positive[3], mask=active)
-    tl.store(negative_real + offset, negative[2], mask=active)
-    tl.store(negative_imag + offset, negative[3], mask=active)
+    if COMBINED_STATES:
+        plane_size = line_count * width * modes
+        tl.store(positive_real + plane_size + offset, positive[3], mask=active)
+        tl.store(positive_real + 2 * plane_size + offset, negative[2], mask=active)
+        tl.store(positive_real + 3 * plane_size + offset, negative[3], mask=active)
+    else:
+        tl.store(positive_imag + offset, positive[3], mask=active)
+        tl.store(negative_real + offset, negative[2], mask=active)
+        tl.store(negative_imag + offset, negative[3], mask=active)
 
 
 @triton.jit
@@ -202,6 +226,10 @@ def _bidirectional_backward_kernel(
     width: int,
     line_count: int,
     modes: int,
+    SOURCE_REAL_STRIDE: tl.constexpr,
+    SOURCE_IMAG_STRIDE: tl.constexpr,
+    GRAD_SOURCE_STRIDE: tl.constexpr,
+    PACKED_SOURCE_GRADIENT: tl.constexpr,
     BLOCK_WIDTH: tl.constexpr,
     BLOCK_MODES: tl.constexpr,
     RECOMPUTE_STATES: tl.constexpr,
@@ -238,28 +266,30 @@ def _bidirectional_backward_kernel(
     )
     plr, pli = positive_adjoint[2], positive_adjoint[3]
     nlr, nli = negative_adjoint[2], negative_adjoint[3]
-    sr = tl.load(source_real + offset, mask=active, other=0.0).to(tl.float32)
-    si = tl.load(source_imag + offset, mask=active, other=0.0).to(tl.float32)
+    source_real_offset = (line * width + x) * SOURCE_REAL_STRIDE + mode
+    source_imag_offset = (line * width + x) * SOURCE_IMAG_STRIDE + mode
+    sr = tl.load(source_real + source_real_offset, mask=active, other=0.0).to(tl.float32)
+    si = tl.load(source_imag + source_imag_offset, mask=active, other=0.0).to(tl.float32)
     if RECOMPUTE_STATES:
         positive_previous_offset = offset - modes
         negative_previous_offset = offset + modes
         psr = tl.load(
-            source_real + positive_previous_offset,
+            source_real + source_real_offset - SOURCE_REAL_STRIDE,
             mask=active & (x > 0),
             other=0.0,
         ).to(tl.float32)
         psi = tl.load(
-            source_imag + positive_previous_offset,
+            source_imag + source_imag_offset - SOURCE_IMAG_STRIDE,
             mask=active & (x > 0),
             other=0.0,
         ).to(tl.float32)
         nsr = tl.load(
-            source_real + negative_previous_offset,
+            source_real + source_real_offset + SOURCE_REAL_STRIDE,
             mask=active & (x < width - 1),
             other=0.0,
         ).to(tl.float32)
         nsi = tl.load(
-            source_imag + negative_previous_offset,
+            source_imag + source_imag_offset + SOURCE_IMAG_STRIDE,
             mask=active & (x < width - 1),
             other=0.0,
         ).to(tl.float32)
@@ -307,8 +337,23 @@ def _bidirectional_backward_kernel(
             mask=active & (x < width - 1),
             other=0.0,
         ).to(tl.float32)
-    tl.store(grad_source_real + offset, plr * gr + pli * gi + nlr * gr - nli * gi, mask=active)
-    tl.store(grad_source_imag + offset, -plr * gi + pli * gr + nlr * gi + nli * gr, mask=active)
+    tl.store(
+        grad_source_real + (line * width + x) * GRAD_SOURCE_STRIDE + mode,
+        plr * gr + pli * gi + nlr * gr - nli * gi,
+        mask=active,
+    )
+    if PACKED_SOURCE_GRADIENT:
+        tl.store(
+            grad_source_real + (line * width + x) * GRAD_SOURCE_STRIDE + mode + modes,
+            -plr * gi + pli * gr + nlr * gi + nli * gr,
+            mask=active,
+        )
+    else:
+        tl.store(
+            grad_source_imag + (line * width + x) * GRAD_SOURCE_STRIDE + mode,
+            -plr * gi + pli * gr + nlr * gi + nli * gr,
+            mask=active,
+        )
     cdr = tl.sum(
         tl.where(active, plr * ppr + pli * ppi + nlr * npr + nli * npi, 0.0),
         axis=0,
@@ -347,7 +392,9 @@ def _forward_op(
         return bidirectional_product_scan_reference(pole, source)
     outputs = cast(
         "BidirectionalField",
-        tuple(torch.empty_like(source_real) for _ in range(4)),
+        tuple(
+            torch.empty_like(source_real, memory_format=torch.contiguous_format) for _ in range(4)
+        ),
     )
     batch, height, width, modes = source_real.shape
     line_count = batch * height
@@ -362,15 +409,48 @@ def _forward_op(
         return line_count, int(triton.cdiv(modes, metadata["BLOCK_MODES"]))
 
     wrap_triton(forward_kernel)[grid](
-        *(value.contiguous() for value in (*pole, *source)),
+        *(value.contiguous() for value in pole),
+        *source,
         *outputs,
         height,
         width,
         line_count,
         modes,
+        SOURCE_REAL_STRIDE=source_real.stride(-2),
+        SOURCE_IMAG_STRIDE=source_imag.stride(-2),
         BLOCK_WIDTH=triton.next_power_of_2(width),
+        COMBINED_STATES=False,
     )
     return outputs
+
+
+@triton_op("lnet::pac_bidirectional_product_scan_planes", mutates_args={})
+def _forward_planes_op(
+    decay_real: Tensor, decay_imag: Tensor, gamma_real: Tensor, gamma_imag: Tensor,
+    source_real: Tensor, source_imag: Tensor,
+) -> Tensor:
+    """Internal scan storage: four contiguous coordinate planes, one allocation."""
+    pole = decay_real, decay_imag, gamma_real, gamma_imag
+    source = source_real, source_imag
+    _validate(*pole, *source)
+    if not source_real.is_cuda:
+        return torch.stack(bidirectional_product_scan_reference(pole, source), dim=0)
+    output = source_real.new_empty((4, *source_real.shape))
+    dummy = source_real.new_empty((0,))
+    batch, height, width, modes = source_real.shape
+    line_count = batch * height
+    kernel = autotuned(
+        _bidirectional_forward_kernel, FORWARD_LAUNCH_NAME,
+        key=("height", "width", "line_count", "modes"),
+        scope=_scan_launch_scope(_bidirectional_forward_kernel, source_real),
+    )
+    wrap_triton(kernel)[lambda meta: (line_count, triton.cdiv(modes, meta["BLOCK_MODES"]))](
+        *(value.contiguous() for value in pole), *source, output, dummy, dummy, dummy,
+        height, width, line_count, modes,
+        SOURCE_REAL_STRIDE=source_real.stride(-2), SOURCE_IMAG_STRIDE=source_imag.stride(-2),
+        BLOCK_WIDTH=triton.next_power_of_2(width), COMBINED_STATES=True,
+    )
+    return output
 
 
 def _storage_kind(dtype: torch.dtype) -> int:
@@ -388,6 +468,7 @@ def _launch_backward(
     output_gradients: BidirectionalField,
     *,
     launch_name: str,
+    source_gradient_buffer: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     source_real, source_imag = source
     batch, height, width, modes = source_real.shape
@@ -396,7 +477,14 @@ def _launch_backward(
         "tuple[Tensor, Tensor, Tensor, Tensor]",
         tuple(torch.zeros_like(value, memory_format=torch.contiguous_format) for value in pole),
     )
-    source_gradients = torch.empty_like(source_real), torch.empty_like(source_imag)
+    source_gradients = (
+        (
+            torch.empty_like(source_real, memory_format=torch.contiguous_format),
+            torch.empty_like(source_imag, memory_format=torch.contiguous_format),
+        )
+        if source_gradient_buffer is None
+        else (source_gradient_buffer[..., :modes], source_gradient_buffer[..., modes:])
+    )
     backward_kernel = autotuned(
         _bidirectional_backward_kernel,
         launch_name,
@@ -415,15 +503,26 @@ def _launch_backward(
 
     wrap_triton(backward_kernel)[grid](
         *(value.contiguous() for value in pole),
-        *(value.contiguous() for value in source),
-        *(value.contiguous() for value in (states or (source_real,) * 4)),
+        *source,
+        *(tuple(value.contiguous() for value in states) if states else (source_real,) * 4),
         *(value.contiguous() for value in output_gradients),
         *coefficient_gradients,
-        *source_gradients,
+        *(
+            source_gradients
+            if source_gradient_buffer is None
+            else (
+                source_gradient_buffer,
+                source_real.new_empty((0,)),
+            )
+        ),
         height,
         width,
         line_count,
         modes,
+        SOURCE_REAL_STRIDE=source_real.stride(-2),
+        SOURCE_IMAG_STRIDE=source_imag.stride(-2),
+        GRAD_SOURCE_STRIDE=source_gradients[0].stride(-2),
+        PACKED_SOURCE_GRADIENT=source_gradient_buffer is not None,
         BLOCK_WIDTH=triton.next_power_of_2(width),
         RECOMPUTE_STATES=states is None,
         STORAGE_KIND=_storage_kind(source_real.dtype),

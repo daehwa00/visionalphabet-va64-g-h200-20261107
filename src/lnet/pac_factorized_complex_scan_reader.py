@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import torch
 from torch import Tensor, nn
@@ -22,6 +23,12 @@ class FactorizedComplexConv2dReader(nn.Module):
 
     where ``A`` and ``D`` are strict-complex weights.  ``rank`` controls how
     many independently detected local events each output pole can combine.
+    The VA128 builder fixes execution to ``factorized_triton``. The ``dense``
+    and grouped ``factorized`` paths remain available as comparison references.
+    All paths preserve the parameter layout, with different floating-point rounding.
+    ``factorized_triton`` keeps the pointwise convolution and fuses spatial
+    filtering, rank reduction and output layout on CUDA, including backward.
+    On CPU that mode uses the dense tensor reference.
     """
 
     def __init__(
@@ -35,6 +42,7 @@ class FactorizedComplexConv2dReader(nn.Module):
         normalize_input: bool = False,
         match_input_rms: bool = False,
         rms_reference_modes: int | None = None,
+        execution_mode: Literal["dense", "factorized", "factorized_triton"] = "dense",
     ) -> None:
         super().__init__()
         if input_modes <= 0 or output_modes <= 0:
@@ -50,6 +58,9 @@ class FactorizedComplexConv2dReader(nn.Module):
             message = "factorized complex reader variance epsilon must be positive"
             raise ValueError(message)
 
+        if execution_mode not in ("dense", "factorized", "factorized_triton"):
+            raise ValueError("reader execution mode must be dense, factorized or factorized_triton")
+        self.execution_mode = execution_mode
         self.input_modes = int(input_modes)
         self.output_modes = int(output_modes)
         self.rank = int(rank)
@@ -309,23 +320,174 @@ class FactorizedComplexConv2dReader(nn.Module):
             message = "factorized complex reader input has an incompatible mode dimension"
             raise ValueError(message)
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def _factorized_conv(self, packed_input: Tensor) -> Tensor:
+        """Apply the same normalized kernel without a dense spatial convolution.
+
+        Projection channels are (component, pole, rank). Grouped spatial channels
+        are (pole, component, rank), with one complex output per pole. Normalize
+        the spatial factors using the *full* synthesized row energy, preserving
+        cross-rank terms and gradients through the normalization denominator.
+        """
+        point_real = self.point_weight_real.float().flatten(0, 1)[..., None, None]
+        point_imag = self.point_weight_imag.float().flatten(0, 1)[..., None, None]
+        point_kernel = torch.cat((
+            torch.cat((point_real, -point_imag), dim=1),
+            torch.cat((point_imag, point_real), dim=1),
+        ), dim=0)
+        projected = functional.conv2d(packed_input, point_kernel)
+        batch, _, height, width = projected.shape
+        grouped_input = projected.reshape(
+            batch, 2, self.output_modes, self.rank, height, width,
+        ).permute(0, 2, 1, 3, 4, 5).reshape(
+            batch, 2 * self.output_modes * self.rank, height, width,
+        )
+        full_real, full_imag = self.synthesized_kernel()
+        inverse_rms = torch.rsqrt(
+            full_real.square().add(full_imag.square()).sum(dim=(1, 2, 3), keepdim=True)
+            .clamp_min(self.variance_epsilon)
+        )
+        spatial_real = self.spatial_weight_real.float() * inverse_rms
+        spatial_imag = self.spatial_weight_imag.float() * inverse_rms
+        spatial_kernel = torch.stack((
+            torch.cat((spatial_real, -spatial_imag), dim=1),
+            torch.cat((spatial_imag, spatial_real), dim=1),
+        ), dim=1).reshape(
+            2 * self.output_modes, 2 * self.rank, self.kernel_size, self.kernel_size,
+        )
+        grouped_output = functional.conv2d(
+            grouped_input, spatial_kernel, padding=self.padding, groups=self.output_modes,
+        )
+        return grouped_output.reshape(batch, self.output_modes, 2, height, width).permute(
+            0, 2, 1, 3, 4,
+        ).reshape(batch, 2 * self.output_modes, height, width)
+
+    def _pointwise_kernel(self) -> Tensor:
+        point_real = self.point_weight_real.float().flatten(0, 1)
+        point_imag = self.point_weight_imag.float().flatten(0, 1)
+        return torch.cat((
+            torch.cat((point_real, -point_imag), dim=1),
+            torch.cat((point_imag, point_real), dim=1),
+        ), dim=0)
+
+    def _normalized_spatial_factors(self, dtype: torch.dtype) -> ComplexField:
+        full_real, full_imag = self.synthesized_kernel()
+        inverse_rms = torch.rsqrt(
+            full_real.square().add(full_imag.square()).sum(dim=(1, 2, 3), keepdim=True)
+            .clamp_min(self.variance_epsilon)
+        )
+        return (
+            (self.spatial_weight_real.float() * inverse_rms).to(dtype).contiguous(),
+            (self.spatial_weight_imag.float() * inverse_rms).to(dtype).contiguous(),
+        )
+
+    def _factorized_triton_conv(self, packed_input: Tensor) -> ComplexField:
+        if not packed_input.is_cuda:
+            raise ValueError("factorized_triton requires CUDA inputs")
+        # Keep the default CPU reader independent of the optional CUDA backend.
+        from .pac_triton_factorized_spatial import factorized_spatial  # noqa: PLC0415
+
+        projected = functional.conv2d(packed_input, self._pointwise_kernel()[..., None, None])
+        spatial_real, spatial_imag = self._normalized_spatial_factors(projected.dtype)
+        return factorized_spatial(projected, spatial_real, spatial_imag)
+
+    def _factorized_triton_conv_packed(self, packed_input: Tensor) -> Tensor:
+        from .pac_triton_factorized_spatial import factorized_spatial_packed  # noqa: PLC0415
+
+        # Linear reads NHW rows directly; movedim is a channels-last NCHW view.
+        projected = functional.linear(packed_input, self._pointwise_kernel()).movedim(-1, 1)
+        spatial_real, spatial_imag = self._normalized_spatial_factors(projected.dtype)
+        return factorized_spatial_packed(projected, spatial_real, spatial_imag)
+
+    def forward_packed(self, packed: Tensor) -> Tensor:
+        """Read NHW[real | imag] coordinates without unpacking activation buffers.
+
+        CUDA factorized execution projects packed rows directly and writes one
+        packed spatial output. Parameters and normalization equations are shared
+        with the separate-coordinate API, preserving checkpoint compatibility.
+        """
+        if packed.ndim != 4 or packed.shape[-1] != 2 * self.input_modes:
+            raise ValueError("factorized complex reader requires NHW[real | imag] input")
+        if self.input_norm is not None:
+            # The reader's reference normalizer preserves its input dtype. In
+            # particular RMS matching must see FP32 normalized rows, not an
+            # early BF16 cast introduced by the PostFusion-specific kernel.
+            real, imag = packed.chunk(2, dim=-1)
+            energy = (real.float().square() + imag.float().square()).mean(-1, keepdim=True)
+            inverse_rms = torch.rsqrt(energy + self.input_norm.epsilon).to(packed.dtype)
+            coordinates = packed.unflatten(-1, (2, self.input_modes))
+            packed = (
+                coordinates * inverse_rms.unsqueeze(-1)
+                * self.input_norm.weight.to(packed.dtype)
+            ).flatten(-2)
+
+        if self.execution_mode == "factorized_triton" and packed.is_cuda:
+            output = self._factorized_triton_conv_packed(packed)
+        elif self.execution_mode == "factorized":
+            output = self._factorized_conv(packed.movedim(-1, 1)).movedim(1, -1).contiguous()
+        elif self.execution_mode == "dense" or (
+            self.execution_mode == "factorized_triton" and not packed.is_cuda
+        ):
+            kernel_real, kernel_imag = self.unit_energy_kernel()
+            kernel = torch.cat((
+                torch.cat((kernel_real, -kernel_imag), dim=1),
+                torch.cat((kernel_imag, kernel_real), dim=1),
+            ), dim=0)
+            output = functional.conv2d(
+                packed.movedim(-1, 1), kernel, padding=self.padding,
+            ).movedim(1, -1).contiguous()
+        else:
+            raise ValueError("reader execution mode must be dense, factorized or factorized_triton")
+
+        if self.match_input_rms:
+            input_energy = packed.float().square().sum(dim=-1, keepdim=True).div(self.input_modes)
+            coordinates = output.reshape(*output.shape[:-1], 2, self.output_modes)
+            output_energy = (
+                coordinates[..., 0, : self.rms_reference_modes].float().square().sum(dim=-1)
+                + coordinates[..., 1, : self.rms_reference_modes].float().square().sum(dim=-1)
+            ).unsqueeze(-1).div(self.rms_reference_modes
+            )
+            scale = torch.sqrt(
+                (input_energy + self.variance_epsilon) / (output_energy + self.variance_epsilon)
+            ).to(output.dtype)
+            output = output * scale
+        return output
+
+    def forward(self, real: Tensor, imag: Tensor | None = None) -> ComplexField | Tensor:
+        if imag is None:
+            return self.forward_packed(real)
         self._validate_input(real, imag)
         if self.input_norm is not None:
             real, imag = self.input_norm(real, imag)
-        kernel_real, kernel_imag = self.unit_energy_kernel()
-        kernel_top = torch.cat((kernel_real, -kernel_imag), dim=1)
-        kernel_bottom = torch.cat((kernel_imag, kernel_real), dim=1)
-        packed_kernel = torch.cat((kernel_top, kernel_bottom), dim=0)
         packed_input = torch.cat(
-            (real.movedim(-1, 1), imag.movedim(-1, 1)),
-            dim=1,
+            (real.movedim(-1, 1), imag.movedim(-1, 1)), dim=1,
         )
-        output = functional.conv2d(
-            packed_input,
-            packed_kernel,
-            padding=self.padding,
-        )
+        if self.execution_mode == "dense" or (
+            self.execution_mode == "factorized_triton" and not packed_input.is_cuda
+        ):
+            kernel_real, kernel_imag = self.unit_energy_kernel()
+            kernel_top = torch.cat((kernel_real, -kernel_imag), dim=1)
+            kernel_bottom = torch.cat((kernel_imag, kernel_real), dim=1)
+            packed_kernel = torch.cat((kernel_top, kernel_bottom), dim=0)
+            output = functional.conv2d(packed_input, packed_kernel, padding=self.padding)
+        elif self.execution_mode == "factorized":
+            output = self._factorized_conv(packed_input)
+        elif self.execution_mode == "factorized_triton":
+            output_real, output_imag = self._factorized_triton_conv(packed_input)
+            if self.match_input_rms:
+                input_energy = packed_input.float().square().sum(dim=1).div(self.input_modes)
+                output_energy = (
+                    output_real[..., : self.rms_reference_modes].float().square().sum(dim=-1)
+                    + output_imag[..., : self.rms_reference_modes].float().square().sum(dim=-1)
+                ).div(self.rms_reference_modes)
+                token_scale = torch.sqrt(
+                    (input_energy + self.variance_epsilon)
+                    / (output_energy + self.variance_epsilon)
+                ).to(output_real.dtype).unsqueeze(-1)
+                output_real = output_real * token_scale
+                output_imag = output_imag * token_scale
+            return output_real, output_imag
+        else:
+            raise ValueError("reader execution mode must be dense, factorized or factorized_triton")
 
         if self.match_input_rms:
             input_energy = (

@@ -22,6 +22,7 @@ from .pac_grouped_path_cffn import (
     GroupedWidelyLinear,
     grouped_cartesian_cell_cffn,
     grouped_cartesian_cffn,
+    grouped_cartesian_cffn_packed,
 )
 from .pac_mean_one_magnitude_gate import MeanOneMagnitudeGate
 from .pac_path_cffn import D4PathModeCombiner
@@ -137,7 +138,9 @@ class PathOnlyCollapse(D4PathModeCombiner):
         self.path_input.load_state_dict(baseline.path_input.state_dict())
         self.path_output.load_state_dict(baseline.path_output.state_dict())
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def forward(self, real: Tensor, imag: Tensor | None = None) -> ComplexField | Tensor:
+        if imag is None:
+            return self.forward_real_packed(real)
         if real.shape != imag.shape or real.shape[-1] != self.input_modes:
             message = "path-only stage mixer inputs have incompatible shapes"
             raise ValueError(message)
@@ -156,6 +159,14 @@ class PathOnlyCollapse(D4PathModeCombiner):
         return grouped_cartesian_cffn(
             source_real,
             source_imag,
+            input_projection=self.path_input,
+            output_projection=self.path_output,
+        )
+
+    def forward_real_packed(self, source: Tensor) -> Tensor:
+        """Consume NHW-path-2mode states and return one NHW-2mode tensor."""
+        return grouped_cartesian_cffn_packed(
+            source,
             input_projection=self.path_input,
             output_projection=self.path_output,
         )
@@ -308,9 +319,7 @@ class PathSwiGLUCollapse(D4PathModeCombiner):
             path_hidden,
             bias=False,
         )
-        self.gate_weight = nn.Parameter(
-            torch.empty(modes, path_hidden, 2 * self.path_count)
-        )
+        self.gate_weight = nn.Parameter(torch.empty(modes, path_hidden, 2 * self.path_count))
         nn.init.uniform_(
             self.gate_weight,
             -1.0 / math.sqrt(2 * self.path_count),
@@ -339,9 +348,7 @@ class PathSwiGLUCollapse(D4PathModeCombiner):
                 source_imag,
                 *parameters,
             ):
-                raise RuntimeError(
-                    "CUDA Path-SwiGLU requires the fused BF16-autocast contract"
-                )
+                raise RuntimeError("CUDA Path-SwiGLU requires the fused BF16-autocast contract")
             return d4_grouped_path_swiglu(
                 source_real.contiguous(),
                 source_imag.contiguous(),
@@ -367,11 +374,15 @@ class PathSwiGLUCollapse(D4PathModeCombiner):
             dim=1,
         ).contiguous()
         joint_bias = value_weight.new_zeros((self.modes, 3 * self.path_hidden))
-        output_weight = self.output.packed_weight().reshape(
-            self.modes,
-            2,
-            2 * self.path_hidden,
-        ).contiguous()
+        output_weight = (
+            self.output.packed_weight()
+            .reshape(
+                self.modes,
+                2,
+                2 * self.path_hidden,
+            )
+            .contiguous()
+        )
         output_bias = value_weight.new_zeros((self.modes, 2))
         return joint_weight, joint_bias, output_weight, output_bias
 
@@ -504,9 +515,7 @@ class DirectMagnitudePathCollapse(D4PathModeCombiner):
             or source_real.ndim != 5
             or tuple(source_real.shape[-2:]) != expected
         ):
-            raise ValueError(
-                "magnitude-gated direct collapse requires NHW-path-mode inputs"
-            )
+            raise ValueError("magnitude-gated direct collapse requires NHW-path-mode inputs")
         gate = self.gate(
             source_real.transpose(-2, -1),
             source_imag.transpose(-2, -1),
@@ -537,9 +546,7 @@ class PathCoherenceGateCollapse(D4PathModeCombiner):
         self.path_count = 4
         self.output_paths = 1
         self.input_modes = self.path_count * modes
-        self.coherence_weight = nn.Parameter(
-            torch.zeros(modes, self.path_count, self.path_count)
-        )
+        self.coherence_weight = nn.Parameter(torch.zeros(modes, self.path_count, self.path_count))
         self.output = GroupedWidelyLinear(modes, self.path_count, 1, bias=True)
 
     def forward(self, real: Tensor, imag: Tensor) -> ComplexField:

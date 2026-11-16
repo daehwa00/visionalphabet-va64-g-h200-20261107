@@ -159,7 +159,11 @@ class SameResolutionPoleScanBlock(nn.Module):
             return real, imag
         return self.memory_projection(real, imag)
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def forward(self, real: Tensor, imag: Tensor | None = None) -> ComplexField | Tensor:
+        if imag is None:
+            from .pac_packed_execution import same_resolution_packed  # noqa: PLC0415
+
+            return same_resolution_packed(self, real)
         if real.shape != imag.shape or real.ndim != 4 or real.shape[-1] != self.modes:
             message = "same-resolution pole block requires matching NHWM tensors"
             raise ValueError(message)

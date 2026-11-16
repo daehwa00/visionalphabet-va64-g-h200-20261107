@@ -41,6 +41,8 @@ FORWARD_LAUNCH_NAME = "d4_grouped_path_collapse_forward"
 BACKWARD_LAUNCH_NAME = "d4_grouped_path_collapse_backward"
 CELL_FORWARD_LAUNCH_NAME = "d4_grouped_cell_path_collapse_forward"
 CELL_BACKWARD_LAUNCH_NAME = "d4_grouped_cell_path_collapse_backward"
+PACKED_FORWARD_LAUNCH_NAME = "d4_grouped_path_collapse_packed_forward"
+PACKED_BACKWARD_LAUNCH_NAME = "d4_grouped_path_collapse_packed_backward"
 _LAUNCH_CANDIDATES = tuple(
     LaunchGeometry.build(
         num_warps=warps,
@@ -82,6 +84,13 @@ register_default(
     _DEFAULT_LAUNCH_GEOMETRY,
     candidates=_LAUNCH_CANDIDATES,
 )
+
+for _packed_launch_name in (PACKED_FORWARD_LAUNCH_NAME, PACKED_BACKWARD_LAUNCH_NAME):
+    register_default(
+        _packed_launch_name,
+        _DEFAULT_LAUNCH_GEOMETRY,
+        candidates=_LAUNCH_CANDIDATES,
+    )
 
 
 class _AutogradContext(Protocol):
@@ -177,9 +186,8 @@ def d4_grouped_path_swiglu_reference(
         (source_real.transpose(-2, -1), source_imag.transpose(-2, -1)),
         dim=-1,
     ).to(dtype=_execution_dtype(source_real))
-    joint = (
-        torch.einsum("...mi,mhi->...mh", source, _typed(input_weight, source))
-        + _typed(input_bias, source)
+    joint = torch.einsum("...mi,mhi->...mh", source, _typed(input_weight, source)) + _typed(
+        input_bias, source
     )
     value = joint[..., : 2 * hidden_modes]
     gate_logits = joint[..., 2 * hidden_modes :]
@@ -312,6 +320,94 @@ def _validate(
         raise TypeError("grouped D4 path-collapse sources must share one dtype")
 
 
+def _validate_real_packed(
+    source: Tensor,
+    input_weight: Tensor,
+    input_bias: Tensor,
+    output_weight: Tensor,
+    output_bias: Tensor,
+) -> None:
+    if (
+        source.ndim < 2
+        or source.shape[-2] != _PATH_COUNT
+        or source.shape[-1] <= 0
+        or source.shape[-1] % 2
+    ):
+        raise ValueError("packed D4 collapse requires (..., 4, 2 * modes) sources")
+    modes = source.shape[-1] // 2
+    if (
+        input_weight.ndim != 3
+        or input_weight.shape[0] != modes
+        or input_weight.shape[2] != _PACKED_INPUTS
+        or input_weight.shape[1] <= 0
+        or input_weight.shape[1] % 2
+    ):
+        raise ValueError("packed D4 input projection has incompatible dimensions")
+    hidden = input_weight.shape[1]
+    if (
+        input_bias.shape != (modes, hidden)
+        or output_weight.shape != (modes, _PACKED_OUTPUTS, hidden)
+        or output_bias.shape != (modes, _PACKED_OUTPUTS)
+    ):
+        raise ValueError("packed D4 output projection has incompatible dimensions")
+    if any(
+        value.device != source.device
+        for value in (input_weight, input_bias, output_weight, output_bias)
+    ):
+        raise ValueError("packed D4 collapse tensors must share one device")
+
+
+def supports_d4_grouped_path_collapse_packed(
+    source: Tensor,
+    input_weight: Tensor,
+    input_bias: Tensor,
+    output_weight: Tensor,
+    output_bias: Tensor,
+) -> bool:
+    """Check the native packed training contract without creating channel views."""
+    try:
+        _validate_real_packed(source, input_weight, input_bias, output_weight, output_bias)
+    except (TypeError, ValueError):
+        return False
+    return (
+        source.is_cuda
+        and _execution_dtype(source) is torch.bfloat16
+        and source.numel() > 0
+        and source.is_contiguous()
+        and not torch.are_deterministic_algorithms_enabled()
+        and all(
+            value.dtype is torch.float32 and value.is_contiguous()
+            for value in (input_weight, input_bias, output_weight, output_bias)
+        )
+    )
+
+
+def d4_grouped_path_collapse_packed_reference(
+    source: Tensor,
+    input_weight: Tensor,
+    input_bias: Tensor,
+    output_weight: Tensor,
+    output_bias: Tensor,
+) -> Tensor:
+    """Cartesian SiLU reference for [..., path, real-modes + imag-modes]."""
+    _validate_real_packed(source, input_weight, input_bias, output_weight, output_bias)
+    modes = source.shape[-1] // 2
+    cartesian = (
+        source.reshape(*source.shape[:-2], _PATH_COUNT, 2, modes)
+        .transpose(-3, -1)
+        .flatten(-2)
+        .to(dtype=_execution_dtype(source))
+    )
+    hidden = functional.silu(
+        torch.einsum("...mi,mhi->...mh", cartesian, _typed(input_weight, cartesian))
+        + _typed(input_bias, cartesian)
+    )
+    output = torch.einsum("...mh,moh->...mo", hidden, _typed(output_weight, cartesian)) + _typed(
+        output_bias, cartesian
+    )
+    return output.transpose(-2, -1).contiguous().reshape(*source.shape[:-2], 2 * modes)
+
+
 def _validate_swiglu(
     source_real: Tensor,
     source_imag: Tensor,
@@ -395,9 +491,7 @@ def _validate_cells(
         _PATH_COUNT,
         _PATH_COUNT,
     ):
-        raise ValueError(
-            "grouped D4 cell collapse requires BHW-direction-local-mode sources"
-        )
+        raise ValueError("grouped D4 cell collapse requires BHW-direction-local-mode sources")
 
 
 def supports_d4_grouped_path_collapse(
@@ -440,6 +534,8 @@ def supports_d4_grouped_path_collapse(
             for value in (input_weight, input_bias, output_weight, output_bias)
         )
     )
+
+
 def supports_d4_grouped_cell_path_collapse(
     source_real: Tensor,
     source_imag: Tensor,
@@ -555,10 +651,11 @@ def _launch_scope(
     path_hidden: int,
     *,
     cell_layout: bool = False,
+    real_packed: bool = False,
 ) -> LaunchScope:
-    modes = source.shape[-1]
+    modes = source.shape[-1] // 2 if real_packed else source.shape[-1]
     paths_per_token = _PATH_COUNT * (_PATH_COUNT if cell_layout else 1)
-    tokens = source.numel() // (paths_per_token * modes)
+    tokens = source.numel() // (paths_per_token * modes * (2 if real_packed else 1))
     if cell_layout:
         tokens *= _PATH_COUNT
     return make_launch_scope(
@@ -569,6 +666,7 @@ def _launch_scope(
             "modes": modes,
             "path_hidden": path_hidden,
             "cell_layout": cell_layout,
+            "real_packed": real_packed,
         },
     )
 
@@ -625,6 +723,7 @@ def _d4_grouped_path_collapse_forward_kernel(
     BLOCK_MODES: tl.constexpr,
     BLOCK_HIDDEN: tl.constexpr,
     BLOCK_SWIGLU_VALUE: tl.constexpr,
+    REAL_PACKED: tl.constexpr = 0,
 ) -> None:
     mode = tl.program_id(1) * BLOCK_MODES + tl.arange(0, BLOCK_MODES)
     token = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
@@ -636,7 +735,7 @@ def _d4_grouped_path_collapse_forward_kernel(
         token[None, :, None],
         path[None, None, :],
         mode[:, None, None],
-        modes,
+        modes * (2 if REAL_PACKED else 1),
         coarse_height,
         coarse_width,
         CELL_LAYOUT,
@@ -652,7 +751,7 @@ def _d4_grouped_path_collapse_forward_kernel(
         tl.where(
             coordinate[None, None, :] < _PACKED_INPUTS_TL,
             tl.load(
-                source_imag + source_offset,
+                source_imag + source_offset + (modes if REAL_PACKED else 0),
                 mask=source_mask & (coordinate[None, None, :] >= _PATHS),
                 other=0.0,
             ),
@@ -737,9 +836,13 @@ def _d4_grouped_path_collapse_forward_kernel(
         tl.where(output_coordinate[None, None, :] == 1, active_output, 0.0),
         axis=2,
     ).to(tl.bfloat16)
-    output_offset = token[None, :] * modes + mode[:, None]
+    output_offset = token[None, :] * modes * (2 if REAL_PACKED else 1) + mode[:, None]
     tl.store(output_real + output_offset, active_output_real, mask=valid_row)
-    tl.store(output_imag + output_offset, active_output_imag, mask=valid_row)
+    if REAL_PACKED:
+        # Keep one mutated argument so AOT functionalization retains both halves.
+        tl.store(output_real + output_offset + modes, active_output_imag, mask=valid_row)
+    else:
+        tl.store(output_imag + output_offset, active_output_imag, mask=valid_row)
 
 
 @triton.jit
@@ -769,6 +872,7 @@ def _d4_grouped_path_collapse_backward_kernel(
     BLOCK_MODES: tl.constexpr,
     BLOCK_HIDDEN: tl.constexpr,
     BLOCK_SWIGLU_VALUE: tl.constexpr,
+    REAL_PACKED: tl.constexpr = 0,
 ) -> None:
     mode = tl.program_id(1) * BLOCK_MODES + tl.arange(0, BLOCK_MODES)
     token = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
@@ -780,7 +884,7 @@ def _d4_grouped_path_collapse_backward_kernel(
         token[None, :, None],
         path[None, None, :],
         mode[:, None, None],
-        modes,
+        modes * (2 if REAL_PACKED else 1),
         coarse_height,
         coarse_width,
         CELL_LAYOUT,
@@ -796,7 +900,7 @@ def _d4_grouped_path_collapse_backward_kernel(
         tl.where(
             coordinate[None, None, :] < _PACKED_INPUTS_TL,
             tl.load(
-                source_imag + source_offset,
+                source_imag + source_offset + (modes if REAL_PACKED else 0),
                 mask=source_mask & (coordinate[None, None, :] >= _PATHS),
                 other=0.0,
             ),
@@ -823,14 +927,14 @@ def _d4_grouped_path_collapse_backward_kernel(
     ).to(tl.bfloat16)
     preactivation = (preactivation + active_input_bias[:, None, :]).to(tl.bfloat16)
     output_coordinate = tl.arange(0, _DOT_OUTPUTS)
-    output_offset = token[None, :] * modes + mode[:, None]
+    output_offset = token[None, :] * modes * (2 if REAL_PACKED else 1) + mode[:, None]
     active_grad_output_real = tl.load(
         grad_output_real + output_offset,
         mask=valid_row,
         other=0.0,
     ).to(tl.bfloat16)
     active_grad_output_imag = tl.load(
-        grad_output_imag + output_offset,
+        grad_output_imag + output_offset + (modes if REAL_PACKED else 0),
         mask=valid_row,
         other=0.0,
     ).to(tl.bfloat16)
@@ -880,8 +984,7 @@ def _d4_grouped_path_collapse_backward_kernel(
         gate_derivative = gate_sigmoid * (1.0 + gate_logits * (1.0 - gate_sigmoid))
         grad_gate_contribution = grad_gated_value * active_value * gate_derivative
         value_match = (
-            hidden_coordinate[None, None, None, :]
-            == value_coordinate[None, None, :, None]
+            hidden_coordinate[None, None, None, :] == value_coordinate[None, None, :, None]
         )
         value_joint_gradient = tl.sum(
             tl.where(value_match, grad_value[:, :, :, None], 0.0),
@@ -889,9 +992,7 @@ def _d4_grouped_path_collapse_backward_kernel(
         )
         gate_match = (
             hidden_coordinate[None, None, None, :]
-            == (
-                    2 * SWIGLU_HIDDEN + value_coordinate % SWIGLU_HIDDEN
-            )[None, None, :, None]
+            == (2 * SWIGLU_HIDDEN + value_coordinate % SWIGLU_HIDDEN)[None, None, :, None]
         )
         gate_joint_gradient = tl.sum(
             tl.where(gate_match, grad_gate_contribution[:, :, :, None], 0.0),
@@ -993,7 +1094,7 @@ def _d4_grouped_path_collapse_backward_kernel(
         token[None, :, None],
         path_coordinate[None, None, :],
         mode[:, None, None],
-        modes,
+        modes * (2 if REAL_PACKED else 1),
         coarse_height,
         coarse_width,
         CELL_LAYOUT,
@@ -1004,11 +1105,197 @@ def _d4_grouped_path_collapse_backward_kernel(
         grad_source_real_values,
         mask=grad_source_mask,
     )
-    tl.store(
-        grad_source_imag + grad_source_offset,
-        grad_source_imag_values,
-        mask=grad_source_mask,
+    if REAL_PACKED:
+        tl.store(
+            grad_source_real + grad_source_offset + modes,
+            grad_source_imag_values,
+            mask=grad_source_mask,
+        )
+    else:
+        tl.store(
+            grad_source_imag + grad_source_offset,
+            grad_source_imag_values,
+            mask=grad_source_mask,
+        )
+
+
+@triton_op("lnet::pac_d4_grouped_path_collapse_packed", mutates_args={})
+def _packed_forward_op(
+    source: Tensor,
+    input_weight: Tensor,
+    input_bias: Tensor,
+    output_weight: Tensor,
+    output_bias: Tensor,
+) -> Tensor:
+    _validate_real_packed(source, input_weight, input_bias, output_weight, output_bias)
+    if not source.is_cuda:
+        return d4_grouped_path_collapse_packed_reference(
+            source, input_weight, input_bias, output_weight, output_bias
+        )
+    modes = source.shape[-1] // 2
+    token_count = source.numel() // (_PATH_COUNT * 2 * modes)
+    packed_hidden = input_weight.shape[1]
+    output = torch.empty(
+        (*source.shape[:-2], 2 * modes), device=source.device, dtype=torch.bfloat16
     )
+    kernel = autotuned(
+        _d4_grouped_path_collapse_forward_kernel,
+        PACKED_FORWARD_LAUNCH_NAME,
+        key=("token_count", "modes", "packed_hidden"),
+        scope=_launch_scope(
+            _d4_grouped_path_collapse_forward_kernel,
+            source,
+            packed_hidden // 2,
+            real_packed=True,
+        ),
+    )
+
+    def grid(metadata: dict[str, int]) -> tuple[int, int]:
+        return (
+            int(triton.cdiv(token_count, metadata["BLOCK_TOKENS"])),
+            int(triton.cdiv(modes, metadata["BLOCK_MODES"])),
+        )
+
+    wrap_triton(kernel)[grid](
+        source,
+        source,
+        input_weight,
+        input_bias,
+        output_weight,
+        output_bias,
+        output,
+        source,  # Unused read-only argument in the packed specialization.
+        token_count,
+        modes,
+        packed_hidden,
+        0,
+        0,
+        CELL_LAYOUT=False,
+        PATH_SWIGLU=False,
+        SWIGLU_HIDDEN=0,
+        BLOCK_HIDDEN=max(16, triton.next_power_of_2(packed_hidden)),
+        BLOCK_SWIGLU_VALUE=16,
+        REAL_PACKED=True,
+    )
+    return output
+
+
+@triton_op("lnet::pac_d4_grouped_path_collapse_packed_backward", mutates_args={})
+def _packed_backward_op(
+    source: Tensor,
+    input_weight: Tensor,
+    input_bias: Tensor,
+    output_weight: Tensor,
+    output_bias: Tensor,
+    grad_output: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    modes = source.shape[-1] // 2
+    token_count = source.numel() // (_PATH_COUNT * 2 * modes)
+    packed_hidden = input_weight.shape[1]
+    grad_source = torch.empty_like(source)
+    gradients = tuple(
+        torch.zeros_like(value, memory_format=torch.contiguous_format)
+        for value in (input_weight, input_bias, output_weight, output_bias)
+    )
+    kernel = autotuned(
+        _d4_grouped_path_collapse_backward_kernel,
+        PACKED_BACKWARD_LAUNCH_NAME,
+        key=("token_count", "modes", "packed_hidden"),
+        restore_value=(
+            "grad_input_weight",
+            "grad_input_bias",
+            "grad_output_weight",
+            "grad_output_bias",
+        ),
+        scope=_launch_scope(
+            _d4_grouped_path_collapse_backward_kernel,
+            source,
+            packed_hidden // 2,
+            real_packed=True,
+        ),
+    )
+
+    def grid(metadata: dict[str, int]) -> tuple[int, int]:
+        return (
+            int(triton.cdiv(token_count, metadata["BLOCK_TOKENS"])),
+            int(triton.cdiv(modes, metadata["BLOCK_MODES"])),
+        )
+
+    wrap_triton(kernel)[grid](
+        source,
+        source,
+        input_weight,
+        input_bias,
+        output_weight,
+        grad_output,
+        grad_output,
+        grad_source,
+        source,  # Unused read-only argument in the packed specialization.
+        *gradients,
+        token_count,
+        modes,
+        packed_hidden,
+        0,
+        0,
+        CELL_LAYOUT=False,
+        PATH_SWIGLU=False,
+        SWIGLU_HIDDEN=0,
+        BLOCK_HIDDEN=max(16, triton.next_power_of_2(packed_hidden)),
+        BLOCK_SWIGLU_VALUE=16,
+        REAL_PACKED=True,
+    )
+    return grad_source, gradients[0], gradients[1], gradients[2], gradients[3]
+
+
+def _packed_setup_context(
+    ctx: _AutogradContext,
+    inputs: tuple[Tensor, ...],
+    output: Tensor,
+) -> None:
+    del output
+    ctx.save_for_backward(*inputs)
+
+
+def _packed_backward(
+    ctx: _AutogradContext,
+    grad_output: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    inputs = ctx.saved_tensors
+    if not inputs[0].is_cuda:
+        differentiable = tuple(value.detach().requires_grad_() for value in inputs)
+        with torch.enable_grad():
+            output = d4_grouped_path_collapse_packed_reference(*differentiable)
+        return cast(
+            "tuple[Tensor, Tensor, Tensor, Tensor, Tensor]",
+            torch.autograd.grad(output, differentiable, grad_output),
+        )
+    return _packed_backward_op(*inputs, grad_output.contiguous())
+
+
+torch.library.register_autograd(
+    "lnet::pac_d4_grouped_path_collapse_packed",
+    _packed_backward,
+    setup_context=_packed_setup_context,
+)
+
+
+def d4_grouped_path_collapse_packed(
+    source: Tensor,
+    input_weight: Tensor,
+    input_bias: Tensor,
+    output_weight: Tensor,
+    output_bias: Tensor,
+) -> Tensor:
+    """Collapse [..., 4, 2P] directly into one contiguous [..., 2P] buffer."""
+    if not source.is_cuda:
+        return d4_grouped_path_collapse_packed_reference(
+            source, input_weight, input_bias, output_weight, output_bias
+        )
+    if not supports_d4_grouped_path_collapse_packed(
+        source, input_weight, input_bias, output_weight, output_bias
+    ):
+        raise RuntimeError("unsupported CUDA contract reached packed D4 path collapse")
+    return _packed_forward_op(source, input_weight, input_bias, output_weight, output_bias)
 
 
 @triton_op("lnet::pac_d4_grouped_path_collapse", mutates_args={})
@@ -1089,6 +1376,7 @@ def _forward_op(
         SWIGLU_HIDDEN=0,
         BLOCK_HIDDEN=max(16, triton.next_power_of_2(packed_hidden)),
         BLOCK_SWIGLU_VALUE=16,
+        REAL_PACKED=False,
     )
     return outputs
 
@@ -1171,6 +1459,7 @@ def _swiglu_forward_op(
         SWIGLU_HIDDEN=hidden_modes,
         BLOCK_HIDDEN=max(16, triton.next_power_of_2(packed_hidden)),
         BLOCK_SWIGLU_VALUE=max(16, triton.next_power_of_2(2 * hidden_modes)),
+        REAL_PACKED=False,
     )
     return outputs
 
@@ -1254,6 +1543,7 @@ def _cell_forward_op(
         SWIGLU_HIDDEN=0,
         BLOCK_HIDDEN=max(16, triton.next_power_of_2(packed_hidden)),
         BLOCK_SWIGLU_VALUE=16,
+        REAL_PACKED=False,
     )
     return outputs
 
@@ -1388,10 +1678,9 @@ def _atomic_backward(
         SWIGLU_HIDDEN=swiglu_hidden,
         BLOCK_HIDDEN=max(16, triton.next_power_of_2(packed_hidden)),
         BLOCK_SWIGLU_VALUE=(
-            max(16, triton.next_power_of_2(2 * swiglu_hidden))
-            if path_swiglu
-            else 16
+            max(16, triton.next_power_of_2(2 * swiglu_hidden)) if path_swiglu else 16
         ),
+        REAL_PACKED=False,
     )
     return (
         grad_source_real,
@@ -1425,6 +1714,7 @@ def _cell_backward_op(
         grad_output_imag,
         cell_layout=True,
     )
+
 
 def _setup_context(
     ctx: _AutogradContext,

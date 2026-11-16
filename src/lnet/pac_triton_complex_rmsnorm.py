@@ -71,6 +71,7 @@ register_default(
 
 class _AutogradContext(Protocol):
     saved_tensors: tuple[Tensor, ...]
+    input_dtypes: tuple[torch.dtype, torch.dtype]
 
     def save_for_backward(self, *tensors: Tensor) -> None: ...
 
@@ -149,9 +150,9 @@ def _row_layout(tensor: Tensor) -> tuple[int, int, int, int]:
     return inner_rows, outer_row_stride, tensor.stride(-2), tensor.stride(-1)
 
 
-def _scope(kernel: object, real: Tensor) -> LaunchScope:
-    modes = real.shape[-1]
-    rows = real.numel() // modes
+def _scope(kernel: object, real: Tensor, *, packed: bool = False) -> LaunchScope:
+    modes = real.shape[-1] // 2 if packed else real.shape[-1]
+    rows = real.numel() // real.shape[-1]
     inner_rows, outer_stride, inner_stride, mode_stride = _row_layout(real)
     return make_launch_scope(
         kernel,
@@ -170,6 +171,8 @@ def _scope(kernel: object, real: Tensor) -> LaunchScope:
 @triton.jit
 def _packed_complex_rmsnorm_forward_kernel(
     real,
+    addend,
+    merged,
     imag,
     norm_weight,
     output,
@@ -185,19 +188,38 @@ def _packed_complex_rmsnorm_forward_kernel(
     BLOCK_MODES: tl.constexpr,
     CONTIGUOUS_SOURCE: tl.constexpr,
     SOURCE_IS_BF16: tl.constexpr,
+    PACKED_COORDINATES: tl.constexpr,
+    ADD_RESIDUAL: tl.constexpr,
 ) -> None:
     row_id = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     row = row_id[:, None]
     mode = tl.arange(0, BLOCK_MODES)[None, :]
     mask = (row < rows) & (mode < modes)
     if CONTIGUOUS_SOURCE:
-        offset = row * modes + mode
+        offset = row * modes * (2 if PACKED_COORDINATES else 1) + mode
     else:
         outer_row = row // inner_rows
         inner_row = row % inner_rows
         offset = outer_row * outer_row_stride + inner_row * inner_row_stride + mode * mode_stride
     active_real = tl.load(real + offset, mask=mask, other=0.0).to(tl.float32)
-    active_imag = tl.load(imag + offset, mask=mask, other=0.0).to(tl.float32)
+    imag_offset = modes * mode_stride if PACKED_COORDINATES else 0
+    active_imag = tl.load(imag + offset + imag_offset, mask=mask, other=0.0).to(tl.float32)
+    if ADD_RESIDUAL:
+        active_real = (
+            (active_real + tl.load(addend + offset, mask=mask, other=0).to(tl.float32))
+            .to(merged.dtype.element_ty)
+            .to(tl.float32)
+        )
+        active_imag = (
+            (
+                active_imag
+                + tl.load(addend + offset + imag_offset, mask=mask, other=0).to(tl.float32)
+            )
+            .to(merged.dtype.element_ty)
+            .to(tl.float32)
+        )
+        tl.store(merged + row * (2 * modes) + mode, active_real, mask=mask)
+        tl.store(merged + row * (2 * modes) + modes + mode, active_imag, mask=mask)
     energy = tl.sum(active_real * active_real + active_imag * active_imag, axis=1)
     inverse_rms = tl.rsqrt(energy / modes + epsilon)
     active_weight = tl.load(norm_weight + mode, mask=mode < modes, other=0.0)
@@ -240,6 +262,7 @@ def _packed_complex_rmsnorm_backward_kernel(
     PARTIAL_ROWS: tl.constexpr,
     CONTIGUOUS_SOURCE: tl.constexpr,
     SOURCE_IS_BF16: tl.constexpr,
+    PACKED_COORDINATES: tl.constexpr,
 ) -> None:
     row_block = tl.program_id(0)
     row_id = row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
@@ -247,16 +270,17 @@ def _packed_complex_rmsnorm_backward_kernel(
     mode = tl.arange(0, BLOCK_MODES)[None, :]
     mask = (row < rows) & (mode < modes)
     if CONTIGUOUS_SOURCE:
-        source_offset = row * modes + mode
+        source_offset = row * modes * (2 if PACKED_COORDINATES else 1) + mode
     else:
         outer_row = row // inner_rows
         inner_row = row % inner_rows
         source_offset = (
             outer_row * outer_row_stride + inner_row * inner_row_stride + mode * mode_stride
         )
-    output_offset = row * modes + mode
+    output_offset = row * modes * (2 if PACKED_COORDINATES else 1) + mode
     active_real = tl.load(real + source_offset, mask=mask, other=0.0).to(tl.float32)
-    active_imag = tl.load(imag + source_offset, mask=mask, other=0.0).to(tl.float32)
+    imag_offset = modes * mode_stride if PACKED_COORDINATES else 0
+    active_imag = tl.load(imag + source_offset + imag_offset, mask=mask, other=0.0).to(tl.float32)
     grad_normalized_real = tl.load(grad_output + row * (2 * modes) + mode, mask=mask, other=0.0)
     grad_normalized_imag = tl.load(
         grad_output + row * (2 * modes) + modes + mode,
@@ -299,7 +323,11 @@ def _packed_complex_rmsnorm_backward_kernel(
         active_inverse_rms[:, None] * scaled_grad_imag - active_imag * correction[:, None]
     )
     tl.store(grad_real + output_offset, active_grad_real, mask=mask)
-    tl.store(grad_imag + output_offset, active_grad_imag, mask=mask)
+    if PACKED_COORDINATES:
+        # One mutated argument avoids AOT functionalization cloning aliased outputs.
+        tl.store(grad_real + output_offset + modes, active_grad_imag, mask=mask)
+    else:
+        tl.store(grad_imag + output_offset, active_grad_imag, mask=mask)
 
     grad_weight_contribution = (
         grad_normalized_real.to(tl.float32) * normalized_base_real
@@ -362,8 +390,21 @@ def _forward_op(
     if not _supports_forward_op(real, imag, norm_weight):
         message = "CUDA packed RMSNorm requires BF16 or FP32 inside BF16 autocast"
         raise RuntimeError(message)
-    modes = real.shape[-1]
-    rows = real.numel() // modes
+    return _run_forward(real, imag, norm_weight, epsilon)
+
+
+def _run_forward(
+    real: Tensor,
+    imag: Tensor,
+    norm_weight: Tensor,
+    epsilon: float,
+    *,
+    packed: bool = False,
+    addend: Tensor | None = None,
+    merged: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    modes = real.shape[-1] // 2 if packed else real.shape[-1]
+    rows = real.numel() // real.shape[-1]
     inner_rows, outer_stride, inner_stride, mode_stride = _row_layout(real)
     output = torch.empty(
         (*real.shape[:-1], 2 * modes),
@@ -382,7 +423,7 @@ def _forward_op(
             "inner_row_stride",
             "mode_stride",
         ),
-        scope=_scope(_packed_complex_rmsnorm_forward_kernel, real),
+        scope=_scope(_packed_complex_rmsnorm_forward_kernel, real, packed=packed),
     )
 
     def grid(metadata: dict[str, int]) -> tuple[int]:
@@ -390,6 +431,8 @@ def _forward_op(
 
     wrap_triton(kernel)[grid](
         real,
+        real if addend is None else addend,
+        real if merged is None else merged,
         imag,
         norm_weight,
         output,
@@ -403,7 +446,9 @@ def _forward_op(
         mode_stride,
         BLOCK_MODES=max(16, triton.next_power_of_2(modes)),
         CONTIGUOUS_SOURCE=real.is_contiguous(),
-        SOURCE_IS_BF16=real.dtype is torch.bfloat16,
+        SOURCE_IS_BF16=(real if merged is None else merged).dtype is torch.bfloat16,
+        PACKED_COORDINATES=packed,
+        ADD_RESIDUAL=addend is not None,
     )
     return output, row_inverse_rms
 
@@ -426,11 +471,25 @@ def _backward_op(
     row_inverse_rms: Tensor,
     grad_output: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    modes = real.shape[-1]
-    rows = real.numel() // modes
+    return _run_backward(real, imag, norm_weight, row_inverse_rms, grad_output)
+
+
+def _run_backward(
+    real: Tensor,
+    imag: Tensor,
+    norm_weight: Tensor,
+    row_inverse_rms: Tensor,
+    grad_output: Tensor,
+    *,
+    packed: bool = False,
+) -> tuple[Tensor, Tensor, Tensor]:
+    modes = real.shape[-1] // 2 if packed else real.shape[-1]
+    rows = real.numel() // real.shape[-1]
     inner_rows, outer_stride, inner_stride, mode_stride = _row_layout(real)
     grad_real = torch.empty_like(real, memory_format=torch.contiguous_format)
-    grad_imag = torch.empty_like(imag, memory_format=torch.contiguous_format)
+    grad_imag = (
+        grad_real if packed else torch.empty_like(imag, memory_format=torch.contiguous_format)
+    )
     partial_rows = device_parameter_reduction_rows(real, rows)
     partial_count = int(triton.cdiv(rows, partial_rows))
     partial_grad_norm_weight = torch.zeros(
@@ -450,7 +509,7 @@ def _backward_op(
             "inner_row_stride",
             "mode_stride",
         ),
-        scope=_scope(_packed_complex_rmsnorm_backward_kernel, real),
+        scope=_scope(_packed_complex_rmsnorm_backward_kernel, real, packed=packed),
         reset_to_zero=("partial_grad_norm_weight",),
     )
 
@@ -464,7 +523,7 @@ def _backward_op(
         row_inverse_rms,
         grad_output,
         grad_real,
-        grad_imag,
+        real if packed else grad_imag,
         partial_grad_norm_weight,
         rows,
         modes,
@@ -476,6 +535,7 @@ def _backward_op(
         PARTIAL_ROWS=partial_rows,
         CONTIGUOUS_SOURCE=real.is_contiguous(),
         SOURCE_IS_BF16=real.dtype is torch.bfloat16,
+        PACKED_COORDINATES=packed,
     )
 
     reduce_kernel = autotuned(
@@ -531,6 +591,96 @@ torch.library.register_autograd(
 )
 
 
+def _validate_packed(packed: Tensor, norm_weight: Tensor, epsilon: float) -> None:
+    if packed.ndim < 1 or packed.shape[-1] <= 0 or packed.shape[-1] % 2:
+        raise ValueError("packed complex RMSNorm requires a positive even final dimension")
+    if norm_weight.shape != (packed.shape[-1] // 2,):
+        raise ValueError("complex RMSNorm scale has incompatible dimensions")
+    if epsilon <= 0.0:
+        raise ValueError("complex RMSNorm epsilon must be positive")
+    if norm_weight.device != packed.device:
+        raise ValueError("complex RMSNorm tensors must share one device")
+    if not packed.is_floating_point():
+        raise TypeError("packed complex RMSNorm requires real floating-point coordinates")
+
+
+@triton_op("lnet::packed_complex_rmsnorm_from_packed", mutates_args={})
+def _native_packed_forward_op(
+    packed: Tensor,
+    norm_weight: Tensor,
+    epsilon: float,
+) -> tuple[Tensor, Tensor]:
+    _validate_packed(packed, norm_weight, epsilon)
+    if not _supports_forward_op(packed, packed, norm_weight):
+        raise RuntimeError("CUDA packed RMSNorm requires dense BF16 or FP32 rows")
+    return _run_forward(packed, packed, norm_weight, epsilon, packed=True)
+
+
+@triton_op("lnet::packed_complex_rmsnorm_from_packed_backward", mutates_args={})
+def _native_packed_backward_op(
+    packed: Tensor,
+    norm_weight: Tensor,
+    row_inverse_rms: Tensor,
+    grad_output: Tensor,
+) -> tuple[Tensor, Tensor]:
+    grad_packed, _, grad_weight = _run_backward(
+        packed, packed, norm_weight, row_inverse_rms, grad_output, packed=True
+    )
+    return grad_packed, grad_weight
+
+
+def _native_packed_setup_context(
+    ctx: _AutogradContext,
+    inputs: tuple[Tensor, Tensor, float],
+    output: tuple[Tensor, Tensor],
+) -> None:
+    packed, norm_weight, _ = inputs
+    _, row_inverse_rms = output
+    ctx.save_for_backward(packed, norm_weight, row_inverse_rms)
+
+
+def _native_packed_backward(
+    ctx: _AutogradContext,
+    grad_output: Tensor | None,
+    grad_row_inverse_rms: Tensor | None,
+) -> tuple[Tensor, Tensor, None]:
+    del grad_row_inverse_rms
+    packed, norm_weight, row_inverse_rms = ctx.saved_tensors
+    if grad_output is None:
+        grad_output = torch.zeros_like(packed, dtype=torch.bfloat16)
+    grad_packed, grad_weight = _native_packed_backward_op(
+        packed, norm_weight, row_inverse_rms, grad_output.contiguous()
+    )
+    return grad_packed, grad_weight, None
+
+
+torch.library.register_autograd(
+    "lnet::packed_complex_rmsnorm_from_packed",
+    _native_packed_backward,
+    setup_context=_native_packed_setup_context,
+)
+
+
+def packed_complex_rms_norm_from_packed(
+    packed: Tensor,
+    norm_weight: Tensor,
+    epsilon: float,
+) -> Tensor:
+    """Normalize packed rows using mean complex energy, retaining one packed gradient."""
+    _validate_packed(packed, norm_weight, epsilon)
+    if _supports_forward_op(packed, packed, norm_weight) and (
+        packed.dtype is torch.bfloat16 or _cuda_bf16_autocast_enabled()
+    ):
+        output, _ = _native_packed_forward_op(packed, norm_weight, epsilon)
+        return output
+    # Keep the Cartesian axis as a view so the fallback also avoids split/cat.
+    coordinates = packed.unflatten(-1, (2, packed.shape[-1] // 2))
+    energy = coordinates.float().square().sum(dim=-2).mean(dim=-1, keepdim=True)
+    inverse_rms = torch.rsqrt(energy + epsilon).to(dtype=packed.dtype)
+    weight = norm_weight.to(dtype=packed.dtype)
+    return (coordinates * inverse_rms.unsqueeze(-1) * weight).flatten(-2)
+
+
 def packed_complex_rms_norm(
     real: Tensor,
     imag: Tensor,
@@ -547,11 +697,79 @@ def packed_complex_rms_norm(
     return output
 
 
+@triton_op("lnet::packed_add_complex_rmsnorm", mutates_args={})
+def _add_norm_op(
+    left: Tensor, right: Tensor, weight: Tensor, epsilon: float
+) -> tuple[Tensor, Tensor, Tensor]:
+    merged = torch.empty_like(left, dtype=torch.promote_types(left.dtype, right.dtype))
+    normalized, inverse = _run_forward(
+        left, left, weight, epsilon, packed=True, addend=right, merged=merged
+    )
+    return merged, normalized, inverse
+
+
+def _add_norm_setup(
+    ctx: _AutogradContext,
+    inputs: tuple[Tensor, Tensor, Tensor, float],
+    output: tuple[Tensor, Tensor, Tensor],
+) -> None:
+    ctx.input_dtypes = (inputs[0].dtype, inputs[1].dtype)
+    ctx.save_for_backward(output[0], inputs[2], output[2])
+
+
+def _add_norm_backward(
+    ctx: _AutogradContext,
+    grad_merged: Tensor | None,
+    grad_normalized: Tensor | None,
+    grad_inverse: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor, None]:
+    del grad_inverse
+    merged, weight, inverse = ctx.saved_tensors
+    if grad_normalized is None:
+        grad_normalized = torch.zeros_like(merged, dtype=torch.bfloat16)
+    grad, grad_weight = _native_packed_backward_op(
+        merged, weight, inverse, grad_normalized.contiguous()
+    )
+    if grad_merged is not None:
+        grad = grad + grad_merged
+    return grad.to(ctx.input_dtypes[0]), grad.to(ctx.input_dtypes[1]), grad_weight, None
+
+
+torch.library.register_autograd(
+    "lnet::packed_add_complex_rmsnorm", _add_norm_backward, setup_context=_add_norm_setup
+)
+
+
+def packed_add_complex_rms_norm(
+    left: Tensor, right: Tensor, weight: Tensor, epsilon: float
+) -> tuple[Tensor, Tensor]:
+    """Add residuals and normalize in one pass, preserving the rounded sum."""
+    _validate_packed(left, weight, epsilon)
+    if left.shape != right.shape or left.device != right.device:
+        raise ValueError("residual inputs must have matching shapes and devices")
+    if (
+        right.dtype in (torch.float32, torch.bfloat16)
+        and left.is_contiguous()
+        and right.is_contiguous()
+        and _supports_forward_op(left, left, weight)
+        and (
+            (left.dtype is torch.bfloat16 and right.dtype is torch.bfloat16)
+            or _cuda_bf16_autocast_enabled()
+        )
+    ):
+        merged, normalized, _ = _add_norm_op(left, right, weight, epsilon)
+        return merged, normalized
+    merged = left + right
+    return merged, packed_complex_rms_norm_from_packed(merged, weight, epsilon)
+
+
 __all__ = [
     "BACKWARD_LAUNCH_NAME",
     "BACKWARD_REDUCE_LAUNCH_NAME",
     "FORWARD_LAUNCH_NAME",
+    "packed_add_complex_rms_norm",
     "packed_complex_rms_norm",
+    "packed_complex_rms_norm_from_packed",
     "packed_complex_rms_norm_reference",
     "supports_packed_complex_rms_norm",
 ]

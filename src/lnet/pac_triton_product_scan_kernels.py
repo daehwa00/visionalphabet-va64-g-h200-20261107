@@ -19,6 +19,7 @@ _PACKED_PATH_OUTPUTS_TL = tl.constexpr(_PACKED_PATH_OUTPUTS)
 _PATH_DOT_INPUTS_TL = tl.constexpr(_PATH_DOT_INPUTS)
 _PATH_DOT_OUTPUTS_TL = tl.constexpr(_PATH_DOT_OUTPUTS)
 
+
 @triton.jit
 def _compose_complex_pair(
     left_ar,
@@ -51,7 +52,42 @@ def _compose_complex_pair(
 
 
 @triton.jit
-def _product_scan_coarse4_associative_forward_kernel(
+def _coordinate_offset(offset, mode, PACKED: tl.constexpr):
+    if PACKED:
+        return 2 * offset - mode
+    return offset
+
+
+@triton.jit
+def _store_complex_coordinates(
+    real_pointer,
+    imag_pointer,
+    offset,
+    real,
+    imag,
+    mask,
+    modes,
+    PACKED: tl.constexpr,
+):
+    # A packed allocation must be exposed as one mutated pointer to AOT.
+    tl.store(real_pointer + offset, real, mask=mask)
+    if PACKED:
+        tl.store(real_pointer + offset + modes, imag, mask=mask)
+    else:
+        tl.store(imag_pointer + offset, imag, mask=mask)
+
+
+@triton.jit
+def _coarse_path_endpoint(value, PATH: tl.constexpr):
+    """Select the y endpoint; A/B streams already come from odd/even x."""
+    value = value.to(tl.bfloat16).to(tl.float32)
+    cells = tl.reshape(value, (value.shape[0] // 2, 2, value.shape[1], value.shape[2]))
+    row = tl.arange(0, 2)[None, :, None, None]
+    return tl.sum(tl.where(row == (1 if PATH < 2 else 0), cells, 0.0), axis=1)
+
+
+@triton.jit
+def _product_scan_coarse4_associative_forward_kernel(  # noqa: C901, PLR0912
     decay_real,
     decay_imag,
     gamma_real,
@@ -90,12 +126,17 @@ def _product_scan_coarse4_associative_forward_kernel(
     BLOCK_MODES: tl.constexpr,
     BLOCK_PATH_HIDDEN: tl.constexpr,
     BLOCK_SWIGLU_VALUE: tl.constexpr,
+    PACKED_OUTPUT: tl.constexpr = 0,
+    COARSE_PATHS: tl.constexpr = 0,
+    PLANAR_PATH_OUTPUT: tl.constexpr = 0,
+    DETERMINISTIC_DESCRIPTOR: tl.constexpr = 0,
 ) -> None:
     batch_size = line_count // width
+    scan_width = width // 2 if COARSE_PATHS else width
     line_group = tl.program_id(0)
     if BLOCK_LINES == 1:
-        batch = line_group // width
-        x_group = line_group - batch * width
+        batch = line_group // scan_width
+        x_group = line_group - batch * scan_width
     else:
         # Grouped programs are interleaved across batches.  Adjacent CTAs then
         # update different descriptor rows instead of contending on one batch.
@@ -105,10 +146,15 @@ def _product_scan_coarse4_associative_forward_kernel(
     y = tl.arange(0, BLOCK_HEIGHT)[:, None, None]
     mode_vector = tl.program_id(1) * BLOCK_MODES + tl.arange(0, BLOCK_MODES)
     mode = mode_vector[None, None, :]
-    valid_line = x < width
+    valid_line = x < scan_width
     active = valid_line & (y < height) & (mode < modes)
     valid_mode = valid_line & (mode < modes)
-    offset = ((batch * height + y) * width + x) * modes + mode
+    # Coarse endpoints need positive-x streams only at odd columns and
+    # negative-x streams only at even columns; the other scans are unused.
+    source_x_a = 2 * x + 1 if COARSE_PATHS else x
+    source_x_b = 2 * x if COARSE_PATHS else x
+    offset = ((batch * height + y) * width + source_x_a) * modes + mode
+    offset_b = ((batch * height + y) * width + source_x_b) * modes + mode
 
     ar = tl.load(decay_real + mode, mask=mode < modes, other=0.0).to(tl.float32)
     ai = tl.load(decay_imag + mode, mask=mode < modes, other=0.0).to(tl.float32)
@@ -116,8 +162,8 @@ def _product_scan_coarse4_associative_forward_kernel(
     gi = tl.load(gamma_imag + mode, mask=mode < modes, other=0.0).to(tl.float32)
     sar = tl.load(source_real_a + offset, mask=active, other=0.0).to(tl.float32)
     sai = tl.load(source_imag_a + offset, mask=active, other=0.0).to(tl.float32)
-    sbr = tl.load(source_real_b + offset, mask=active, other=0.0).to(tl.float32)
-    sbi = tl.load(source_imag_b + offset, mask=active, other=0.0).to(tl.float32)
+    sbr = tl.load(source_real_b + offset_b, mask=active, other=0.0).to(tl.float32)
+    sbi = tl.load(source_imag_b + offset_b, mask=active, other=0.0).to(tl.float32)
     scan_ar = tl.where(active, ar, 1.0)
     scan_ai = tl.where(active, ai, 0.0)
     positive = tl.associative_scan(
@@ -153,11 +199,12 @@ def _product_scan_coarse4_associative_forward_kernel(
         inverse_na = inverse_pa
         inverse_nb = inverse_pa
     else:
-        x_offset = x * modes + mode
+        x_offset = source_x_a * modes + mode
+        x_offset_b = source_x_b * modes + mode
         y_offset = y * modes + mode
         vx_positive = tl.load(variance_x + x_offset, mask=valid_mode, other=0.0)
         vx_negative = tl.load(
-            variance_x + width * modes + x_offset,
+            variance_x + width * modes + x_offset_b,
             mask=valid_mode,
             other=0.0,
         )
@@ -180,37 +227,40 @@ def _product_scan_coarse4_associative_forward_kernel(
     r3, i3 = tl.where(active, nbr * inverse_nb, 0.0), tl.where(active, nbi * inverse_nb, 0.0)
 
     if COLLAPSE_PATHS:
+        path_height: tl.constexpr = BLOCK_HEIGHT // 2 if COARSE_PATHS else BLOCK_HEIGHT
+        path_lines: tl.constexpr = BLOCK_LINES
+        path_tokens: tl.constexpr = path_height * path_lines
         r0_flat = tl.reshape(
-            tl.permute(r0, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r0, 0) if COARSE_PATHS else r0, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         r1_flat = tl.reshape(
-            tl.permute(r1, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r1, 1) if COARSE_PATHS else r1, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         r2_flat = tl.reshape(
-            tl.permute(r2, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r2, 2) if COARSE_PATHS else r2, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         r3_flat = tl.reshape(
-            tl.permute(r3, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r3, 3) if COARSE_PATHS else r3, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i0_flat = tl.reshape(
-            tl.permute(i0, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i0, 0) if COARSE_PATHS else i0, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i1_flat = tl.reshape(
-            tl.permute(i1, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i1, 1) if COARSE_PATHS else i1, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i2_flat = tl.reshape(
-            tl.permute(i2, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i2, 2) if COARSE_PATHS else i2, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i3_flat = tl.reshape(
-            tl.permute(i3, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i3, 3) if COARSE_PATHS else i3, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         path_coordinate = tl.arange(0, _PATH_DOT_INPUTS_TL)
         path = path_coordinate % _PATHS_TL
@@ -245,6 +295,10 @@ def _product_scan_coarse4_associative_forward_kernel(
             active_path,
             active_path_imag,
         ).to(tl.bfloat16)
+        if COARSE_PATHS:
+            packed_path = tl.where(
+                path_coordinate[None, None, :] < _PACKED_PATH_INPUTS_TL, packed_path, 0.0,
+            ).to(tl.bfloat16)
         hidden_coordinate = tl.arange(0, BLOCK_PATH_HIDDEN)
         input_weight_offset = (
             mode_vector[:, None, None] * packed_path_hidden + hidden_coordinate[None, None, :]
@@ -280,7 +334,7 @@ def _product_scan_coarse4_associative_forward_kernel(
                 value_coordinate[None, None, :],
                 (
                     BLOCK_MODES,
-                    BLOCK_HEIGHT * BLOCK_LINES,
+                    path_tokens,
                     BLOCK_SWIGLU_VALUE,
                 ),
             )
@@ -288,7 +342,7 @@ def _product_scan_coarse4_associative_forward_kernel(
                 (2 * SWIGLU_HIDDEN + value_coordinate % SWIGLU_HIDDEN)[None, None, :],
                 (
                     BLOCK_MODES,
-                    BLOCK_HEIGHT * BLOCK_LINES,
+                    path_tokens,
                     BLOCK_SWIGLU_VALUE,
                 ),
             )
@@ -329,13 +383,18 @@ def _product_scan_coarse4_associative_forward_kernel(
             ).to(tl.bfloat16)
             path_output = tl.dot(hidden, active_output_weight)
             path_output = (path_output + active_output_bias[:, None, :]).to(tl.bfloat16)
+        if COARSE_PATHS:
+            cell_y = tl.arange(0, path_height)[:, None, None]
+            cell_x = x_group * path_lines + tl.arange(0, path_lines)[None, :, None]
+            path_offset = ((batch * (height // 2) + cell_y) * (width // 2) + cell_x) * modes + mode
+            path_active = (cell_y < height // 2) & (cell_x < width // 2) & (mode < modes)
+        else:
+            path_offset, path_active = offset, active
         physical_offset = tl.reshape(
-            tl.permute(offset, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(path_offset, (2, 0, 1)), (BLOCK_MODES, path_tokens),
         )
         physical_active = tl.reshape(
-            tl.permute(active, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(path_active, (2, 0, 1)), (BLOCK_MODES, path_tokens),
         )
         collapsed_real_value = tl.sum(
             tl.where(output_coordinate[None, None, :] == 0, path_output, 0.0),
@@ -345,16 +404,21 @@ def _product_scan_coarse4_associative_forward_kernel(
             tl.where(output_coordinate[None, None, :] == 1, path_output, 0.0),
             axis=2,
         )
-        tl.store(
-            collapsed_real + physical_offset,
-            collapsed_real_value,
-            mask=physical_active,
-        )
-        tl.store(
-            collapsed_imag + physical_offset,
-            collapsed_imag_value,
-            mask=physical_active,
-        )
+        if PLANAR_PATH_OUTPUT:
+            plane_size = batch_size * (height // 2 if COARSE_PATHS else height) * (
+                width // 2 if COARSE_PATHS else width
+            ) * modes
+            tl.store(collapsed_real + physical_offset, collapsed_real_value, mask=physical_active)
+            tl.store(
+                collapsed_real + plane_size + physical_offset,
+                collapsed_imag_value, mask=physical_active,
+            )
+        else:
+            _store_complex_coordinates(
+                collapsed_real, collapsed_imag,
+                _coordinate_offset(physical_offset, mode_vector[:, None], PACKED_OUTPUT),
+                collapsed_real_value, collapsed_imag_value, physical_active, modes, PACKED_OUTPUT,
+            )
 
     if EMIT_COARSE:
         cell = (batch * (height // 2) + y // 2) * (width // 2) + x // 2
@@ -369,85 +433,143 @@ def _product_scan_coarse4_associative_forward_kernel(
             base1 = ((cell * 4 + 1) * 4 + local1) * modes + mode
             base2 = ((cell * 4 + 2) * 4 + local2) * modes + mode
             base3 = ((cell * 4 + 3) * 4 + local3) * modes + mode
-            tl.store(coarse_real + base0, r0, mask=active)
-            tl.store(coarse_imag + base0, i0, mask=active)
-            tl.store(coarse_real + base1, r1, mask=active)
-            tl.store(coarse_imag + base1, i1, mask=active)
-            tl.store(coarse_real + base2, r2, mask=active)
-            tl.store(coarse_imag + base2, i2, mask=active)
-            tl.store(coarse_real + base3, r3, mask=active)
-            tl.store(coarse_imag + base3, i3, mask=active)
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(base0, mode, PACKED_OUTPUT),
+                r0,
+                i0,
+                active,
+                modes,
+                PACKED_OUTPUT,
+            )
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(base1, mode, PACKED_OUTPUT),
+                r1,
+                i1,
+                active,
+                modes,
+                PACKED_OUTPUT,
+            )
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(base2, mode, PACKED_OUTPUT),
+                r2,
+                i2,
+                active,
+                modes,
+                PACKED_OUTPUT,
+            )
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(base3, mode, PACKED_OUTPUT),
+                r3,
+                i3,
+                active,
+                modes,
+                PACKED_OUTPUT,
+            )
         else:
             coarse_base = (cell * 4) * modes + mode
             positive_endpoint = active & ((y & 1) == 1)
             negative_endpoint = active & ((y & 1) == 0)
-            tl.store(
-                coarse_real + coarse_base,
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(coarse_base, mode, PACKED_OUTPUT),
                 r0,
-                mask=positive_endpoint & ((x & 1) == 1),
-            )
-            tl.store(
-                coarse_imag + coarse_base,
                 i0,
-                mask=positive_endpoint & ((x & 1) == 1),
+                positive_endpoint & ((x & 1) == 1),
+                modes,
+                PACKED_OUTPUT,
             )
-            tl.store(
-                coarse_real + coarse_base + modes,
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(coarse_base + modes, mode, PACKED_OUTPUT),
                 r1,
-                mask=positive_endpoint & ((x & 1) == 0),
-            )
-            tl.store(
-                coarse_imag + coarse_base + modes,
                 i1,
-                mask=positive_endpoint & ((x & 1) == 0),
+                positive_endpoint & ((x & 1) == 0),
+                modes,
+                PACKED_OUTPUT,
             )
-            tl.store(
-                coarse_real + coarse_base + 2 * modes,
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(coarse_base + 2 * modes, mode, PACKED_OUTPUT),
                 r2,
-                mask=negative_endpoint & ((x & 1) == 1),
-            )
-            tl.store(
-                coarse_imag + coarse_base + 2 * modes,
                 i2,
-                mask=negative_endpoint & ((x & 1) == 1),
+                negative_endpoint & ((x & 1) == 1),
+                modes,
+                PACKED_OUTPUT,
             )
-            tl.store(
-                coarse_real + coarse_base + 3 * modes,
+            _store_complex_coordinates(
+                coarse_real,
+                coarse_imag,
+                _coordinate_offset(coarse_base + 3 * modes, mode, PACKED_OUTPUT),
                 r3,
-                mask=negative_endpoint & ((x & 1) == 0),
-            )
-            tl.store(
-                coarse_imag + coarse_base + 3 * modes,
                 i3,
-                mask=negative_endpoint & ((x & 1) == 0),
+                negative_endpoint & ((x & 1) == 0),
+                modes,
+                PACKED_OUTPUT,
             )
 
     raw0 = tl.sum(tl.sum(r0 * r0 + i0 * i0, axis=0), axis=0)
     raw1 = tl.sum(tl.sum(r1 * r1 + i1 * i1, axis=0), axis=0)
     raw2 = tl.sum(tl.sum(r2 * r2 + i2 * i2, axis=0), axis=0)
     raw3 = tl.sum(tl.sum(r3 * r3 + i3 * i3, axis=0), axis=0)
-    descriptor_mode = batch * (4 * modes) + mode_vector
     valid_descriptor_mode = mode_vector < modes
-    tl.atomic_add(
-        descriptor_energy + descriptor_mode,
-        raw0,
-        mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
-    )
-    tl.atomic_add(
-        descriptor_energy + descriptor_mode + modes,
-        raw1,
-        mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
-    )
-    tl.atomic_add(
-        descriptor_energy + descriptor_mode + 2 * modes,
-        raw2,
-        mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
-    )
-    tl.atomic_add(
-        descriptor_energy + descriptor_mode + 3 * modes,
-        raw3,
-        mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
-    )
+    if DETERMINISTIC_DESCRIPTOR:
+        # One unique row per line group; unused rows stay zero. A separate
+        # fixed-order reduction avoids inter-CTA floating-point atomic races.
+        descriptor_mode = (batch * width + x_group) * (4 * modes) + mode_vector
+        tl.store(
+            descriptor_energy + descriptor_mode,
+            raw0,
+            valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
+        tl.store(
+            descriptor_energy + descriptor_mode + modes,
+            raw1,
+            valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
+        tl.store(
+            descriptor_energy + descriptor_mode + 2 * modes,
+            raw2,
+            valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
+        tl.store(
+            descriptor_energy + descriptor_mode + 3 * modes,
+            raw3,
+            valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
+    else:
+        descriptor_mode = batch * (4 * modes) + mode_vector
+        valid_descriptor_mode = mode_vector < modes
+        tl.atomic_add(
+            descriptor_energy + descriptor_mode,
+            raw0,
+            mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
+        tl.atomic_add(
+            descriptor_energy + descriptor_mode + modes,
+            raw1,
+            mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
+        tl.atomic_add(
+            descriptor_energy + descriptor_mode + 2 * modes,
+            raw2,
+            mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
+        tl.atomic_add(
+            descriptor_energy + descriptor_mode + 3 * modes,
+            raw3,
+            mask=valid_descriptor_mode & EMIT_DESCRIPTOR,
+        )
 
 
 @triton.jit
@@ -467,16 +589,21 @@ def _finalize_descriptor_kernel(
     if MEAN_DIRECTION_ENERGY:
         energy = tl.full((BLOCK_MODES,), 0.0, tl.float32)
         for component in tl.static_range(4):
-            energy += tl.load(descriptor_energy + base + component * modes,
-                              mask=valid_mode, other=0.0)
-        tl.store(descriptor + batch * modes + mode,
-                 libdevice.log1p(energy * (0.25 * inverse_spatial)), mask=valid_mode)
+            energy += tl.load(
+                descriptor_energy + base + component * modes, mask=valid_mode, other=0.0
+            )
+        tl.store(
+            descriptor + batch * modes + mode,
+            libdevice.log1p(energy * (0.25 * inverse_spatial)),
+            mask=valid_mode,
+        )
     else:
         for component in tl.static_range(4):
             offset = base + component * modes
             energy = tl.load(descriptor_energy + offset, mask=valid_mode, other=0.0)
-            tl.store(descriptor + offset, libdevice.log1p(energy * inverse_spatial),
-                     mask=valid_mode)
+            tl.store(
+                descriptor + offset, libdevice.log1p(energy * inverse_spatial), mask=valid_mode
+            )
 
 
 @triton.jit
@@ -487,19 +614,30 @@ def _unpack_path_gradient(
     BLOCK_HEIGHT: tl.constexpr,
     BLOCK_LINES: tl.constexpr,
     BLOCK_MODES: tl.constexpr,
+    COARSE_PATHS: tl.constexpr,
 ):
     values = tl.sum(
         tl.where(coordinate[None, None, :] == index, gradient, 0.0),
         axis=2,
     )
-    return tl.permute(
-        tl.reshape(values, (BLOCK_MODES, BLOCK_HEIGHT, BLOCK_LINES)),
-        (1, 2, 0),
-    )
+    if COARSE_PATHS:
+        coarse = tl.permute(
+            tl.reshape(values, (BLOCK_MODES, BLOCK_HEIGHT // 2, BLOCK_LINES)), (1, 2, 0),
+        )
+        row = tl.arange(0, 2)[None, :, None, None]
+        path: tl.constexpr = index % 4
+        endpoints = tl.where(
+            row == (1 if path < 2 else 0), coarse[:, None, :, :], 0.0,
+        )
+        return tl.reshape(endpoints, (BLOCK_HEIGHT, BLOCK_LINES, BLOCK_MODES))
+    else:  # noqa: RET505 - Triton must not type-check the other static reshape.
+        return tl.permute(
+            tl.reshape(values, (BLOCK_MODES, BLOCK_HEIGHT, BLOCK_LINES)), (1, 2, 0),
+        )
 
 
 @triton.jit
-def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
+def _product_scan_coarse4_associative_backward_kernel(  # noqa: C901, PLR0912
     decay_real,
     decay_imag,
     gamma_real,
@@ -550,33 +688,57 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
     BLOCK_MODES: tl.constexpr,
     BLOCK_PATH_HIDDEN: tl.constexpr,
     BLOCK_SWIGLU_VALUE: tl.constexpr,
+    PACKED_OUTPUT: tl.constexpr = 0,
+    COARSE_PATHS: tl.constexpr = 0,
+    PLANAR_PATH_OUTPUT: tl.constexpr = 0,
+    COMBINED_STATE_GRADS: tl.constexpr = 0,
+    MEAN_DESCRIPTOR_GRAD: tl.constexpr = 0,
+    BATCH_PARTIAL_GRADS: tl.constexpr = 0,
 ) -> None:
     batch_size = line_count // width
+    scan_width = width // 2 if COARSE_PATHS else width
     line_group = tl.program_id(0)
     if BLOCK_LINES == 1:
-        batch = line_group // width
-        x_group = line_group - batch * width
+        batch = line_group // scan_width
+        x_group = line_group - batch * scan_width
     else:
         # Spread coefficient atomics across batches while each grouped CTA
         # accumulates several neighboring x-lines before issuing its update.
         x_group = line_group // batch_size
         batch = line_group - x_group * batch_size
+    if BATCH_PARTIAL_GRADS:
+        # Keep parameter atomics local to a batch row before the final reduction.
+        grad_decay_real += batch * modes
+        grad_decay_imag += batch * modes
+        grad_gamma_real += batch * modes
+        grad_gamma_imag += batch * modes
+        if COLLAPSE_PATHS_GRAD:
+            grad_path_input_weight += batch * modes * packed_path_hidden * _PACKED_PATH_INPUTS_TL
+            grad_path_input_bias += batch * modes * packed_path_hidden
+            output_hidden = 2 * SWIGLU_HIDDEN if PATH_SWIGLU else packed_path_hidden
+            grad_path_output_weight += batch * modes * _PACKED_PATH_OUTPUTS_TL * output_hidden
+            grad_path_output_bias += batch * modes * _PACKED_PATH_OUTPUTS_TL
     x = x_group * BLOCK_LINES + tl.arange(0, BLOCK_LINES)[None, :, None]
     y = tl.arange(0, BLOCK_HEIGHT)[:, None, None]
     mode_vector = tl.program_id(1) * BLOCK_MODES + tl.arange(0, BLOCK_MODES)
     mode = mode_vector[None, None, :]
-    valid_line = x < width
+    valid_line = x < scan_width
     active = valid_line & (y < height) & (mode < modes)
     valid_mode = valid_line & (mode < modes)
-    offset = ((batch * height + y) * width + x) * modes + mode
+    # Coarse endpoints need positive-x streams only at odd columns and
+    # negative-x streams only at even columns; the other scans are unused.
+    source_x_a = 2 * x + 1 if COARSE_PATHS else x
+    source_x_b = 2 * x if COARSE_PATHS else x
+    offset = ((batch * height + y) * width + source_x_a) * modes + mode
+    offset_b = ((batch * height + y) * width + source_x_b) * modes + mode
     ar = tl.load(decay_real + mode, mask=valid_mode, other=0.0).to(tl.float32)
     ai = tl.load(decay_imag + mode, mask=valid_mode, other=0.0).to(tl.float32)
     gr = tl.load(gamma_real + mode, mask=valid_mode, other=0.0).to(tl.float32)
     gi = tl.load(gamma_imag + mode, mask=valid_mode, other=0.0).to(tl.float32)
     sar = tl.load(source_real_a + offset, mask=active, other=0.0).to(tl.float32)
     sai = tl.load(source_imag_a + offset, mask=active, other=0.0).to(tl.float32)
-    sbr = tl.load(source_real_b + offset, mask=active, other=0.0).to(tl.float32)
-    sbi = tl.load(source_imag_b + offset, mask=active, other=0.0).to(tl.float32)
+    sbr = tl.load(source_real_b + offset_b, mask=active, other=0.0).to(tl.float32)
+    sbi = tl.load(source_imag_b + offset_b, mask=active, other=0.0).to(tl.float32)
     scan_ar = tl.where(active, ar, 1.0)
     scan_ai = tl.where(active, ai, 0.0)
     positive = tl.associative_scan(
@@ -613,11 +775,12 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
         inverse_na = inverse_pa
         inverse_nb = inverse_pa
     else:
-        x_offset = x * modes + mode
+        x_offset = source_x_a * modes + mode
+        x_offset_b = source_x_b * modes + mode
         y_offset = y * modes + mode
         vx_positive = tl.load(variance_x + x_offset, mask=valid_mode, other=0.0)
         vx_negative = tl.load(
-            variance_x + width * modes + x_offset,
+            variance_x + width * modes + x_offset_b,
             mask=valid_mode,
             other=0.0,
         )
@@ -635,24 +798,24 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
     r1, i1 = tl.where(active, pbr * inverse_pb, 0.0), tl.where(active, pbi * inverse_pb, 0.0)
     r2, i2 = tl.where(active, nar * inverse_na, 0.0), tl.where(active, nai * inverse_na, 0.0)
     r3, i3 = tl.where(active, nbr * inverse_nb, 0.0), tl.where(active, nbi * inverse_nb, 0.0)
-    descriptor_base = batch * (4 * modes) + mode
+    descriptor_base = batch * (modes if MEAN_DESCRIPTOR_GRAD else 4 * modes) + mode
     raw_factor0 = tl.load(
         descriptor_gradient_factor + descriptor_base,
         mask=valid_mode & HAS_DESCRIPTOR_GRAD,
         other=0.0,
     )
     raw_factor1 = tl.load(
-        descriptor_gradient_factor + descriptor_base + modes,
+        descriptor_gradient_factor + descriptor_base + (0 if MEAN_DESCRIPTOR_GRAD else 1 * modes),
         mask=valid_mode & HAS_DESCRIPTOR_GRAD,
         other=0.0,
     )
     raw_factor2 = tl.load(
-        descriptor_gradient_factor + descriptor_base + 2 * modes,
+        descriptor_gradient_factor + descriptor_base + (0 if MEAN_DESCRIPTOR_GRAD else 2 * modes),
         mask=valid_mode & HAS_DESCRIPTOR_GRAD,
         other=0.0,
     )
     raw_factor3 = tl.load(
-        descriptor_gradient_factor + descriptor_base + 3 * modes,
+        descriptor_gradient_factor + descriptor_base + (0 if MEAN_DESCRIPTOR_GRAD else 3 * modes),
         mask=valid_mode & HAS_DESCRIPTOR_GRAD,
         other=0.0,
     )
@@ -666,37 +829,40 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
     grad_i3 = 2.0 * raw_factor3 * i3 * inverse_nb
 
     if COLLAPSE_PATHS_GRAD:
+        path_height: tl.constexpr = BLOCK_HEIGHT // 2 if COARSE_PATHS else BLOCK_HEIGHT
+        path_lines: tl.constexpr = BLOCK_LINES
+        path_tokens: tl.constexpr = path_height * path_lines
         r0_flat = tl.reshape(
-            tl.permute(r0, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r0, 0) if COARSE_PATHS else r0, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         r1_flat = tl.reshape(
-            tl.permute(r1, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r1, 1) if COARSE_PATHS else r1, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         r2_flat = tl.reshape(
-            tl.permute(r2, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r2, 2) if COARSE_PATHS else r2, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         r3_flat = tl.reshape(
-            tl.permute(r3, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(r3, 3) if COARSE_PATHS else r3, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i0_flat = tl.reshape(
-            tl.permute(i0, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i0, 0) if COARSE_PATHS else i0, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i1_flat = tl.reshape(
-            tl.permute(i1, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i1, 1) if COARSE_PATHS else i1, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i2_flat = tl.reshape(
-            tl.permute(i2, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i2, 2) if COARSE_PATHS else i2, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         i3_flat = tl.reshape(
-            tl.permute(i3, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(_coarse_path_endpoint(i3, 3) if COARSE_PATHS else i3, (2, 0, 1)),
+            (BLOCK_MODES, path_tokens),
         )
         path_coordinate = tl.arange(0, _PATH_DOT_INPUTS_TL)
         path = path_coordinate % _PATHS_TL
@@ -731,6 +897,10 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
             active_path_real,
             active_path_imag,
         ).to(tl.bfloat16)
+        if COARSE_PATHS:
+            packed_path = tl.where(
+                path_coordinate[None, None, :] < _PACKED_PATH_INPUTS_TL, packed_path, 0.0,
+            ).to(tl.bfloat16)
         hidden_coordinate = tl.arange(0, BLOCK_PATH_HIDDEN)
         input_weight_offset = (
             mode_vector[:, None, None] * packed_path_hidden + hidden_coordinate[None, None, :]
@@ -752,21 +922,30 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
         ).to(tl.bfloat16)
         preactivation = (preactivation + active_input_bias[:, None, :]).to(tl.bfloat16)
         output_coordinate = tl.arange(0, _PATH_DOT_OUTPUTS_TL)
+        if COARSE_PATHS:
+            cell_y = tl.arange(0, path_height)[:, None, None]
+            cell_x = x_group * path_lines + tl.arange(0, path_lines)[None, :, None]
+            path_offset = ((batch * (height // 2) + cell_y) * (width // 2) + cell_x) * modes + mode
+            path_active = (cell_y < height // 2) & (cell_x < width // 2) & (mode < modes)
+        else:
+            path_offset, path_active = offset, active
         physical_offset = tl.reshape(
-            tl.permute(offset, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(path_offset, (2, 0, 1)), (BLOCK_MODES, path_tokens),
         )
         physical_active = tl.reshape(
-            tl.permute(active, (2, 0, 1)),
-            (BLOCK_MODES, BLOCK_HEIGHT * BLOCK_LINES),
+            tl.permute(path_active, (2, 0, 1)), (BLOCK_MODES, path_tokens),
+        )
+        gradient_offset = (
+            physical_offset if PLANAR_PATH_OUTPUT
+            else _coordinate_offset(physical_offset, mode_vector[:, None], PACKED_OUTPUT)
         )
         active_grad_real = tl.load(
-            grad_collapsed_real + physical_offset,
+            grad_collapsed_real + gradient_offset,
             mask=physical_active,
             other=0.0,
         ).to(tl.bfloat16)
         active_grad_imag = tl.load(
-            grad_collapsed_imag + physical_offset,
+            grad_collapsed_imag + gradient_offset,
             mask=physical_active,
             other=0.0,
         ).to(tl.bfloat16)
@@ -785,7 +964,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 value_coordinate[None, None, :],
                 (
                     BLOCK_MODES,
-                    BLOCK_HEIGHT * BLOCK_LINES,
+                    path_tokens,
                     BLOCK_SWIGLU_VALUE,
                 ),
             )
@@ -793,7 +972,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 (2 * SWIGLU_HIDDEN + value_coordinate % SWIGLU_HIDDEN)[None, None, :],
                 (
                     BLOCK_MODES,
-                    BLOCK_HEIGHT * BLOCK_LINES,
+                    path_tokens,
                     BLOCK_SWIGLU_VALUE,
                 ),
             )
@@ -839,7 +1018,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 axis=2,
             )
             grad_preactivation = (value_joint_gradient + gate_joint_gradient).to(tl.bfloat16)
-            if BLOCK_HEIGHT * BLOCK_LINES >= 16:
+            if path_tokens >= 16:
                 path_output_weight_gradient = tl.dot(
                     tl.permute(active_grad_output, (0, 2, 1)),
                     gated_value,
@@ -858,50 +1037,74 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
             preactivation_float = preactivation.to(tl.float32)
             sigmoid = tl.sigmoid(preactivation_float)
             hidden = (preactivation_float * sigmoid).to(tl.bfloat16)
-            output_weight_offset = (
-                mode_vector[:, None, None] * _PACKED_PATH_OUTPUTS_TL
-                + output_coordinate[None, :, None]
-            ) * packed_path_hidden + hidden_coordinate[None, None, :]
-            active_output_weight = tl.load(
-                path_output_weight + output_weight_offset,
-                mask=(mode_vector[:, None, None] < modes)
-                & (output_coordinate[None, :, None] < _PACKED_PATH_OUTPUTS_TL)
-                & (hidden_coordinate[None, None, :] < packed_path_hidden),
-                other=0.0,
-            ).to(tl.bfloat16)
-            grad_hidden = tl.dot(active_grad_output, active_output_weight).to(tl.float32)
+            # This CFFN has exactly two outputs. Avoid padding its output
+            # adjoint and parameter reduction to a 16-column tensor-core tile.
+            output_offset = (
+                mode_vector[:, None] * (2 * packed_path_hidden) + hidden_coordinate[None, :]
+            )
+            output_mask = (mode_vector[:, None] < modes) & (
+                hidden_coordinate[None, :] < packed_path_hidden
+            )
+            weight_real = (
+                tl.load(path_output_weight + output_offset, mask=output_mask, other=0.0)
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            weight_imag = (
+                tl.load(
+                    path_output_weight + output_offset + packed_path_hidden,
+                    mask=output_mask,
+                    other=0.0,
+                )
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            grad_hidden = (
+                active_grad_real.to(tl.float32)[:, :, None] * weight_real[:, None, :]
+                + active_grad_imag.to(tl.float32)[:, :, None] * weight_imag[:, None, :]
+            )
             grad_preactivation = (
                 grad_hidden * sigmoid * (1.0 + preactivation_float * (1.0 - sigmoid))
             ).to(tl.bfloat16)
-            if BLOCK_HEIGHT * BLOCK_LINES >= 16:
-                path_output_weight_gradient = tl.dot(
-                    tl.permute(active_grad_output, (0, 2, 1)),
-                    hidden,
-                )
-            else:
-                path_output_weight_gradient = tl.sum(
-                    active_grad_output[:, :, :, None] * hidden[:, :, None, :],
-                    axis=1,
-                )
-            output_weight_mask = (
-                (mode_vector[:, None, None] < modes)
-                & (output_coordinate[None, :, None] < _PACKED_PATH_OUTPUTS_TL)
-                & (hidden_coordinate[None, None, :] < packed_path_hidden)
+            grad_weight_real = tl.sum(
+                active_grad_real.to(tl.float32)[:, :, None] * hidden.to(tl.float32), axis=1
             )
-        tl.atomic_add(
-            grad_path_output_weight + output_weight_offset,
-            path_output_weight_gradient,
-            mask=output_weight_mask,
-        )
-        tl.atomic_add(
-            grad_path_output_bias
-            + mode_vector[:, None] * _PACKED_PATH_OUTPUTS_TL
-            + output_coordinate[None, :],
-            tl.sum(active_grad_output.to(tl.float32), axis=1),
-            mask=(mode_vector[:, None] < modes)
-            & (output_coordinate[None, :] < _PACKED_PATH_OUTPUTS_TL),
-        )
-        if BLOCK_HEIGHT * BLOCK_LINES >= 16:
+            grad_weight_imag = tl.sum(
+                active_grad_imag.to(tl.float32)[:, :, None] * hidden.to(tl.float32), axis=1
+            )
+            tl.atomic_add(
+                grad_path_output_weight + output_offset, grad_weight_real, mask=output_mask
+            )
+            tl.atomic_add(
+                grad_path_output_weight + output_offset + packed_path_hidden,
+                grad_weight_imag,
+                mask=output_mask,
+            )
+            tl.atomic_add(
+                grad_path_output_bias + 2 * mode_vector,
+                tl.sum(active_grad_real.to(tl.float32), axis=1),
+                mask=mode_vector < modes,
+            )
+            tl.atomic_add(
+                grad_path_output_bias + 2 * mode_vector + 1,
+                tl.sum(active_grad_imag.to(tl.float32), axis=1),
+                mask=mode_vector < modes,
+            )
+        if PATH_SWIGLU:
+            tl.atomic_add(
+                grad_path_output_weight + output_weight_offset,
+                path_output_weight_gradient,
+                mask=output_weight_mask,
+            )
+            tl.atomic_add(
+                grad_path_output_bias
+                + mode_vector[:, None] * _PACKED_PATH_OUTPUTS_TL
+                + output_coordinate[None, :],
+                tl.sum(active_grad_output.to(tl.float32), axis=1),
+                mask=(mode_vector[:, None] < modes)
+                & (output_coordinate[None, :] < _PACKED_PATH_OUTPUTS_TL),
+            )
+        if path_tokens >= 16:
             path_input_weight_gradient = tl.dot(
                 tl.permute(grad_preactivation, (0, 2, 1)),
                 packed_path,
@@ -932,6 +1135,8 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
             grad_preactivation,
             tl.permute(active_input_weight, (0, 2, 1)),
         ).to(tl.float32)
+        if COARSE_PATHS:
+            grad_packed_path = grad_packed_path.to(tl.bfloat16).to(tl.float32)
 
         grad_r0 += (
             _unpack_path_gradient(
@@ -941,6 +1146,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_pa
         )
@@ -952,6 +1158,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_pb
         )
@@ -963,6 +1170,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_na
         )
@@ -974,6 +1182,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_nb
         )
@@ -985,6 +1194,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_pa
         )
@@ -996,6 +1206,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_pb
         )
@@ -1007,6 +1218,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_na
         )
@@ -1018,6 +1230,7 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
                 BLOCK_HEIGHT,
                 BLOCK_LINES,
                 BLOCK_MODES,
+                COARSE_PATHS,
             )
             * inverse_nb
         )
@@ -1035,14 +1248,70 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
             base1 = ((cell * 4 + 1) * 4 + local1) * modes + mode
             base2 = ((cell * 4 + 2) * 4 + local2) * modes + mode
             base3 = ((cell * 4 + 3) * 4 + local3) * modes + mode
-            grad_r0 += tl.load(grad_coarse_real + base0, mask=active, other=0.0) * inverse_pa
-            grad_i0 += tl.load(grad_coarse_imag + base0, mask=active, other=0.0) * inverse_pa
-            grad_r1 += tl.load(grad_coarse_real + base1, mask=active, other=0.0) * inverse_pb
-            grad_i1 += tl.load(grad_coarse_imag + base1, mask=active, other=0.0) * inverse_pb
-            grad_r2 += tl.load(grad_coarse_real + base2, mask=active, other=0.0) * inverse_na
-            grad_i2 += tl.load(grad_coarse_imag + base2, mask=active, other=0.0) * inverse_na
-            grad_r3 += tl.load(grad_coarse_real + base3, mask=active, other=0.0) * inverse_nb
-            grad_i3 += tl.load(grad_coarse_imag + base3, mask=active, other=0.0) * inverse_nb
+            grad_r0 += (
+                tl.load(
+                    grad_coarse_real + _coordinate_offset(base0, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_pa
+            )
+            grad_i0 += (
+                tl.load(
+                    grad_coarse_imag + _coordinate_offset(base0, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_pa
+            )
+            grad_r1 += (
+                tl.load(
+                    grad_coarse_real + _coordinate_offset(base1, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_pb
+            )
+            grad_i1 += (
+                tl.load(
+                    grad_coarse_imag + _coordinate_offset(base1, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_pb
+            )
+            grad_r2 += (
+                tl.load(
+                    grad_coarse_real + _coordinate_offset(base2, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_na
+            )
+            grad_i2 += (
+                tl.load(
+                    grad_coarse_imag + _coordinate_offset(base2, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_na
+            )
+            grad_r3 += (
+                tl.load(
+                    grad_coarse_real + _coordinate_offset(base3, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_nb
+            )
+            grad_i3 += (
+                tl.load(
+                    grad_coarse_imag + _coordinate_offset(base3, mode, PACKED_OUTPUT),
+                    mask=active,
+                    other=0.0,
+                )
+                * inverse_nb
+            )
         else:
             coarse_base = (cell * 4) * modes + mode
             positive_endpoint = active & ((y & 1) == 1)
@@ -1051,28 +1320,72 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
             mask1 = positive_endpoint & ((x & 1) == 0)
             mask2 = negative_endpoint & ((x & 1) == 1)
             mask3 = negative_endpoint & ((x & 1) == 0)
-            grad_r0 += tl.load(grad_coarse_real + coarse_base, mask=mask0, other=0.0) * inverse_pa
-            grad_i0 += tl.load(grad_coarse_imag + coarse_base, mask=mask0, other=0.0) * inverse_pa
+            grad_r0 += (
+                tl.load(
+                    grad_coarse_real + _coordinate_offset(coarse_base, mode, PACKED_OUTPUT),
+                    mask=mask0,
+                    other=0.0,
+                )
+                * inverse_pa
+            )
+            grad_i0 += (
+                tl.load(
+                    grad_coarse_imag + _coordinate_offset(coarse_base, mode, PACKED_OUTPUT),
+                    mask=mask0,
+                    other=0.0,
+                )
+                * inverse_pa
+            )
             grad_r1 += (
-                tl.load(grad_coarse_real + coarse_base + modes, mask=mask1, other=0.0) * inverse_pb
+                tl.load(
+                    grad_coarse_real + _coordinate_offset(coarse_base + modes, mode, PACKED_OUTPUT),
+                    mask=mask1,
+                    other=0.0,
+                )
+                * inverse_pb
             )
             grad_i1 += (
-                tl.load(grad_coarse_imag + coarse_base + modes, mask=mask1, other=0.0) * inverse_pb
+                tl.load(
+                    grad_coarse_imag + _coordinate_offset(coarse_base + modes, mode, PACKED_OUTPUT),
+                    mask=mask1,
+                    other=0.0,
+                )
+                * inverse_pb
             )
             grad_r2 += (
-                tl.load(grad_coarse_real + coarse_base + 2 * modes, mask=mask2, other=0.0)
+                tl.load(
+                    grad_coarse_real
+                    + _coordinate_offset(coarse_base + 2 * modes, mode, PACKED_OUTPUT),
+                    mask=mask2,
+                    other=0.0,
+                )
                 * inverse_na
             )
             grad_i2 += (
-                tl.load(grad_coarse_imag + coarse_base + 2 * modes, mask=mask2, other=0.0)
+                tl.load(
+                    grad_coarse_imag
+                    + _coordinate_offset(coarse_base + 2 * modes, mode, PACKED_OUTPUT),
+                    mask=mask2,
+                    other=0.0,
+                )
                 * inverse_na
             )
             grad_r3 += (
-                tl.load(grad_coarse_real + coarse_base + 3 * modes, mask=mask3, other=0.0)
+                tl.load(
+                    grad_coarse_real
+                    + _coordinate_offset(coarse_base + 3 * modes, mode, PACKED_OUTPUT),
+                    mask=mask3,
+                    other=0.0,
+                )
                 * inverse_nb
             )
             grad_i3 += (
-                tl.load(grad_coarse_imag + coarse_base + 3 * modes, mask=mask3, other=0.0)
+                tl.load(
+                    grad_coarse_imag
+                    + _coordinate_offset(coarse_base + 3 * modes, mode, PACKED_OUTPUT),
+                    mask=mask3,
+                    other=0.0,
+                )
                 * inverse_nb
             )
     positive_adjoint = tl.associative_scan(
@@ -1104,26 +1417,41 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
     l1r, l1i = positive_adjoint[4], positive_adjoint[5]
     l2r, l2i = negative_adjoint[2], negative_adjoint[3]
     l3r, l3i = negative_adjoint[4], negative_adjoint[5]
+    if COMBINED_STATE_GRADS:
+        plane_size = batch_size * height * width * modes
+        grad_a_real_pointer = grad_source_real_a
+        grad_a_imag_pointer = grad_source_real_a + plane_size
+        grad_b_real_pointer = grad_source_real_a + 2 * plane_size
+        grad_b_imag_pointer = grad_source_real_a + 3 * plane_size
+    else:
+        grad_a_real_pointer, grad_a_imag_pointer = grad_source_real_a, grad_source_imag_a
+        grad_b_real_pointer, grad_b_imag_pointer = grad_source_real_b, grad_source_imag_b
     tl.store(
-        grad_source_real_a + offset,
+        grad_a_real_pointer + offset,
         gr * l0r + gi * l0i + gr * l2r - gi * l2i,
         mask=active,
     )
     tl.store(
-        grad_source_imag_a + offset,
+        grad_a_imag_pointer + offset,
         -gi * l0r + gr * l0i + gi * l2r + gr * l2i,
         mask=active,
     )
     tl.store(
-        grad_source_real_b + offset,
+        grad_b_real_pointer + offset_b,
         gr * l1r + gi * l1i + gr * l3r - gi * l3i,
         mask=active,
     )
     tl.store(
-        grad_source_imag_b + offset,
+        grad_b_imag_pointer + offset_b,
         -gi * l1r + gr * l1i + gi * l3r + gr * l3i,
         mask=active,
     )
+
+    if COARSE_PATHS:
+        tl.store(grad_a_real_pointer + offset_b, 0.0, mask=active)
+        tl.store(grad_a_imag_pointer + offset_b, 0.0, mask=active)
+        tl.store(grad_b_real_pointer + offset, 0.0, mask=active)
+        tl.store(grad_b_imag_pointer + offset, 0.0, mask=active)
 
     inverse_decay = 1.0 / decay_norm
     positive_drive_ar, positive_drive_ai = gr * sar - gi * sai, gr * sai + gi * sar
@@ -1232,7 +1560,6 @@ def _product_scan_coarse4_associative_backward_kernel(  # noqa: PLR0912
         grad_gi,
         mask=valid_coefficient_mode,
     )
-
 
 
 __all__ = [

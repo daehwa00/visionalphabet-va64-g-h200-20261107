@@ -10,7 +10,9 @@ from .complex_scan_transitions import ComplexRMSNorm, complex_rms_unit
 from .pac_complex_layers import ComplexLinear, PackedComplexLinear, WidelyLinear
 from .pac_pole_excitation_transition import PoleExcitationS2DPostFusionTransition
 from .pac_triton_complex_rmsnorm import (
+    packed_add_complex_rms_norm,
     packed_complex_rms_norm,
+    packed_complex_rms_norm_from_packed,
     supports_packed_complex_rms_norm,
 )
 
@@ -78,9 +80,36 @@ class _GatedPostFusionBase(nn.Module):
         scaled = value.unflatten(-1, (2, self.hidden_modes)) * gate.unsqueeze(-2)
         return scaled.flatten(-2)
 
-    def forward(self, real: Tensor, imag: Tensor) -> ComplexField:
+    def forward(self, real: Tensor, imag: Tensor | None = None) -> ComplexField | Tensor:
+        if imag is None:
+            return self.forward_packed(real)
         self._validate(real, imag)
         normalized = self._packed_normalized(real, imag)
+        packed_update = self._packed_update(normalized)
+        update_real, update_imag = packed_update.split(self.modes, dim=-1)
+        return real + update_real, imag + update_imag
+
+    def forward_packed(self, packed: Tensor) -> Tensor:
+        """Normalize, gate and add the residual entirely in packed Cartesian rows."""
+        if packed.ndim < 1 or packed.shape[-1] != 2 * self.modes:
+            raise ValueError("packed gated PostFusion inputs have incompatible shapes")
+        normalized = packed_complex_rms_norm_from_packed(
+            packed, self.norm.weight, self.norm.epsilon
+        )
+        return packed + self._packed_update(normalized)
+
+    # Opt in for lower peak memory; measured full-step throughput regresses slightly.
+    fuse_residual_norm: bool = False
+
+    def forward_residual_packed(self, left: Tensor, right: Tensor) -> Tensor:
+        if not self.fuse_residual_norm:
+            return self.forward_packed(left + right)
+        merged, normalized = packed_add_complex_rms_norm(
+            left, right, self.norm.weight, self.norm.epsilon
+        )
+        return merged + self._packed_update(normalized)
+
+    def _packed_update(self, normalized: Tensor) -> Tensor:
         joint = functional.linear(
             normalized,
             torch.cat((self.value.packed_weight(), self.gate.weight), dim=0),
@@ -90,9 +119,7 @@ class _GatedPostFusionBase(nn.Module):
             dim=-1,
         )
         gated_value = self._gated_value(value, functional.silu(gate_logits))
-        packed_update = functional.linear(gated_value, self.out.packed_weight())
-        update_real, update_imag = packed_update.split(self.modes, dim=-1)
-        return real + update_real, imag + update_imag
+        return functional.linear(gated_value, self.out.packed_weight())
 
     def _split_forward(self, real: Tensor, imag: Tensor) -> ComplexField:
         """Evaluate the residual one coordinate at a time for custom gates."""
@@ -154,6 +181,11 @@ class GatedStrictComplexMagnitudePostFusion(GatedStrictComplexPostFusion):
         # rows, so this variant keeps the split residual.
         return self._split_forward(real, imag)
 
+    def forward_packed(self, packed: Tensor) -> Tensor:
+        """Reject the Cartesian gate path for this phase-invariant gate variant."""
+        del packed
+        raise NotImplementedError("magnitude-gated PostFusion requires its phase-invariant gate")
+
 
 class GatedPoleExcitationS2DTransition(PoleExcitationS2DPostFusionTransition):
     """Keep the established memory/carry merge and use gated PostFusion."""
@@ -177,13 +209,49 @@ class GatedPoleExcitationS2DTransition(PoleExcitationS2DPostFusionTransition):
         del self.post_output
         self.post_fusion = GatedComplexPostFusion(output_modes, post_hidden)
 
+    def forward_reduced_packed(
+        self, memory_packed: Tensor, carry_packed: Tensor, *, memory_planar: bool = False,
+    ) -> Tensor:
+        """Merge packed memory with an already weighted and spatially reduced carry."""
+        if type(self).forward is not GatedPoleExcitationS2DTransition.forward:
+            raise NotImplementedError("this transition variant requires its own packed merge")
+        if memory_planar:
+            if (memory_packed.ndim < 2 or memory_packed.shape[0] != 2
+                    or memory_packed.shape[-1] != self.input_modes
+                    or self.memory_projection is None):
+                raise ValueError("planar transition memory requires a compatible projection")
+            spatial_shape = memory_packed.shape[1:-1]
+        else:
+            if memory_packed.ndim < 1 or memory_packed.shape[-1] != 2 * self.input_modes:
+                raise ValueError("packed transition memory has incompatible shape")
+            spatial_shape = memory_packed.shape[:-1]
+        if (
+            carry_packed.ndim < 1
+            or carry_packed.shape[-1] != 2 * self.excitation_modes
+            or carry_packed.shape[:-1] != spatial_shape
+        ):
+            raise ValueError("packed transition reduced carry has incompatible shape")
+        memory = memory_packed
+        if self.memory_projection is not None:
+            memory = self.memory_projection(memory, planar=memory_planar)
+        carry = carry_packed
+        if self.carry_projection is not None:
+            carry = self.carry_projection.forward_packed(carry)
+        return self.post_fusion.forward_residual_packed(memory, carry)
+
     def forward(
         self,
         memory_real: Tensor,
-        memory_imag: Tensor,
+        memory_imag: Tensor | None = None,
         carry_real: Tensor | None = None,
         carry_imag: Tensor | None = None,
-    ) -> ComplexField:
+        *,
+        memory_planar: bool = False,
+    ) -> ComplexField | Tensor:
+        if memory_imag is None:
+            if carry_real is None or carry_imag is not None:
+                raise ValueError("packed transition requires one reduced packed carry")
+            return self.forward_reduced_packed(memory_real, carry_real, memory_planar=memory_planar)
         if memory_real.shape != memory_imag.shape or memory_real.shape[-1] != self.input_modes:
             message = "gated pole/excitation transition memory has incompatible shape"
             raise ValueError(message)

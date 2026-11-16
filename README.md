@@ -1,53 +1,9 @@
-# VisionAlphabet
+# Optimized VisionAlphabet A — terminal raw G, ImageNet-1K
 
-This is the canonical VisionAlphabet project directory. The vision model,
-experiment runners, tests, paper, and reviewer materials live here as real
-files, not as duplicate copies.
+This branch runs the exact optimized A backbone used in the completed IN100 experiment, changing only the terminal energy readout to raw mean(2s·conj(u)−|u|²), with real/imaginary concatenation. No readout power normalization, log transform or denominator stop-gradient is applied. The classifier keeps BatchNorm(1024, affine=False) and uses Linear(1024,1000). Intermediate fused scans and path readers are unchanged. 3,910,504 parameters; scratch initialization, no trained IN100 weights.
 
-| Directory | Purpose |
-| --- | --- |
-| `src/lnet/` | Vision backbone, complex spatial scan, and optimized kernels |
-| `scripts/` | Vision training, evaluation, queue, and benchmark entry points |
-| `tests/` | Vision model and experiment regression tests |
-| `paper/` | Live ICLR manuscript, figures, tables, and analysis |
-| `reviewer-code/` | Frozen reviewer reproduction package and checkpoints |
-| `releases/` | Previously generated submission archives |
-| `h200/`, `side_experiments/`, `figures/` | Vision experiment support and assets |
-| `docs/`, `outputs/`, `artifacts/` | Hardware notes, local measurements, and generated visuals |
+Authorized run: seed0, 100epochs, effective batch1024, LR0.003. The established IN1K runtime retains AdamW, weight decay0.05, five-epoch warmup, cosine schedule, label smoothing0.1 and MixUp alpha0.8. Physical batch256 with accumulation4 is preferred; a CUDA OOM in the separate smoke process alone triggers fallback to128×8. The optimizer-update count differs from the earlier effective-batch256 protocol.
 
-Work on model code in `src/lnet/` and `scripts/`, not in `reviewer-code/`.
-The latter is an export and must be regenerated after a model change. Work on
-the manuscript in `paper/`; its web preview uses `paper/build/main.pdf`.
+Entry: `bash h200/terminal_rawg/run.sh`. It verifies the pinned environment, whole H200 allocation and the complete IN1K dataset; runs tests and a full224px two-update smoke plus checkpoint restore; then trains from scratch. Any non-OOM preflight failure stops the launch. The existing supervisor reports logs, epochs and metrics to a dedicated relay and honors a remote stop. Latest/best checkpoints are local during training. At normal completion, latest/best, contracts and results are uploaded for external hash verification and private W&B archival before completion is acknowledged.
 
-The neighboring `lnet` checkout keeps compatibility links for the previous
-model, script, test, and reviewer-package paths. Its old paper-project path is
-an empty Docker mount point; edit the manuscript here in `paper/`, not through
-that host path. The web services mount this directory directly. The old
-`src/lnet/` still owns the separate ALPHABET-LM experiment, while
-`scripts/paper_platform/` and `tests/paper_platform/` remain with the paper
-workspace application. New VisionAlphabet development belongs here.
-
-The live paper mount is declared in
-`/home/qlab/.local/state/paper-workspace/accounts/project-mounts.yaml`.
-Do not replace the empty legacy project mount point with a symlink: the
-project-runtime service rejects symlinked project roots.
-
-From this directory, with dependencies installed:
-
-```bash
-PYTHONPATH=src:scripts python -m pytest -q tests
-PYTHONPATH=src:scripts python scripts/run_lnet_k128_p160_160_160_128_d2262_imagenet1k.py --help
-```
-
-The second command only inspects the launcher; training requires data and an
-explicit output directory. To refresh the manuscript preview, run this from
-`paper/`:
-
-```bash
-latexmk -pdf -interaction=nonstopmode -halt-on-error -output-directory=build main.tex
-```
-
-## Project map and rebuttal preparation
-
-- [코드·폴더 구조 안내](docs/PROJECT_MAP.ko.md)
-- [2026-11-06 리뷰 쟁점·근거·영문 리버탈 초안](docs/rebuttal-2026-11-06/README.md)
+Source integrity: SOURCE_MANIFEST.json. Secrets are stored outside this repository and are never passed in the GitHub issue or public command. This branch uses a dedicated relay/observer, leaving previous H200 runs untouched.

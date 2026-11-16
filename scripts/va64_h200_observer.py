@@ -359,26 +359,23 @@ def _cleanup_managed_archives(root: Path, job: str, keep_latest: int = 2) -> Non
 
 def validate_checkpoint_bundle(archive: Path) -> None:
     import io, tarfile, torch
-    import run_va64_retrain_imagenet1k as experiment
+    import run_terminal_rawg_imagenet1k as experiment
     with tarfile.open(archive, "r:gz") as stream:
         member = stream.extractfile("checkpoint.pt")
         if member is None: raise ValueError("checkpoint missing")
         payload = torch.load(io.BytesIO(member.read()), map_location="cpu", weights_only=True)
         if not isinstance(payload.get("model"), dict) or not isinstance(payload.get("optimizer"), dict) or not isinstance(payload.get("rng"), dict):
-            raise ValueError("checkpoint model/optimizer missing")
-        model = experiment.build_model("G", prepared=False)
+            raise ValueError("checkpoint model/optimizer/RNG missing")
+        model = experiment.build_model(prepared=False)
         model.load_state_dict(payload["model"], strict=True)
-        if payload.get("variant") == "G":
-            if payload.get("definition") != experiment.definition_digest("G"): raise ValueError("G definition mismatch")
-        else:
-            contracts = [m for m in stream.getmembers() if m.name.startswith("contracts/") and m.name.endswith(".json")]
-            matches = []
-            for record in contracts:
-                value = json.load(stream.extractfile(record))
-                if value.get("schema") == experiment.runtime.SCHEMA and value.get("model", {}).get("key") == "va_k64_retrain_G":
-                    matches.append(value)
-            if len(matches) != 1: raise ValueError("G checkpoint contract missing or ambiguous")
-            experiment.runtime._validate_binding(payload, matches[0])
+        contracts = [m for m in stream.getmembers() if m.name.startswith("contracts/") and m.name.endswith(".json")]
+        matches = []
+        for record in contracts:
+            value = json.load(stream.extractfile(record))
+            if value.get("schema") == experiment.runtime.SCHEMA and value.get("model", {}).get("key") == experiment.MODEL_KEY:
+                matches.append(value)
+        if len(matches) != 1: raise ValueError("RawG checkpoint contract missing or ambiguous")
+        experiment.runtime._validate_binding(payload, matches[0])
 
 
 def _backup_latest(
