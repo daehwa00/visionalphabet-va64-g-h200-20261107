@@ -163,6 +163,7 @@ def run():
     assert f.profile_winner(best)
     m,records,label=f.PLANS[best]
     f.audit['observed_shapes']={str(m):{n:[json.loads(k)['shape'] for k in keys] for n,keys in v['observed'].items()} for m,v in f.disc.items()}
+    (f.root/'final-discovery.json').write_text(json.dumps(dict(observed=f.disc[m]['observed'],defaults=f.disc[m]['defaults'])))
     last=history[-1]['families']
     f.audit['alternatives_exhausted']=(len(last)==len(order) and all(e['generated']==e['completed'] for e in last)
             and not f.audit['errors'] and not any(p.get('capacity_failed') or p.get('reason') for p in f.audit['pairs']))

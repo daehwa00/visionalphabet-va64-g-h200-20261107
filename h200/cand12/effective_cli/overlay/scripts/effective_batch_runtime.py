@@ -36,6 +36,7 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
         files = (
             "effective_batch_runtime.py",
             "effective_batch_search.py",
+            "effective_batch_proposals.py",
             "effective_batch_update.py",
             "effective_batch_epoch.py",
             "imagenet100_data_runtime.py",

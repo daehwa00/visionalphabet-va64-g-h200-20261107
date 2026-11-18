@@ -5,7 +5,7 @@ import hashlib,json,math,os,secrets,socket,subprocess,threading,time,zlib
 from pathlib import Path
 import requests
 
-BASE="https://va-effective-receipt-h200-20261119.gpupulse-monitor.workers.dev/va64g"
+BASE="https://va-r3-combined-result-20261119.gpupulse-monitor.workers.dev/va64g"
 CHUNK=8192
 def publish(raw,summary):
     from effective_batch_search import valid_receipt

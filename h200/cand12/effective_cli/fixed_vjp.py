@@ -8,7 +8,7 @@ root=Path(os.environ['RUN_ROOT']);source=root/'source';sys.path[:0]=[str(source/
 from automatic_training_layout import candidates,compare_tensors,digest
 from effective_batch_search import _run_arm,vjp_candidates,_vjp_applied,_vjp_contract,VJP_NAME
 work=root/'fixed-continuation';work.mkdir()
-os.environ.update(TORCHINDUCTOR_CACHE_DIR=str(root/'ind-normal'),TRITON_CACHE_DIR=str(root/'tri-normal'),LNET_LAUNCH_CACHE=str(root/'fixed-local'))
+os.environ.update(TORCHINDUCTOR_CACHE_DIR=str(root/'ind-fixed'),TRITON_CACHE_DIR=str(root/'tri-fixed'),LNET_LAUNCH_CACHE=str(root/'fixed-local'))
 torch.set_num_threads(4)
 audit=dict(runs={},screen=[],pairs=[],ranks=[],winners=[],errors=[]);champions=set()
 ref={};disc={};count=0

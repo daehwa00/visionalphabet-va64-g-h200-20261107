@@ -17,6 +17,8 @@ import time
 import torch
 from torch._inductor import config as inductor
 
+from effective_batch_proposals import proposal_candidates
+
 from automatic_training_layout import (
     BUNDLE,
     BUNDLED_LAYOUTS,
@@ -133,6 +135,20 @@ def _vjp_contract(records):
     contracts = []
     for key, marker in records.get(VJP_NAME, {}).items():
         if not marker.get("blocks"):
+            if marker != {"blocks": {}, "num_warps": 4, "num_stages": 1}:
+                raise ValueError("Invalid disabled VJP sentinel")
+            if _direct_scope(key):
+                keys = _parent_keys(records, key)
+                parents = [records.get(name, {}).get(k) for name, k in keys.items()]
+                if (
+                    parents[0]
+                    and all(g == parents[0] for g in parents)
+                    and parents[0].get("blocks", {}).get("DOUBLING") == 1
+                ):
+                    shape = _scope_fields(key)["shape"]
+                    contracts.append(
+                        (tuple(shape[n] for n in ("batch", "height", "width", "modes")), 0)
+                    )
             continue
         variant = marker["blocks"].get("VARIANT")
         if (
@@ -612,6 +628,23 @@ def _run_arm(work, label, microbatch, records, *, discover=False, confirm=False,
     return result, checks
 
 
+def _plan_digest(records, defaults):
+    """Ignore only explicit overrides exactly equal to observed defaults.
+
+    An off marker over an active default remains an override. Unknown defaults
+    also remain explicit, so this never assumes a missing dispatch is disabled.
+    """
+    changed = {
+        name: {
+            key: value
+            for key, value in table.items()
+            if key not in defaults.get(name, {}) or defaults[name][key] != value
+        }
+        for name, table in records.items()
+    }
+    return digest({name: table for name, table in changed.items() if table})
+
+
 def measure(snapshot, key, info, work):
     work.mkdir(parents=True, exist_ok=True)
     torch.save(snapshot, work / "snapshot.pt")
@@ -654,6 +687,8 @@ def measure(snapshot, key, info, work):
     best = dict(microbatch=baseline, records={}, ms=discoveries[baseline]["ms"], plan="baseline")
     winner, winning_pairs = None, []
     portfolio = []
+    proposal_rejections = {}
+    proposal_provenance = {}
     for micro, discovery in discoveries.items():
         if micro != baseline:
             portfolio.append((f"micro-{micro}-default", micro, {}))
@@ -661,9 +696,19 @@ def measure(snapshot, key, info, work):
         parent_plans = candidates(original)
         plans = published_candidates(original) if micro == 32 else dict(parent_plans)
         plans.update(vjp_candidates(discovery["observed"], discovery["defaults"], parent_plans))
+        rejected = []
+        provenance = {}
+        plans.update(
+            proposal_candidates(discovery["observed"], diagnostics=rejected, provenance=provenance)
+        )
+        if provenance:
+            proposal_provenance[str(micro)] = provenance
+        if rejected:
+            proposal_rejections[str(micro)] = rejected
+            print(f"[effective batch] proposal rejections micro={micro}: {rejected}", flush=True)
         seen_records = set()
         for name, records in plans.items():
-            records_key = digest(records)
+            records_key = _plan_digest(records, discovery["defaults"])
             if records_key in seen_records:
                 continue
             seen_records.add(records_key)
@@ -830,6 +875,8 @@ def measure(snapshot, key, info, work):
         screening=dict(warmup=2, groups=1, updates=3),
         confirmation=dict(warmup=2, groups=3, updates=2),
         portfolio=[name for name, _, _ in portfolio],
+        proposal_rejections=proposal_rejections,
+        proposal_provenance=proposal_provenance,
     )
 
 

@@ -103,7 +103,20 @@ def main():
     result['preserved']=d['state_before']; result['receipt_sha256']=hashlib.sha256(raw).hexdigest()
     result['fixed_cli_group_digest']=d['fixed_input_digest'];result['winner']=d['winner'];result['micro']=d['microbatch']
     result['accumulation']=1024//d['microbatch'];result['status']=d['status'];save()
-    warm=ordinary('warm')
+    catalog=src/'src/lnet/effective_update_proposals.json'
+    active_catalog=catalog.read_bytes()
+    verify_catalog=json.loads(active_catalog)
+    assert len(verify_catalog['proposals'])>=2
+    verify_catalog['proposals'].reverse()
+    catalog.write_text(json.dumps(verify_catalog,sort_keys=True,indent=2)+'\n')
+    reordered_sha=hashfile(catalog)
+    assert reordered_sha!=hashlib.sha256(active_catalog).hexdigest()
+    try:
+        warm=ordinary('warm')
+    finally:
+        catalog.write_bytes(active_catalog)
+    result['catalog_only_warm_check']=dict(cold_sha256=hashlib.sha256(active_catalog).hexdigest(),warm_sha256=reordered_sha,
+                                          warm_key=warm['audit']['key'],restored=hashfile(catalog)==hashlib.sha256(active_catalog).hexdigest())
     assert warm['audit']['source']=='local' and warm['audit']['key']==d['key'] and not warm['started_worker']
     assert receipt.read_bytes()==raw and receipt.stat().st_mtime_ns==mtime
     pub=d  # Validate and replay the exact complete receipt without removing fields.
@@ -116,6 +129,15 @@ def main():
     bundled=ordinary('bundled')
     assert bundled['audit']['source']=='bundled' and bundled['audit']['key']==d['key'] and not bundled['started_worker']
     result['postupdate_vs_cold']=compare_updates(d['capture_schema']['trainable_names'])
+    from r3_catalog import inspect_receipt
+    result['actual_fixed_candidate_screens']=inspect_receipt(d,root)
+    result['qualified_catalog']=json.loads((root/'qualified-catalog.json').read_text())
+    table=json.loads((root/'matched-table.json').read_text())
+    result['fixed_matched_evidence']=[{**{k:v[k] for k in ('microbatch','accumulation','role','qualified','median_ms','img_s','median_peak_mib',
+        'three_pair_gain','ranges_separated','winner_records_sha256')},'pairs':[{'order':pair['order'],'numeric':pair['numeric'],
+        'arms':{n:{k:a[k] for k in ('wall_samples_ms','median_ms','images_s','peak_allocated_mib','capture_counts','capture_finite','workload_sha256')}
+                for n,a in pair['arms'].items()}} for pair in v['pairs']]} for v in table['plans']]
+    result['source_freeze_sha256']=hashfile(Path(__file__).parent/'common-release.sha256')
     result['valid_receipt']=True
     result['source_closure']=json.loads((root/'source-manifest.json').read_text()) if (root/'source-manifest.json').exists() else {}
     (root/'winning-receipt.json').write_text(json.dumps(pub,separators=(',',':'),sort_keys=True))

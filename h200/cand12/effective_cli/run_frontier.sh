@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export RUN_ROOT=/app/output/va-h200-effective1024-frontier-20261119
+export RUN_ROOT=/app/output/va-h200-effective1024-r3-combined-20261119
 mkdir -p "$RUN_ROOT"
 cd ../..
 python3 -m pip install --disable-pip-version-check --target "$RUN_ROOT/bootstrap" uv==0.11.26
@@ -69,9 +69,18 @@ taskset -c "$affinity" python -u effective_cli/frontier.py > "$RUN_ROOT/frontier
     tail -10 "$RUN_ROOT/frontier.log" | cut -c1-1200
     exit 1
 }
-if python -c 'import json,os,sys; sys.exit(not json.load(open(os.environ["RUN_ROOT"]+"/fixed-continuation.json"))["needs_official"])'; then
-    taskset -c "$affinity" python -u effective_cli/matched_table.py > "$RUN_ROOT/matched.log" 2>&1 || {
-        tail -8 "$RUN_ROOT/matched.log" | cut -c1-1200
-        exit 1
-    }
+taskset -c "$affinity" python -u effective_cli/matched_table.py > "$RUN_ROOT/matched.log" 2>&1 || {
+    tail -8 "$RUN_ROOT/matched.log" | cut -c1-1200
+    exit 1
+}
+export R3_JOB_COMMIT
+R3_JOB_COMMIT=$(git rev-parse HEAD)
+python effective_cli/r3_catalog.py
+python effective_cli/data.py
+if taskset -c "$affinity" python -u effective_cli/cli_e2e.py > "$RUN_ROOT/cli-e2e.log" 2>&1; then
+    echo ORDINARY_R3_VERIFIED
+else
+    echo ORDINARY_R3_NEEDS_REVIEW
+    tail -12 "$RUN_ROOT/cli-e2e.log" | cut -c1-1100
+    exit 1
 fi

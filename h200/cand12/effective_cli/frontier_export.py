@@ -5,6 +5,12 @@ root=Path(os.environ['RUN_ROOT'])
 def marker(name,d):
     blob=base64.b64encode(lzma.compress(json.dumps(d,separators=(',',':')).encode(),preset=9)).decode()
     print(name,blob)
+catalog=root/'qualified-catalog.json'
+if catalog.is_file():marker('R3_QUALIFIED_PROPOSAL_XZ',json.loads(catalog.read_text()))
+ordinary=root/'ordinary-result.json'
+if ordinary.is_file():
+    r=json.loads(ordinary.read_text())
+    marker('R3_ORDINARY_STATUS_XZ',{k:r[k] for k in ('winner','micro','valid_receipt','receipt_sha256','actual_fixed_candidate_screens','catalog_only_warm_check') if k in r})
 p=root/'matched-table.json'
 if p.is_file():marker('MATCHED_FIXED_TABLE_XZ',json.loads(p.read_text()))
 p=root/'fixed-continuation.json'
