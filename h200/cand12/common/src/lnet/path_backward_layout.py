@@ -5,11 +5,13 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import cache
 from pathlib import Path
 
 import torch
+from torch._inductor import config as inductor_config
+from torch._inductor.custom_graph_pass import CustomGraphPass
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
 
 from .kernel_launch_config import (
@@ -77,7 +79,7 @@ def selected_layout(source: torch.Tensor) -> tuple[int, int, LaunchGeometry | No
         "width": width,
         "modes": modes,
         "deterministic": int(torch.are_deterministic_algorithms_enabled()),
-        "emulate_precision_casts": int(torch._inductor.config.emulate_precision_casts),
+        "emulate_precision_casts": int(inductor_config.emulate_precision_casts),
         "cudnn_benchmark": int(torch.backends.cudnn.benchmark),
         "cudnn_tf32": int(torch.backends.cudnn.allow_tf32),
     }
@@ -117,15 +119,30 @@ def selected_layout(source: torch.Tensor) -> tuple[int, int, LaunchGeometry | No
     return 0, 0, None
 
 
-def configure_layout_cache() -> None:
-    """AOT/Inductor may reuse a graph before the Triton dispatch is traced."""
-    from torch.compiler import config
+@dataclass(frozen=True)
+class _LayoutGraphPass(CustomGraphPass):
+    fingerprint: str
+    previous: object
 
-    revision = _layout_revision()
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        if callable(self.previous):
+            self.previous(graph)
+
+    def uuid(self):
+        if self.previous is None:
+            return self.fingerprint
+        # Preserve a caller's existing pass and its cacheability.
+        previous_id = (
+            self.previous.uuid() if isinstance(self.previous, CustomGraphPass) else None
+        )
+        return (self.fingerprint, previous_id) if previous_id else None
+
+
+def layout_graph_pass() -> CustomGraphPass:
+    """Key the AOT/FX graph on the layout without retuning unrelated Triton kernels."""
     records = geometry_store_signature(LAYOUT_NAME, BUNDLED_LAYOUTS)
     profile = os.environ.get("LNET_COMPILE_PROFILE", "")
-    digest = hashlib.sha256(
-        f"{revision}|{records}|{profile}|{_driver_api_version()}".encode()
+    fingerprint = hashlib.sha256(
+        f"{_layout_revision()}|{records}|{profile}|{_driver_api_version()}".encode()
     ).hexdigest()
-    prefix = config.cache_key_tag.split("|lnet-path-layout=", 1)[0]
-    config.cache_key_tag = f"{prefix}|lnet-path-layout={digest}"
+    return _LayoutGraphPass(fingerprint, inductor_config.post_grad_custom_pre_pass)

@@ -375,27 +375,21 @@ def _build_runtime(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
     compile_mode = os.environ.get("LNET_COMPILE_MODE") or recipe.get("compile_mode")
     if compile_mode is None:
         return model
-    from lnet.path_backward_layout import configure_layout_cache
+    from lnet.path_backward_layout import layout_graph_pass
 
     _configure_compile_runtime(recipe)
-    configure_layout_cache()
     requested_cudagraphs = str(compile_mode) in _CUDA_GRAPH_COMPILE_MODES
     repeated_stages = requested_cudagraphs and _has_replayed_cudagraph_stages(model)
     os.environ["LNET_CUDAGRAPHS_ACTIVE"] = "1" if requested_cudagraphs else "0"
     _exclude_capture_hostile_submodules(model, exclude_classifier=requested_cudagraphs)
-    if repeated_stages:
-        return cast(
-            "nn.Module",
-            torch.compile(
-                model,
-                options=_replayed_stage_compile_options(str(compile_mode)),
-                fullgraph=False,
-                dynamic=False,
-            ),
-        )
+    options = (
+        _replayed_stage_compile_options(str(compile_mode))
+        if repeated_stages else dict(torch._inductor.list_mode_options(str(compile_mode)))
+    )
+    options["post_grad_custom_pre_pass"] = layout_graph_pass()
     return cast(
         "nn.Module",
-        torch.compile(model, mode=str(compile_mode), fullgraph=False, dynamic=False),
+        torch.compile(model, options=options, fullgraph=False, dynamic=False),
     )
 
 

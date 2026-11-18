@@ -9,13 +9,13 @@ import sys
 
 def main():
     from lnet.kernel_launch_config import capture_launch_scopes, store_geometry, stored_geometry
-    from lnet.path_backward_layout import LAYOUT_NAME, candidate_geometry
+    from lnet.path_backward_layout import BUNDLED_LAYOUTS, LAYOUT_NAME, candidate_geometry
     from tune_path_backward import launch_contracts, load_scope
     root=Path(os.environ["RUN_ROOT"])
     arm=os.environ["ARM"]
     shape=(1024,56,56,160)
     scope_file=root/"observed.json"
-    specs={"common8":(4,8,4,3),"common2w":(4,4,2,3)}
+    specs={"deploy2w": (4,4,2,3)}
     if arm=="discovery":
         with capture_launch_scopes(LAYOUT_NAME) as found:
             # Discovery uses a fresh graph cache. Read the scope produced by an actual backward.
@@ -32,9 +32,21 @@ def main():
     scope=load_scope(json.loads(scope_file.read_text()))
     spec=specs[arm]
     geometry=candidate_geometry(*spec)
-    if "--layout-check" in sys.argv:
-        store_geometry(LAYOUT_NAME,geometry,scope=scope)
-    assert stored_geometry(LAYOUT_NAME,scope=scope)==geometry
+    # Package the discovered trial record in the isolated job's bundle. The
+    # benchmark runs in a separate process with an untouched local tuning store.
+    if "--package-record" in sys.argv:
+        store_geometry(LAYOUT_NAME, geometry, scope=scope)
+        store = Path(os.environ["LNET_LAUNCH_CACHE"]) / "launch_geometry.json"
+        incoming = json.loads(store.read_text())
+        existing = json.loads(BUNDLED_LAYOUTS.read_text())
+        assert incoming["records"].keys().isdisjoint(existing["records"].keys())
+        existing["records"].update(incoming["records"])
+        BUNDLED_LAYOUTS.write_text(json.dumps(existing, indent=2))
+        print("TRIAL_RECORD",arm,json.dumps(incoming))
+        return
+    assert not (Path(os.environ["LNET_LAUNCH_CACHE"]) / "launch_geometry.json").exists()
+    assert stored_geometry(LAYOUT_NAME, scope=scope) is None
+    assert stored_geometry(LAYOUT_NAME, scope=scope, path=BUNDLED_LAYOUTS) == geometry
     runpy.run_path("benchmark_imagenet1k.py",run_name="__main__")
     if "--kernel-profile" in sys.argv:
         launches=launch_contracts(Path("kernel-trace.json"),shape)
