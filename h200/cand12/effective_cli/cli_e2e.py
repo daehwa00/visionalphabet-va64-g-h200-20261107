@@ -86,7 +86,10 @@ def compare_updates(names):
     return out
 
 def main():
-    assert not Path(env['LNET_LAUNCH_CACHE']).exists()
+    initial_empty={k:not Path(env[k]).exists() for k in ('LNET_LAUNCH_CACHE','TORCHINDUCTOR_CACHE_DIR','TRITON_CACHE_DIR')}
+    assert all(initial_empty.values()),initial_empty
+    result['cold_cache_absent']=initial_empty
+    result['calibration_command_is_training_command']=True
     assert not (root/'cold').exists()
     cold=ordinary('cold')
     assert cold['audit']['status']=='calibrated' and cold['started_worker']
