@@ -16,11 +16,12 @@ from timm.data.mixup import Mixup
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch", type=int, choices=(256, 1024), required=True)
+    parser.add_argument("--batch", type=int, choices=(128, 256, 1024), required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--profile-updates", type=int, default=0)
     parser.add_argument("--loader-batch", type=int)
+    parser.add_argument("--kernel-profile", choices=("trace", "counters"))
     args = parser.parse_args()
     loader_batch = args.loader_batch or args.batch
     if loader_batch < 1 or args.batch % loader_batch:
@@ -129,6 +130,27 @@ def main():
     torch.cuda.synchronize()
     start = time.perf_counter()
     batches = iter(loader)
+    if args.kernel_profile:
+        for _ in range(16):
+            update(batches)
+        torch.cuda.synchronize()
+        if args.kernel_profile == "counters":
+            torch.cuda.cudart().cudaProfilerStart()
+            update(batches)
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+        else:
+            with torch.profiler.profile(activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]) as trace:
+                for _ in range(3):
+                    update(batches)
+                torch.cuda.synchronize()
+            trace.export_chrome_trace("kernel-trace.json")
+            from summarize_kernels import summarize
+            summarize(Path("kernel-trace.json"), args.batch, accumulation, 3)
+        return
     updates = count // effective
     if args.profile_updates:
         updates = min(updates, args.profile_updates)
