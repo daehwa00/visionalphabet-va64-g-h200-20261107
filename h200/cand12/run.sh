@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 cd "$(dirname "$0")"
-export RUN_ROOT=/app/output/cand12-eb1024-20261118
+export RUN_ROOT=/app/output/cand12-search-20261118
 mkdir -p "$RUN_ROOT"
 cd ../..
 python3 -m pip install --disable-pip-version-check --target "$RUN_ROOT/bootstrap" uv==0.11.26
@@ -14,6 +14,9 @@ cd h200/cand12
 PYTHONPATH=code-control/src:code-control/scripts:code-control python init.py
 python -c "import torch; assert 'H200' in torch.cuda.get_device_name(), torch.cuda.get_device_name()"
 export VA_REAL_MEMORY_SCAN_BATCH_PARTIALS=1 LNET_DISABLE_LAUNCH_AUTOTUNE=0 PYTHONHASHSEED=0
+if [[ "${TUNE_PHYSICAL_BATCH:-0}" == 1 ]]; then
+  exec python -u select_batch.py --effective-batch 1024 --candidates 128 256 512 1024
+fi
 mkdir -p results
 run_measurement() {
   local side=$1 batch=$2 name=$3 steps=$4 repeats=$5 warmup=$6
