@@ -19,7 +19,10 @@ def main():
     parser.add_argument("--batch", type=int, choices=(256, 1024), required=True)
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--profile-updates", type=int, default=0)
     args = parser.parse_args()
+    if args.profile_updates < 0:
+        parser.error("--profile-updates must be nonnegative")
     effective = 1024
     accumulation = effective // args.batch
     torch.manual_seed(501)
@@ -53,20 +56,57 @@ def main():
     optimizer = target_runner._build_optimizer(model, recipe)
     mixup = Mixup(mixup_alpha=0.8, cutmix_alpha=0, label_smoothing=0.1, num_classes=1000)
 
+    timings = []
+    loader_wait = []
+    previous_end = None
+    profiling = False
+
+    def mark():
+        if profiling:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event
+        return None
+
     def update(batches):
+        nonlocal previous_end
         optimizer.zero_grad(set_to_none=True)
         for _ in range(accumulation):
+            if profiling:
+                before_load = time.perf_counter()
             images, labels = next(batches)
+            if profiling:
+                loader_wait.append((time.perf_counter() - before_load) * 1000)
+            transfer_start = mark()
+            if previous_end is not None:
+                timings.append(("stream_gap_before_transfer", previous_end, transfer_start))
             images = images.cuda(non_blocking=True, memory_format=torch.channels_last)
             labels = labels.cuda(non_blocking=True)
+            transfer_end = mark()
             images, soft_targets = mixup(images, labels)
+            forward_start = mark()
             torch.compiler.cudagraph_mark_step_begin()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = runtime(images)[0]
                 loss = F.cross_entropy(logits, soft_targets)
+            forward_end = mark()
             (loss / accumulation).backward()
+            backward_end = mark()
+            if profiling:
+                timings.extend([
+                    ("transfer_and_layout", transfer_start, transfer_end),
+                    ("mixup", transfer_end, forward_start),
+                    ("forward_and_loss", forward_start, forward_end),
+                    ("backward", forward_end, backward_end),
+                ])
+            previous_end = backward_end
+        optimizer_start = mark()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        optimizer_end = mark()
+        if profiling:
+            timings.append(("clipping_and_optimizer", optimizer_start, optimizer_end))
+        previous_end = optimizer_end
         return loss.detach()
 
     batches = iter(loader)
@@ -81,6 +121,15 @@ def main():
     start = time.perf_counter()
     batches = iter(loader)
     updates = count // effective
+    if args.profile_updates:
+        updates = min(updates, args.profile_updates)
+        # Let the loader and GPU settle after restarting the timed iterator.
+        for _ in range(16):
+            update(batches)
+        torch.cuda.synchronize()
+        profiling = True
+        start = time.perf_counter()
+        count = updates * effective
     for step in range(updates):
         loss = update(batches)
         if step % 100 == 99:
@@ -89,6 +138,17 @@ def main():
     seconds = time.perf_counter() - start
     if not loss.isfinite().item() or not all(p.isfinite().all().item() for p in model.parameters()):
         raise RuntimeError("Nonfinite training result")
+    if profiling:
+        stage_ms = {}
+        for stage, first, last in timings:
+            stage_ms[stage] = stage_ms.get(stage, 0.0) + first.elapsed_time(last)
+        stage_ms = {stage: total / updates for stage, total in stage_ms.items()}
+        print("IMAGENET_PROFILE=" + json.dumps(dict(
+            batch=args.batch, accumulation=accumulation, updates=updates,
+            images_s=count / seconds, wall_ms_per_update=seconds * 1000 / updates,
+            loader_cpu_wait_ms_per_update=sum(loader_wait) / updates,
+            cuda_ms_per_update=stage_ms,
+        )), flush=True)
     print("IMAGENET_BENCH=" + json.dumps(dict(
         batch=args.batch, accumulation=accumulation, workers=args.workers,
         examples=count, updates=updates, epoch_seconds=seconds, images_s=count / seconds,
