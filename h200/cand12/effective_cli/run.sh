@@ -72,11 +72,15 @@ else
     echo ORDINARY_NEEDS_REVIEW
     tail -15 "$RUN_ROOT/cli-e2e.log" | cut -c1-1700
 fi
-echo 'START_FIXED_GROUP_VJP'
-if taskset -c "$affinity" python -u effective_cli/fixed_vjp.py > "$RUN_ROOT/fixed-new-vjp.log" 2>&1; then
-    echo FIXED_NEW_VJP_COMPLETE
+if [[ -f effective_cli/previous-fixed.json ]]; then
+    echo 'START_FIXED_GROUP_VJP'
+    if taskset -c "$affinity" python -u effective_cli/fixed_vjp.py > "$RUN_ROOT/fixed-new-vjp.log" 2>&1; then
+        echo FIXED_NEW_VJP_COMPLETE
+    else
+        echo FIXED_NEW_VJP_NEEDS_REVIEW
+        tail -15 "$RUN_ROOT/fixed-new-vjp.log" | cut -c1-1400
+    fi
 else
-    echo FIXED_NEW_VJP_NEEDS_REVIEW
-    tail -15 "$RUN_ROOT/fixed-new-vjp.log" | cut -c1-1400
+    echo FIXED_CONTINUATION_DEFERRED_NO_VERIFIED_PRIOR
 fi
 python effective_cli/export.py
