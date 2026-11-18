@@ -22,7 +22,9 @@ def main():
     parser.add_argument("--profile-updates", type=int, default=0)
     parser.add_argument("--loader-batch", type=int)
     parser.add_argument("--kernel-profile", choices=("trace", "counters"))
+    parser.add_argument("--layout-check", choices=("seed", "compare"))
     args = parser.parse_args()
+    np.random.seed(501)
     loader_batch = args.loader_batch or args.batch
     if loader_batch < 1 or args.batch % loader_batch:
         parser.error("Loader batch must divide the physical batch")
@@ -120,8 +122,13 @@ def main():
         return loss.detach()
 
     batches = iter(loader)
-    for _ in range(8):
-        update(batches)
+    if args.layout_check != "compare":
+        for _ in range(8):
+            update(batches)
+    if args.layout_check:
+        from layout_gate import check
+        check(args.layout_check, model, runtime, optimizer, mixup, batches)
+        return
     torch.cuda.synchronize()
     model.load_state_dict(initial)
     optimizer = target_runner._build_optimizer(model, recipe)
@@ -158,6 +165,7 @@ def main():
         for _ in range(16):
             update(batches)
         torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
         profiling = True
         start = time.perf_counter()
         count = updates * effective
