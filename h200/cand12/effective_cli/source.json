@@ -28,7 +28,7 @@
   "src/lnet/direct_path_scan_kernels.py": "7be7e1582535799fceca398129019c50a026cfbadf8c5cf7c7bacba199f0a074",
   "src/lnet/directional.py": "8640e22a23aa626caec1e9f4bb2519769708f44195134a33ff3738b761ed7379",
   "src/lnet/effective_output_vjp.py": "2e618676bb311d56edb83bea5556a060614e0de9e8890abfa72dfe37ab37c670",
-  "src/lnet/effective_update_proposals.json": "42de0541dc5c0597d0b2c4fa3d3498a25b6f9ceb7f0c8ccc228a394677b4905b",
+  "src/lnet/effective_update_proposals.json": "216011d6aec516919ac2a366ebba122890e4d4ab98e6037537d0cb18fddfba04",
   "src/lnet/factorized_complex_scan_reader.py": "51a45a5758d9415267f46c15eaaec9d362118511a337e2fab707621ab6797d68",
   "src/lnet/gated_post_fusion.py": "970641b2d0edb10229f00c228ddffca468c936c770327a3a0c8914ca39ec1087",
   "src/lnet/grouped_path_cffn.py": "5768c86a6c134efe3ff2b6b6caa8c6cc8f3b1441544a5919e688af51686fd1f9",
