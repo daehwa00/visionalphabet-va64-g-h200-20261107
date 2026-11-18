@@ -20,7 +20,12 @@ def main():
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--profile-updates", type=int, default=0)
+    parser.add_argument("--loader-batch", type=int)
     args = parser.parse_args()
+    loader_batch = args.loader_batch or args.batch
+    if loader_batch < 1 or args.batch % loader_batch:
+        parser.error("Loader batch must divide the physical batch")
+    chunks_per_batch = args.batch // loader_batch
     if args.profile_updates < 0:
         parser.error("--profile-updates must be nonnegative")
     effective = 1024
@@ -42,7 +47,7 @@ def main():
     count = len(dataset) // effective * effective
     order = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(501)).tolist()[:count]
     loader = DataLoader(
-        dataset, batch_size=args.batch, sampler=order, num_workers=args.workers,
+        dataset, batch_size=loader_batch, sampler=order, num_workers=args.workers,
         pin_memory=True, persistent_workers=True, prefetch_factor=1,
         generator=torch.Generator().manual_seed(501),
     )
@@ -74,14 +79,18 @@ def main():
         for _ in range(accumulation):
             if profiling:
                 before_load = time.perf_counter()
-            images, labels = next(batches)
+            chunks = [next(batches) for _ in range(chunks_per_batch)]
             if profiling:
                 loader_wait.append((time.perf_counter() - before_load) * 1000)
             transfer_start = mark()
             if previous_end is not None:
                 timings.append(("stream_gap_before_transfer", previous_end, transfer_start))
-            images = images.cuda(non_blocking=True, memory_format=torch.channels_last)
-            labels = labels.cuda(non_blocking=True)
+            image_chunks = [images.cuda(non_blocking=True, memory_format=torch.channels_last)
+                            for images, _ in chunks]
+            label_chunks = [labels.cuda(non_blocking=True) for _, labels in chunks]
+            images = image_chunks[0] if chunks_per_batch == 1 else torch.cat(image_chunks)
+            labels = label_chunks[0] if chunks_per_batch == 1 else torch.cat(label_chunks)
+            del chunks, image_chunks, label_chunks
             transfer_end = mark()
             images, soft_targets = mixup(images, labels)
             forward_start = mark()
@@ -144,7 +153,8 @@ def main():
             stage_ms[stage] = stage_ms.get(stage, 0.0) + first.elapsed_time(last)
         stage_ms = {stage: total / updates for stage, total in stage_ms.items()}
         print("IMAGENET_PROFILE=" + json.dumps(dict(
-            batch=args.batch, accumulation=accumulation, updates=updates,
+            batch=args.batch, accumulation=accumulation, workers=args.workers,
+            loader_batch=loader_batch, updates=updates,
             images_s=count / seconds, wall_ms_per_update=seconds * 1000 / updates,
             loader_cpu_wait_ms_per_update=sum(loader_wait) / updates,
             cuda_ms_per_update=stage_ms,
