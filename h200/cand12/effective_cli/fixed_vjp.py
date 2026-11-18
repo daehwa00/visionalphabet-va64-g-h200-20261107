@@ -153,7 +153,7 @@ def snapshot():
                          'prepare':['va_imagenet100_runtime','prepare_model'],'optimizer':['run_va_eight_ablations','_build_optimizer']}),work/'snapshot.pt')
 def main():
     snapshot()
-    prior=json.loads((Path(__file__).parent/'previous-fixed.json').read_text());pm=prior['micro']
+    prior=json.loads((Path(os.environ['COLD_INPUTS'])/'previous-fixed.json').read_text());pm=prior['micro']
     assert observed(pm)
     best=put(pm,complete(pm,transplant(prior['records'],pm)),'previous fixed-data winner')
     champions.add(best)

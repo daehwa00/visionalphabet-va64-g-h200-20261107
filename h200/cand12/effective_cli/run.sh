@@ -72,7 +72,7 @@ else
     echo ORDINARY_NEEDS_REVIEW
     tail -15 "$RUN_ROOT/cli-e2e.log" | cut -c1-1700
 fi
-if [[ -f effective_cli/previous-fixed.json ]]; then
+if [[ -f "$fixture/previous-fixed.json" ]]; then
     echo 'START_FIXED_GROUP_VJP'
     if taskset -c "$affinity" python -u effective_cli/fixed_vjp.py > "$RUN_ROOT/fixed-new-vjp.log" 2>&1; then
         echo FIXED_NEW_VJP_COMPLETE

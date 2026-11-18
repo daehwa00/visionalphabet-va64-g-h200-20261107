@@ -69,6 +69,11 @@ def main(target):
     clear=AESGCM(bytes.fromhex(spec["key"])).decrypt(bytes.fromhex(spec["nonce"]),ciphertext,b"VA-IN100-B128-v1")
     verified={}
     expected=dict(line.split()[::-1] for line in Path("effective_cli/inputs.sha256").read_text().splitlines())
+    if "fixed_control_sha256" in spec:
+        import re
+        control_digest = spec["fixed_control_sha256"]
+        assert isinstance(control_digest, str) and re.fullmatch("[0-9a-f]{64}", control_digest)
+        expected["previous-fixed.json"] = control_digest
     with zipfile.ZipFile(io.BytesIO(clear)) as z:
         assert sorted(z.namelist()) == sorted(expected)
         for name,h in expected.items():
