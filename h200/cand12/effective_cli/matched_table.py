@@ -89,7 +89,8 @@ def profile_evidence(trace,records):
                          first=launches[0]))
     ranking=rank(trace)
     assert ranking['top'] and ranking['total_kernel_ms']>0
-    return dict(trace_sha256=digest(trace),top=ranking['top'][:5],dispatch=rows)
+    return dict(trace_sha256=digest(trace),total_kernel_ms=ranking['total_kernel_ms'],
+                kernel_event_count=ranking['kernel_event_count'],top=ranking['top'][:5],dispatch=rows)
 
 
 def compare_plan(plan,folder,source,pins,fixture,lr):

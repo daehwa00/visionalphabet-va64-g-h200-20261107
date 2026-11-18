@@ -64,6 +64,8 @@ export CONTRACT="$PWD/contract.json"
 export COLD_INPUTS="$fixture"
 export PYTHONPATH="$RUN_ROOT/source/scripts:$RUN_ROOT/source/src:$PWD/effective_cli" WANDB_MODE=disabled
 export TORCHINDUCTOR_COMPILE_THREADS=2
+python effective_cli/data.py
+CUDA_VISIBLE_DEVICES='' python effective_cli/contract_preflight.py
 trap 'python effective_cli/frontier_export.py' EXIT
 taskset -c "$affinity" python -u effective_cli/frontier.py > "$RUN_ROOT/frontier.log" 2>&1 || {
     tail -10 "$RUN_ROOT/frontier.log" | cut -c1-1200
@@ -73,10 +75,10 @@ taskset -c "$affinity" python -u effective_cli/matched_table.py > "$RUN_ROOT/mat
     tail -8 "$RUN_ROOT/matched.log" | cut -c1-1200
     exit 1
 }
+python effective_cli/kernel_events.py
 export R3_JOB_COMMIT
 R3_JOB_COMMIT=$(git rev-parse HEAD)
 python effective_cli/r3_catalog.py
-python effective_cli/data.py
 if taskset -c "$affinity" python -u effective_cli/cli_e2e.py > "$RUN_ROOT/cli-e2e.log" 2>&1; then
     echo ORDINARY_R3_VERIFIED
 else

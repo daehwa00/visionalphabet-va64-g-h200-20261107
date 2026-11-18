@@ -1,4 +1,5 @@
 {
+  "pyproject.toml": "dc170f1b92c3cc6cd71512cfd4d0e5533694e88a4e3e3d4fb89a66870ae8def7",
   "scripts/automatic_training_layout.py": "4a7334c4d12f860224fbc194cbcd0092a46bbf0ad2239cee59a78d49924c9dbe",
   "scripts/effective_batch_epoch.py": "54e50c1626fb9cee162e911fc509ea6ef578d77737573a9c5e2ba01ae1184518",
   "scripts/effective_batch_proposals.py": "94acc584901a6ebb781042fe4e3932d6471704ee9ca58b63d69e5e2e5a7b8aa6",

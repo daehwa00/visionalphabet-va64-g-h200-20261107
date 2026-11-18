@@ -137,6 +137,12 @@ def main():
         'three_pair_gain','ranges_separated','winner_records_sha256')},'pairs':[{'order':pair['order'],'numeric':pair['numeric'],
         'arms':{n:{k:a[k] for k in ('wall_samples_ms','median_ms','images_s','peak_allocated_mib','capture_counts','capture_finite','workload_sha256')}
                 for n,a in pair['arms'].items()}} for pair in v['pairs']]} for v in table['plans']]
+    for compact,plan in zip(result['fixed_matched_evidence'],table['plans'],strict=True):
+        for dst,pair in zip(compact['pairs'],plan['pairs'],strict=True):
+            for side,arm in pair['arms'].items():
+                if 'profile_outside_timer' in arm:
+                    dst['arms'][side]['profile_outside_timer']=arm['profile_outside_timer']
+    result['kernel_events_status']=json.loads((root/'kernel-events-status.json').read_text())
     result['source_freeze_sha256']=hashfile(Path(__file__).parent/'common-release.sha256')
     result['valid_receipt']=True
     result['source_closure']=json.loads((root/'source-manifest.json').read_text()) if (root/'source-manifest.json').exists() else {}

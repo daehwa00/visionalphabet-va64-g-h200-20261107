@@ -28,4 +28,4 @@ def rank(path):
         key=(role,name[:160],json.dumps(shape),tuple(a.get('grid',[])),tuple(a.get('block',[])))
         bins[key][0]+=1;bins[key][1]+=e['dur']/1000;fam[role]+=e['dur']/1000
     rows=[dict(family=k[0],name=k[1],shape=json.loads(k[2]),grid=k[3],block=k[4],calls=v[0],ms_update=v[1]) for k,v in sorted(bins.items(),key=lambda x:-x[1][1])]
-    return dict(total_kernel_ms=sum(fam.values()),families_ms=dict(fam),top=rows[:18])
+    return dict(total_kernel_ms=sum(fam.values()),kernel_event_count=sum(v[0] for v in bins.values()),families_ms=dict(fam),top=rows[:18])
