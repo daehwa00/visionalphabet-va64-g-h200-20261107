@@ -1,0 +1,260 @@
+{
+  "982b121e96733593163ad838dddf513ad78b71856e738b12290af537e032333d": {
+    "key": "982b121e96733593163ad838dddf513ad78b71856e738b12290af537e032333d",
+    "observed": {
+      "product_scan_direct_path_backward_layout": [
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"435521b2bb907ea1e402b85ac832de8d6a12bc01caff0e51779ef2ec677bee05\",\"shape\":{\"batch\":128,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"height\":14,\"modes\":160,\"width\":14},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"435521b2bb907ea1e402b85ac832de8d6a12bc01caff0e51779ef2ec677bee05\",\"shape\":{\"batch\":128,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"height\":28,\"modes\":160,\"width\":28},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}"
+      ],
+      "retained_path_step": [
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"cfe4aeee6a57755bdc160537258462872b817b13ec0a04e209424d1635cde817\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":0,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}"
+      ]
+    },
+    "records": {},
+    "status": "baseline",
+    "trials": [
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "adjoints"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "retained-wide"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "associative"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "order-only"
+      }
+    ],
+    "version": 1,
+    "winner": null,
+    "winning_pairs": [],
+    "workload": {
+      "channels_last": true,
+      "cuda": "12.8",
+      "cuda_arch": [
+        8,
+        9
+      ],
+      "cuda_bf16_reduced": true,
+      "cuda_fp16_reduced": true,
+      "cudnn_version": 91002,
+      "device": "NVIDIA_GeForce_RTX_4090-sm89",
+      "driver_api": 13000,
+      "grad_accum": 1,
+      "input_dtype": "torch.float32",
+      "input_shape": [
+        128,
+        3,
+        224,
+        224
+      ],
+      "input_stride": [
+        150528,
+        1,
+        672,
+        3
+      ],
+      "legacy_records": "cd9e603e4a9d58a6872fe544dda5574c1bbbf9600c0d0d05687012cebcf579d6",
+      "legacy_revision": "435521b2bb907ea1e402b85ac832de8d6a12bc01caff0e51779ef2ec677bee05",
+      "microbatches": 1,
+      "mixup_alpha": 0.8,
+      "model": "2fc2460c33ae7b815f550f2f240c11636d77ab9d78089d7eb15290cfa0873ea6",
+      "objective": "one MixUp cross-entropy on terminal-Q4 affine logits; no auxiliary term",
+      "precision": "bfloat16",
+      "profile": "{\"dynamic\":false,\"fullgraph\":false,\"mode\":\"default\"}",
+      "retained_records": "c57f7f25f414f32004aab37f21f06ea1c57e3282303c749c83cdc22dc9c175f6",
+      "scan_env": {
+        "LNET_DISABLE_LAUNCH_AUTOTUNE": null,
+        "VA_REAL_MEMORY_SCAN_BATCH_PARTIALS": null,
+        "VA_REAL_MEMORY_TRAINING_OPTIMIZATIONS": null
+      },
+      "schedule_phase": "scheduled",
+      "settings": {
+        "cudnn_benchmark": true,
+        "cudnn_deterministic": false,
+        "cudnn_tf32": true,
+        "deterministic": false,
+        "emulate_precision_casts": false,
+        "matmul": "high",
+        "threads": 8,
+        "warn_only": false
+      },
+      "step_revisions": [
+        "cfe4aeee6a57755bdc160537258462872b817b13ec0a04e209424d1635cde817",
+        "873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252",
+        "98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8"
+      ],
+      "torch": "2.9.1+cu128",
+      "train_function": [
+        "va_ablation_augment",
+        "train_epoch"
+      ],
+      "train_options": {
+        "cutmix": false
+      },
+      "training_code": "7854a6223daf2526255fbc0b907fa0ce9458164c32334fb7aba653c9d4e7f51d",
+      "triton": "3.5.1",
+      "zero_lr_groups": [
+        false,
+        false,
+        false,
+        false
+      ]
+    }
+  },
+  "b622509f4d210fe9dcd490ef3e2c3dc5e83266838aa122be3ea4039ec935a323": {
+    "key": "b622509f4d210fe9dcd490ef3e2c3dc5e83266838aa122be3ea4039ec935a323",
+    "observed": {
+      "product_scan_direct_path_backward_layout": [
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"435521b2bb907ea1e402b85ac832de8d6a12bc01caff0e51779ef2ec677bee05\",\"shape\":{\"batch\":128,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"height\":14,\"modes\":160,\"width\":14},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"435521b2bb907ea1e402b85ac832de8d6a12bc01caff0e51779ef2ec677bee05\",\"shape\":{\"batch\":128,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"height\":28,\"modes\":160,\"width\":28},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}"
+      ],
+      "retained_four_row_prefix": [
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"29743320dec66137dc5930697a3d0b6853159405b2e6c61880324b953b286f54\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"29743320dec66137dc5930697a3d0b6853159405b2e6c61880324b953b286f54\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}"
+      ],
+      "retained_path_step": [
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}",
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"cfe4aeee6a57755bdc160537258462872b817b13ec0a04e209424d1635cde817\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":0,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}"
+      ]
+    },
+    "records": {},
+    "status": "baseline",
+    "trials": [
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "retained-small"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "adjoints"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "retained-wide"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "associative"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "order-only"
+      },
+      {
+        "clean_pairs": 3,
+        "execution_failure": false,
+        "numerical_failure": false,
+        "plan": "four-row"
+      }
+    ],
+    "version": 1,
+    "winner": null,
+    "winning_pairs": [],
+    "workload": {
+      "channels_last": true,
+      "cuda": "12.8",
+      "cuda_arch": [
+        8,
+        9
+      ],
+      "cuda_bf16_reduced": true,
+      "cuda_fp16_reduced": true,
+      "cudnn_version": 91002,
+      "device": "NVIDIA_GeForce_RTX_4090-sm89",
+      "driver_api": 13000,
+      "grad_accum": 1,
+      "input_dtype": "torch.float32",
+      "input_shape": [
+        128,
+        3,
+        224,
+        224
+      ],
+      "input_stride": [
+        150528,
+        1,
+        672,
+        3
+      ],
+      "legacy_records": "43d356d3e617c1f21a0937ed551b27266fd153bfa16142185f72034a6c8d3cb6",
+      "legacy_revision": "435521b2bb907ea1e402b85ac832de8d6a12bc01caff0e51779ef2ec677bee05",
+      "microbatches": 1,
+      "mixup_alpha": 0.8,
+      "model": "2fc2460c33ae7b815f550f2f240c11636d77ab9d78089d7eb15290cfa0873ea6",
+      "objective": "one MixUp cross-entropy on terminal-Q4 affine logits; no auxiliary term",
+      "precision": "bfloat16",
+      "profile": "{\"dynamic\":false,\"fullgraph\":false,\"mode\":\"default\"}",
+      "retained_records": "c57f7f25f414f32004aab37f21f06ea1c57e3282303c749c83cdc22dc9c175f6",
+      "scan_env": {
+        "LNET_DISABLE_LAUNCH_AUTOTUNE": null,
+        "VA_REAL_MEMORY_SCAN_BATCH_PARTIALS": null,
+        "VA_REAL_MEMORY_TRAINING_OPTIMIZATIONS": null
+      },
+      "schedule_phase": "scheduled",
+      "segment_records": "eda34d8628d60ca367edebf5b8db7b9471f24bf2f1966e9e840fa15bc3231f03",
+      "segment_revision": "29743320dec66137dc5930697a3d0b6853159405b2e6c61880324b953b286f54",
+      "settings": {
+        "cudnn_benchmark": true,
+        "cudnn_deterministic": false,
+        "cudnn_tf32": true,
+        "deterministic": false,
+        "emulate_precision_casts": false,
+        "matmul": "high",
+        "threads": 8,
+        "warn_only": false
+      },
+      "step_revisions": [
+        "cfe4aeee6a57755bdc160537258462872b817b13ec0a04e209424d1635cde817",
+        "873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252",
+        "98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8"
+      ],
+      "torch": "2.9.1+cu128",
+      "train_function": [
+        "va_ablation_augment",
+        "train_epoch"
+      ],
+      "train_options": {
+        "cutmix": false
+      },
+      "training_code": "490ba0887a6d790aebb764d7362b5701a987e61787064765686a17664f441b71",
+      "triton": "3.5.1",
+      "zero_lr_groups": [
+        false,
+        false,
+        false,
+        false
+      ]
+    }
+  }
+}
