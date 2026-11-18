@@ -1,5 +1,7 @@
 """Download only the three pinned benchmark fixtures from the experiment relay."""
 import concurrent.futures
+import base64
+import threading
 import hashlib
 import json
 import os
@@ -30,9 +32,11 @@ def main(target):
         time.sleep(5)
     response.raise_for_status()
     session = response.json()["session_id"]
-    headers = {"Authorization":"Bearer "+token,"X-Session-ID":session, "Accept":"application/octet-stream"}
+    headers = {"Authorization":"Bearer "+token,"X-Session-ID":session, "Accept":"application/json","Accept-Encoding":"identity"}
     files = {"checkpoint.pt":"checkpoint","images.pt":"images","4090.validation.pt":"validation"}
     verified = {}
+    pace_lock=threading.Lock()
+    next_read=0.0
     for line in Path("matched-inputs.sha256").read_text().splitlines():
         digest,name=line.split()
         job=files[name]
@@ -42,11 +46,15 @@ def main(target):
         meta=meta.json()
         assert meta["sha"]==digest and meta["bytes"]>0 and meta["verified"]
         def read_chunk(part):
+            nonlocal next_read
             for attempt in range(5):
                 try:
+                    with pace_lock:
+                        time.sleep(max(0,next_read-time.monotonic()))
+                        next_read=time.monotonic()+.125
                     res=requests.get(f"{url}/{digest}/{part}",headers=headers,timeout=40)
                     res.raise_for_status()
-                    chunk=res.content
+                    chunk=base64.b64decode(res.json()["base64"],validate=True)
                     assert len(chunk)==min(meta["chunk_bytes"],meta["bytes"]-part*meta["chunk_bytes"])
                     return chunk
                 except requests.RequestException:
