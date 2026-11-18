@@ -32,6 +32,7 @@ def main(target):
     session = response.json()["session_id"]
     headers = {"Authorization":"Bearer "+token,"X-Session-ID":session, "Accept":"application/octet-stream"}
     files = {"checkpoint.pt":"checkpoint","images.pt":"images","4090.validation.pt":"validation"}
+    verified = {}
     for line in Path("matched-inputs.sha256").read_text().splitlines():
         digest,name=line.split()
         job=files[name]
@@ -57,7 +58,12 @@ def main(target):
             for blob in pool.map(read_chunk,range(meta["chunks"])):
                 f.write(blob);h.update(blob)
         assert h.hexdigest()==digest and p.stat().st_size==meta["bytes"]
+        verified[name] = digest
         print("VERIFIED_PRIVATE_INPUT",name,digest,flush=True)
+
+    ack = requests.post(BASE+"/received", headers=headers, json=verified, timeout=30)
+    ack.raise_for_status()
+    assert ack.json()["closed"]
 
 
 if __name__=="__main__":
