@@ -3,6 +3,11 @@ from pathlib import Path
 import base64,json,lzma,os,hashlib
 root=Path(os.environ['RUN_ROOT'])
 def read(p):return json.loads(p.read_text()) if p.exists() else {}
+matched=read(root/'matched-table.json')
+if matched:
+    # Keep the final comparison separate from the exploratory search payload.
+    payload=base64.b64encode(lzma.compress(json.dumps(matched,separators=(',',':')).encode(),preset=9)).decode()
+    print('MATCHED_FIXED_TABLE_XZ',payload)
 result=read(root/'ordinary-result.json')
 result.pop('source_closure',None)
 print("ORDINARY_SUMMARY",json.dumps(result,separators=(',',':')))

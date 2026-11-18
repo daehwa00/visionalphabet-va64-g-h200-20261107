@@ -193,7 +193,10 @@ def main():
             # User's new VJPs must be tested on the same geometries as the validated parent. Donor choices remain trials.
             parents={'output-dot-direct-prior':parent,**candidates(discovery['observed'])}
             options=vjp_candidates(discovery['observed'],discovery['defaults'],parents)
-            assert options, f'No VJP proposals for feasible microbatch {m}'
+            if not options:
+                audit.setdefault('vjp_unavailable',{})[str(m)]='no matching direct-dot parent in observed scopes'
+                save()
+                continue
             dedup=set()
             for label,recs in options.items():
                 tag=put(m,complete(m,recs),label)
@@ -232,9 +235,19 @@ def main():
             if ms>c[0]['ms']*1.005:break
             if confirm(best,tag):best=tag;break
         if best==old:break
-    profile_winner(best)
-    audit['alternatives_exhausted']=True
-    audit['fixed_best']=dict(micro=PLANS[best][0],records=PLANS[best][1],name=PLANS[best][2],tag=best);save()
+    if not profile_winner(best):
+        raise RuntimeError('Final fixed-input profile or numerical verification failed')
+    audit['alternatives_exhausted']=not audit['errors'] and not audit.get('vjp_unavailable')
+    m, records, label = PLANS[best]
+    audit['fixed_best']=dict(micro=m,records=records,name=label,tag=best)
+    audit['comparison_plans']=[dict(role='native',micro=m,winner=records,defaults=complete(m,{}))]
+    save()
+    if m != 128 and observed(128):
+        mapped=transplant(records,128)
+        audit['comparison_plans'].append(dict(role='matched_4090_micro_trial',micro=128,
+            winner=complete(128,mapped),defaults=complete(128,{}),
+            mapped_scopes=sum(map(len,mapped.values())),parent_scopes=sum(map(len,records.values()))))
+        save()
 if __name__=='__main__':
     try:main()
     except Exception as exc:audit['errors'].append(str(exc)[-1500:]);raise

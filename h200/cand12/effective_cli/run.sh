@@ -76,6 +76,12 @@ if [[ -f "$fixture/previous-fixed.json" ]]; then
     echo 'START_FIXED_GROUP_VJP'
     if taskset -c "$affinity" python -u effective_cli/fixed_vjp.py > "$RUN_ROOT/fixed-new-vjp.log" 2>&1; then
         echo FIXED_NEW_VJP_COMPLETE
+        if taskset -c "$affinity" python -u effective_cli/matched_table.py > "$RUN_ROOT/matched-table.log" 2>&1; then
+            echo MATCHED_FIXED_RUN_COMPLETE
+        else
+            echo MATCHED_FIXED_RUN_NEEDS_REVIEW
+            tail -10 "$RUN_ROOT/matched-table.log" | cut -c1-1500
+        fi
     else
         echo FIXED_NEW_VJP_NEEDS_REVIEW
         tail -15 "$RUN_ROOT/fixed-new-vjp.log" | cut -c1-1400
