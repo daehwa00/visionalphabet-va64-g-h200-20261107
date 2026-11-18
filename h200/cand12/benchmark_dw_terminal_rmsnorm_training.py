@@ -63,6 +63,7 @@ def main() -> None:
     p.add_argument("--contract", type=Path, required=True)
     p.add_argument("--images", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--accumulation", type=int, default=1)
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--cpu-threads", type=int, default=4)
     p.add_argument("--mode", default="default")
@@ -225,13 +226,14 @@ def main() -> None:
         os.environ["LNET_COMPILE_MODE"] = a.mode
         runtime_model = runner.harness._build_runtime(model, recipe)
 
-    def gradients() -> tuple[torch.Tensor, torch.Tensor]:
+    def gradients(*, reset=True, divisor=1) -> tuple[torch.Tensor, torch.Tensor]:
         torch.compiler.cudagraph_mark_step_begin()
-        optimizer.zero_grad(set_to_none=True)
+        if reset:
+            optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = runtime_model(inputs)
             logits, loss, _ = runner.heads._training_objective(model, outputs, targets, other, 0.4)
-        loss.backward()
+        (loss / divisor).backward()
         return logits, loss
 
     torch.manual_seed(809)
@@ -300,7 +302,8 @@ def main() -> None:
     del checks, before, logits, loss
 
     def step() -> torch.Tensor:
-        _, current = gradients()
+        for microstep in range(a.accumulation):
+            _, current = gradients(reset=microstep == 0, divisor=a.accumulation)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         return current
@@ -356,7 +359,9 @@ def main() -> None:
         wall_ms=samples,
         event_ms=events,
         median_ms=statistics.median(samples),
-        images_s=a.batch * 1000 / statistics.median(samples),
+        effective_batch=a.batch * a.accumulation,
+        accumulation=a.accumulation,
+        images_s=a.batch * a.accumulation * 1000 / statistics.median(samples),
         peak_allocated_mib=max(steady_peaks) if steady_peaks else torch.cuda.max_memory_allocated() / 2**20,
         reserved_mib=torch.cuda.memory_reserved() / 2**20,
         final_loss=float(loss.detach()),
@@ -390,4 +395,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except torch.cuda.OutOfMemoryError:
+        raise SystemExit(42)

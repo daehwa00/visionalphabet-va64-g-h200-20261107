@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -eu
 cd "$(dirname "$0")"
-export RUN_ROOT=/app/output/cand12-bench-20261118
+export RUN_ROOT=/app/output/cand12-eb1024-20261118
 mkdir -p "$RUN_ROOT"
 cd ../..
 python3 -m pip install --disable-pip-version-check --target "$RUN_ROOT/bootstrap" uv==0.11.26
@@ -15,10 +15,21 @@ PYTHONPATH=code-control/src:code-control/scripts:code-control python init.py
 python -c "import torch; assert 'H200' in torch.cuda.get_device_name(), torch.cuda.get_device_name()"
 export VA_REAL_MEMORY_SCAN_BATCH_PARTIALS=1 LNET_DISABLE_LAUNCH_AUTOTUNE=0 PYTHONHASHSEED=0
 mkdir -p results
+run_measurement() {
+  local side=$1 batch=$2 name=$3 steps=$4 repeats=$5 warmup=$6
+  PYTHONPATH="code-$side/scripts:code-$side/src:code-$side" TORCHINDUCTOR_CACHE_DIR="$PWD/cache-$side" python benchmark_dw_terminal_rmsnorm_training.py --checkpoint checkpoint.pt --contract contract.json --images images.pt --batch "$batch" --accumulation "$((1024/batch))" --output "results/$name.json" --warmup "$warmup" --steps "$steps" --repeats "$repeats" --spatial --vector --reset-each-step
+}
+batch=256
+for side in control cand12; do
+  if run_measurement "$side" 256 "probe-$side" 1 1 1; then continue; else rc=$?; fi
+  if [[ $rc != 42 ]]; then exit "$rc"; fi
+  batch=128
+  break
+done
+echo "H200_BATCH=$batch ACCUMULATION=$((1024/batch))"
 for spec in control:1 cand12:1 cand12:2 control:2 control:3 cand12:3; do
   side=${spec%:*}
-  round=${spec#*:}
-  PYTHONPATH="code-$side/scripts:code-$side/src:code-$side" TORCHINDUCTOR_CACHE_DIR="$PWD/cache-$side" python benchmark_dw_terminal_rmsnorm_training.py --checkpoint checkpoint.pt --contract contract.json --images images.pt --batch 128 --output "results/$side-$round.json" --warmup 20 --steps 10 --repeats 5 --spatial --vector --reset-each-step
+  run_measurement "$side" "$batch" "$side-${spec#*:}" 5 5 5
 done
 python - <<'RESULT'
 import json, pathlib, statistics
