@@ -1,0 +1,99 @@
+{
+  "records": {
+    "NVIDIA_GeForce_RTX_4090-sm89": {
+      "retained_path_step": {
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 4,
+            "DOUBLING": 1,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 2
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 4,
+            "DOUBLING": 1,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 2
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 32,
+            "GROUP": 1
+          },
+          "num_stages": 1,
+          "num_warps": 4
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 32,
+            "GROUP": 1
+          },
+          "num_stages": 1,
+          "num_warps": 4
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"cfe4aeee6a57755bdc160537258462872b817b13ec0a04e209424d1635cde817\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":0,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 8,
+            "DOUBLING": 0,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 4
+        }
+      }
+    },
+    "NVIDIA_H200_NVL-sm90": {
+      "retained_path_step": {
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13020,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 4,
+            "DOUBLING": 1,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 2
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13020,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"873342992ff3555203194f8c985ef791165b7e31c5cdc3eb968b4ccbb3536252\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 4,
+            "DOUBLING": 1,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 2
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13020,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 32,
+            "GROUP": 1
+          },
+          "num_stages": 1,
+          "num_warps": 4
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13020,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"98c2e5cfb12ad3b7e3ea3dcfe6a2fa1012f0fa2de30ebefba5daad6757cc0ae8\",\"shape\":{\"batch\":128,\"coarse\":1,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":2,\"source_requires_grad\":0,\"source_row_stride\":320,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 32,
+            "GROUP": 1
+          },
+          "num_stages": 1,
+          "num_warps": 4
+        },
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13020,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"cfe4aeee6a57755bdc160537258462872b817b13ec0a04e209424d1635cde817\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":0,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 8,
+            "DOUBLING": 0,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 4
+        }
+      }
+    }
+  },
+  "schema_version": 2
+}
