@@ -9,7 +9,18 @@ def rank(path):
     for e in es:
         if e.get('cat')!='kernel':continue
         a=e['args'];c=cpu.get(a.get('External id'),{});name=e['name'];dims=c.get('Input Dims',[])
-        shape=[list(v) for v in dims if len(v) in (4,5) and len(v)>0 and v[0]>1][:2]
+        # Kineto also serializes List[Tensor] as nested dimension lists.
+        shape=[]
+        def visit(v):
+            if not isinstance(v,(list,tuple)):return
+            if len(v) in (4,5) and all(type(i) is int for i in v) and v[0]>1:
+                shape.append(list(v))
+            elif len(shape)<2:
+                for child in v:
+                    if len(shape)>=2:break
+                    visit(child)
+        visit(dims)
+        shape=shape[:2]
         role=('vback' if 'associative_backward' in name or name=='_path_backward_kernel' else
               'hback' if 'bidirectional' in name.lower() and 'backward' in name.lower() or 'horizontal_path_backward' in name else
               'vfwd' if 'associative_forward' in name or name=='_path_forward_kernel' else

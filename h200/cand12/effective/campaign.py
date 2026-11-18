@@ -57,7 +57,8 @@ def run(tag,label,*,discover=False,profile=False,confirm=False):
         audit['errors'].append(dict(label=label,attempt=attempt,rc=proc.returncode,detail=base.with_suffix('.log').read_text()[-1200:]))
         if attempt==0:env['TORCHINDUCTOR_COMPILE_THREADS']='1'
     if proc.returncode or data.get('status')!='passed':
-        status='oom' if data.get('status')=='oom' else 'execution_error'
+        is_cuda_oom=data.get('status')=='oom' and 'CUDA out of memory' in str(data.get('error','')) and 'OutOfMemoryError' in str(data.get('traceback',''))
+        status='oom' if is_cuda_oom else 'execution_error'
         audit['runs'][label]=dict(plan=tag,status=status);save();return None
     assert data['effective_batch']==1024 and data['epoch']==18 and data['global_step']==18270
     assert data['checkpoint_sha256']=='af07043f8407221dfe0d75c0d689d76e573119ad8708ee8df5b29cc564ed1fc6'
@@ -72,7 +73,16 @@ def run(tag,label,*,discover=False,profile=False,confirm=False):
     audit['runs'][label]=row
     if discover: observed[m]=json.loads(base.with_suffix('.scopes.json').read_text())
     if profile:
-        row['trace']=rank(base.with_suffix('.trace.json'))
+        try:
+            row['trace']=rank(base.with_suffix('.trace.json'))
+        except (TypeError,KeyError,ValueError) as exc:
+            audit['errors'].append(dict(label=label,attempt=1,rc=0,detail='trace analysis: '+repr(exc)))
+            es=json.loads(base.with_suffix('.trace.json').read_text())['traceEvents']
+            times={}
+            for e in es:
+                if e.get('cat')=='kernel':times[e['name']]=times.get(e['name'],0.0)+e['dur']/1000
+            row['trace']=dict(total_kernel_ms=sum(times.values()),families_ms={},shape_analysis=False,
+                top=[dict(family='other',name=k,ms_update=v) for k,v in sorted(times.items(),key=lambda x:-x[1])[:18]])
         if plan['records']:
             path=base.with_suffix('.applied.json');assert path.is_file()
             row['applied']=json.loads(path.read_text())
@@ -91,7 +101,9 @@ def rank_winner(tag,round_name):
     run_result=run(tag,'rank-'+round_name,profile=True)
     if run_result is None:
         audit['rankings'].append(dict(round=round_name,plan=tag,status='trace_failed'));return False
-    row,_=run_result;assert row['same_micro']['passed']
+    row,_=run_result
+    if not row['same_micro']['passed']:
+        audit['rankings'].append(dict(round=round_name,plan=tag,status='profile_numerical_failure'));save();return False
     audit['rankings'].append(dict(round=round_name,plan=tag,ms=row['ms'],trace=row['trace']));save();return True
 def confirm(best,candidate,name):
     if best==candidate or candidate in promoted:return False
@@ -118,8 +130,10 @@ def confirm(best,candidate,name):
         entry['passed']=max(v['candidate_ms'] for v in entry['pairs'])<min(v['control_ms'] for v in entry['pairs'])
     save()
     if entry['passed']:
+        if not rank_winner(candidate,name):
+            entry['passed']=False;entry['error']='winner trace or numerical verification failed';save();return False
         promoted.add(candidate)
-        audit['winners'].append(dict(plan=candidate,against=best,test=name));rank_winner(candidate,name)
+        audit['winners'].append(dict(plan=candidate,against=best,test=name));save()
     return entry['passed']
 
 def donor(m,device,oldbatch=128):
