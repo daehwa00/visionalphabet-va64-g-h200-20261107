@@ -150,7 +150,7 @@ def main():
             with torch.profiler.profile(activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
-            ]) as trace:
+            ], record_shapes=True) as trace:
                 for _ in range(3):
                     update(batches)
                 torch.cuda.synchronize()

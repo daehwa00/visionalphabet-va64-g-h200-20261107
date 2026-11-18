@@ -1,0 +1,18 @@
+{
+  "records": {
+    "NVIDIA_GeForce_RTX_4090-sm89": {
+      "product_scan_direct_path_backward_layout": {
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"3a060d66be429d8693a4dbd7306a9115e3e2b35e1c438f6cc7e2276e3f70c89b\",\"shape\":{\"batch\":128,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"height\":56,\"modes\":160,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BLOCK_MODES": 4,
+            "COMPACT_CHANNELS": 3,
+            "LINES_PER_GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 2
+        }
+      }
+    }
+  },
+  "schema_version": 2
+}
