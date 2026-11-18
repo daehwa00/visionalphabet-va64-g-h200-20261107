@@ -14,7 +14,7 @@ import time
 
 import requests
 
-BASE = "https://va-effcli-h200-20261118.gpupulse-monitor.workers.dev/va64g"
+BASE = "https://va-fixedfront-h200-20261119.gpupulse-monitor.workers.dev/va64g"
 
 
 def main(target):
