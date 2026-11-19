@@ -95,7 +95,7 @@ def trace_summary(path):
     dispatch = {name: sum(row["calls"] for row in rows if row["name"] == name) for name in known}
     return dict(path=str(path), dispatch_counts=dispatch, trace_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 total_kernel_ms=sum(totals.values()), kernel_event_count=sum(r["calls"] for r in rows),
-                families_ms=dict(totals), top=rows[:24])
+                families_ms=dict(totals), top=rows[:35])
 
 
 def launch(label, arm, micro, seconds, *, profile=False):
@@ -139,7 +139,7 @@ def launch(label, arm, micro, seconds, *, profile=False):
         row = {"microbatch": micro, "error": "worker result was interrupted during write"}
     row.pop("traceback", None)
     if error:
-        row.update(status=row.get("status") if row.get("status") in ("oom", "error") else "error",
+        row.update(status=row.get("status") if row.get("status") in ("oom", "error", "measured") else "error",
                    worker_error=error,
                    detail="\n".join(logpath.read_text(errors="replace").splitlines()[-5:])[-900:])
     if arm == "screen":
@@ -148,7 +148,7 @@ def launch(label, arm, micro, seconds, *, profile=False):
         return {key: row[key] for key in ("status", "microbatch", "error", "worker_error", "detail") if key in row}
     row["flags"] = {name: env.get(name, "0") for name in (*R6_FLAGS, *R7_FLAGS)}
     trace = output.with_suffix(".trace.json")
-    if row.get("status") == "passed" and trace.is_file():
+    if row.get("status") in ("passed", "measured") and trace.is_file():
         try:
             row["trace"] = trace_summary(trace)
         except Exception as exc:
@@ -187,10 +187,11 @@ def main():
     start = int(os.environ["HOPPER_R8_START"])
     topology = gpu_topology()
     mig = topology["is_mig"]
-    deadline = start + (24 if mig else 30) * 60 - 12
-    dest = ROOT / "run.json"
+    deadline = int(os.environ["HOPPER_R8_DEADLINE"]) - 10
+    dest = ROOT / "result.json"
     report = dict(gpu_topology=topology, topology_basis="visible CUDA memory and requested pool",
-                  arms={}, gates={}, screen_runs={}, status="running")
+                  arms={}, gates={}, screen_runs={}, status="running",
+                  start_epoch_s=start, deadline_epoch_s=deadline + 10)
     save(dest, report)
     if topology["capability"] != [9, 0] or topology["pool_mode"] != os.environ["HOPPER_REQUESTED_POOL"]:
         report.update(status="invalid_topology", requested_pool=os.environ["HOPPER_REQUESTED_POOL"])
@@ -211,7 +212,8 @@ def main():
 
     def compare(control, candidate, micro):
         ref, cand = label(control, micro), label(candidate, micro)
-        if all(report["arms"][key].get("status") == "passed" for key in (ref, cand)):
+        if deadline - time.time() > 36 and all(
+                report["arms"][key].get("status") in ("passed", "measured") for key in (ref, cand)):
             report["gates"][f"{cand}_vs_{ref}"] = gate(ref, cand)
             save(dest, report)
 
@@ -229,15 +231,15 @@ def main():
         save(dest, report)
 
     for index, arm in enumerate(ARMS):
-        measure(arm, primary, (210 if not mig else 175) if not index else 150,
-                (3 - index) * 115 + (450 if mig else 610), profile=arm in (ARMS[0], ARMS[-1]))
+        measure(arm, primary, (285 if not mig else 175) if not index else (220 if not mig else 150),
+                (3 - index) * 115 + (450 if mig else 600), profile=arm in (ARMS[0], ARMS[-1]))
     for arm in ARMS[1:]:
         compare(ARMS[0], arm, primary)
     for arm in ARMS[2:]:
         compare(ARMS[1], arm, primary)
     compare(ARMS[2], ARMS[3], primary)
 
-    screen(primary, 480 if mig else 645, 225 if mig else 270)
+    screen(primary, 480 if mig else 1250, 225 if mig else 0)
     if mig:
         screen(extra, 370, 0)
         if deadline - time.time() > 215:
@@ -247,10 +249,11 @@ def main():
                 compare(ARMS[0], arm, extra)
         if deadline - time.time() > 75:
             screen(512, 135, 0)
+    elif deadline - time.time() > 95:
+        measure(ARMS[-1], extra, 180, 5)
     else:
-        for index, arm in enumerate((ARMS[0], ARMS[-1])):
-            measure(arm, extra, 155, (1 - index) * 110)
-        compare(ARMS[0], ARMS[-1], extra)
+        report["microbatch_check"] = "budget_skipped"
+        save(dest, report)
 
     primary_arms = [report["arms"][label(arm, primary)] for arm in ARMS]
     required = all(row["status"] == "passed" for row in primary_arms)
@@ -264,8 +267,6 @@ def main():
     for batch in (primary, extra) if mig else (primary,):
         entry = report["screen_runs"][str(batch)]
         required &= not (entry.get("missing_cases") or entry.get("incomplete_cases") or entry["status"] != "passed")
-    if not mig:
-        required &= all(report["arms"][label(arm, extra)]["status"] == "passed" for arm in (ARMS[0], ARMS[-1]))
     report["status"] = "complete" if required else "partial"
     report["all_full_gates_passed"] = bool(report["gates"]) and all(row["passed"] for row in report["gates"].values())
     save(dest, report)

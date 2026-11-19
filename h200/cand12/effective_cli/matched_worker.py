@@ -35,7 +35,9 @@ def main():
                   fixture_sha256=sha(a.fixture), worker_sha256=sha(__file__),
                   warmup=a.warmup, groups=a.groups, samples=a.samples)
     def save():
-        a.output.write_text(json.dumps(result, indent=2) + '\n')
+        tmp = a.output.with_suffix('.tmp')
+        tmp.write_text(json.dumps(result, indent=2) + '\n')
+        tmp.replace(a.output)
     save()
     try:
         import torch
@@ -150,6 +152,7 @@ def main():
         result.update(median_ms=median, images_s=1024000 / median,
                       peak_allocated_mib=max(peaks), reserved_mib=torch.cuda.memory_reserved()/2**20)
         if a.profile:
+            result['status'] = 'measured'; save()
             restore(); torch.cuda.synchronize()
             with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                     torch.profiler.ProfilerActivity.CUDA],

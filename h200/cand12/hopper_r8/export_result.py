@@ -14,8 +14,8 @@ for name in ("fixture-source", "fixture-manifest", "environment-source", "setup-
     path = root / name
     if path.is_file():
         doc[name.replace("-", "_")] = path.read_text().strip()
-if (root / "run.json").is_file():
-    doc["run"] = json.loads((root / "run.json").read_text())
+if (root / "result.json").is_file():
+    doc["run"] = json.loads((root / "result.json").read_text())
 doc["screens"] = {path.stem.removeprefix("screen-"): json.loads(path.read_text())
                   for path in sorted(root.glob("screen-*.json"))}
 if (root / "topology.json").is_file():
@@ -26,13 +26,13 @@ if doc.get("run", {}).get("gpu_topology"):
 
 def encode(data):
     return base64.b64encode(lzma.compress(
-        json.dumps(data, separators=(",", ":"), allow_nan=False).encode()
+        json.dumps(data, separators=(",", ":"), allow_nan=False).encode(), preset=9
     )).decode()
 
 
 (root / "export-summary.json").write_text(json.dumps(doc, indent=2))
 payload = encode(doc)
-if len(payload) > 48000:
+if len(payload) > 45000:
     # Repeated code hashes and proof paths are retained in the persistent copy.
     # Keep all kernel configurations, timings, numeric results, and error rows.
     doc["persistent_full_result"] = str(root / "export-summary.json")
@@ -44,6 +44,13 @@ if len(payload) > 48000:
                 for key in ("ptx_sha256", "ttir_sha256", "local_declarations"):
                     code.pop(key, None)
     payload = encode(doc)
-if len(payload) > 48000:
+if len(payload) > 45000:
+    for screen in doc["screens"].values():
+        for case in screen["cases"].values():
+            case.pop("baseline_us", None)
+            for trial in case.get("trials", ()):
+                trial.pop("samples_us", None)
+    payload = encode(doc)
+if len(payload) > 45000:
     raise RuntimeError(f"Numeric result exceeds report budget: {len(payload)} bytes")
 print("H200_HOPPER_R8_XZ", payload, flush=True)

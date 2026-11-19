@@ -396,7 +396,7 @@ def replay(fn, case, reference, grid, geometry, row, checkpoint, deadline, batch
     for config in options:
         if config in seen:
             continue
-        limit = 60 if case[0] in ("H1", "H3") else 42
+        limit = (100 if case[0] in ("H1", "H3") else 72) if batch == 1024 else (60 if case[0] in ("H1", "H3") else 42)
         if time.time() >= deadline or time.monotonic() - start > limit:
             row["status"] = "budget_limited"
             return
@@ -480,7 +480,7 @@ def install(batch, *, pilot=False):
         try:
             with torch.no_grad():
                 replay(operator.fn, case, named, grid, geometry, row, checkpoint, deadline,
-                           batch, topology["multi_processor_count"], pilot)
+                       batch, topology["multi_processor_count"], pilot)
         except Exception as exc:
             row.update(status="error", error=f"{type(exc).__name__}: {str(exc)[-500:]}")
         print("SCREEN_CASE", tag, row["status"], flush=True)
