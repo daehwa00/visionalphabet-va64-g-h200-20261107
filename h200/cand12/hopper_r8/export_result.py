@@ -10,7 +10,7 @@ root = Path(os.environ["RUN_ROOT"])
 doc = dict(schema=1, commit=os.environ.get("HOPPER_R8_COMMIT"),
            requested_pool=os.environ.get("HOPPER_REQUESTED_POOL"),
            exit_code=int(sys.argv[1]), run_root=str(root))
-for name in ("fixture-source", "environment-source"):
+for name in ("fixture-source", "fixture-manifest", "environment-source", "setup-error"):
     path = root / name
     if path.is_file():
         doc[name.replace("-", "_")] = path.read_text().strip()
@@ -18,6 +18,8 @@ if (root / "run.json").is_file():
     doc["run"] = json.loads((root / "run.json").read_text())
 doc["screens"] = {path.stem.removeprefix("screen-"): json.loads(path.read_text())
                   for path in sorted(root.glob("screen-*.json"))}
+if (root / "topology.json").is_file():
+    doc["gpu_topology"] = json.loads((root / "topology.json").read_text())
 if doc.get("run", {}).get("gpu_topology"):
     doc["gpu_topology"] = doc["run"]["gpu_topology"]
 

@@ -24,17 +24,38 @@ unset LNET_R6_HBACK LNET_R6_CABWD LNET_R7_AFWD LNET_R7_DIRECT
 export CONTRACT="$CAND12/contract.json"
 trap 'result=$?; python3 "$HERE/export_result.py" "$result"; exit "$result"' EXIT
 
+python3 "$HERE/probe_topology.py"
 persistent=/app/output/va-h200-effective1024-r3-combined-20261119
-export COLD_INPUTS="$persistent/private-input"
-(cd "$COLD_INPUTS" && sha256sum --quiet -c "$CAND12/effective_cli/inputs.sha256")
+markerfix=/app/output/va-h200-r4-marker-fix-20261119
+unset COLD_INPUTS
+for spec in "$persistent:$CAND12/effective_cli/inputs.sha256" "$markerfix:$HERE/markerfix-inputs.sha256"; do
+    path=${spec%%:*}/private-input
+    manifest=${spec#*:}
+    if [[ -d "$path" ]] && (cd "$path" && sha256sum --quiet -c "$manifest"); then
+        export COLD_INPUTS="$path"
+        printf '%s\n' "$manifest" > "$RUN_ROOT/fixture-manifest"
+        break
+    fi
+done
+if [[ ! -v COLD_INPUTS ]]; then
+    printf '%s\n' 'Neither verified persistent fixture directory is accessible' > "$RUN_ROOT/setup-error"
+    cat "$RUN_ROOT/setup-error" >&2
+    exit 1
+fi
 echo "FIXTURE_SOURCE=$COLD_INPUTS"
 printf '%s\n' "$COLD_INPUTS" > "$RUN_ROOT/fixture-source"
 
 verify_environment() {
     "$1" -c 'import torch, triton, torchvision, numpy, timm; assert torch.__version__ == "2.9.1+cu128"; assert triton.__version__ == "3.5.1"'
 }
-env_python="$persistent/environment/bin/python"
-if ! [[ -x "$env_python" ]] || ! verify_environment "$env_python"; then
+env_python=
+for candidate in "$persistent/environment/bin/python" "$markerfix/environment/bin/python"; do
+    if [[ -x "$candidate" ]] && verify_environment "$candidate"; then
+        env_python="$candidate"
+        break
+    fi
+done
+if [[ -z "$env_python" ]]; then
     env_python="$RUN_ROOT/environment/bin/python"
     export UV_PYTHON_INSTALL_DIR="$RUN_ROOT/python"
     timeout --kill-after=10s 300s bash -euc '
