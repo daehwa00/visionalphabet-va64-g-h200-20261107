@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "visionalphabet"
+version = "0.1.0"
+description = "Complex-pole spatial memory for compact visual recognition."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "numpy>=2.0.0",
+  "torch>=2.9.0,<2.10",
+  "torchvision>=0.24.0,<0.25",
+]
+
+[project.optional-dependencies]
+baselines = ["timm==1.0.26", "einops==0.8.1", "PyYAML==6.0.3", "opencv-python-headless>=4.13"]
+tracking = ["wandb==0.22.3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lnet"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/scripts", "/tests", "/docs", "/h200", "/side_experiments", "/figures", "/README.md", "/pyproject.toml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "scripts", "."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812",
+  "CPY001",
+  "D",
+  "D203",
+  "D213",
+  "EM101",
+  "EM102",
+  "INP001",
+  "PLR0913",
+  "PLR0917",
+  "PLR2004",
+  "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = [
+  "ANN401", "C901", "E501", "PERF401", "PLC0415", "PLR0912", "PLR0915",
+  "RUF007", "S603", "S607", "SLF001", "T201", "TC003",
+]
+"src/lnet/complex_scan.py" = ["PLR0915"]
+"src/lnet/complex_scan_stage.py" = ["C901", "PLR0912", "PLR0915"]
+"src/lnet/pac_launch_tuning.py" = ["C901"]
+"src/lnet/pac_*.py" = ["SLF001"]
+"src/lnet/pac_product_scan_contracts.py" = ["C901"]
+"src/lnet/pac_product_scan_normalization.py" = ["ANN001", "ANN202", "N803"]
+"src/lnet/pac_triton_*.py" = [
+  "ANN001", "ANN202", "FBT001", "N803", "PLR0915", "SIM108", "SLF001",
+]
+"src/lnet/pac_real2d_math.py" = ["PLW0603"]
+"src/lnet/pac_recurrence.py" = ["PLW0603"]
+"tests/*.py" = [
+  "ANN001", "ANN202", "FBT001", "N803", "PLR2004", "S101", "S603", "SLF001",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.13"
+include = ["src"]
+reportMissingTypeStubs = false
+reportAny = false
+reportUnknownArgumentType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+reportImplicitOverride = false
+reportUnannotatedClassAttribute = false
+reportUnnecessaryComparison = false
+reportUnreachable = false
+reportUntypedBaseClass = false
+reportUntypedFunctionDecorator = false
+reportUnusedCallResult = false

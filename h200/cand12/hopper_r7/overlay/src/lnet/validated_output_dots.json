@@ -1,0 +1,31 @@
+{
+  "records": {
+    "NVIDIA_GeForce_RTX_4090-sm89": {
+      "retained_output_weight_bias_dot": {
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13000,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"a4a9bd364ada30cd4437d2408060d5056e5935cb2d7cbf108e1ff2830b94de1b\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 4,
+            "DOUBLING": 1,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 2
+        }
+      }
+    },
+    "NVIDIA_H200_NVL-sm90": {
+      "retained_output_weight_bias_dot": {
+        "{\"compile_profile\":\"{\\\"dynamic\\\":false,\\\"fullgraph\\\":false,\\\"mode\\\":\\\"default\\\"}\",\"cuda_driver_version\":13020,\"cuda_version\":\"12.8\",\"dtype\":\"bfloat16\",\"execution_regime\":\"compiled\",\"kernel_revision\":\"a4a9bd364ada30cd4437d2408060d5056e5935cb2d7cbf108e1ff2830b94de1b\",\"shape\":{\"batch\":128,\"coarse\":0,\"cudnn_benchmark\":1,\"cudnn_tf32\":1,\"deterministic\":0,\"emulate_precision_casts\":0,\"grad_enabled\":0,\"height\":56,\"modes\":160,\"operation\":1,\"source_requires_grad\":0,\"source_row_stride\":160,\"weight_requires_grad\":1,\"width\":56},\"torch_version\":\"2.9.1+cu128\",\"triton_version\":\"3.5.1\"}": {
+          "blocks": {
+            "BM": 4,
+            "DOUBLING": 1,
+            "GROUP": 4
+          },
+          "num_stages": 1,
+          "num_warps": 2
+        }
+      }
+    }
+  },
+  "schema_version": 2
+}
