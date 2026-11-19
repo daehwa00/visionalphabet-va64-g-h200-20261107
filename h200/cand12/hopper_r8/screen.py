@@ -51,7 +51,7 @@ def fields(fn, args, kwargs):
         for record in fn.inductor_meta.get("precomputed_grids", ()):
             if record["config"] == dict(geometry.kwargs, num_warps=geometry.num_warps,
                                         num_stages=geometry.num_stages):
-                grid = tuple(record["python"])
+                grid = tuple(map(int, record["python"]))
                 break
     known = {**constants, **dict(zip(names, args)), **{k: v for k, v in kwargs.items() if k in names}}
     return known, grid, geometry
