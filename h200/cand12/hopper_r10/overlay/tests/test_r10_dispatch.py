@@ -50,7 +50,7 @@ def test_tuned_geometries(batch, monkeypatch):
     monkeypatch.setenv("LNET_R10_SEG4PACK2", "1")
     kernel, _, options = forward_launch(56, 56, batch, 160, coarse=True)
     assert kernel.configs[0].num_stages == 1
-    assert options["SEGMENT"] is True
+    assert kernel.fn.__name__ == "r10_segmented_coarse_forward"
 
 
 @pytest.mark.parametrize("batch", [1, 37, 1024, 10699, 10700])

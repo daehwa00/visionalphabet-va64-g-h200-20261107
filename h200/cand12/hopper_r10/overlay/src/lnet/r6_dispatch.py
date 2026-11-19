@@ -25,6 +25,7 @@ R6_SOURCES = (
     "r9_rms.py",
     "r10_horizontal.py",
     "r10_rms.py",
+    "r10_segmented_coarse.py",
 )
 
 

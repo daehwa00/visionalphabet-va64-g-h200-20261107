@@ -27,8 +27,16 @@ def main(root, exit_code):
         path = root / file
         if path.is_file():
             doc[name] = json.loads(path.read_text())
-    full = root / "export-summary.json"
-    full.write_text(json.dumps(doc, indent=2))
+    persist = os.environ.get("PERSIST_ROOT")
+    full = Path(persist) / "export-summary.json" if persist else root / "export-summary.json"
+    try:
+        full.write_text(json.dumps(doc, indent=2))
+    except OSError:
+        full = root / "export-summary.json"
+        try:
+            full.write_text(json.dumps(doc, indent=2))
+        except OSError:
+            pass
     payload = encode(doc)
     if len(payload) > 46000:
         doc["persistent_full_result"] = str(full)

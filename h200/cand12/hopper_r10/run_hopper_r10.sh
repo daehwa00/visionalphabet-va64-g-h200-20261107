@@ -12,7 +12,11 @@ case "$HOPPER_REQUESTED_POOL" in
     *) exit 2 ;;
 esac
 export RUN_ROOT
-RUN_ROOT=$(mktemp -d /app/output/va-h200-hopper-r10-20261119.XXXXXX)
+RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/va-h200-hopper-r10-20261119.XXXXXX")
+export PERSIST_ROOT=
+PERSIST_ROOT=$(mktemp -d /app/output/va-h200-hopper-r10-results.XXXXXX) || true
+df -Pk "$RUN_ROOT" /app/output
+export XDG_CACHE_HOME="$RUN_ROOT/xdg" UV_CACHE_DIR="$RUN_ROOT/uv-cache"
 export HOPPER_R10_COMMIT
 HOPPER_R10_COMMIT=$(git rev-parse HEAD)
 export HOPPER_R10_DEADLINE=$(( HOPPER_R10_START + budget * 60 ))
@@ -49,6 +53,7 @@ if [[ -z "$env_python" ]]; then
         python3 -m uv pip install --python "$1" -r "$2" cryptography
     ' bash "$env_python" "$CAND12/../terminal_rawg/requirements.txt"
     verify_environment "$env_python"
+    rm -rf -- "$UV_CACHE_DIR"
 fi
 echo "ENVIRONMENT_PYTHON=$env_python"
 printf '%s\n' "$env_python" > "$RUN_ROOT/environment-source"
@@ -64,7 +69,7 @@ printf '%s\n' sealed-relay > "$RUN_ROOT/fixture-source"
 # The sealed operand files are used only in this allocation.
 trap 'result=$?; rm -rf -- "$RUN_ROOT/private-input"; python3 "$HERE/export_result.py" "$result"; exit "$result"' EXIT
 
-mkdir -p "$RUN_ROOT/r4" "$RUN_ROOT/current"
+mkdir -p "$RUN_ROOT/r4" "$RUN_ROOT/current" "$RUN_ROOT/r7-reference"
 for layer in code-cand12 common replay/known-overlay segment/overlay official/overlay effective/overlay effective_cli/overlay; do
     cp -a "$layer/." "$RUN_ROOT/r4/"
 done
@@ -72,6 +77,8 @@ cp "$COLD_INPUTS/packaged-4090-effective.json" "$RUN_ROOT/r4/src/lnet/validated_
 (cd "$RUN_ROOT/r4" && sha256sum -c "$CAND12/effective_cli/common-release.sha256")
 (cd "$HERE/overlay" && sha256sum --quiet -c "$HERE/overlay.sha256")
 cp -a "$RUN_ROOT/r4/." "$RUN_ROOT/current/"
+cp -a "$RUN_ROOT/r4/." "$RUN_ROOT/r7-reference/"
+cp -a "$HERE/../hopper_r8/overlay/." "$RUN_ROOT/r7-reference/"
 cp -a "$HERE/overlay/." "$RUN_ROOT/current/"
 remaining=$(( HOPPER_R10_DEADLINE - $(date +%s) ))
 (( remaining > 0 ))

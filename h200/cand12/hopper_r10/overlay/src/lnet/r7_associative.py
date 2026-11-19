@@ -3,7 +3,6 @@
 import triton
 import triton.language as tl
 
-from .r6_segment import _segment_pair
 from .effective_output_vjp import _pack_once8, _pad16_perm
 from .triton_product_scan_kernels import (
     _PACKED_PATH_INPUTS_TL,
@@ -56,7 +55,6 @@ def r7_associative_forward(  # noqa: C901, PLR0912
     BLOCK_PATH_HIDDEN: tl.constexpr,
     BLOCK_SWIGLU_VALUE: tl.constexpr,
     SINGLE_LOAD: tl.constexpr = False,
-    SEGMENT: tl.constexpr = False,
     PACKED_OUTPUT: tl.constexpr = 0,
     COARSE_PATHS: tl.constexpr = 0,
     PLANAR_PATH_OUTPUT: tl.constexpr = 0,
@@ -95,27 +93,18 @@ def r7_associative_forward(  # noqa: C901, PLR0912
     sai = tl.load(source_imag_a + offset, mask=active, other=0.0).to(tl.float32)
     sbr = tl.load(source_real_b + offset_b, mask=active, other=0.0).to(tl.float32)
     sbi = tl.load(source_imag_b + offset_b, mask=active, other=0.0).to(tl.float32)
-    if SEGMENT:
-        pos = _segment_pair(
-            tl.broadcast_to(ar, (1, BLOCK_LINES, BLOCK_MODES)),
-            tl.broadcast_to(ai, (1, BLOCK_LINES, BLOCK_MODES)),
-            gr * sar - gi * sai, gr * sai + gi * sar,
-            gr * sbr - gi * sbi, gr * sbi + gi * sbr, False, True,
-        )
-        positive = (ar, ai, pos[0], pos[1], pos[2], pos[3])
-    else:
-        positive = tl.associative_scan(
-            (
-                tl.where(active, ar, 1.0),
-                tl.where(active, ai, 0.0),
-                gr * sar - gi * sai,
-                gr * sai + gi * sar,
-                gr * sbr - gi * sbi,
-                gr * sbi + gi * sbr,
-            ),
-            axis=0,
-            combine_fn=_compose_complex_pair,
-        )
+    positive = tl.associative_scan(
+        (
+            tl.where(active, ar, 1.0),
+            tl.where(active, ai, 0.0),
+            gr * sar - gi * sai,
+            gr * sai + gi * sar,
+            gr * sbr - gi * sbi,
+            gr * sbi + gi * sbr,
+        ),
+        axis=0,
+        combine_fn=_compose_complex_pair,
+    )
     x_offset = source_x_a * modes + mode
     x_offset_b = source_x_b * modes + mode
     y_offset = y * modes + mode
@@ -148,28 +137,19 @@ def r7_associative_forward(  # noqa: C901, PLR0912
         sai_n = tl.load(source_imag_a + offset, mask=active, other=0.0).to(tl.float32)
         sbr_n = tl.load(source_real_b + offset_b, mask=active, other=0.0).to(tl.float32)
         sbi_n = tl.load(source_imag_b + offset_b, mask=active, other=0.0).to(tl.float32)
-    if SEGMENT:
-        neg = _segment_pair(
-            tl.broadcast_to(ar, (1, BLOCK_LINES, BLOCK_MODES)),
-            tl.broadcast_to(-ai, (1, BLOCK_LINES, BLOCK_MODES)),
-            gr * sar_n + gi * sai_n, gr * sai_n - gi * sar_n,
-            gr * sbr_n + gi * sbi_n, gr * sbi_n - gi * sbr_n, True, True,
-        )
-        negative = (ar, ai, neg[0], neg[1], neg[2], neg[3])
-    else:
-        negative = tl.associative_scan(
-            (
-                tl.where(active, ar, 1.0),
-                tl.where(active, -ai, 0.0),
-                gr * sar_n + gi * sai_n,
-                gr * sai_n - gi * sar_n,
-                gr * sbr_n + gi * sbi_n,
-                gr * sbi_n - gi * sbr_n,
-            ),
-            axis=0,
-            combine_fn=_compose_complex_pair,
-            reverse=True,
-        )
+    negative = tl.associative_scan(
+        (
+            tl.where(active, ar, 1.0),
+            tl.where(active, -ai, 0.0),
+            gr * sar_n + gi * sai_n,
+            gr * sai_n - gi * sar_n,
+            gr * sbr_n + gi * sbi_n,
+            gr * sbi_n - gi * sbr_n,
+        ),
+        axis=0,
+        combine_fn=_compose_complex_pair,
+        reverse=True,
+    )
     x_offset_n = source_x_a * modes + mode
     x_offset_bn = source_x_b * modes + mode
     y_offset_n = y * modes + mode

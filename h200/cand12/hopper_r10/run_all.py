@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import runpy
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -38,7 +39,7 @@ ARMS = {
 SCREEN_CASES = {"H3-56-0", "H1-56-0", "H1-56-1", "H5-56-0-forward"}
 DISPATCH = ("r7_associative_forward", "r7_direct_backward", "coarse_associative_backward", "hback56",
             "r8_horizontal_forward", "r8_horizontal_backward", "r9_channel_weight_partial",
-            "r10_hfwd56_seg4", "r10_rms56_partial")
+            "r10_hfwd56_seg4", "r10_rms56_partial", "r10_segmented_coarse_forward")
 
 
 
@@ -46,6 +47,15 @@ def save(path, obj):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, allow_nan=False, indent=2) + "\n")
     tmp.replace(path)
+    persist = os.environ.get("PERSIST_ROOT")
+    if persist and path.name in ("result.json", "screen-vertical.json"):
+        try:
+            dst = Path(persist) / path.name
+            partial = dst.with_suffix(".tmp")
+            shutil.copyfile(path, partial)
+            partial.replace(dst)
+        except OSError:
+            pass
 
 
 def read(path):
@@ -100,6 +110,31 @@ def observe_rms_graph(output):
     RMS56ScaleGradientPass.__call__ = record
 
 
+def diagnose_nonfinite(output):
+    from functools import wraps
+    import effective_batch_update
+
+    original = effective_batch_update.run_update
+
+    @wraps(original)
+    def update(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except FloatingPointError as exc:
+            traceback = exc.__traceback__
+            while traceback:
+                tensors = traceback.tb_frame.f_locals.get("checks")
+                if tensors:
+                    report = {group: [name for name, t in values.items() if not bool(t.isfinite().all())]
+                              for group, values in tensors.items()}
+                    save(output.with_suffix(".nonfinite.json"), report)
+                    break
+                traceback = traceback.tb_next
+            raise
+
+    effective_batch_update.run_update = update
+
+
 def worker():
     import torch
     import triton
@@ -113,8 +148,10 @@ def worker():
 
         install(micro)
     records = workload(micro, "none" if arm == "screen" else ARMS[arm][0])
+    output = Path(sys.argv[sys.argv.index("--output") + 1])
+    diagnose_nonfinite(output)
     if os.environ.get("LNET_R10_RMS_DW56") == "1":
-        observe_rms_graph(Path(sys.argv[sys.argv.index("--output") + 1]))
+        observe_rms_graph(output)
     worker_path = EFFECTIVE / "matched_worker.py"
     sys.argv = [str(worker_path), *sys.argv[4:]]
     with workload_geometries(records):
@@ -162,7 +199,8 @@ def launch(label, arm, micro, seconds, *, profile=False):
     output = ROOT / "results" / f"{label}.json"
     if seconds <= 0:
         return dict(status="budget_skipped", microbatch=micro)
-    source = ROOT / ("r4" if arm in (CONTROL, "screen") else "current")
+    branch = "r4" if arm in (CONTROL, "screen") else "r7-reference" if arm == "r5_r6_r7" else "current"
+    source = ROOT / branch
     cache = ROOT / "cache"
     env = dict(
         os.environ, PYTHONPATH=os.pathsep.join(map(str, (source / "scripts", source / "src", HERE))),
@@ -218,10 +256,25 @@ def launch(label, arm, micro, seconds, *, profile=False):
     fx = output.with_suffix(".fx-rms56.json")
     if fx.is_file():
         row["rms56_fx"] = read(fx)
+    bad = output.with_suffix(".nonfinite.json")
+    if bad.is_file():
+        nonfinite = read(bad)
+        row["nonfinite"] = {k: dict(count=len(v), examples=v[:10]) for k, v in nonfinite.items()}
     trace = output.with_suffix(".trace.json")
     if row.get("status") in ("passed", "measured") and trace.is_file():
         try:
             row["trace"] = trace_summary(trace)
+            persist = os.environ.get("PERSIST_ROOT")
+            if persist:
+                import gzip
+
+                target = Path(persist) / (trace.name + ".gz")
+                try:
+                    with trace.open("rb") as src, gzip.open(target, "wb", compresslevel=3) as dst:
+                        shutil.copyfileobj(src, dst)
+                    row["trace"]["persistent_gzip"] = str(target)
+                except OSError:
+                    target.unlink(missing_ok=True)
         except Exception as exc:
             row["trace_error"] = str(exc)[-400:]
     print("FULL_ARM", label, row.get("status"), row.get("median_ms"), error or "", flush=True)
@@ -246,6 +299,14 @@ def gate(control, candidate):
     report = {key: doc[key] for key in from_keys}
     report["raw_report_path"] = str(output)
     report["raw_report_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
+    persist = os.environ.get("PERSIST_ROOT")
+    if persist:
+        try:
+            dst = Path(persist) / output.name
+            shutil.copyfile(output, dst)
+            report["raw_report_path"] = str(dst)
+        except OSError:
+            pass
     report["raw"] = {}
     for group, values in doc["raw"].items():
         finite = [key for key in values if values[key]["finite"]]
@@ -300,6 +361,9 @@ def main():
             return report["gates"][key]
         return dict(passed=False, error="Missing measurements or exhausted deadline")
 
+    def release_capture(label):
+        (ROOT / "results" / f"{label}.capture.pt").unlink(missing_ok=True)
+
     labels = {arm: f"{arm}_1024x1" for arm in ARMS}
     r4 = labels[CONTROL]
     ablations = list(ARMS)[:7]
@@ -308,6 +372,7 @@ def main():
         measure(labels[arm], arm, 300 if arm == CONTROL else 180, 425, profile=arm == CONTROL)
         if arm != CONTROL:
             compare(r4, labels[arm])
+            release_capture(labels[arm])
     passing = {arm: report["arms"][labels[arm]]["median_ms"] for arm in ablations[3:]
                if report["gates"].get(f"{labels[arm]}_vs_{r4}", {}).get("passed")}
     if passing:
@@ -321,6 +386,8 @@ def main():
                 measure(pair_labels[arm], arm, 150, 210, profile=index == 1 and arm == winner)
             ref, cand = pair_labels[CONTROL], pair_labels[winner]
             numerical = compare(ref, cand)
+            release_capture(ref)
+            release_capture(cand)
             pair = dict(index=index, order=list(order), control=ref, candidate=cand,
                         numerical_pass=numerical["passed"],
                         **strict_pair(report["arms"][ref], report["arms"][cand]))
@@ -331,7 +398,10 @@ def main():
         report["raw_strict_separation_all_pairs"] = len(controls) == len(candidates) == 3 and max(candidates) < min(controls)
         trace = report["arms"].get("pair1_candidate_1024x1", {}).get("trace", {})
         counts = trace.get("dispatch_counts", {})
-        report["missing_optimized_dispatches"] = [name for name in DISPATCH if not counts.get(name)]
+        wanted = set(DISPATCH) - {"r10_segmented_coarse_forward"}
+        if PACK_FLAG in ARMS[winner][1]:
+            wanted.add("r10_segmented_coarse_forward")
+        report["missing_optimized_dispatches"] = sorted(name for name in wanted if not counts.get(name))
         report["qualified"] = (len(report["pairs"]) == 3 and all(
             p["dominance"] and p["raw_strict_separation"] and p["numerical_pass"] for p in report["pairs"])
             and report["raw_strict_separation_all_pairs"] and not report["missing_optimized_dispatches"]
@@ -349,6 +419,8 @@ def main():
     for arm in isolation:
         measure(labels[arm], arm, 125, 36)
         compare(r4, labels[arm])
+        release_capture(labels[arm])
+    release_capture(r4)
     candidates = [labels[arm] for arm in ablations[1:]+isolation]
     required = all(f"{label}_vs_{r4}" in report["gates"] for label in candidates)
     required &= not (report["vertical_screen"]["missing_cases"] or report["vertical_screen"]["incomplete_cases"])

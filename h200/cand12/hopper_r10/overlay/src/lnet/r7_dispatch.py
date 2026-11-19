@@ -25,20 +25,22 @@ def forward_launch(height, width, batch, modes, *, coarse):
 
     block_height, block_modes, block_lines, warps, single_load = FORWARD_GEOMETRY[height, coarse]
     stages = 1
-    options = {"SINGLE_LOAD": single_load}
+    implementation, key = r7_associative_forward, "r7_afwd"
     if coarse and os.environ.get("LNET_R10_TUNED_LAUNCH") == "1":
         block_modes, warps, stages = 8, 4, 2
     if (height, coarse) == (56, True) and os.environ.get("LNET_R10_SEG4PACK2") == "1":
         block_modes, block_lines, warps, stages = 8, 1, 4, 1
-        options["SEGMENT"] = True
+        from .r10_segmented_coarse import r10_segmented_coarse_forward
+
+        implementation, key = r10_segmented_coarse_forward, "r10_segmented_coarse_forward"
     if triton.cdiv(modes, block_modes) > 65535:
         return None
     geometry = LaunchGeometry.build(
         num_warps=warps, num_stages=stages,
         blocks={"BLOCK_MODES": block_modes, "BLOCK_LINES": block_lines},
     )
-    kernel = autotuned(r7_associative_forward, "r7_afwd", key=(), geometry=geometry)
-    return kernel, block_height, options
+    kernel = autotuned(implementation, key, key=(), geometry=geometry)
+    return kernel, block_height, {"SINGLE_LOAD": single_load}
 
 
 def direct_backward_launch(height, width, batch, modes):
