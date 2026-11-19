@@ -16,7 +16,7 @@ def encode(data):
 def main(root, exit_code):
     doc = dict(schema=1, commit=os.environ.get("HOPPER_R10_COMMIT"),
                requested_pool=os.environ.get("HOPPER_REQUESTED_POOL"),
-               exit_code=exit_code, run_root=str(root),
+               exit_code=exit_code, mode=os.environ.get("HOPPER_R10_MODE"), run_root=str(root),
                remote_plaintext_absent=not (root / "private-input").exists())
     for name in ("fixture-source", "fixture-manifest", "environment-source", "setup-error"):
         path = root / name

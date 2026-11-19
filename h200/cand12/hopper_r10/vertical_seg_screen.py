@@ -170,7 +170,6 @@ def replay(kernel, case, named, grid, geometry, row, checkpoint):
 
 
 def install(batch):
-    import lnet
     import torch
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
     from run_all import ROOT, save
@@ -179,7 +178,6 @@ def install(batch):
     sys.path.append(str(here.parent / "hopper_r8"))
     from screen import describe, fields
 
-    lnet.__path__.append(str(ROOT / "current/src/lnet"))
     (ROOT / "proof").mkdir(exist_ok=True)
     end = int(os.environ["HOPPER_SCREEN_DEADLINE"])
     path = ROOT / "screen-vertical.json"

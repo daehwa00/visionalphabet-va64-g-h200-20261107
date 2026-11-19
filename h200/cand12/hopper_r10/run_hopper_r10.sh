@@ -7,6 +7,11 @@ CAND12=$PWD
 export HOPPER_R10_START
 HOPPER_R10_START=$(date +%s)
 export HOPPER_REQUESTED_POOL="${1:?Expected pool is required}"
+export HOPPER_R10_MODE="${2:-full}"
+case "$HOPPER_R10_MODE" in
+    full|screen_only) ;;
+    *) exit 2 ;;
+esac
 case "$HOPPER_REQUESTED_POOL" in
     whole_h200) budget=38 ;;
     *) exit 2 ;;

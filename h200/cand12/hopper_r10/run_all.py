@@ -144,6 +144,9 @@ def worker():
     arm, micro = sys.argv[2], int(sys.argv[3])
     assert torch.__version__ == "2.9.1+cu128" and triton.__version__ == "3.5.1"
     if arm == "screen":
+        import lnet
+
+        lnet.__path__.append(str(ROOT / "current/src/lnet"))
         from vertical_seg_screen import install
 
         install(micro)
@@ -331,6 +334,15 @@ def strict_pair(control, candidate):
         return dict(dominance=False, raw_strict_separation=False)
 
 
+def run_screen(budget):
+    result = launch("vertical_screen", "screen", 1024, budget)
+    path = ROOT / "screen-vertical.json"
+    cases = read(path)["cases"] if path.is_file() else {}
+    result["missing_cases"] = sorted(SCREEN_CASES - cases.keys())
+    result["incomplete_cases"] = sorted(k for k, v in cases.items() if v["status"] != "complete")
+    return result
+
+
 def main():
     start = int(os.environ["HOPPER_R10_START"])
     topology = gpu_topology()
@@ -345,6 +357,12 @@ def main():
         raise RuntimeError("Visible device must match the Whole H200 request")
     print("GPU_TOPOLOGY", json.dumps(topology), flush=True)
     (ROOT / "results").mkdir(exist_ok=True)
+    if os.environ.get("HOPPER_R10_MODE") == "screen_only":
+        screen = report["vertical_screen"] = run_screen(min(600, deadline - int(time.time())))
+        ready = screen["status"] == "passed" and not (screen["missing_cases"] or screen["incomplete_cases"])
+        report["status"] = "complete" if ready else "partial"
+        save(dest, report)
+        return
 
     def measure(key, arm, limit, reserve, profile=False):
         budget = min(limit, deadline - int(time.time()) - reserve)
@@ -408,12 +426,7 @@ def main():
             and "trace" in report["arms"][r4])
         save(dest, report)
 
-    budget = min(320, deadline - int(time.time()) - 140)
-    report["vertical_screen"] = launch("vertical_screen", "screen", 1024, budget)
-    screen_path = ROOT / "screen-vertical.json"
-    screen = read(screen_path)["cases"] if screen_path.is_file() else {}
-    report["vertical_screen"]["missing_cases"] = sorted(SCREEN_CASES - screen.keys())
-    report["vertical_screen"]["incomplete_cases"] = sorted(k for k, v in screen.items() if v["status"] != "complete")
+    report["vertical_screen"] = run_screen(min(320, deadline - int(time.time()) - 140))
     save(dest, report)
 
     for arm in isolation:
