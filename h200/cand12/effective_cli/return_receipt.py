@@ -5,7 +5,7 @@ import hashlib,json,math,os,secrets,socket,subprocess,threading,time,zlib
 from pathlib import Path
 import requests
 
-BASE="https://va-r3-combined-result-20261119.gpupulse-monitor.workers.dev/va64g"
+BASE="https://va-r4-marker-result-20261119.gpupulse-monitor.workers.dev/va64g"
 CHUNK=8192
 def publish(raw,summary):
     from effective_batch_search import valid_receipt
@@ -24,11 +24,7 @@ def upload(blob,kind):
     assert kind in ('receipt','kernel-events') and 0<len(blob)<=32*1024**2
     sig=hashlib.sha256(blob).hexdigest()
     # Both uploads authenticate as the same allocated pod. Enrollment is idempotent for this token.
-    tokenfile=Path(os.environ['RUN_ROOT'])/'.result-session'
-    if not tokenfile.exists():
-        with os.fdopen(os.open(tokenfile,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as fd:
-            fd.write(secrets.token_hex(32))
-    token=tokenfile.read_text()
+    token=(Path(os.environ['RUN_ROOT'])/'private-input/.result-sender').read_text().strip()
     code=subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).parent,text=True).strip()
     identity=dict(pod=socket.gethostname(),code_sha=code,token_hash=hashlib.sha256(token.encode()).hexdigest())
     def req(method,path,headers,obj=None):

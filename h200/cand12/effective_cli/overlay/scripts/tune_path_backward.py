@@ -210,7 +210,7 @@ def retained_launches(
             )
             parsed[source] = (
                 constants,
-                "_output_weight_bias_vjp" in helpers,
+                "_output_weight_bias_vjp" in helpers or (structural_variant == 5 and variant == 2),
                 4 if "_segment_four" in helpers else 1,
                 variant,
                 structural_variant,

@@ -17,7 +17,7 @@ import time
 import torch
 from torch._inductor import config as inductor
 
-from effective_batch_proposals import proposal_candidates
+from effective_batch_proposals import OFF, proposal_candidates, related_geometry, same_launch_scope
 
 from automatic_training_layout import (
     BUNDLE,
@@ -158,6 +158,9 @@ def _vjp_contract(records):
             or marker != {"blocks": {"VARIANT": variant}, "num_warps": 4, "num_stages": 1}
         ):
             raise ValueError("Invalid effective output VJP marker scope/geometry")
+        structural = related_geometry(records, STRUCT_NAME, key)
+        if structural and structural.get("blocks"):
+            raise ValueError("a structural backward implements its own output VJP")
         keys = _parent_keys(records, key)
         if any(k is None for k in keys.values()):
             raise ValueError("VJP marker requires explicit retained/segment/dot parents")
@@ -172,43 +175,51 @@ def _vjp_contract(records):
     return contracts
 
 
-def _vjp_applied(records, applied):
+def _dispatch_error(records, applied):
+    """Describe the first missing or incorrect compiled leaf, including nested structural VJPs."""
+    expected = []
     try:
+        structural = _structural_contract(records)
+        owns_output = {shape for phase, shape, v in structural if phase == "backward" and v}
         for shape, variant in _vjp_contract(records):
-            rows = [
-                row
-                for row in applied
-                if row.get("phase") == "backward" and tuple(row.get("shape", ())) == shape
-            ]
-            if not rows or not all(
-                row.get("launches")
-                and all(
-                    launch.get("output_vjp_variant") == variant
-                    and launch.get("segment_rows") == 4
-                    and launch.get("output_weight_bias_dot") is True
-                    for launch in row["launches"]
+            if shape in owns_output:
+                if variant:
+                    return f"backward {shape}: a structural backward implements its own output VJP"
+                continue
+            expected.append(("backward", shape, dict(
+                output_vjp_variant=variant, segment_rows=4, output_weight_bias_dot=True
+            )))
+        for phase, shape, variant in structural:
+            fields = {"structural_variant": variant}
+            if variant and phase in ("backward", "coarse-backward"):
+                # The structural adjoint replaces the parent JIT. Its unpack_rows
+                # form calls the rows dot directly; the other forms use the canonical dot.
+                fields.update(
+                    output_vjp_variant=2 if variant == 5 else 0,
+                    segment_rows=4,
+                    output_weight_bias_dot=True,
                 )
-                for row in rows
-            ):
-                return False
-        for phase, shape, variant in _structural_contract(records):
-            rows = [
-                row
-                for row in applied
-                if row.get("phase") == phase and tuple(row.get("shape", ())) == shape
-            ]
-            if not rows or not all(
-                row.get("launches")
-                and all(
-                    launch.get("structural_variant", 0) == variant
-                    for launch in row["launches"]
-                )
-                for row in rows
-            ):
-                return False
-        return True
-    except (KeyError, TypeError, ValueError):
-        return False
+            expected.append((phase, shape, fields))
+    except (KeyError, TypeError, ValueError) as exc:
+        return f"invalid marker contract: {exc}"
+    if expected and (not isinstance(applied, list) or any(not isinstance(r, dict) for r in applied)):
+        return "missing compiled launch evidence"
+    for phase, shape, fields in expected:
+        rows = [r for r in applied if r.get("phase") == phase and tuple(r.get("shape", ())) == shape]
+        if not rows or any(not r.get("launches") for r in rows):
+            return f"{phase} {shape}: expected {fields}, missing profiled launches"
+        for row in rows:
+            for launch in row["launches"]:
+                if not isinstance(launch, dict):
+                    return f"{phase} {shape}: invalid compiled launch evidence"
+                found = {k: launch.get(k) for k in fields}
+                if found != fields:
+                    return f"{phase} {shape}: expected {fields}, observed {found}, grid={launch.get('grid')}"
+    return None
+
+
+def _vjp_applied(records, applied):
+    return _dispatch_error(records, applied) is None
 
 
 def _structural_contract(records):
@@ -267,6 +278,9 @@ def vjp_candidates(observed, defaults, parents):
     for label, source in sources:
         plan, usable = copy.deepcopy(source), []
         for key in targets:
+            structural = related_geometry(source, STRUCT_NAME, key)
+            if structural and structural.get("blocks"):
+                continue
             keys = _parent_keys(observed, key)
             if any(k is None for k in keys.values()):
                 continue
@@ -282,6 +296,10 @@ def vjp_candidates(observed, defaults, parents):
                 continue
             for name, parent_key in keys.items():
                 plan.setdefault(name, {})[parent_key] = copy.deepcopy(values[0])
+            for struct_key in observed.get(STRUCT_NAME, []):
+                inherited = defaults.get(STRUCT_NAME, {}).get(struct_key) or {}
+                if same_launch_scope(struct_key, key) and inherited.get("blocks"):
+                    plan.setdefault(STRUCT_NAME, {})[struct_key] = copy.deepcopy(OFF)
             usable.append(key)
         if not usable:
             continue
@@ -645,8 +663,9 @@ def worker(jobfile):
             trace = jobfile.with_suffix(".trace.json")
             prof.export_chrome_trace(str(trace))
             result["applied"] = check_compiled_plan(trace, job["records"])
-            if not _vjp_applied(job["records"], result["applied"]):
-                raise RuntimeError("Compiled output VJP did not match the trial marker")
+            mismatch = _dispatch_error(job["records"], result["applied"])
+            if mismatch:
+                raise RuntimeError(f"{jobfile.stem}: compiled trial dispatch mismatch: {mismatch}")
         atomic_json(jobfile.with_suffix(".result.json"), result)
 
 

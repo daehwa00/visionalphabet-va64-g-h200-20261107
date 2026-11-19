@@ -41,12 +41,12 @@ def _identity(fields):
     return {k: v for k, v in fields.items() if k != "kernel_revision"}
 
 
-def _same_scope(first, second):
+def same_launch_scope(first, second):
     return _identity(_scope(first)) == _identity(_scope(second))
 
 
-def _related(plan, family, key):
-    return next((v for k, v in plan.get(family, {}).items() if _same_scope(k, key)), None)
+def related_geometry(plan, family, key):
+    return next((v for k, v in plan.get(family, {}).items() if same_launch_scope(k, key)), None)
 
 
 def _active(geometry):
@@ -132,7 +132,7 @@ def _parents(plan):
             if not _active(geometry):
                 continue
             shape = _scope(key)["shape"]
-            retained = _related(plan, PROFILE_NAME, key)
+            retained = related_geometry(plan, PROFILE_NAME, key)
             if (
                 not _active(retained)
                 or retained["blocks"].get("DOUBLING") != 1
@@ -142,24 +142,26 @@ def _parents(plan):
                 raise ValueError("active specializer lacks explicit four-row retained parent")
             if family in (SEGMENT_NAME, DOT_NAME) and geometry != retained:
                 raise ValueError("specializer/retained parent geometry mismatch")
-            if family in (DOT_NAME, VJP_NAME) and _related(plan, SEGMENT_NAME, key) != retained:
+            if family in (DOT_NAME, VJP_NAME) and related_geometry(plan, SEGMENT_NAME, key) != retained:
                 raise ValueError("dot/VJP lacks identical explicit segment parent")
-            if family == VJP_NAME and _related(plan, DOT_NAME, key) != retained:
+            if family == VJP_NAME and related_geometry(plan, DOT_NAME, key) != retained:
                 raise ValueError("VJP lacks identical explicit dot parent")
     for key, geometry in plan.get(STRUCT_NAME, {}).items():
         if not _active(geometry):
             continue
         shape = _scope(key)["shape"]
-        retained = _related(plan, PROFILE_NAME, key)
+        retained = related_geometry(plan, PROFILE_NAME, key)
         if not _active(retained) or shape.get("height") != 56:
             raise ValueError("active structural scan lacks explicit retained parent")
         if shape.get("operation") == 1:
             if (
                 retained["blocks"].get("DOUBLING") != 1
-                or _related(plan, SEGMENT_NAME, key) != retained
-                or _related(plan, DOT_NAME, key) != retained
+                or related_geometry(plan, SEGMENT_NAME, key) != retained
+                or related_geometry(plan, DOT_NAME, key) != retained
             ):
                 raise ValueError("backward structural scan requires four-row retained/segment/dot parents")
+            if _active(related_geometry(plan, VJP_NAME, key)):
+                raise ValueError("a structural backward implements its own output VJP")
 
 
 def _map_proposal(proposal, observed):
@@ -227,13 +229,12 @@ def _map_proposal(proposal, observed):
     ):
         for parent_key in list(plan.get(parent_family, {})):
             for key in observed.get(child_family, []):
-                if _same_scope(parent_key, key) and key not in plan.get(child_family, {}):
+                if same_launch_scope(parent_key, key) and key not in plan.get(child_family, {}):
                     plan.setdefault(child_family, {})[key] = copy.deepcopy(OFF)
-    if STRUCT_NAME in plan:
-        for parent_key in list(plan.get(PROFILE_NAME, {})):
-            for key in observed.get(STRUCT_NAME, []):
-                if _same_scope(parent_key, key) and key not in plan.get(STRUCT_NAME, {}):
-                    plan.setdefault(STRUCT_NAME, {})[key] = copy.deepcopy(OFF)
+    for parent_key in plan.get(PROFILE_NAME, {}):
+        for key in observed.get(STRUCT_NAME, []):
+            if same_launch_scope(parent_key, key):
+                plan.setdefault(STRUCT_NAME, {}).setdefault(key, copy.deepcopy(OFF))
     _parents(plan)
     return plan
 
@@ -280,7 +281,8 @@ def proposal_candidates(observed, path=None, *, diagnostics=None, provenance=Non
                     _scope(key)["shape"].get("coarse"),
                 )
                 == (56, 1, 0)
-                and _active(_related(plan, DOT_NAME, key))
+                and _active(related_geometry(plan, DOT_NAME, key))
+                and not _active(related_geometry(plan, STRUCT_NAME, key))
             ]
             for variant in (1, 2):
                 if not direct:

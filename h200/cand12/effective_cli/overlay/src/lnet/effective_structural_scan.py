@@ -1182,9 +1182,7 @@ def _make_vback_half_hidden():
     return _path_backward_kernel
 
 
-def _make_vback_unpack_prev(use_rows_vjp: bool = False):
-    vjp_fn = _effective_output_vjp_rows if use_rows_vjp else _output_weight_bias_vjp
-    tag_fn = _structural_unpack_rows if use_rows_vjp else _structural_unpack_prev
+def _make_vback_unpack_prev():
 
     @triton.jit
     def _path_backward_kernel(
@@ -1223,7 +1221,7 @@ def _make_vback_unpack_prev(use_rows_vjp: bool = False):
         COARSE: tl.constexpr,
         DOUBLING: tl.constexpr,
     ):
-        batch_size = tag_fn(line_count // width)
+        batch_size = _structural_unpack_prev(line_count // width)
         scan_width = width // 2 if COARSE else width
         tile = tl.program_id(0)
         mode_group = tile // GROUP
@@ -1347,7 +1345,368 @@ def _make_vback_unpack_prev(use_rows_vjp: bool = False):
         hidden8 = (pre8_f * sig8).to(tl.bfloat16)
         silu_deriv8 = (sig8 * (1.0 + pre8_f * (1.0 - sig8))).to(tl.bfloat16)
         hidden16 = _pad_high8(hidden8, BM, path_tokens)
-        vjp_fn(
+        _output_weight_bias_vjp(
+            active_grad_real,
+            active_grad_imag,
+            hidden16,
+            mode_vector,
+            path_coordinate,
+            hidden_coordinate,
+            packed_path_hidden,
+            modes,
+            grad_path_output_weight,
+            grad_path_output_bias,
+        )
+        output_offset8 = mode_vector[:, None] * (2 * packed_path_hidden) + h8_coord[None, :]
+        output_mask8 = (mode_vector[:, None] < modes) & (h8_coord[None, :] < packed_path_hidden)
+        weight_real8 = (
+            tl.load(path_output_weight + output_offset8, mask=output_mask8, other=0.0)
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        weight_imag8 = (
+            tl.load(
+                path_output_weight + output_offset8 + packed_path_hidden,
+                mask=output_mask8,
+                other=0.0,
+            )
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        grad_hidden8 = (
+            active_grad_real.to(tl.float32)[:, :, None] * weight_real8[:, None, :]
+            + active_grad_imag.to(tl.float32)[:, :, None] * weight_imag8[:, None, :]
+        )
+        grad_pre8 = (grad_hidden8 * silu_deriv8.to(tl.float32)).to(tl.bfloat16)
+        tl.atomic_add(
+            grad_path_input_bias + mode_vector[:, None] * packed_path_hidden + h8_coord[None, :],
+            tl.sum(grad_pre8.to(tl.float32), axis=1),
+            mask=output_mask8,
+            sem="relaxed",
+        )
+        grad_preactivation = _pad_high8(grad_pre8, BM, path_tokens)
+        path_input_weight_gradient = tl.dot(tl.permute(grad_preactivation, (0, 2, 1)), packed_path)
+        path_input_weight_gradient_offset = (
+            mode_vector[:, None, None] * packed_path_hidden + hidden_coordinate[None, :, None]
+        ) * 8 + path_coordinate[None, None, :]
+        tl.atomic_add(
+            grad_path_input_weight + path_input_weight_gradient_offset,
+            path_input_weight_gradient,
+            mask=(mode_vector[:, None, None] < modes)
+            & (hidden_coordinate[None, :, None] < packed_path_hidden)
+            & (path_coordinate[None, None, :] < 8),
+            sem="relaxed",
+        )
+        grad_packed_path = tl.dot(
+            grad_preactivation, tl.permute(active_input_weight, (0, 2, 1))
+        ).to(tl.float32)
+        if COARSE:
+            grad_packed_path = grad_packed_path.to(tl.bfloat16).to(tl.float32)
+        g0, g1, g2, g3, g4, g5, g6, g7 = _unpack_all_once(grad_packed_path, BM, COARSE)
+        nr0 = g2.to(tl.bfloat16)
+        nr1 = g3.to(tl.bfloat16)
+        ni0 = g6.to(tl.bfloat16)
+        ni1 = g7.to(tl.bfloat16)
+        l0r, l0i, l1r, l1i = _prefix_pair(
+            ar, -ai, g0 * pa, g4 * pa, g1 * pb, g5 * pb, active, True, DOUBLING
+        )
+        l2r, l2i, l3r, l3i = _prefix_pair(
+            ar,
+            ai,
+            nr0.to(tl.float32) * na,
+            ni0.to(tl.float32) * na,
+            nr1.to(tl.float32) * nb,
+            ni1.to(tl.float32) * nb,
+            active,
+            False,
+            DOUBLING,
+        )
+        sar = tl.load(source_real_a + offset, mask=active, other=0.0).to(tl.float32)
+        sai = tl.load(source_imag_a + offset, mask=active, other=0.0).to(tl.float32)
+        sbr = tl.load(source_real_b + offset_b, mask=active, other=0.0).to(tl.float32)
+        sbi = tl.load(source_imag_b + offset_b, mask=active, other=0.0).to(tl.float32)
+        plane_size = tl.cast(batch_size, tl.int64) * (height * width * modes)
+        grad_a_imag_pointer = grad_source_real_a + plane_size
+        grad_b_real_pointer = grad_source_real_a + 2 * plane_size
+        grad_b_imag_pointer = grad_source_real_a + 3 * plane_size
+        tl.store(grad_source_real_a + offset, gr * l0r + gi * l0i + gr * l2r - gi * l2i, mask=active)
+        tl.store(
+            grad_a_imag_pointer + offset, -gi * l0r + gr * l0i + gi * l2r + gr * l2i, mask=active
+        )
+        tl.store(
+            grad_b_real_pointer + offset_b, gr * l1r + gi * l1i + gr * l3r - gi * l3i, mask=active
+        )
+        tl.store(
+            grad_b_imag_pointer + offset_b, -gi * l1r + gr * l1i + gi * l3r + gr * l3i, mask=active
+        )
+        decay_norm = ar * ar + ai * ai
+        inverse_decay = 1.0 / decay_norm
+        positive_drive_ar, positive_drive_ai = (gr * sar - gi * sai, gr * sai + gi * sar)
+        positive_drive_br, positive_drive_bi = (gr * sbr - gi * sbi, gr * sbi + gi * sbr)
+        negative_drive_ar, negative_drive_ai = (gr * sar + gi * sai, gr * sai - gi * sar)
+        negative_drive_br, negative_drive_bi = (gr * sbr + gi * sbi, gr * sbi - gi * sbr)
+        if COARSE:
+            par, pai, pbr, pbi = _prefix_pair(
+                ar,
+                ai,
+                positive_drive_ar,
+                positive_drive_ai,
+                positive_drive_br,
+                positive_drive_bi,
+                active,
+                False,
+                DOUBLING,
+            )
+            nar, nai, nbr, nbi = _prefix_pair(
+                ar,
+                -ai,
+                negative_drive_ar,
+                negative_drive_ai,
+                negative_drive_br,
+                negative_drive_bi,
+                active,
+                True,
+                DOUBLING,
+            )
+        else:
+            u0, u1, u2, u3, u4, u5, u6, u7 = _unpack_8(paths8, BM, COARSE)
+            par, pai, pbr, pbi = (
+                u0.to(tl.float32) / pa,
+                u4.to(tl.float32) / pa,
+                u1.to(tl.float32) / pb,
+                u5.to(tl.float32) / pb,
+            )
+            nar, nai, nbr, nbi = (
+                u2.to(tl.float32) / na,
+                u6.to(tl.float32) / na,
+                u3.to(tl.float32) / nb,
+                u7.to(tl.float32) / nb,
+            )
+        previous_0r = (ar * (par - positive_drive_ar) + ai * (pai - positive_drive_ai)) * inverse_decay
+        previous_0i = (ar * (pai - positive_drive_ai) - ai * (par - positive_drive_ar)) * inverse_decay
+        previous_1r = (ar * (pbr - positive_drive_br) + ai * (pbi - positive_drive_bi)) * inverse_decay
+        previous_1i = (ar * (pbi - positive_drive_bi) - ai * (pbr - positive_drive_br)) * inverse_decay
+        previous_2r = (ar * (nar - negative_drive_ar) - ai * (nai - negative_drive_ai)) * inverse_decay
+        previous_2i = (ai * (nar - negative_drive_ar) + ar * (nai - negative_drive_ai)) * inverse_decay
+        previous_3r = (ar * (nbr - negative_drive_br) - ai * (nbi - negative_drive_bi)) * inverse_decay
+        previous_3i = (ai * (nbr - negative_drive_br) + ar * (nbi - negative_drive_bi)) * inverse_decay
+        grad_dr = _sum_line(
+            l0r * previous_0r
+            + l0i * previous_0i
+            + l1r * previous_1r
+            + l1i * previous_1i
+            + l2r * previous_2r
+            + l2i * previous_2i
+            + l3r * previous_3r
+            + l3i * previous_3i,
+            active,
+        )
+        grad_di = _sum_line(
+            -l0r * previous_0i
+            + l0i * previous_0r
+            - l1r * previous_1i
+            + l1i * previous_1r
+            + l2r * previous_2i
+            - l2i * previous_2r
+            + l3r * previous_3i
+            - l3i * previous_3r,
+            active,
+        )
+        grad_gr = _sum_line(
+            l0r * sar
+            + l0i * sai
+            + l1r * sbr
+            + l1i * sbi
+            + l2r * sar
+            + l2i * sai
+            + l3r * sbr
+            + l3i * sbi,
+            active,
+        )
+        grad_gi = _sum_line(
+            -l0r * sai
+            + l0i * sar
+            - l1r * sbi
+            + l1i * sbr
+            + l2r * sai
+            - l2i * sar
+            + l3r * sbi
+            - l3i * sbr,
+            active,
+        )
+        pole_mask = (x_group < scan_width) & (mode_vector < modes)
+        tl.atomic_add(grad_decay_real + mode_vector, grad_dr, mask=pole_mask, sem="relaxed")
+        tl.atomic_add(grad_decay_imag + mode_vector, grad_di, mask=pole_mask, sem="relaxed")
+        tl.atomic_add(grad_gamma_real + mode_vector, grad_gr, mask=pole_mask, sem="relaxed")
+        tl.atomic_add(grad_gamma_imag + mode_vector, grad_gi, mask=pole_mask, sem="relaxed")
+
+    return _path_backward_kernel
+
+
+def _make_vback_unpack_rows():
+
+    @triton.jit
+    def _path_backward_kernel(
+        decay_real,
+        decay_imag,
+        gamma_real,
+        gamma_imag,
+        source_real_a,
+        source_imag_a,
+        source_real_b,
+        source_imag_b,
+        variance_x,
+        variance_y,
+        path_input_weight,
+        path_input_bias,
+        path_output_weight,
+        grad_collapsed_real,
+        grad_collapsed_imag,
+        grad_path_input_weight,
+        grad_path_input_bias,
+        grad_path_output_weight,
+        grad_path_output_bias,
+        grad_decay_real,
+        grad_decay_imag,
+        grad_gamma_real,
+        grad_gamma_imag,
+        grad_source_real_a,
+        height: tl.constexpr,
+        width: int,
+        line_count: int,
+        modes: int,
+        packed_path_hidden: int,
+        epsilon: tl.constexpr,
+        BM: tl.constexpr,
+        GROUP: tl.constexpr,
+        COARSE: tl.constexpr,
+        DOUBLING: tl.constexpr,
+    ):
+        batch_size = _structural_unpack_rows(line_count // width)
+        scan_width = width // 2 if COARSE else width
+        tile = tl.program_id(0)
+        mode_group = tile // GROUP
+        line_group = tl.program_id(1) * GROUP + tile % GROUP
+        batch = line_group // scan_width
+        x_group = line_group - batch * scan_width
+        grad_decay_real += batch * modes
+        grad_decay_imag += batch * modes
+        grad_gamma_real += batch * modes
+        grad_gamma_imag += batch * modes
+        grad_path_input_weight += batch * modes * packed_path_hidden * 8
+        grad_path_input_bias += batch * modes * packed_path_hidden
+        grad_path_output_weight += batch * modes * 2 * packed_path_hidden
+        grad_path_output_bias += batch * modes * 2
+        x = x_group + tl.arange(0, 1)[None, :, None]
+        y = tl.arange(0, 64)[:, None, None]
+        mode_vector = mode_group * BM + tl.arange(0, BM)
+        mode = mode_vector[None, None, :]
+        valid_line = x < scan_width
+        active = valid_line & (y < height) & (mode < modes)
+        valid_mode = valid_line & (mode < modes)
+        source_x_a = 2 * x + 1 if COARSE else x
+        source_x_b = 2 * x if COARSE else x
+        offset = ((batch * height + y) * width + source_x_a) * modes + mode
+        offset_b = offset - modes if COARSE else offset
+        ar = tl.load(decay_real + mode, mask=valid_mode, other=0.0).to(tl.float32)
+        ai = tl.load(decay_imag + mode, mask=valid_mode, other=0.0).to(tl.float32)
+        gr = tl.load(gamma_real + mode, mask=valid_mode, other=0.0).to(tl.float32)
+        gi = tl.load(gamma_imag + mode, mask=valid_mode, other=0.0).to(tl.float32)
+        valid_y = (y < height) & (mode < modes)
+        x_offset = source_x_a * modes + mode
+        x_offset_b = source_x_b * modes + mode
+        y_offset = y * modes + mode
+        vx_positive = tl.load(variance_x + x_offset, mask=valid_mode, other=0.0)
+        vx_negative = tl.load(variance_x + width * modes + x_offset_b, mask=valid_mode, other=0.0)
+        vy_pos_fwd = tl.load(variance_y + y_offset, mask=valid_y, other=0.0)
+        pa = tl.rsqrt(tl.maximum(vx_positive * vy_pos_fwd, epsilon))
+        pb = tl.rsqrt(tl.maximum(vx_negative * vy_pos_fwd, epsilon))
+        sar = tl.load(source_real_a + offset, active, 0).to(tl.float32)
+        sai = tl.load(source_imag_a + offset, active, 0).to(tl.float32)
+        sbr = tl.load(source_real_b + offset_b, active, 0).to(tl.float32)
+        sbi = tl.load(source_imag_b + offset_b, active, 0).to(tl.float32)
+        par, pai, pbr, pbi = _prefix_pair(
+            ar,
+            ai,
+            gr * sar - gi * sai,
+            gr * sai + gi * sar,
+            gr * sbr - gi * sbi,
+            gr * sbi + gi * sbr,
+            active,
+            False,
+            DOUBLING,
+        )
+        r0 = _prep_chan(par, pa, active, 0, COARSE)
+        r1 = _prep_chan(pbr, pb, active, 1, COARSE)
+        i0 = _prep_chan(pai, pa, active, 0, COARSE)
+        i1 = _prep_chan(pbi, pb, active, 1, COARSE)
+        vy_neg_fwd = tl.load(variance_y + height * modes + y_offset, mask=valid_y, other=0.0)
+        na = tl.rsqrt(tl.maximum(vx_positive * vy_neg_fwd, epsilon))
+        nb = tl.rsqrt(tl.maximum(vx_negative * vy_neg_fwd, epsilon))
+        sar_n = tl.load(source_real_a + offset, active, 0).to(tl.float32)
+        sai_n = tl.load(source_imag_a + offset, active, 0).to(tl.float32)
+        sbr_n = tl.load(source_real_b + offset_b, active, 0).to(tl.float32)
+        sbi_n = tl.load(source_imag_b + offset_b, active, 0).to(tl.float32)
+        nar, nai, nbr, nbi = _prefix_pair(
+            ar,
+            -ai,
+            gr * sar_n + gi * sai_n,
+            gr * sai_n - gi * sar_n,
+            gr * sbr_n + gi * sbi_n,
+            gr * sbi_n - gi * sbr_n,
+            active,
+            True,
+            DOUBLING,
+        )
+        r2 = _prep_chan(nar, na, active, 2, COARSE)
+        r3 = _prep_chan(nbr, nb, active, 3, COARSE)
+        i2 = _prep_chan(nai, na, active, 2, COARSE)
+        i3 = _prep_chan(nbi, nb, active, 3, COARSE)
+        path_height: tl.constexpr = 64 // 2 if COARSE else 64
+        path_tokens: tl.constexpr = path_height
+        paths8 = _pack_once8(r0, r1, r2, r3, i0, i1, i2, i3, BM, path_tokens)
+        packed_path = _pad_high8(paths8, BM, path_tokens)
+        path_coordinate = tl.arange(0, 16)
+        hidden_coordinate = tl.arange(0, 16)
+        h8_coord = tl.arange(0, 8)
+        input_weight_offset = (
+            mode_vector[:, None, None] * packed_path_hidden + hidden_coordinate[None, None, :]
+        ) * 8 + path_coordinate[None, :, None]
+        active_input_weight = tl.load(
+            path_input_weight + input_weight_offset,
+            mask=(mode_vector[:, None, None] < modes)
+            & (hidden_coordinate[None, None, :] < packed_path_hidden)
+            & (path_coordinate[None, :, None] < 8),
+            other=0.0,
+        ).to(tl.bfloat16)
+        pre8 = _take_low8(tl.dot(packed_path, active_input_weight), BM, path_tokens)
+        bias8 = tl.load(
+            path_input_bias + mode_vector[:, None] * packed_path_hidden + h8_coord[None, :],
+            mask=(mode_vector[:, None] < modes) & (h8_coord[None, :] < packed_path_hidden),
+            other=0.0,
+        ).to(tl.bfloat16)
+        pre8 = (pre8 + bias8[:, None, :]).to(tl.bfloat16)
+        if COARSE:
+            cell_y = tl.arange(0, path_height)[:, None, None]
+            cell_x = x
+            path_offset = ((batch * (height // 2) + cell_y) * (width // 2) + cell_x) * modes + mode
+            path_active = (cell_y < height // 2) & (cell_x < width // 2) & (mode < modes)
+        else:
+            path_offset, path_active = (offset, active)
+        physical_offset = tl.reshape(tl.permute(path_offset, (2, 0, 1)), (BM, path_tokens))
+        physical_active = tl.reshape(tl.permute(path_active, (2, 0, 1)), (BM, path_tokens))
+        active_grad_real = tl.load(
+            grad_collapsed_real + physical_offset, mask=physical_active, other=0.0
+        ).to(tl.bfloat16)
+        active_grad_imag = tl.load(
+            grad_collapsed_imag + physical_offset, mask=physical_active, other=0.0
+        ).to(tl.bfloat16)
+        pre8_f = pre8.to(tl.float32)
+        sig8 = tl.sigmoid(pre8_f)
+        hidden8 = (pre8_f * sig8).to(tl.bfloat16)
+        silu_deriv8 = (sig8 * (1.0 + pre8_f * (1.0 - sig8))).to(tl.bfloat16)
+        hidden16 = _pad_high8(hidden8, BM, path_tokens)
+        _effective_output_vjp_rows(
             active_grad_real,
             active_grad_imag,
             hidden16,
@@ -2036,8 +2395,8 @@ def _make_vfwd_fast_pack():
 _recompute_prev_kernel = _make_vback_recompute_prev()
 _fast_mlp_kernel = _make_vback_fast_mlp()
 _half_hidden_kernel = _make_vback_half_hidden()
-_unpack_prev_kernel = _make_vback_unpack_prev(use_rows_vjp=False)
-_unpack_rows_kernel = _make_vback_unpack_prev(use_rows_vjp=True)
+_unpack_prev_kernel = _make_vback_unpack_prev()
+_unpack_rows_kernel = _make_vback_unpack_rows()
 _col_loop2_kernel = _make_vback_col_loop2()
 _fast_forward_kernel = _make_vfwd_fast_pack()
 

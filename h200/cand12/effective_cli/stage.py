@@ -14,7 +14,7 @@ import time
 
 import requests
 
-BASE = "https://va-fixedfront-h200-20261119.gpupulse-monitor.workers.dev/va64g"
+BASE = "https://va-r4-marker-input-20261119.gpupulse-monitor.workers.dev/va64g"
 
 
 def main(target):
@@ -82,6 +82,11 @@ def main(target):
             (target/name).write_bytes(data)
             verified[name]=h
             print("VERIFIED_PRIVATE_INPUT",name,h,flush=True)
+    import re
+    sender=spec['result_sender']
+    assert isinstance(sender,str) and re.fullmatch(r'[0-9a-f]{64}',sender)
+    with os.fdopen(os.open(target/'.result-sender',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'w') as fd:
+        fd.write(sender)
     ack = requests.post(BASE+"/received", headers=headers, json=verified, timeout=30)
     ack.raise_for_status()
     assert ack.json()["closed"]
