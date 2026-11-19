@@ -47,6 +47,7 @@ MODULE = Path(__file__).resolve()
 VERSION = 2
 MICROBATCHES = (1024, 512, 256, 128, 64, 32)
 VJP_NAME = "effective_output_vjp"
+STRUCT_NAME = "effective_structural_scan"
 LEGACY_NAMES = (LAYOUT_NAME, PROFILE_NAME, SEGMENT_NAME, DOT_NAME)
 
 
@@ -190,9 +191,66 @@ def _vjp_applied(records, applied):
                 for row in rows
             ):
                 return False
+        for phase, shape, variant in _structural_contract(records):
+            rows = [
+                row
+                for row in applied
+                if row.get("phase") == phase and tuple(row.get("shape", ())) == shape
+            ]
+            if not rows or not all(
+                row.get("launches")
+                and all(
+                    launch.get("structural_variant", 0) == variant
+                    for launch in row["launches"]
+                )
+                for row in rows
+            ):
+                return False
         return True
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def _structural_contract(records):
+    contracts = []
+    for key, marker in records.get(STRUCT_NAME, {}).items():
+        fields = _scope_fields(key)
+        shape = fields["shape"]
+        op, coarse = shape.get("operation"), shape.get("coarse")
+        phase = (
+            "backward"
+            if (op, coarse) == (1, 0)
+            else "coarse-backward"
+            if (op, coarse) == (1, 1)
+            else "forward"
+            if (op, coarse) == (0, 0)
+            else None
+        )
+        if not marker.get("blocks"):
+            if marker != {"blocks": {}, "num_warps": 4, "num_stages": 1}:
+                raise ValueError("Invalid disabled structural sentinel")
+            if phase is not None and fields.get("execution_regime") == "compiled" and shape.get("height") == 56:
+                contracts.append(
+                    (phase, tuple(shape[n] for n in ("batch", "height", "width", "modes")), 0)
+                )
+            continue
+        variant = marker["blocks"].get("VARIANT")
+        valid_op = (
+            (phase == "backward" and variant in (1, 2, 3, 4, 5, 6))
+            or (phase == "coarse-backward" and variant in (1, 2, 3, 4, 5))
+            or (phase == "forward" and variant == 1)
+        )
+        if (
+            fields.get("execution_regime") != "compiled"
+            or shape.get("height") != 56
+            or not valid_op
+            or marker != {"blocks": {"VARIANT": variant}, "num_warps": 4, "num_stages": 1}
+        ):
+            raise ValueError("Invalid structural scan marker scope/geometry")
+        contracts.append(
+            (phase, tuple(shape[n] for n in ("batch", "height", "width", "modes")), variant)
+        )
+    return contracts
 
 
 def vjp_candidates(observed, defaults, parents):
@@ -454,6 +512,7 @@ def worker(jobfile):
 
     job = read_json(jobfile)
     _vjp_contract(job["records"])
+    _structural_contract(job["records"])
     snapshot = torch.load(jobfile.parent / "snapshot.pt", map_location="cpu", weights_only=False)
     device = torch.device("cuda", snapshot["index"])
     torch.cuda.set_device(device)
@@ -486,8 +545,9 @@ def worker(jobfile):
                 job["records"], discovery=str(jobfile.parent) if job["discover"] else ""
             )
         )
-        names = (*LEGACY_NAMES, VJP_NAME)
+        names = (*LEGACY_NAMES, VJP_NAME, STRUCT_NAME)
         vjp_bundle = importlib.import_module("lnet.effective_output_vjp").BUNDLE
+        struct_bundle = importlib.import_module("lnet.effective_structural_scan").BUNDLE
         found = {n: stack.enter_context(capture_launch_scopes(n)) for n in names}
         reset()
         runtime = _build_runtime(model, recipe)
@@ -535,6 +595,7 @@ def worker(jobfile):
                         SEGMENT_NAME: SEGMENT_BUNDLE,
                         DOT_NAME: DOT_BUNDLE,
                         VJP_NAME: vjp_bundle,
+                        STRUCT_NAME: struct_bundle,
                     }[n],
                 )
                 defaults[n][scope.key] = (
@@ -725,7 +786,11 @@ def measure(snapshot, key, info, work):
             plan=name, microbatch=micro, records=records, records_digest=digest(records), pairs=[]
         )
         trials.append(entry)
-        result, tensors = arm(micro, records, profile=bool(records.get(VJP_NAME)))
+        result, tensors = arm(
+            micro,
+            records,
+            profile=bool(records.get(VJP_NAME)) or bool(records.get(STRUCT_NAME)),
+        )
         if result["status"] == "oom":
             entry["status"] = "oom"
             continue
@@ -735,9 +800,11 @@ def measure(snapshot, key, info, work):
             screen=result,
             reference_checks=proof,
         )
-        if records.get(VJP_NAME) and not _vjp_applied(records, result.get("applied", [])):
+        if (records.get(VJP_NAME) or records.get(STRUCT_NAME)) and not _vjp_applied(
+            records, result.get("applied", [])
+        ):
             entry["status"] = "numerical_failure"
-            entry["dispatch_failure"] = "VJP marker was not executed"
+            entry["dispatch_failure"] = "VJP or structural marker was not executed"
             continue
         if proof["passed"] and result["ms"] < best["ms"]:
             promising.append((name, micro, records, entry, result["ms"]))
@@ -788,7 +855,9 @@ def measure(snapshot, key, info, work):
                     m,
                     plan,
                     confirm=True,
-                    profile=bool(plan.get(VJP_NAME)) or (side == "candidate" and bool(records)),
+                    profile=bool(plan.get(VJP_NAME))
+                    or bool(plan.get(STRUCT_NAME))
+                    or (side == "candidate" and bool(records)),
                 )
                 if result["status"] == "oom":
                     entry["status"] = "oom"

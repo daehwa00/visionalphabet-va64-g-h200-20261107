@@ -97,7 +97,8 @@ def compare_plan(plan,folder,source,pins,fixture,lr):
     micro=plan['micro']
     assert micro>0 and 1024%micro==0
     folder.mkdir()
-    records={'control':{},'winner':plan['winner']}
+    control_rec=plan.get('control_override',{})
+    records={'control':control_rec,'winner':plan['winner']}
     schemas={'control':plan['defaults'],'winner':plan['winner']}
     for side in records:
         write(folder/(side+'.json'),records[side])

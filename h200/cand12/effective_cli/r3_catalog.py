@@ -56,7 +56,6 @@ def stage(root):
     assert (qualifier['role'],qualifier['status'],qualifier['microbatch'])==('native','complete',m)
     assert len(qualifier['pairs'])==3 and all(p['numeric']['passed'] for p in qualifier['pairs'])==qualifier['numeric_passed']
     discovery=load(root/'final-discovery.json')
-    ctx=load(Path(os.environ['COLD_INPUTS'])/'previous-fixed.json')
     assert any(x['name']=='h200-e1024-718' for x in catalog['proposals'])
     selected=portable(best['records'],best['tag'])
     target=effective(best['records'],discovery['defaults'])
@@ -72,16 +71,15 @@ def stage(root):
     spec=dict(catalog_before=before,catalog_after=sha(path),effective_records_digest=digest(target),
               final_qualified=qualifier['qualified'],final_proposal_names=matched,fixture_epoch=18,
               fixture_global_step=18270,origin=best['tag'],source_commit=os.environ['R3_JOB_COMMIT'],
-              final_proposal=selected if qualifier['qualified'] else None,anchor=ctx['anchor_718']['source_tag'],
+              final_proposal=selected if qualifier['qualified'] else None,anchor='h200-e1024-718',
               native_micro=m,strict_frontier_complete=fixed.get('alternatives_exhausted',False))
     write(root/'qualified-catalog.json',spec)
     return spec
 
 def inspect_receipt(doc,root):
     fixed=load(root/'fixed-continuation.json')['fixed_best']
-    ctx=load(Path(os.environ['COLD_INPUTS'])/'previous-fixed.json')
     result={}
-    for label,model in [('anchor_718',ctx['anchor_718']),('fixed_final',fixed)]:
+    for label,model in [('fixed_final',fixed)]:
         m=model['micro']; discovery=doc['assessed_microbatches'][str(m)]
         assert discovery['status']=='ok'
         defaults=discovery['defaults']

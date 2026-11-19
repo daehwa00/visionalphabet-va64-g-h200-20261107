@@ -193,13 +193,29 @@ def retained_launches(
                 if "_effective_output_vjp_rows" in helpers
                 else 0
             )
+            structural_variant = (
+                1
+                if "_structural_recompute_prev" in helpers or "_structural_fast_forward" in helpers
+                else 2
+                if "_structural_fast_mlp" in helpers
+                else 3
+                if "_structural_half_hidden" in helpers
+                else 4
+                if "_structural_unpack_prev" in helpers
+                else 5
+                if "_structural_unpack_rows" in helpers
+                else 6
+                if "_structural_col_loop2" in helpers
+                else 0
+            )
             parsed[source] = (
                 constants,
                 "_output_weight_bias_vjp" in helpers,
                 4 if "_segment_four" in helpers else 1,
                 variant,
+                structural_variant,
             )
-        constants, output_dot, segment_rows, output_variant = parsed[source]
+        constants, output_dot, segment_rows, output_variant, structural_variant = parsed[source]
         if (
             int(
                 constants.get(
@@ -214,6 +230,7 @@ def retained_launches(
             dict(
                 output_weight_bias_dot=output_dot,
                 output_vjp_variant=output_variant,
+                structural_variant=structural_variant,
                 segment_rows=segment_rows,
                 group=int(tile.get("GROUP", 0)),
                 modes=int(tile.get("BM", tile.get("BLOCK_MODES", 0))),

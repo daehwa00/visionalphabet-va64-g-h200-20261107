@@ -67,7 +67,12 @@ export TORCHINDUCTOR_COMPILE_THREADS=2
 python effective_cli/data.py
 CUDA_VISIBLE_DEVICES='' python effective_cli/contract_preflight.py
 trap 'python effective_cli/frontier_export.py' EXIT
-taskset -c "$affinity" python -u effective_cli/frontier.py > "$RUN_ROOT/frontier.log" 2>&1 || {
+taskset -c "$affinity" python -u effective_cli/structural_replay.py > "$RUN_ROOT/structural-replay.log" 2>&1 || {
+    tail -12 "$RUN_ROOT/structural-replay.log" | cut -c1-1200
+    exit 1
+}
+cat "$RUN_ROOT/structural-replay.log"
+taskset -c "$affinity" python -u effective_cli/structural_frontier.py > "$RUN_ROOT/frontier.log" 2>&1 || {
     tail -10 "$RUN_ROOT/frontier.log" | cut -c1-1200
     exit 1
 }

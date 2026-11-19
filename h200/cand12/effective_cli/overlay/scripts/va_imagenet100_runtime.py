@@ -431,7 +431,11 @@ def _build_runtime(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
     )
     if recipe.get("effective_batch_size") == 1024:
         from lnet.effective_output_vjp import vjp_graph_pass
-        options["post_grad_custom_pre_pass"] = vjp_graph_pass(options["post_grad_custom_pre_pass"])
+        from lnet.effective_structural_scan import structural_graph_pass
+
+        options["post_grad_custom_pre_pass"] = structural_graph_pass(
+            vjp_graph_pass(options["post_grad_custom_pre_pass"])
+        )
     return cast(
         "nn.Module",
         torch.compile(model, options=options, fullgraph=False, dynamic=False),

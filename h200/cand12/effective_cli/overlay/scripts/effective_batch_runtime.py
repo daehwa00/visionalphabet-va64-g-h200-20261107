@@ -46,11 +46,10 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
             b"".join(Path(__file__).with_name(s).read_bytes() for s in files)
         ).hexdigest()
 
-    def saved(self, key):
+    def saved(self, key, info=None):
         for path, origin in ((self.base / (key + ".json"), "local"), (PACKAGED, "bundled")):
-            doc = read_json(path)
-            if origin == "bundled":
-                doc = doc.get(key, {})
+            raw = read_json(path)
+            doc = raw.get(key, {}) if origin == "bundled" else raw
             if valid_receipt(doc, key):
                 self.event(
                     key,
@@ -60,6 +59,26 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
                     microbatch=doc["microbatch"],
                 )
                 return doc
+            if origin == "bundled" and info is not None and isinstance(raw, dict):
+                target_hw = {k: v for k, v in info.items() if k != "policy_revision"}
+                for bundled_key, bundled_doc in raw.items():
+                    if not isinstance(bundled_doc, dict):
+                        continue
+                    w = bundled_doc.get("workload")
+                    if (
+                        isinstance(w, dict)
+                        and {k: v for k, v in w.items() if k != "policy_revision"} == target_hw
+                        and valid_receipt(bundled_doc, bundled_key)
+                    ):
+                        self.event(
+                            key,
+                            "reused",
+                            source="bundled-compatible",
+                            bundled_key=bundled_key,
+                            decision=bundled_doc["status"],
+                            microbatch=bundled_doc["microbatch"],
+                        )
+                        return bundled_doc
         return None
 
     def configure(self, batch):
@@ -110,7 +129,7 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
             "device_uuid": str(getattr(props, "uuid", props.name)),
         }
         key = digest(info)
-        decision = self.saved(key)
+        decision = self.saved(key, info)
         if decision is None:
             self.base.mkdir(parents=True, exist_ok=True)
             lock_name = "gpu-" + digest((socket.gethostname(), info["device_uuid"])) + ".lock"
@@ -120,7 +139,7 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
             ):
                 fcntl.flock(job, fcntl.LOCK_EX)
                 fcntl.flock(card, fcntl.LOCK_EX)
-                decision = self.saved(key)
+                decision = self.saved(key, info)
                 if decision is None:
                     self.event(key, "calibrating", effective_samples=len(y))
                     live = self.live_state(device)

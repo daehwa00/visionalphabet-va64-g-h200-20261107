@@ -20,8 +20,9 @@ from lnet.retained_path_dispatch import PROFILE_NAME, step_geometry
 from lnet.segmented_path_scan import SEGMENT_NAME
 
 VJP_NAME = "effective_output_vjp"
+STRUCT_NAME = "effective_structural_scan"
 CATALOG = Path(__file__).resolve().parents[1] / "src/lnet/effective_update_proposals.json"
-FAMILIES = (LAYOUT_NAME, PROFILE_NAME, SEGMENT_NAME, DOT_NAME, VJP_NAME)
+FAMILIES = (LAYOUT_NAME, PROFILE_NAME, SEGMENT_NAME, DOT_NAME, VJP_NAME, STRUCT_NAME)
 OFF = {"blocks": {}, "num_warps": 4, "num_stages": 1}
 
 
@@ -78,6 +79,22 @@ def _geometry(family, geometry, fields):
         ):
             raise ValueError("unsupported VJP marker")
         return
+    if family == STRUCT_NAME:
+        variant = blocks.get("VARIANT")
+        op, coarse = shape.get("operation"), shape.get("coarse")
+        valid_op = (
+            (op == 1 and coarse == 0 and variant in (1, 2, 3, 4, 5, 6))
+            or (op == 1 and coarse == 1 and variant in (1, 2, 3, 4, 5))
+            or (op == 0 and coarse == 0 and variant == 1)
+        )
+        if (
+            geometry != {"blocks": {"VARIANT": variant}, "num_warps": 4, "num_stages": 1}
+            or not valid_op
+            or (shape["height"], shape["width"]) != (56, 56)
+            or fields["dtype"] != "bfloat16"
+        ):
+            raise ValueError("unsupported structural scan marker")
+        return
     if family == LAYOUT_NAME:
         checked = candidate_geometry(
             blocks["LINES_PER_GROUP"],
@@ -129,6 +146,20 @@ def _parents(plan):
                 raise ValueError("dot/VJP lacks identical explicit segment parent")
             if family == VJP_NAME and _related(plan, DOT_NAME, key) != retained:
                 raise ValueError("VJP lacks identical explicit dot parent")
+    for key, geometry in plan.get(STRUCT_NAME, {}).items():
+        if not _active(geometry):
+            continue
+        shape = _scope(key)["shape"]
+        retained = _related(plan, PROFILE_NAME, key)
+        if not _active(retained) or shape.get("height") != 56:
+            raise ValueError("active structural scan lacks explicit retained parent")
+        if shape.get("operation") == 1:
+            if (
+                retained["blocks"].get("DOUBLING") != 1
+                or _related(plan, SEGMENT_NAME, key) != retained
+                or _related(plan, DOT_NAME, key) != retained
+            ):
+                raise ValueError("backward structural scan requires four-row retained/segment/dot parents")
 
 
 def _map_proposal(proposal, observed):
@@ -198,6 +229,11 @@ def _map_proposal(proposal, observed):
             for key in observed.get(child_family, []):
                 if _same_scope(parent_key, key) and key not in plan.get(child_family, {}):
                     plan.setdefault(child_family, {})[key] = copy.deepcopy(OFF)
+    if STRUCT_NAME in plan:
+        for parent_key in list(plan.get(PROFILE_NAME, {})):
+            for key in observed.get(STRUCT_NAME, []):
+                if _same_scope(parent_key, key) and key not in plan.get(STRUCT_NAME, {}):
+                    plan.setdefault(STRUCT_NAME, {})[key] = copy.deepcopy(OFF)
     _parents(plan)
     return plan
 
