@@ -1,8 +1,9 @@
-"""Enroll this pinned pod, decrypt the sealed benchmark inputs, and return their path."""
+"""Stage the seven pinned inputs through the sealed relay."""
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
+import json
 from pathlib import Path
 import secrets
 import shutil
@@ -14,12 +15,13 @@ import time
 from urllib.parse import urlparse
 import zipfile
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import requests
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 BASE = "https://va-hopper-r11-input-20261120.gpupulse-monitor.workers.dev/va64g"
 AAD = b"VA-HOPPER-R11-INPUT-v1"
 MANIFEST = Path(__file__).with_name("inputs_r11.sha256")
+
 
 
 def pinned_hashes():
@@ -50,7 +52,7 @@ def enroll(token):
         if response is not None:
             if response.ok:
                 return {"Authorization": f"Bearer {token}", "X-Session-ID": response.json()["session_id"]}
-            if response.status_code not in (403, 404, 429, 502, 503, 504):
+            if response.status_code not in (403, 404, 429, 500, 502, 503, 504):
                 raise RuntimeError(f"Relay enrollment HTTP {response.status_code}")
         if attempt < 89:
             time.sleep(5)
