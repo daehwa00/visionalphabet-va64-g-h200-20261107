@@ -7,6 +7,7 @@ from pathlib import Path
 import statistics
 import sys
 import time
+import traceback
 from types import FunctionType
 
 import triton
@@ -145,6 +146,8 @@ def replay(kernel, case, named, grid, geometry, row, checkpoint):
                 trial["speedup"] = statistics.median(ref) / trial["median_us"]
         except Exception as exc:
             trial["error"] = f"{type(exc).__name__}: {str(exc)[-700:]}"
+            trial["error_frames"] = [f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                                     for frame in traceback.extract_tb(exc.__traceback__)[-6:]]
         checkpoint()
 
     run("r4", kernel, working, grid, geometry.num_warps, geometry.num_stages)
@@ -169,6 +172,29 @@ def replay(kernel, case, named, grid, geometry, row, checkpoint):
     row["status"] = "complete" if not any("error" in t for t in row["trials"]) else "partial"
 
 
+def replay_kernel(operator, case):
+    if operator.fn.fn is not None:
+        return operator.fn
+    reload_kernel = getattr(operator, "_reload_kernel", None)
+    if callable(reload_kernel):
+        loaded = reload_kernel().fn
+        if loaded.fn is not None:
+            return loaded
+    # The target can arrive as a static launcher restored from a disk bundle.
+    # These are the leaves pinned by r4_records.json, checked against live outputs.
+    if case[0] == "H3":
+        from lnet.direct_path_scan_kernels import _path_forward_kernel
+
+        return _path_forward_kernel
+    if case[0] == "H1":
+        from lnet.effective_structural_scan import _BACKWARD_VARIANTS
+
+        return _BACKWARD_VARIANTS[3 if case[2] else 2]
+    from lnet.triton_bidirectional_product_scan import _bidirectional_forward_kernel
+
+    return _bidirectional_forward_kernel
+
+
 def install(batch):
     import torch
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
@@ -179,6 +205,7 @@ def install(batch):
     from screen import describe, fields
 
     (ROOT / "proof").mkdir(exist_ok=True)
+    triton.set_allocator(lambda size, alignment, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
     end = int(os.environ["HOPPER_SCREEN_DEADLINE"])
     path = ROOT / "screen-vertical.json"
     doc = dict(batch=batch, cases={}, capture_errors={})
@@ -210,7 +237,8 @@ def install(batch):
         checkpoint()
         try:
             with torch.no_grad():
-                replay(operator.fn, case, named, grid, geometry, row, checkpoint)
+                kernel = replay_kernel(operator, case)
+                replay(kernel, case, named, grid, geometry, row, checkpoint)
         except Exception as exc:
             row.update(status="error", error=f"{type(exc).__name__}: {str(exc)[-700:]}")
         checkpoint()
