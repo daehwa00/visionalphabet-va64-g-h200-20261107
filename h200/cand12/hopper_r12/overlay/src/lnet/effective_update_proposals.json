@@ -1,0 +1,934 @@
+{
+  "proposals": [
+    {
+      "dtype": "bfloat16",
+      "effective_samples": 1024,
+      "name": "h200-e1024-718",
+      "origin": "1024-2dd78beafd09f8",
+      "settings": [
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 4,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "height": 14,
+            "modes": 160,
+            "width": 14
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 8,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "height": 28,
+            "modes": 160,
+            "width": 28
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 32,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 16,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 0,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 0,
+            "width": 56
+          }
+        }
+      ],
+      "settings_count": 11,
+      "settings_digest": "90992f989a933c286a3e2d7824de30489b85b8d49578f803be1ac003ccd83d0e"
+    },
+    {
+      "dtype": "bfloat16",
+      "effective_samples": 1024,
+      "name": "rtx4090-rows128",
+      "origin": "micro-128-vjp-2-default-direct-round-1",
+      "settings": [
+        {
+          "family": "effective_output_vjp",
+          "geometry": {
+            "blocks": {
+              "VARIANT": 2
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 8,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "height": 14,
+            "modes": 160,
+            "width": 14
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 4,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "height": 28,
+            "modes": 160,
+            "width": 28
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 8,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {},
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 8,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 32,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 32,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 8,
+              "DOUBLING": 0,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 0,
+            "width": 56
+          }
+        }
+      ],
+      "settings_count": 12,
+      "settings_digest": "4688c4803ab22b3a55d489f745fdbcd50c82c604cf081b0012cb9d8b606f24d5"
+    },
+    {
+      "dtype": "bfloat16",
+      "effective_samples": 1024,
+      "name": "rtx4090-rows128-forward4",
+      "origin": "h200x-confirm-h200x-rows-forward",
+      "settings": [
+        {
+          "family": "effective_output_vjp",
+          "geometry": {
+            "blocks": {
+              "VARIANT": 2
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 8,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "height": 14,
+            "modes": 160,
+            "width": 14
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 4,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "height": 28,
+            "modes": 160,
+            "width": 28
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 8,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {},
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 8,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 32,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 32,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 0,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 0,
+            "width": 56
+          }
+        }
+      ],
+      "settings_count": 12,
+      "settings_digest": "3c191f326fc7db88f9bfbfc1abf63c6d5891547b23f7964a4c9f14ddc422e00f"
+    },
+    {
+      "dtype": "bfloat16",
+      "effective_samples": 1024,
+      "name": "h200-structural-fastmlp-c0v2-c1v3",
+      "origin": "1024-effb63cb1c47bdcf",
+      "settings": [
+        {
+          "family": "effective_structural_scan",
+          "geometry": {
+            "blocks": {
+              "VARIANT": 2
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "effective_structural_scan",
+          "geometry": {
+            "blocks": {
+              "VARIANT": 3
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 4,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "height": 14,
+            "modes": 160,
+            "width": 14
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 8,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "height": 28,
+            "modes": 160,
+            "width": 28
+          }
+        },
+        {
+          "family": "product_scan_direct_path_backward_layout",
+          "geometry": {
+            "blocks": {
+              "BLOCK_MODES": 4,
+              "COMPACT_CHANNELS": 3,
+              "LINES_PER_GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "height": 56,
+            "modes": 160,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_four_row_prefix",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_output_weight_bias_dot",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 1,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 2
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 1,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 32,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 16,
+              "GROUP": 1
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 1,
+            "height": 56,
+            "modes": 160,
+            "operation": 2,
+            "width": 56
+          }
+        },
+        {
+          "family": "retained_path_step",
+          "geometry": {
+            "blocks": {
+              "BM": 4,
+              "DOUBLING": 0,
+              "GROUP": 4
+            },
+            "num_stages": 1,
+            "num_warps": 4
+          },
+          "shape": {
+            "coarse": 0,
+            "height": 56,
+            "modes": 160,
+            "operation": 0,
+            "width": 56
+          }
+        }
+      ],
+      "settings_count": 14,
+      "settings_digest": "9a84b66a5f86df7601315abc2bca448dfc1598ce872f8a848e2f27e493e3d70f"
+    }
+  ],
+  "schema_version": 1
+}
