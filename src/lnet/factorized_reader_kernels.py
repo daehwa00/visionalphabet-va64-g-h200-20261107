@@ -175,9 +175,14 @@ __device__ __forceinline__ void sliding_spatial(
     constexpr int Inputs = Backward ? 2 : R * (Strict ? 2 : 1);
     // Small real filters fit alongside the low-precision window in registers.
     // Reuse them across columns without reloading taps from shared memory.
+    #if READER_REGISTER_FILTERS >= 0
+    constexpr bool RegisterFilters = !Strict && READER_REGISTER_FILTERS;
+#else
     constexpr bool RegisterFilters = !Strict && (
         (R <= 2 && sizeof(Input) == 2) || (Rows == 4 && Warps == 2));
-    constexpr bool KeepReal = RegisterFilters || (Backward && READER_WIDTH >= 28);
+    #endif
+    constexpr bool KeepReal = RegisterFilters ||
+        (Backward && (READER_KEEP_REAL < 0 ? READER_WIDTH >= 28 : READER_KEEP_REAL != 0));
     const int lane = threadIdx.x % 32;
     const int mode = blockIdx.x * 32 + lane;
     const int xtiles = (width + Columns * Warps - 1) / (Columns * Warps);
@@ -852,12 +857,15 @@ def _reader_cuda_module(
     normalize: bool = False,
     spatial_geometry: tuple[int, int] = _DEFAULT_SPATIAL_GEOMETRY,
     weight_geometry: tuple[int, int, int] | None = None,
+    register_filters: int = -1,
+    keep_real: int = -1,
 ) -> _CudaModule:
     weight_tile, weight_rows, weight_warps = weight_geometry or _DEFAULT_WEIGHT_GEOMETRY
     macros = {
         **dict(zip(("BATCH", "HEIGHT", "WIDTH", "MODES"), shape, strict=True)),
         "COLUMNS": columns, "RANK": rank, "KERNEL": kernel, "STRICT": int(strict),
         "SPATIAL_ROWS": spatial_geometry[0], "SPATIAL_WARPS": spatial_geometry[1],
+        "REGISTER_FILTERS": register_filters, "KEEP_REAL": keep_real,
         "BFLOAT16": int("__nv_bfloat16" in types),
         "WEIGHT_TILE": weight_tile, "WEIGHT_ROWS": weight_rows, "WEIGHT_WARPS": weight_warps,
         **dict(zip(("INPUT", "WEIGHT", "GRAD"), types, strict=True)),

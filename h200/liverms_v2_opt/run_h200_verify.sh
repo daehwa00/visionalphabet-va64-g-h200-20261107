@@ -91,19 +91,18 @@ run_pytest() {
 variants=(17-p1-nr4-1024d-v3 17-live-complex-rms-s03 17-e2-multiscale-s3s4-live-rms-v2)
 names=(p1_nr4 liverms multiscale)
 run_bench probe "$RUN_ROOT/probe.json"
-if [[ ${2:-} != --infer-only ]]; then
+if [[ ${2:-} == --probe-only ]]; then
+    run_bench kernel-probe "$RUN_ROOT/kernel_probe.json"
+elif [[ ${2:-} != --infer-only ]]; then
     run_pytest pytest_full 12m -v
     run_bench dynamo "$RUN_ROOT/dynamo.json"
-    run_bench kernel-probe "$RUN_ROOT/kernel_probe.json"
 
     for i in "${!variants[@]}"; do
         LNET_NR4_FUSED=0 LNET_GENERAL_SCANS=0 LNET_FUSED_FACTORIZED_READER=0 run_bench train-arm \
             "$RUN_ROOT/arms/va17_${names[i]}_opt_off_b1024.json" --variant "${variants[i]}" --batch 1024
     done
-    for i in "${!variants[@]}"; do
-        LNET_NR4_FUSED=0 run_bench train-arm \
-            "$RUN_ROOT/arms/va17_${names[i]}_nr4_off_b1024.json" --variant "${variants[i]}" --batch 1024
-    done
+    LNET_NR4_FUSED=0 run_bench train-arm \
+        "$RUN_ROOT/arms/va17_${names[0]}_nr4_off_b1024.json" --variant "${variants[0]}" --batch 1024
     for i in "${!variants[@]}"; do
         run_bench train-arm "$RUN_ROOT/arms/va17_${names[i]}_opt_on_b1024.json" \
             --variant "${variants[i]}" --batch 1024 --profile
@@ -115,12 +114,14 @@ if [[ ${2:-} != --infer-only ]]; then
         done
     done
 fi
-for batch in 128 1024; do
-    for i in "${!variants[@]}"; do
-        run_bench infer-fold "$RUN_ROOT/infer/va17_${names[i]}_b$batch.json" \
-            --variant "${variants[i]}" --batch "$batch"
+if [[ ${2:-} != --probe-only ]]; then
+    for batch in 128 1024; do
+        for i in "${!variants[@]}"; do
+            run_bench infer-fold "$RUN_ROOT/infer/va17_${names[i]}_b$batch.json" \
+                --variant "${variants[i]}" --batch "$batch"
+        done
     done
-done
+fi
 
 # Complete all stages and export their diagnostics even when one stage fails.
 "$ENV_PYTHON" - "$RUN_ROOT" <<'PYTHON'

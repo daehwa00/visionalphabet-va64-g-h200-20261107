@@ -586,68 +586,128 @@ def scan_probe() -> dict:
     return result
 
 
-def reader_probe() -> dict:
-    from unittest.mock import patch
-
+def reader_probe() -> dict:  # noqa: C901, PLR0915
     import torch
 
     from lnet import factorized_reader_kernels as reader
 
-    results = {}
+    device = torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
     shapes = [(1024, side, side, 160 if side != 7 else 128) for side in (56, 28, 14, 7)]
-    shapes.extend(((4, 96, 128, 80), (4, 128, 192, 160)))
-    launch = reader._launch_reader_cuda
-    geometry = reader._weight_geometry
-    rank, kernel = 2, 3
+    shapes.extend(((4, 128, 192, 160), (4, 512, 768, 48)))
+    spatial_candidates = {
+        "s4x2_reg": (4, 2, 1, -1),
+        "s4x2_smem": (4, 2, 0, -1),
+        "s4x4_smem": (4, 4, 0, -1),
+        "s8x2_smem": (8, 2, 0, -1),
+        "s4x4_smem_nokeep": (4, 4, 0, 0),
+        "s2x4_nokeep": (2, 4, -1, 0),
+    }
+    weight_candidates = {
+        "t2_r2_w8_s20": (2, 2, 8, 20),
+        "t2_r2_w8_s40": (2, 2, 8, 40),
+        "t2_r4_w4": (2, 4, 4, 5),
+        "t2_r4_w8_s20": (2, 4, 8, 20),
+        "t4_r2_w4": (4, 2, 4, 5),
+        "t4_r2_w4_s20": (4, 2, 4, 20),
+        "t4_r2_w8_s20": (4, 2, 8, 20),
+        "t4_r2_w8_s40": (4, 2, 8, 40),
+        "t4_r4_w4_s20": (4, 4, 4, 20),
+    }
+    rank, kernel = 4, 3
+    dtype = torch.bfloat16
+    types = (reader._CUDA_TYPES[dtype],) * 3
+    div = reader._ceildiv
+
+    def measure(
+        module: reader._CudaModule, operation: str, grid: tuple[int, int, int],
+        tensors: tuple[torch.Tensor, ...], sizes: tuple[int, ...], threads: int,
+    ) -> dict:
+        stream = reader._reader_stream(module, tensors[0].device)
+
+        def call() -> None:
+            reader._launch_reader_cuda(
+                module, operation, grid, tensors, sizes, stream=stream, threads=threads,
+            )
+
+        median = event_median(call)
+        logical_bytes = sum(t.numel() * t.element_size() for t in tensors)
+        return {
+            "median_ms": median, "logical_bytes": logical_bytes,
+            "effective_gb_s": logical_bytes / (median * 1e6),
+            "grid": grid, "threads": threads, "kernel": operation,
+        }
+
+    results = {}
     for batch, height, width, modes in shapes:
-        shape_rows = results[f"{batch}x{height}x{width}x{modes}"] = {}
-        spatial = (batch, height, width)
-        kwargs = {"device": "cuda", "dtype": torch.bfloat16}
-        projected = torch.randn((*spatial, rank * modes), **kwargs)
-        grad = torch.randn((*spatial, 2 * modes), **kwargs)
-        real, imag = torch.randn((2, modes, rank, kernel, kernel), **kwargs).unbind()
-        modes_to_probe = ("default", "legacy_2r4w") if spatial == (4, 96, 128) else ("default",)
-        reference = None
-        for mode in modes_to_probe:
-            row = shape_rows[mode] = {"stages": {}}
-
-            def capture(
-                module: reader._CudaModule, operation: str, grid: tuple, tensors: tuple,
-                sizes: tuple, *, stream: ctypes.c_void_p, threads: int = reader._DEFAULT_THREADS,
-                row: dict = row,
-            ) -> None:
-                def call() -> None:
-                    launch(module, operation, grid, tensors, sizes, stream=stream, threads=threads)
-
-                stage = "dweight_reduce" if operation.startswith("dweight_reduce") else operation
-                median = event_median(call)
-                byte_count = sum(t.numel() * t.element_size() for t in tensors)
-                row["stages"][stage] = {
-                    "median_ms": median, "logical_bytes": byte_count,
-                    "effective_gb_s": byte_count / (median * 1e6),
-                    "grid": grid, "threads": threads, "kernel": operation,
-                }
-
+        shape = (batch, height, width, modes)
+        rows = results["x".join(map(str, shape))] = {}
+        plane = shape[:3]
+        kwargs = {"device": "cuda", "dtype": dtype}
+        projected = torch.randn((*plane, rank * modes), **kwargs)
+        grad = torch.randn((*plane, 2 * modes), **kwargs)
+        real, imag = (torch.randn((2, modes, rank, kernel, kernel), **kwargs) * 0.125).unbind()
+        spatial_default = reader._spatial_geometry(width, rank, kernel, dtype, strict=False)
+        weight_default = reader._weight_geometry(projected, modes, rank, dtype)
+        mode_tiles = div(modes, 32)
+        spatial_sizes = (height, width, modes, rank)
+        alignment = (
+            reader._SPECIALIZE_MODE_ALIGNMENT if height * width >= reader._LARGE_WEIGHT_PLANE_PIXELS
+            else reader._WARP_SIZE
+        )
+        compiled_shape = shape if (
+            batch * height * width >= reader._SPECIALIZE_MIN_PIXELS and modes % alignment == 0
+        ) else (0, 0, 0, 0)
+        reference = {}
+        for name in ("default", *spatial_candidates, *weight_candidates):
+            row = rows[name] = {"stages": {}, "parity": {}}
+            sr, sw, register, keep = spatial_candidates.get(name, (*spatial_default, -1, -1))
+            tile, wr, ww, waves = weight_candidates.get(name, (*weight_default, 5))
             try:
-                selected = geometry if mode == "default" else lambda *_: (2, 2, 4)
-                row["weight_geometry"] = selected(projected, modes, rank, grad.dtype)
-                with patch.object(reader, "_launch_reader_cuda", capture), patch.object(
-                    reader, "_weight_geometry", selected,
-                ):
-                    if mode == "default":
-                        reader._packed_spatial(projected, real, imag, strict_complex=False)
-                    output = reader._packed_spatial_backward(
-                        grad, projected, real, imag, strict_complex=False,
+                module = reader._reader_cuda_module(
+                    device, compiled_shape, reader._reader_columns(width), rank, kernel, types,
+                    strict=False, spatial_geometry=(sr, sw), weight_geometry=(tile, wr, ww),
+                    register_filters=register, keep_real=keep,
+                )
+                outputs = {}
+                if name == "default" or name in spatial_candidates:
+                    grid = reader._reader_spatial_grid(batch, height, width, modes, sr, sw)
+                    outputs["forward"] = torch.empty_like(grad)
+                    outputs["dinput"] = torch.empty_like(projected)
+                    for op, source in (("forward", projected), ("dinput", grad)):
+                        row["stages"][op] = measure(
+                            module, op, grid, (source, real, imag, outputs[op]), spatial_sizes,
+                            sw * 32,
+                        )
+                if name == "default" or name in weight_candidates:
+                    workers = min(div(batch * div(height, wr), ww), div(waves * sms, mode_tiles))
+                    partial = projected.new_empty(
+                        (workers, 2, rank, kernel, kernel, modes), dtype=torch.float32,
                     )
-                if mode == "default" and len(modes_to_probe) == 2:
-                    reference = output
-                if reference is not None and mode != "default":
-                    row.update(closeness(output, reference))
-                row["status"] = "ok" if row.get("close", True) else "mismatch"
-                del output
+                    dw = outputs["dweight"] = real.new_empty((2, *real.shape), dtype=torch.float32)
+                    row["stages"]["dweight"] = measure(
+                        module, "dweight", (mode_tiles * div(rank, tile), workers, 1),
+                        (projected, grad, partial), (height, width, modes, batch, rank), ww * 32,
+                    )
+                    parallel = workers >= reader._WEIGHT_PARALLEL_REDUCTION_WORKERS
+                    columns = 32 if parallel else reader._DEFAULT_THREADS
+                    reduce = "dweight_reduce_parallel" if parallel else "dweight_reduce"
+                    row["stages"]["dweight_reduce"] = measure(
+                        module, reduce, (div(dw.numel(), columns), 1, 1),
+                        (partial, dw), (modes, rank, workers), reader._DEFAULT_THREADS,
+                    )
+                    del partial
+                if name == "default":
+                    reference.update(outputs)
+                else:
+                    for op, output in outputs.items():
+                        row["parity"][op] = closeness([output], [reference[op]])
+                passed = all(p["close"] for p in row["parity"].values())
+                row["status"] = "ok" if passed else "mismatch"
+                del outputs
             except (RuntimeError, ValueError) as exc:
                 row.update(status="error", error=str(exc)[-500:])
-        del projected, grad, real, imag, reference
+        del reference, projected, grad, real, imag
     return results
 
 
@@ -656,10 +716,9 @@ def kernel_probe(_args: argparse.Namespace) -> dict:
 
     torch.manual_seed(719)
     with torch.inference_mode():
-        scans = scan_probe()
         reader = reader_probe()
-    ok = all(rows["default"]["status"] == "ok" for rows in (*scans.values(), *reader.values()))
-    return {"status": "ok" if ok else "error", "vscan": scans, "factorized_reader": reader}
+    ok = all(row["status"] == "ok" for rows in reader.values() for row in rows.values())
+    return {"status": "ok" if ok else "error", "factorized_reader": reader}
 
 
 def main() -> None:
