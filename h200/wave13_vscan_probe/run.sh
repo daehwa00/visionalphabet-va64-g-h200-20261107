@@ -42,13 +42,41 @@ mkdir -p "$out/arms" "$out/infer"
 "$run_python" h200/wave13_vscan_probe/bench.py --out "$out/isolated.jsonl" | tee "$out/isolated.log"
 "$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \
     < "$out/isolated.jsonl" > "$out/isolated.json"
-for arm in 0 chunk saved; do
-    export LNET_VSCAN_DECOUPLED=$arm
-    for batch in 1024 128 256 512; do
-        "$run_python" "$bench" train-arm --out "$out/arms/p1_b${batch}_${arm}.json" \
-            --variant 17-p1-nr4-1024d-v3 --batch "$batch" --profile
-    done
-    "$run_python" "$bench" infer-fold --out "$out/infer/p1_b1024_${arm}.json" \
-        --variant 17-p1-nr4-1024d-v3 --batch 1024
-    "$run_python" "$bench" dynamo --out "$out/dynamo_${arm}.json"
-done
+# Reuse the cuDNN autotuner and loaded CUDA kernels between arms.
+"$run_python" - "$out" <<'PYBENCH'
+import gc
+import os
+import runpy
+import sys
+from pathlib import Path
+
+import torch
+
+root = Path(sys.argv[1])
+bench_script = "h200/liverms_v2_opt/bench_h200.py"
+main = runpy.run_path(bench_script)["main"]
+arms = ("0", "chunk", "saved")
+variant = "17-p1-nr4-1024d-v3"
+
+def run(arm, command, out, *options):
+    os.environ["LNET_VSCAN_DECOUPLED"] = arm
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch._dynamo.reset()
+    print(f"begin {arm} {command} {out.name}", flush=True)
+    sys.argv = [bench_script, command, "--out", str(out), *options]
+    main()
+
+for batch in (1024, 128, 256, 512):
+    for arm in arms:
+        run(
+            arm, "train-arm", root / "arms" / f"p1_b{batch}_{arm}.json",
+            "--variant", variant, "--batch", str(batch), "--profile",
+        )
+for arm in arms:
+    run(
+        arm, "infer-fold", root / "infer" / f"p1_b1024_{arm}.json",
+        "--variant", variant, "--batch", "1024",
+    )
+    run(arm, "dynamo", root / f"dynamo_{arm}.json")
+PYBENCH
