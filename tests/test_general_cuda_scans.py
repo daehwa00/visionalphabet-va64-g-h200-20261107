@@ -917,3 +917,54 @@ def test_cuda_coarse_drive_dtypes(monkeypatch: pytest.MonkeyPatch, dtype: torch.
     plane_grads = torch.autograd.grad(planes, params, dy.chunk(2, dim=-1))
     for actual, target in zip(plane_grads, packed_grads, strict=True):
         torch.testing.assert_close(actual, target)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize(
+    ("coarse", "compact", "hidden", "compiled"),
+    [(False, False, 8, False), (True, False, 11, True), (True, True, 5, False)],
+)
+def test_cuda_decoupled_vscan(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    coarse: bool,
+    compact: bool,
+    hidden: int,
+    compiled: bool,
+) -> None:
+    torch.manual_seed(791)
+    _, pole, real, _, auxiliary, path = _inputs(8, 10, 35, hidden, dtype, "cuda", batch=3)
+    path[1] = path[1].to(torch.float16)
+    path[3] = path[3].to(torch.bfloat16)
+    states = torch.stack([real] * 4)
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    expected = scans.vertical_forward(pole, states, auxiliary, path, coarse)
+    dy = tuple(torch.randn_like(value) for value in expected)
+    expected_grads = scans.vertical_backward(
+        pole, states, auxiliary, path, *dy, coarse, compact=compact
+    )
+
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "force")
+    plan_chunk = scans._decoupled_chunk
+    monkeypatch.setattr(scans, "_decoupled_chunk", lambda *args: min(2, plan_chunk(*args)))
+    run = scans.vertical_forward
+    if compiled:
+        run = torch.compile(run, fullgraph=True)
+    actual = run(pole, states, auxiliary, path, coarse)
+    actual_grads = scans.vertical_backward(
+        pole, states, auxiliary, path, *dy, coarse, compact=compact
+    )
+    if dtype == torch.float32:
+        forward_tol, backward_tol = (4e-5, 3e-6), (4e-4, 2e-4)
+    elif dtype == torch.float16:
+        forward_tol, backward_tol = (8e-3, 1e-3), (5e-2, 2e-2)
+    else:
+        forward_tol, backward_tol = (4e-2, 5e-3), (1.2e-1, 8e-2)
+    for values, reference, (rtol, atol) in (
+        (actual, expected, forward_tol),
+        (actual_grads, expected_grads, backward_tol),
+    ):
+        for value, target in zip(values, reference, strict=True):
+            torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
