@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from lnet.pac_complex_layers import (
+from lnet.complex_layers import (
     ComplexLinear,
     ScaleStableComplexLinear,
     semi_orthogonal_complex_linear_,

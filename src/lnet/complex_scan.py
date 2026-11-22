@@ -16,9 +16,9 @@ from . import complex_scan_config as _config
 from . import complex_scan_stage as _bank
 from . import complex_scan_transitions as _transitions
 from . import complex_scan_types as _contracts
-from . import pac_complex_layers as _complex_layers
-from . import pac_path_cffn as _path_cffn
-from . import pac_product_scan_contracts as _product_scan_contracts
+from . import complex_layers as _complex_layers
+from . import path_cffn as _path_cffn
+from . import product_scan_contracts as _product_scan_contracts
 from .complex_scan_stage import (
     ComplexScanStage as _ComplexScanStage,
 )

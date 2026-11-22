@@ -17,10 +17,6 @@ from lnet import complex_scan_transitions as transitions
 from lnet import complex_scan_types as contracts
 from lnet.complex_scan import ComplexScanBackbone, ComplexScanConfig
 
-_PACKED_IMPORT_ORDER = (
-    "pac_packed_postcarry_inference, complex_scan_transitions, complex_scan_stage, complex_scan"
-)
-
 
 def _schema_digest(config: ComplexScanConfig) -> str:
     model = ComplexScanBackbone(config)
@@ -113,9 +109,8 @@ def test_internal_modules_do_not_import_the_public_module() -> None:
 @pytest.mark.parametrize(
     "imports",
     [
-        _PACKED_IMPORT_ORDER,
-        "complex_scan_transitions, complex_scan, pac_packed_postcarry_inference",
-        "complex_scan_stage, complex_scan, a2d_q_heads",
+        "complex_scan_transitions, complex_scan_stage, complex_scan",
+        "complex_scan_stage, complex_scan, classifier_heads",
     ],
 )
 def test_supported_import_orders_start_in_a_fresh_process(imports: str) -> None:

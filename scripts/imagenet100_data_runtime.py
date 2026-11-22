@@ -210,8 +210,11 @@ def loaders(
     data_root: Path,
     *,
     batch_size: int,
+    validation_batch_size: int | None = None,
     workers: int,
     training_generator: torch.Generator,
+    val_persistent_workers: bool = False,
+    isolated_validation: bool = False,
 ) -> tuple[DataLoader[Any], DataLoader[Any]]:
     train_transform, evaluation_transform = transforms_for_imagenet100()
     train_dataset = datasets.ImageFolder(data_root / "train", train_transform)
@@ -236,13 +239,26 @@ def loaders(
         persistent_workers=persistent_workers,
         **common,
     )
+    validation_workers = min(4, active_workers) if isolated_validation else active_workers
+    validation_options = {**common, "num_workers": validation_workers}
+    if validation_workers == 0:
+        validation_options.pop("prefetch_factor", None)
     validation_loader = DataLoader(
         validation_dataset,
         shuffle=False,
-        persistent_workers=False,
-        **common,
+        persistent_workers=val_persistent_workers and validation_workers > 0,
+        generator=torch.Generator().manual_seed(10_502) if isolated_validation else None,
+        **{**validation_options, "batch_size": validation_batch_size or batch_size},
     )
     return train_loader, validation_loader
+
+
+def close_persistent_loader(loader: DataLoader[Any]) -> None:
+    # PyTorch has no public explicit shutdown for a persistent iterator.
+    iterator = loader._iterator
+    if iterator is not None:
+        iterator._shutdown_workers()
+        loader._iterator = None
 
 
 def move_batch(

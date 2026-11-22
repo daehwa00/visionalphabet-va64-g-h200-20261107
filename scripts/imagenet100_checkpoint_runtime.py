@@ -31,8 +31,11 @@ def atomic_json(path: Path, payload: object) -> None:
 def atomic_torch(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
-    torch.save(payload, temporary)
-    temporary.replace(path)
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def restore_checkpoint(
@@ -75,7 +78,8 @@ def restore_checkpoint(
         raise RuntimeError(message)
     training_generator.set_state(payload["training_generator_state"])
     torch.set_rng_state(payload["torch_rng_state"])
-    torch.cuda.set_rng_state_all(payload["cuda_rng_state"])
+    if payload["cuda_rng_state"] and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(payload["cuda_rng_state"])
     random.setstate(payload["python_rng_state"])
     mixup_generator.bit_generator.state = payload["mixup_rng_state"]
     epoch = checkpoint_nonnegative_integer(payload["epoch"], name="epoch")
@@ -137,6 +141,7 @@ def train_epoch_with_step_count(
     precision: str,
     gradient_accumulation_steps: int,
     channels_last: bool,
+    on_step: Callable[[int], None] | None = None,
 ) -> tuple[dict[str, float], int]:
     """Run one epoch and count successful optimizer updates exactly."""
     original_step = optimizer.step
@@ -146,6 +151,8 @@ def train_epoch_with_step_count(
         nonlocal optimizer_steps
         result = original_step(*args, **kwargs)
         optimizer_steps += 1
+        if on_step is not None:
+            on_step(optimizer_steps)
         return result
 
     optimizer.step = step_and_count  # type: ignore[method-assign]

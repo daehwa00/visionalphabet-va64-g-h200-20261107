@@ -7,33 +7,16 @@ from __future__ import annotations
 # pyright: reportArgumentType=false, reportIncompatibleMethodOverride=false
 # pyright: reportIncompatibleUnannotatedOverride=false, reportUnusedFunction=false
 import math
-from dataclasses import replace
-from typing import TYPE_CHECKING, Self, override
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional
 
-from .pac_complex_ffn import ComplexFFN, ComplexFFNActivation
-from .pac_complex_layers import ComplexLinear, WidelyLinear
-from .pac_packed_postcarry_inference import (
-    PackedCFFNSpec,
-    PackedPostCarrySpec,
-    PackedPostCarryWeights,
-    PackedPostFusionSpec,
-    PackedRMSNormSpec,
-    cached_packed_weights,
-    can_use_packed_postcarry_inference,
-    can_use_packed_postfusion_inference,
-    can_use_packed_postfusion_training,
-    packed_postcarry_inference,
-    packed_postfusion_inference,
-    packed_postfusion_training,
-)
+from .complex_ffn import ComplexFFN, ComplexFFNActivation
+from .complex_layers import ComplexLinear, WidelyLinear
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from .complex_scan_types import ComplexCarryMerge, ComplexField
 
 
@@ -502,80 +485,6 @@ class S2DPostCFFNCarryMainTransition(ComplexFFN):
                     )
         # A stage scalar keeps the first intervention maximally identifiable.
         self.pole_scale = nn.Parameter(torch.tensor(pole_scale_initial))
-        # Fused packed blocks for inference.  Deliberately not a buffer: the
-        # cache is derived state and must stay out of ``state_dict``.
-        self._packed_inference_cache: PackedPostCarryWeights | None = None
-
-    @override
-    def _apply(
-        self,
-        fn: Callable[[Tensor], Tensor],
-        recurse: bool = True,
-    ) -> Self:
-        """Drop derived storage before parameters move across device or dtype."""
-        self._packed_inference_cache = None
-        return super()._apply(fn, recurse=recurse)
-
-    @override
-    def _load_from_state_dict(
-        self,
-        state_dict: dict[str, Tensor],
-        prefix: str,
-        local_metadata: dict[str, object],
-        strict: bool,
-        missing_keys: list[str],
-        unexpected_keys: list[str],
-        error_msgs: list[str],
-    ) -> None:
-        """Invalidate derived blocks before checkpoint parameters are copied."""
-        self._packed_inference_cache = None
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-
-    def _base_packed_postcarry_spec(self) -> PackedPostCarrySpec:
-        """Build the base capability after a concrete class opts into it."""
-        carry_projection = self.carry_projection
-        carry_weight = None if carry_projection is not None else self.carry_weight
-        return PackedPostCarrySpec(
-            modes=self.modes,
-            input_modes=self.input_modes,
-            hidden_modes=self.hidden_modes,
-            output_modes=self.output_modes,
-            training=self.training,
-            direction_mixer=self.direction_mixer,
-            ffn_norm=PackedRMSNormSpec(
-                weight=self.ffn_norm.weight,
-                epsilon=self.ffn_norm.epsilon,
-            ),
-            ffn=PackedCFFNSpec(
-                input_projection=self.ffn_input,
-                output_projection=self.ffn_output,
-                activation=self.ffn_activation,
-                activation_scale=self.ffn_activation_scale,
-                residual_scale=self.layer_scale,
-            ),
-            output_norm=PackedRMSNormSpec(
-                weight=self.output_norm.weight,
-                epsilon=self.output_norm.epsilon,
-            ),
-            output_projection=self.output_projection,
-            pole_scale=self.pole_scale,
-            carry_weight=carry_weight,
-            carry_projection=carry_projection,
-        )
-
-    def packed_postcarry_spec(self) -> PackedPostCarrySpec | None:
-        """Opt only the verified concrete base transition into packed inference."""
-        if type(self) is not S2DPostCFFNCarryMainTransition:
-            return None
-        return self._base_packed_postcarry_spec()
 
     def copy_pole_branch_from(
         self,
@@ -638,15 +547,6 @@ class S2DPostCFFNCarryMainTransition(ComplexFFN):
         if carry_real is None or carry_imag is None:
             message = "post-CFFN carry-main transition requires S2D coordinates"
             raise ValueError(message)
-        if can_use_packed_postcarry_inference(self, real, imag, carry_real, carry_imag):
-            return packed_postcarry_inference(
-                self,
-                real,
-                imag,
-                carry_real,
-                carry_imag,
-                weights=cached_packed_weights(self, real),
-            )
         pole_real, pole_imag = self.pole_update(real, imag)
         carry_state_real, carry_state_imag = self._modewise_carry(
             carry_real,
@@ -711,28 +611,6 @@ class S2DPostFusionCFFNTransition(S2DPostCFFNCarryMainTransition):
             torch.full((active_output_modes,), post_layer_scale_initial)
         )
 
-    def packed_postcarry_spec(self) -> PackedPostCarrySpec | None:
-        """Extend the base capability atomically with the post-fusion CFFN."""
-        if type(self) is not S2DPostFusionCFFNTransition:
-            return None
-        base = self._base_packed_postcarry_spec()
-        return replace(
-            base,
-            post_fusion=PackedPostFusionSpec(
-                norm=PackedRMSNormSpec(
-                    weight=self.post_ffn_norm.weight,
-                    epsilon=self.post_ffn_norm.epsilon,
-                ),
-                cffn=PackedCFFNSpec(
-                    input_projection=self.post_ffn_input,
-                    output_projection=self.post_ffn_output,
-                    activation=self.post_ffn_activation,
-                    activation_scale=self.post_ffn_activation_scale,
-                    residual_scale=self.post_ffn_scale,
-                ),
-            ),
-        )
-
     def outer_residual(
         self,
         real: Tensor,
@@ -762,23 +640,6 @@ class S2DPostFusionCFFNTransition(S2DPostCFFNCarryMainTransition):
         if carry_real is None or carry_imag is None:
             message = "post-fusion CFFN transition requires S2D coordinates"
             raise ValueError(message)
-        if can_use_packed_postfusion_training(self, real, imag, carry_real, carry_imag):
-            return packed_postfusion_training(
-                self,
-                real,
-                imag,
-                carry_real,
-                carry_imag,
-            )
-        if can_use_packed_postfusion_inference(self, real, imag, carry_real, carry_imag):
-            return packed_postfusion_inference(
-                self,
-                real,
-                imag,
-                carry_real,
-                carry_imag,
-                weights=cached_packed_weights(self, real),
-            )
         outer_real, outer_imag = self.outer_residual(
             real,
             imag,

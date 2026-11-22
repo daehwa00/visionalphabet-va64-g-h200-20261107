@@ -12,6 +12,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional
 
+from .complex_layers import ComplexLinear, WidelyLinear
 from .complex_scan_transitions import (
     AugmentedComplexTransition,
     ComplexInteractionTransition,
@@ -19,21 +20,27 @@ from .complex_scan_transitions import (
     ComplexResidualFFN,
     ComplexRMSNorm,
 )
-from .pac_complex_layers import ComplexLinear, WidelyLinear
-from .pac_mean_energy_readout import mean_energy_product_scan
-from .pac_feature_pool_readout import feature_pool_product_scan
-from .pac_path_cffn import D4PathModeCombiner, FactorizedQuadrantPathModeCFFNCombiner
-from .pac_product_scan_contracts import (
+from .packed_execution import weighted_s2d_packed
+from .path_cffn import D4PathModeCombiner, FactorizedQuadrantPathModeCFFNCombiner
+from .pole_gamma_math import discrete_pole
+from .product_scan_contracts import (
     ProductGainNormalization,
-    supports_pac_triton_product_scan_coarse4,
-    supports_pac_triton_product_scan_descriptor4,
+    supports_triton_product_scan_coarse4,
+    supports_triton_product_scan_descriptor4,
 )
-from .pac_product_scan_pipeline import ScanMemoryPolicy, run_product_scan_pipeline
-from .pac_real2d_math import discrete_pole_real2d
+from .product_scan_pipeline import (
+    ScanMemoryPolicy,
+    run_product_scan_coarse_path_collapse_packed,
+    run_product_scan_coarse_path_collapse_planes_packed,
+    run_product_scan_pipeline,
+    run_product_scan_pipeline_packed,
+)
 
 if TYPE_CHECKING:
+    from .complex_ffn import ComplexFFN
     from .complex_scan_types import ComplexCarryBasis, ComplexCarryMerge, ComplexField
-    from .pac_complex_ffn import ComplexFFN
+    from .gated_post_fusion import GatedPoleExcitationS2DTransition
+    from .phase_gated_transition import PathOnlyCollapse
 
 
 def pole_aligned_complex_downsample(
@@ -247,6 +254,8 @@ class ComplexCCCNDownsample(nn.Module):
 class ComplexScanStage(nn.Module):
     """Reusable two-dimensional complex product-scan stage."""
 
+    _fuse_coarse_path: bool = False
+
     def __init__(
         self,
         modes: int,
@@ -275,6 +284,7 @@ class ComplexScanStage(nn.Module):
     ) -> None:
         super().__init__()
         self.phase_mode = "learned"
+        self.bound_phase_nyquist = False
         self.readout_mode = "directional"
         _validate_bank_transition(
             modes,
@@ -474,6 +484,35 @@ class ComplexScanStage(nn.Module):
         damping = self.damping_min + (self.damping_max - self.damping_min) * ratio
         return damping[0], damping[1]
 
+    def _effective_phases(self) -> tuple[Tensor, Tensor]:
+        if not self.bound_phase_nyquist:
+            return self.phase_x, self.phase_y
+        # Keep saturated tanh strictly inside Nyquist even after rounding.
+        limit = math.pi * (1 - torch.finfo(self.phase_x.dtype).eps)
+        x = (math.pi * torch.tanh(self.phase_x / math.pi)).clamp(-limit, limit)
+        y = (math.pi * torch.tanh(self.phase_y / math.pi)).clamp(-limit, limit)
+        return x, y
+
+    @torch.no_grad()
+    def enable_pole_unclamp_(self) -> None:
+        """Change pole parameterization after the full initialization pass."""
+        if self.bound_phase_nyquist:
+            raise RuntimeError("Nyquist bounding is already enabled")
+        if self.damping_min != 0.01 or self.damping_max not in (0.7, 2.0):
+            raise ValueError("unexpected initial damping range")
+        if self.log_damping_x is not None or self.log_damping_y is not None:
+            raise ValueError("pole unclamping requires sigmoid damping")
+        if self.damping_max != 2.0:
+            for param in (self.damping_logits_x, self.damping_logits_y):
+                gamma = self.damping_min + (self.damping_max - self.damping_min) * param.sigmoid()
+                param.copy_(torch.logit((gamma - self.damping_min) / (2.0 - self.damping_min)))
+            self.damping_max = 2.0
+        for phase in (self.phase_x, self.phase_y):
+            if not bool((phase.abs() < math.pi).all()):
+                raise ValueError("initial phase must be inside Nyquist")
+            phase.copy_(math.pi * torch.atanh(phase / math.pi))
+        self.bound_phase_nyquist = True
+
     def pole_coefficients(
         self,
         shape: tuple[int, int, int, int],
@@ -485,16 +524,17 @@ class ComplexScanStage(nn.Module):
         _, height, width, _ = shape
         spacing_x, spacing_y = 1.0 / width, 1.0 / height
         damping_x, damping_y = self._damping_fields()
-        phase_x = torch.zeros_like(self.phase_x) if self.phase_mode == "zero" else self.phase_x
-        phase_y = torch.zeros_like(self.phase_y) if self.phase_mode == "zero" else self.phase_y
+        phase_x, phase_y = self._effective_phases()
+        if self.phase_mode == "zero":
+            phase_x, phase_y = torch.zeros_like(phase_x), torch.zeros_like(phase_y)
         frequency_x = (phase_x / spacing_x).view(1, 1, 1, -1)
         frequency_y = (phase_y / spacing_y).view(1, 1, 1, -1)
-        positive_x = discrete_pole_real2d(
+        positive_x = discrete_pole(
             damping_x / spacing_x,
             frequency_x.expand_as(damping_x),
             spacing_x,
         )
-        positive_y = discrete_pole_real2d(
+        positive_y = discrete_pole(
             damping_y / spacing_y,
             frequency_y.expand_as(damping_y),
             spacing_y,
@@ -525,11 +565,76 @@ class ComplexScanStage(nn.Module):
             raise RuntimeError(message)
         return self.output_norm(*self.bridge(real, imag))
 
+    def _forward_packed(
+        self,
+        source: Tensor,
+        *,
+        emit_descriptor: bool,
+    ) -> tuple[Tensor | None, Tensor]:
+        if self.pole_input_projection is None:
+            raise ValueError("packed stage requires a reader")
+        drive = self.pole_input_projection(source)
+        pole_x, pole_y = self.pole_coefficients((*drive.shape[:-1], self.modes))
+        if self.output_modes is None:
+            descriptor = run_product_scan_pipeline_packed(
+                pole_x,
+                pole_y,
+                drive,
+                epilogue="mean_energy" if self.readout_mode == "mean_energy" else "descriptor",
+                gain_normalization=self.product_gain_normalization,
+                memory_policy=self.scan_memory_policy,
+            )
+            return None, cast("Tensor", descriptor)
+        collapse = cast("PathOnlyCollapse", self.quadrant_path_mode_combiner)
+        transition = cast("GatedPoleExcitationS2DTransition", self.augmented)
+        memory_planar = False
+        memory: Tensor | tuple[Tensor, Tensor]
+        if getattr(self, "_fuse_coarse_path", False) and not emit_descriptor:
+            memory_planar = transition.memory_projection is not None
+            if memory_planar:
+                memory = run_product_scan_coarse_path_collapse_planes_packed(
+                    pole_x,
+                    pole_y,
+                    drive,
+                    collapse.packed_parameters(),
+                    gain_normalization=self.product_gain_normalization,
+                    memory_policy=self.scan_memory_policy,
+                )
+            else:
+                memory = run_product_scan_coarse_path_collapse_packed(
+                    pole_x,
+                    pole_y,
+                    drive,
+                    collapse.packed_parameters(),
+                    gain_normalization=self.product_gain_normalization,
+                    planar_output=False,
+                    memory_policy=self.scan_memory_policy,
+                )
+            descriptor = pole_x[0].new_empty((0,))
+        else:
+            coarse, descriptor = run_product_scan_pipeline_packed(
+                pole_x,
+                pole_y,
+                drive,
+                epilogue="coarse",
+                gain_normalization=self.product_gain_normalization,
+                memory_policy=self.scan_memory_policy,
+                emit_descriptor=emit_descriptor,
+            )
+            memory = collapse(coarse)
+        carry = weighted_s2d_packed(source, transition.carry_weight)
+        state = transition(memory, carry_real=carry, memory_planar=memory_planar)
+        return state, descriptor
+
     def forward(
         self,
         real: Tensor,
-        imag: Tensor,
-    ) -> tuple[ComplexField | None, Tensor]:
+        imag: Tensor | None = None,
+        *,
+        emit_descriptor: bool = True,
+    ) -> tuple[ComplexField | Tensor | None, Tensor]:
+        if imag is None:
+            return self._forward_packed(real, emit_descriptor=emit_descriptor)
         if real.shape != imag.shape or real.ndim != 4 or real.shape[-1] != self.input_modes:
             message = "complex scan stage inputs must be matching NHWM tensors"
             raise ValueError(message)
@@ -559,9 +664,9 @@ class ComplexScanStage(nn.Module):
             else "descriptor"
         )
         backend_available = not real.is_cuda or (
-            supports_pac_triton_product_scan_coarse4(real, imag)
+            supports_triton_product_scan_coarse4(real, imag)
             if epilogue != "descriptor"
-            else supports_pac_triton_product_scan_descriptor4(real, imag)
+            else supports_triton_product_scan_descriptor4(real, imag)
         )
         if not backend_available:
             message = "D4 associative product scan is unavailable for these tensors"
@@ -569,22 +674,8 @@ class ComplexScanStage(nn.Module):
 
         input_shape = cast("tuple[int, int, int, int]", tuple(real.shape))
         positive_x, positive_y = self.pole_coefficients(input_shape)
-        if self.readout_mode == "feature_pool":
-            if self.output_modes is not None:
-                raise ValueError("feature pooling readout is terminal-only")
-            return None, feature_pool_product_scan(
-                positive_x, positive_y, (real, imag),
-                gain_normalization=self.product_gain_normalization,
-                memory_policy=self.scan_memory_policy,
-            )
-        if self.readout_mode == "mean_energy":
-            if self.output_modes is not None:
-                raise ValueError("mean-energy readout is terminal-only")
-            return None, mean_energy_product_scan(
-                positive_x, positive_y, (real, imag),
-                gain_normalization=self.product_gain_normalization,
-                memory_policy=self.scan_memory_policy,
-            )
+        if self.readout_mode in {"feature_pool", "mean_energy"}:
+            raise ValueError(f"unsupported legacy readout mode: {self.readout_mode}")
         scan_output = run_product_scan_pipeline(
             positive_x,
             positive_y,
@@ -632,9 +723,10 @@ class ComplexScanStage(nn.Module):
             if path_real.shape != path_imag.shape or tuple(path_real.shape[-2:]) != (4, self.modes):
                 message = "D4 path combiner must preserve four product paths"
                 raise RuntimeError(message)
+            phase_x, phase_y = self._effective_phases()
             carry_vector = torch.sigmoid(
-                self.gate_sharpness * (math.pi / 2.0 - self.phase_x.abs())
-            ) * torch.sigmoid(self.gate_sharpness * (math.pi / 2.0 - self.phase_y.abs()))
+                self.gate_sharpness * (math.pi / 2.0 - phase_x.abs())
+            ) * torch.sigmoid(self.gate_sharpness * (math.pi / 2.0 - phase_y.abs()))
             active_carry = carry_vector.view(1, 1, 1, -1, 1).to(dtype=path_real.dtype)
             packed_real = active_carry * path_real.transpose(-2, -1)
             packed_imag = active_carry * path_imag.transpose(-2, -1)
@@ -663,8 +755,7 @@ class ComplexScanStage(nn.Module):
             shortcut_real, shortcut_imag = pole_aligned_complex_downsample(
                 real,
                 imag,
-                self.phase_x,
-                self.phase_y,
+                *self._effective_phases(),
             )
             scale = self.stage_residual_scale.to(dtype=projected_real.dtype)
             projected_real = shortcut_real + scale * projected_real
@@ -684,8 +775,7 @@ class ComplexScanStage(nn.Module):
             aligned_real, aligned_imag = pole_aligned_complex_downsample(
                 real,
                 imag,
-                self.phase_x,
-                self.phase_y,
+                *self._effective_phases(),
             )
             aligned_real, aligned_imag = self.aligned_residual_norm(
                 aligned_real,
