@@ -5,6 +5,7 @@ from __future__ import annotations
 # Custom op schemas use positional flags.
 # ruff: noqa: FBT001, FBT002
 import ctypes
+import os
 from functools import cache
 from threading import local
 from typing import NamedTuple
@@ -161,7 +162,69 @@ using Grad = READER_GRAD;
 # Each warp streams a row tile with one mode per lane. Neighboring
 # columns stay in registers, and all rank components share the same CTA.
 _READER_CUDA = r"""
-template <class T, class W, class O, int R, bool Strict, bool Backward>
+template <int N> struct ModeValues {
+    float value[N];
+
+    __device__ __forceinline__ ModeValues operator-() const {
+        ModeValues result;
+        #pragma unroll
+        for (int i = 0; i < N; ++i) result.value[i] = -value[i];
+        return result;
+    }
+};
+
+template <int N>
+__device__ __forceinline__ ModeValues<N> fmaf(
+    ModeValues<N> a, ModeValues<N> b, ModeValues<N> c
+) {
+    #pragma unroll
+    for (int i = 0; i < N; ++i) c.value[i] = ::fmaf(a.value[i], b.value[i], c.value[i]);
+    return c;
+}
+
+template <int N, class T, bool ReadOnly = false>
+__device__ __forceinline__ ModeValues<N> mode_load(const T* ptr) {
+    ModeValues<N> result;
+    if constexpr (N == 1) {
+        result.value[0] = as_float(ReadOnly ? __ldg(ptr) : *ptr);
+    }
+#if READER_BFLOAT16
+    else {
+        if constexpr (N == 2) {
+            const auto* packed = reinterpret_cast<const __nv_bfloat162*>(ptr);
+            const float2 pair = __bfloat1622float2(ReadOnly ? __ldg(packed) : *packed);
+            result = {{pair.x, pair.y}};
+        } else {
+            const auto* packed = reinterpret_cast<const uint2*>(ptr);
+            const uint2 quad = ReadOnly ? __ldg(packed) : *packed;
+            const float2 lo = __bfloat1622float2(
+                __halves2bfloat162(
+                    __ushort_as_bfloat16(quad.x), __ushort_as_bfloat16(quad.x >> 16)));
+            const float2 hi = __bfloat1622float2(
+                __halves2bfloat162(
+                    __ushort_as_bfloat16(quad.y), __ushort_as_bfloat16(quad.y >> 16)));
+            result = {{lo.x, lo.y, hi.x, hi.y}};
+        }
+    }
+#endif
+    return result;
+}
+
+template <int N, class T>
+__device__ __forceinline__ void mode_store(T* ptr, ModeValues<N> values) {
+    if constexpr (N == 1) *ptr = from_float<T>(values.value[0]);
+#if READER_BFLOAT16
+    else {
+        #pragma unroll
+        for (int i = 0; i < N; i += 2)
+            reinterpret_cast<__nv_bfloat162*>(ptr)[i / 2] =
+                __floats2bfloat162_rn(values.value[i], values.value[i + 1]);
+    }
+#endif
+}
+
+template <class T, class W, class O, int R, bool Strict, bool Backward,
+          int Vec = READER_SPATIAL_VEC>
 __device__ __forceinline__ void sliding_spatial(
     const T* __restrict__ input,
     const W* __restrict__ real,
@@ -174,6 +237,7 @@ __device__ __forceinline__ void sliding_spatial(
     const int modes = READER_MODES ? READER_MODES : runtime_modes;
     constexpr int Rows = READER_SPATIAL_ROWS, Columns = READER_COLUMNS;
     constexpr int Warps = READER_SPATIAL_WARPS;
+    using V = ModeValues<Vec>;
     constexpr int Inputs = Backward ? 2 : R * (Strict ? 2 : 1);
     // Small real filters fit alongside the low-precision window in registers.
     // Reuse them across columns without reloading taps from shared memory.
@@ -183,21 +247,24 @@ __device__ __forceinline__ void sliding_spatial(
     constexpr bool KeepReal = RegisterFilters ||
         (Backward && (READER_KEEP_REAL < 0 ? READER_WIDTH >= 28 : READER_KEEP_REAL != 0));
     const int lane = threadIdx.x % 32;
-    const int mode = blockIdx.x * 32 + lane;
+    const int mode = (blockIdx.x * 32 + lane) * Vec;
     const int xtiles = (width + Columns * Warps - 1) / (Columns * Warps);
     const int y0 = blockIdx.y / xtiles * Rows;
     const int x0 = (blockIdx.y % xtiles * Warps + threadIdx.x / 32) * Columns;
     const long long base = static_cast<long long>(blockIdx.z) * height * width;
-    __shared__ float filters[2][R][3][3][32];
-    float resident[RegisterFilters ? 2 : 1][R][3][3];
+    __shared__ float filters[2][R][3][3][Vec][32];
+    V resident[RegisterFilters ? 2 : 1][R][3][3];
     if constexpr (!RegisterFilters) {
         // Each tap uses one bank per mode and is shared across the warps.
         for (int field = threadIdx.x / 32; field < 2 * R * 9; field += Warps) {
             const int component = field / (R * 9), r = field / 9 % R, tap = field % 9;
             if (mode < modes) {
-                const int index = (mode * R + r) * 9 + (Backward ? 8 - tap : tap);
-                filters[component][r][tap / 3][tap % 3][lane] =
-                    as_float((component == 0 ? real : imag)[index]);
+                #pragma unroll
+                for (int v = 0; v < Vec; ++v) {
+                    const int index = ((mode + v) * R + r) * 9 + (Backward ? 8 - tap : tap);
+                    filters[component][r][tap / 3][tap % 3][v][lane] =
+                        as_float((component == 0 ? real : imag)[index]);
+                }
             }
         }
         __syncthreads();
@@ -212,15 +279,20 @@ __device__ __forceinline__ void sliding_spatial(
                 for (int kx = 0; kx < 3; ++kx) {
                     if constexpr (RegisterFilters) {
                         const int tap = ky * 3 + kx;
-                        const int index = (mode * R + r) * 9 + (Backward ? 8 - tap : tap);
-                        resident[0][r][ky][kx] = as_float(real[index]);
-                        resident[1][r][ky][kx] = as_float(imag[index]);
+                        #pragma unroll
+                        for (int v = 0; v < Vec; ++v) {
+                            const int index = ((mode + v) * R + r) * 9 + (Backward ? 8 - tap : tap);
+                            resident[0][r][ky][kx].value[v] = as_float(real[index]);
+                            resident[1][r][ky][kx].value[v] = as_float(imag[index]);
+                        }
                     } else {
-                        resident[0][r][ky][kx] = filters[0][r][ky][kx][lane];
+                        #pragma unroll
+                        for (int v = 0; v < Vec; ++v)
+                            resident[0][r][ky][kx].value[v] = filters[0][r][ky][kx][v][lane];
                     }
                 }
     }
-    float left[Rows + 2][Inputs] = {}, middle[Rows + 2][Inputs] = {};
+    V left[Rows + 2][Inputs] = {}, middle[Rows + 2][Inputs] = {};
     #pragma unroll
     for (int y = 0; y < Rows + 2; ++y) {
         const int py = y0 + y - 1;
@@ -228,36 +300,39 @@ __device__ __forceinline__ void sliding_spatial(
         #pragma unroll
         for (int i = 0; i < Inputs; ++i) {
             const long long index = ((base + py * width + x0) * Inputs + i) * modes + mode;
-            middle[y][i] = as_float(input[index]);
-            if (x0 > 0) left[y][i] = as_float(input[index - Inputs * modes]);
+            middle[y][i] = mode_load<Vec>(input + index);
+            if (x0 > 0) left[y][i] = mode_load<Vec>(input + index - Inputs * modes);
         }
     }
     for (int x = x0; x < x0 + Columns && x < width; ++x) {
-        float right[Rows + 2][Inputs] = {};
+        V right[Rows + 2][Inputs] = {};
         #pragma unroll
         for (int y = 0; y < Rows + 2; ++y) {
             const int py = y0 + y - 1;
             if (py < 0 || py >= height || x + 1 == width) continue;
             #pragma unroll
             for (int i = 0; i < Inputs; ++i)
-                right[y][i] = as_float(input[
-                    ((base + py * width + x + 1) * Inputs + i) * modes + mode]);
+                right[y][i] = mode_load<Vec>(input +
+                    ((base + py * width + x + 1) * Inputs + i) * modes + mode);
         }
-        float ar[Rows] = {}, ai[Rows] = {};
+        V ar[Rows] = {}, ai[Rows] = {};
         #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int i = Backward ? 0 : r;
             #pragma unroll
             for (int ky = 0; ky < 3; ++ky) {
                 constexpr int Left = 0, Middle = 1, Right = 2;
-                const float f[2][3] = {
-                    {KeepReal ? resident[0][r][ky][0] : filters[0][r][ky][0][lane],
-                     KeepReal ? resident[0][r][ky][1] : filters[0][r][ky][1][lane],
-                     KeepReal ? resident[0][r][ky][2] : filters[0][r][ky][2][lane]},
-                    {RegisterFilters ? resident[1][r][ky][0] : filters[1][r][ky][0][lane],
-                     RegisterFilters ? resident[1][r][ky][1] : filters[1][r][ky][1][lane],
-                     RegisterFilters ? resident[1][r][ky][2] : filters[1][r][ky][2][lane]},
-                };
+                V f[2][3];
+                #pragma unroll
+                for (int kx = 0; kx < 3; ++kx) {
+                    #pragma unroll
+                    for (int v = 0; v < Vec; ++v) {
+                        f[0][kx].value[v] = KeepReal ? resident[0][r][ky][kx].value[v]
+                            : filters[0][r][ky][kx][v][lane];
+                        f[1][kx].value[v] = RegisterFilters ? resident[1][r][ky][kx].value[v]
+                            : filters[1][r][ky][kx][v][lane];
+                    }
+                }
                 #pragma unroll
                 for (int y = 0; y < Rows; ++y) {
                     ar[y] = fmaf(left[y + ky][i], f[0][Left], ar[y]);
@@ -296,9 +371,9 @@ __device__ __forceinline__ void sliding_spatial(
                     if (y0 + y >= height) continue;
                     const long long pixel = base + (y0 + y) * width + x;
                     const long long index = (pixel * R * (Strict ? 2 : 1) + r) * modes + mode;
-                    output[index] = from_float<O>(ar[y]);
-                    if (Strict) output[index + R * modes] = from_float<O>(ai[y]);
-                    ar[y] = ai[y] = 0;
+                    mode_store(output + index, ar[y]);
+                    if (Strict) mode_store(output + index + R * modes, ai[y]);
+                    ar[y] = ai[y] = {};
                 }
             }
         }
@@ -307,8 +382,8 @@ __device__ __forceinline__ void sliding_spatial(
             for (int y = 0; y < Rows; ++y) {
                 if (y0 + y >= height) continue;
                 const long long pixel = base + (y0 + y) * width + x;
-                output[pixel * 2 * modes + mode] = from_float<O>(ar[y]);
-                output[(pixel * 2 + 1) * modes + mode] = from_float<O>(ai[y]);
+                mode_store(output + pixel * 2 * modes + mode, ar[y]);
+                mode_store(output + (pixel * 2 + 1) * modes + mode, ai[y]);
             }
         }
         #pragma unroll
@@ -502,7 +577,24 @@ __device__ __forceinline__ auto weight_read(const T* value) {
 
 // Center the correlation on projected pixels so each projected load serves
 // all nine taps. The horizontal window and adjacent rows also reuse grad.
-template <class T, class G, int R>
+template <int N, class T> struct WeightWindow { using Type = ModeValues<N>; };
+template <class T> struct WeightWindow<1, T> { using Type = T; };
+
+template <int N, bool ReadOnly, bool Convert, class T>
+__device__ __forceinline__ auto weight_window_load(const T* ptr) {
+    if constexpr (N == 1) return weight_read<ReadOnly, Convert>(ptr);
+    else return mode_load<N, T, ReadOnly>(ptr);
+}
+
+template <class T>
+__device__ __forceinline__ ModeValues<1> window_values(T value) {
+    return {{as_float(value)}};
+}
+
+template <int N>
+__device__ __forceinline__ ModeValues<N> window_values(ModeValues<N> value) { return value; }
+
+template <class T, class G, int R, int Vec = READER_WEIGHT_VEC>
 __device__ __forceinline__ void real_weight_gradient_3x3(
     const T* __restrict__ projected, const G* __restrict__ grad, float* __restrict__ partial,
     int runtime_height, int runtime_width, int runtime_modes, int runtime_batch
@@ -514,17 +606,19 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
     constexpr int Warps = READER_WEIGHT_WARPS, Rows = READER_WEIGHT_ROWS;
     constexpr bool ReadOnly = READER_WIDTH >= 28 || Warps == 8;
     constexpr bool ConvertWindow = R <= 2 && sizeof(G) == 2 && READER_WIDTH > 2 * READER_COLUMNS;
-    using Window = decltype(weight_read<ReadOnly, ConvertWindow>(grad));
+    using V = ModeValues<Vec>;
+    using ScalarWindow = decltype(weight_read<ReadOnly, ConvertWindow>(grad));
+    using Window = typename WeightWindow<Vec, ScalarWindow>::Type;
     constexpr int RankTile = R < READER_WEIGHT_TILE ? R : READER_WEIGHT_TILE;
     constexpr int RankTiles = (R + RankTile - 1) / RankTile;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int mode = blockIdx.x / RankTiles * 32 + lane;
+    const int mode = (blockIdx.x / RankTiles * 32 + lane) * Vec;
     const int r0 = blockIdx.x % RankTiles * RankTile;
     const int ytiles = (height + Rows - 1) / Rows;
-    float sums_r[3][3][RankTile] = {}, sums_i[3][3][RankTile] = {};
+    V sums_r[3][3][RankTile] = {}, sums_i[3][3][RankTile] = {};
     constexpr int ReduceRanks = 1;
     constexpr int Fields = ReduceRanks * 18;
-    __shared__ float warp_sums[Warps][Fields][32];
+    __shared__ float warp_sums[Warps][Fields][Vec][32];
     if (mode < modes) {
         for (int row = blockIdx.y * Warps + warp; row < batch * ytiles;
              row += gridDim.y * Warps) {
@@ -538,8 +632,8 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                 const int gy = y + i - 1;
                 if (gy >= 0 && gy < height) {
                     const G* g = grad + (base + gy * width) * 2 * modes + mode;
-                    middle[i][0] = weight_read<ReadOnly, ConvertWindow>(g);
-                    middle[i][1] = weight_read<ReadOnly, ConvertWindow>(g + modes);
+                    middle[i][0] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g);
+                    middle[i][1] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g + modes);
                 }
             }
             for (int x = 0; x < width; ++x) {
@@ -549,34 +643,33 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                     const int gy = y + i - 1;
                     if (gy >= 0 && gy < height && x + 1 < width) {
                         const G* g = grad + (base + gy * width + x + 1) * 2 * modes + mode;
-                        right[i][0] = weight_read<ReadOnly, ConvertWindow>(g);
-                        right[i][1] = weight_read<ReadOnly, ConvertWindow>(g + modes);
+                        right[i][0] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g);
+                        right[i][1] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g + modes);
                     }
                 }
                 #pragma unroll
                 for (int j = 0; j < Rows; ++j) {
                     if (y + j >= height) continue;
-                    float v[RankTile];
+                    V v[RankTile];
                     #pragma unroll
                     for (int r = 0; r < RankTile; ++r) {
                         const T* current = p + ((j * width + x) * R + r) * modes;
-                        v[r] = r0 + r < R ? as_float(weight_read<ReadOnly>(current)) : 0;
+                        v[r] = r0 + r < R ? mode_load<Vec, T, ReadOnly>(current) : V{};
                     }
                     #pragma unroll
                     for (int ky = 0; ky < 3; ++ky) {
                         const int i = j + 2 - ky;
-                        const float2 l = make_float2(as_float(left[i][0]), as_float(left[i][1]));
-                        const float2 m = make_float2(
-                            as_float(middle[i][0]), as_float(middle[i][1]));
-                        const float2 g = make_float2(as_float(right[i][0]), as_float(right[i][1]));
+                        const V l[] = {window_values(left[i][0]), window_values(left[i][1])};
+                        const V m[] = {window_values(middle[i][0]), window_values(middle[i][1])};
+                        const V g[] = {window_values(right[i][0]), window_values(right[i][1])};
                         #pragma unroll
                         for (int r = 0; r < RankTile; ++r) {
-                            sums_r[ky][0][r] = fmaf(v[r], g.x, sums_r[ky][0][r]);
-                            sums_r[ky][1][r] = fmaf(v[r], m.x, sums_r[ky][1][r]);
-                            sums_r[ky][2][r] = fmaf(v[r], l.x, sums_r[ky][2][r]);
-                            sums_i[ky][0][r] = fmaf(v[r], g.y, sums_i[ky][0][r]);
-                            sums_i[ky][1][r] = fmaf(v[r], m.y, sums_i[ky][1][r]);
-                            sums_i[ky][2][r] = fmaf(v[r], l.y, sums_i[ky][2][r]);
+                            sums_r[ky][0][r] = fmaf(v[r], g[0], sums_r[ky][0][r]);
+                            sums_r[ky][1][r] = fmaf(v[r], m[0], sums_r[ky][1][r]);
+                            sums_r[ky][2][r] = fmaf(v[r], l[0], sums_r[ky][2][r]);
+                            sums_i[ky][0][r] = fmaf(v[r], g[1], sums_i[ky][0][r]);
+                            sums_i[ky][1][r] = fmaf(v[r], m[1], sums_i[ky][1][r]);
+                            sums_i[ky][2][r] = fmaf(v[r], l[1], sums_i[ky][2][r]);
                         }
                     }
                 }
@@ -601,8 +694,12 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                 #pragma unroll
                 for (int r = 0; r < ReduceRanks; ++r) {
                     const int field = r * 9 + ky * 3 + kx;
-                    warp_sums[warp][field][lane] = sums_r[ky][kx][tile + r];
-                    warp_sums[warp][field + Fields / 2][lane] = sums_i[ky][kx][tile + r];
+                    #pragma unroll
+                    for (int v = 0; v < Vec; ++v) {
+                        warp_sums[warp][field][v][lane] = sums_r[ky][kx][tile + r].value[v];
+                        warp_sums[warp][field + Fields / 2][v][lane] =
+                            sums_i[ky][kx][tile + r].value[v];
+                    }
                 }
         __syncthreads();
         if (mode < modes) {
@@ -613,12 +710,15 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                 const long long index = (
                     (static_cast<long long>(blockIdx.y) * 2 + component) * R * 9 + rank * 9 + tap
                 ) * modes;
-                float sum = (warp_sums[0][field][lane] + warp_sums[1][field][lane])
-                          + (warp_sums[2][field][lane] + warp_sums[3][field][lane]);
-                if constexpr (Warps == 8)
-                    sum += (warp_sums[4][field][lane] + warp_sums[5][field][lane])
-                         + (warp_sums[6][field][lane] + warp_sums[7][field][lane]);
-                partial[index + mode] = sum;
+                #pragma unroll
+                for (int v = 0; v < Vec; ++v) {
+                    float sum = (warp_sums[0][field][v][lane] + warp_sums[1][field][v][lane])
+                              + (warp_sums[2][field][v][lane] + warp_sums[3][field][v][lane]);
+                    if constexpr (Warps == 8)
+                        sum += (warp_sums[4][field][v][lane] + warp_sums[5][field][v][lane])
+                             + (warp_sums[6][field][v][lane] + warp_sums[7][field][v][lane]);
+                    partial[index + mode + v] = sum;
+                }
             }
         }
         if (tile + ReduceRanks < RankTile) __syncthreads();
@@ -858,12 +958,15 @@ def _reader_cuda_module(
     weight_geometry: tuple[int, int, int] | None = None,
     register_filters: int = -1,
     keep_real: int = -1,
+    spatial_vec: int = 1,
+    weight_vec: int = 1,
 ) -> _CudaModule:
     weight_tile, weight_rows, weight_warps = weight_geometry or _DEFAULT_WEIGHT_GEOMETRY
     macros = {
         **dict(zip(("BATCH", "HEIGHT", "WIDTH", "MODES"), shape, strict=True)),
         "COLUMNS": columns, "RANK": rank, "KERNEL": kernel, "STRICT": int(strict),
         "SPATIAL_ROWS": spatial_geometry[0], "SPATIAL_WARPS": spatial_geometry[1],
+        "SPATIAL_VEC": spatial_vec, "WEIGHT_VEC": weight_vec,
         "REGISTER_FILTERS": register_filters, "KEEP_REAL": keep_real,
         "BFLOAT16": int("__nv_bfloat16" in types),
         "WEIGHT_TILE": weight_tile, "WEIGHT_ROWS": weight_rows, "WEIGHT_WARPS": weight_warps,
@@ -1048,9 +1151,30 @@ def _rank_four_plan(
     return _RankFourPlan((rows, warps), (tile, rows, warps), 5)
 
 
+def _reader_probe_vectors(
+    projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
+) -> tuple[int, int]:
+    candidate = os.getenv("VA_READER_VECTOR_PROBE")
+    if candidate not in {"2", "4"} or strict:
+        return 1, 1
+    modes, rank, kernel, _ = real.shape
+    vec = int(candidate)
+    if (
+        kernel != _STATIC_SPATIAL_KERNEL or rank > _STATIC_RANK_LIMIT or modes % vec
+        or projected.dtype != torch.bfloat16 or real.dtype != torch.bfloat16
+        or projected.data_ptr() % (vec * projected.element_size())
+        or (grad is not None and (
+            grad.dtype != torch.bfloat16 or grad.data_ptr() % (vec * grad.element_size())
+        ))
+    ):
+        return 1, 1
+    return 2, vec
+
+
 def _reader_module_for(
     projected: Tensor, real: Tensor, grad: Tensor | None = None, *,
     strict: bool, rank_four_plan: _RankFourPlan | None = None,
+    vectors: tuple[int, int] = (1, 1),
 ) -> _CudaModule:
     _, _, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
@@ -1065,13 +1189,20 @@ def _reader_module_for(
     else:
         spatial_geometry = rank_four_plan.spatial
         weight_geometry = rank_four_plan.weight
+    spatial_vec, weight_vec = vectors
+    if spatial_vec > 1:
+        spatial_geometry = (2, 4)
+    if weight_vec > 1:
+        weight_geometry = (1 if weight_vec == 4 else 2, 2, 4)
     return _reader_cuda_module(
         projected.device.index or 0, _reader_compile_shape(projected, modes),
         _reader_columns(width),
         rank if rank <= _STATIC_RANK_LIMIT else 0, kernel,
         tuple(_CUDA_TYPES[dtype] for dtype in dtypes), strict=strict,
         spatial_geometry=spatial_geometry, weight_geometry=weight_geometry,
-        register_filters=0 if rank_four_plan else -1, keep_real=0 if rank_four_plan else -1,
+        register_filters=0 if rank_four_plan or spatial_vec > 1 else -1,
+        keep_real=0 if rank_four_plan or spatial_vec > 1 else -1,
+        spatial_vec=spatial_vec, weight_vec=weight_vec,
     )
 
 
@@ -1230,10 +1361,10 @@ def real_gram_normalize_spatial(
 
 
 def _reader_spatial_grid(
-    batch: int, height: int, width: int, modes: int, rows: int, warps: int,
+    batch: int, height: int, width: int, modes: int, rows: int, warps: int, vec: int = 1,
 ) -> tuple[int, int, int]:
     tiles = _ceildiv(height, rows) * _ceildiv(width, warps * _reader_columns(width))
-    return _ceildiv(modes, _WARP_SIZE), tiles, batch
+    return _ceildiv(modes, _WARP_SIZE * vec), tiles, batch
 
 
 @torch.library.custom_op("va_reader::packed_spatial", mutates_args=(), device_types="cuda")
@@ -1245,16 +1376,20 @@ def _packed_spatial(
     if _use_reader_cuda(projected, real, imag):
         output = projected.new_empty((batch, height, width, 2 * modes))
         plan = _rank_four_plan(projected, real, strict=strict_complex)
+        vectors = _reader_probe_vectors(projected, real, None, strict=strict_complex)
         with torch.cuda.device(projected.device):
             module = _reader_module_for(
-                projected, real, strict=strict_complex, rank_four_plan=plan,
+                projected, real, strict=strict_complex, rank_four_plan=plan, vectors=vectors,
             )
             rows, warps = plan.spatial if plan else _spatial_geometry(
                 width, rank, kernel, projected.dtype, strict=strict_complex,
             )
+            if vectors[0] > 1:
+                rows, warps = 2, 4
             stream = _reader_stream(module, projected.device)
+            grid = _reader_spatial_grid(batch, height, width, modes, rows, warps, vectors[0])
             _launch_reader_cuda(
-                module, "forward", _reader_spatial_grid(batch, height, width, modes, rows, warps),
+                module, "forward", grid,
                 (projected, real, imag, output), (height, width, modes, rank),
                 stream=stream, threads=warps * _WARP_SIZE,
             )
@@ -1282,7 +1417,8 @@ def _packed_spatial_backward(
     if _use_reader_cuda(projected, real, imag, grad):
         grad = grad.contiguous()
         grad_projected = torch.empty_like(projected)
-        mode_tiles = _ceildiv(modes, _WARP_SIZE)
+        vectors = _reader_probe_vectors(projected, real, grad, strict=strict_complex)
+        mode_tiles = _ceildiv(modes, _WARP_SIZE * vectors[1])
         sms = torch.cuda.get_device_properties(projected.device).multi_processor_count
         plan = _rank_four_plan(projected, real, grad, strict=strict_complex)
         if plan is not None:
@@ -1306,6 +1442,10 @@ def _packed_spatial_backward(
             rank_tiles = _ceildiv(rank, rank_tile)
             tap_tiles = 3 if kernel == 3 else kernel**2
             rows, waves, weight_warps = height, 3, 4
+        if vectors[1] > 1:
+            tile, weight_rows, weight_warps = 1 if vectors[1] == 4 else 2, 2, 4
+            rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
+            rows = _ceildiv(height, weight_rows)
         available_workers = _ceildiv(batch * rows, weight_warps)
         workers = min(available_workers, _ceildiv(waves * sms, mode_tiles))
         if weight_warps == _WIDE_WEIGHT_WARPS and rank <= _CENTERED_WEIGHT_TILE:
@@ -1325,7 +1465,7 @@ def _packed_spatial_backward(
         reduce_op = "dweight_reduce_parallel" if parallel_reduce else "dweight_reduce"
         with torch.cuda.device(projected.device):
             module = _reader_module_for(
-                projected, real, grad, strict=strict_complex, rank_four_plan=plan,
+                projected, real, grad, strict=strict_complex, rank_four_plan=plan, vectors=vectors,
             )
             stream = _reader_stream(module, projected.device)
             _launch_reader_cuda(
@@ -1340,7 +1480,11 @@ def _packed_spatial_backward(
             spatial_rows, warps = plan.spatial if plan else _spatial_geometry(
                 width, rank, kernel, projected.dtype, strict=strict_complex,
             )
-            grid = _reader_spatial_grid(batch, height, width, modes, spatial_rows, warps)
+            if vectors[0] > 1:
+                spatial_rows, warps = 2, 4
+            grid = _reader_spatial_grid(
+                batch, height, width, modes, spatial_rows, warps, vectors[0],
+            )
             _launch_reader_cuda(
                 module, "dinput", grid, (grad, real, imag, grad_projected),
                 (height, width, modes, rank), stream=stream, threads=warps * _WARP_SIZE,
