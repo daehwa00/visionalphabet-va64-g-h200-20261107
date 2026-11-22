@@ -31,18 +31,21 @@ bench=h200/liverms_v2_opt/bench_h200.py
 if [[ ${1:-} == --follow-up ]]; then
     "$py" -m h200.wave13_reader_probe.bench --sweep --out "$RUN_ROOT/geometry.json"
     "$py" -m h200.wave13_reader_probe.tensor_bench --batch 1024 --out "$RUN_ROOT/tensor.json"
-    for vec in 1 "${2:-2}"; do
-        for batch in 128 256 512; do
-            VA_READER_VECTOR_PROBE=$vec "$py" "$bench" train-arm \
-                --variant "$variant" --batch "$batch" --profile \
-                --out "$RUN_ROOT/train-$vec-b$batch.json" || true
-        done
-        for batch in 128 1024; do
-            VA_READER_VECTOR_PROBE=$vec "$py" "$bench" infer-fold \
-                --variant "$variant" --batch "$batch" --out "$RUN_ROOT/fold-$vec-b$batch.json" || true
-        done
+    for vec in 1 weight compact; do
+        VA_READER_VECTOR_PROBE=$vec "$py" -m h200.wave13_reader_probe.model_bench train-arm \
+            --variant "$variant" --batch 1024 --profile \
+            --out "$RUN_ROOT/train-$vec-b1024.json" || true
     done
-    VA_READER_VECTOR_PROBE="${2:-2}" "$py" "$bench" dynamo --out "$RUN_ROOT/dynamo.json"
+    for batch in 128 256 512; do
+        VA_READER_VECTOR_PROBE=weight "$py" "$bench" train-arm \
+            --variant "$variant" --batch "$batch" --profile \
+            --out "$RUN_ROOT/train-weight-b$batch.json" || true
+    done
+    for batch in 128 1024; do
+        VA_READER_VECTOR_PROBE=weight "$py" "$bench" infer-fold \
+            --variant "$variant" --batch "$batch" --out "$RUN_ROOT/fold-weight-b$batch.json" || true
+    done
+    VA_READER_VECTOR_PROBE=weight "$py" "$bench" dynamo --out "$RUN_ROOT/dynamo.json"
     set +e
     "$py" -m pytest -v tests/test_factorized_reader_kernels.py tests/test_p1_nr4.py \
         >"$RUN_ROOT/pytest.log" 2>&1

@@ -1155,10 +1155,20 @@ def _reader_probe_vectors(
     projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
 ) -> tuple[int, int]:
     candidate = os.getenv("VA_READER_VECTOR_PROBE")
-    if candidate not in {"2", "4"} or strict:
+    if candidate not in {"2", "4", "weight", "compact"} or strict:
         return 1, 1
     modes, rank, kernel, _ = real.shape
-    vec = int(candidate)
+    weight_only = candidate in {"weight", "compact"}
+    vec = 2 if weight_only else int(candidate)
+    if weight_only:
+        if grad is None:
+            return 1, 1
+        batch, height, width, _ = projected.shape
+        props = torch.cuda.get_device_properties(projected.device)
+        if props.major < 9 or batch * 2 < props.multi_processor_count:
+            return 1, 1
+        if candidate == "compact" and height * width > _SMALL_WEIGHT_PLANE_PIXELS:
+            return 1, 1
     if (
         kernel != _STATIC_SPATIAL_KERNEL or rank > _STATIC_RANK_LIMIT or modes % vec
         or projected.dtype != torch.bfloat16 or real.dtype != torch.bfloat16
@@ -1168,7 +1178,7 @@ def _reader_probe_vectors(
         ))
     ):
         return 1, 1
-    return 2, vec
+    return (1 if weight_only else 2), vec
 
 
 def _reader_module_for(
