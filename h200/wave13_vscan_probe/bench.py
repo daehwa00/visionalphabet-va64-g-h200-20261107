@@ -45,7 +45,8 @@ def probe(shape: tuple, hidden: int, batch_divisor: int = 1) -> dict:
         features = None
         if scans._should_save_vscan(states, coarse):  # noqa: SLF001
             packed, _, features = scans._vertical_forward_saved(  # noqa: SLF001
-                pole, states, auxiliary, path, coarse, 1e-6, planar=True, precise=True, separate=False,
+                pole, states, auxiliary, path, coarse, 1e-6,
+                planar=True, precise=True, separate=False,
             )
             out = packed.unbind(0)
         else:
