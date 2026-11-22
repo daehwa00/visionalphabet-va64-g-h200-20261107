@@ -1201,13 +1201,12 @@ def _run_packed_cuda_forward(
         )
         saved = [] if recompute else [horizontal_storage]
         if operands is not None and _should_save_vscan(horizontal_storage, operands[-1]):
-            output, features = _vertical_forward_saved(
-                *operands, float(epsilon), planar=planar_output or not packed_output,
-                precise=True,
+            output, secondary, features = _vertical_forward_saved(
+                *operands, float(epsilon), planar=planar_output,
+                precise=True, separate=not packed_output,
             )
-            if packed_output:
-                return output, output.new_empty((0,)), output.new_empty((0,)), [*saved, features]
-            return output[0], output[1], output.new_empty((0,)), [*saved, features]
+            descriptor = output.new_empty((0,), dtype=torch.float32)
+            return output, secondary, descriptor, [*saved, features]
         if packed_output and operands is not None:
             output = vertical_forward_packed(*operands, float(epsilon), planar_output)
             return (

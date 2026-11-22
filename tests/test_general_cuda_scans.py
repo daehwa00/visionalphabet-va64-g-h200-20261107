@@ -985,8 +985,9 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     actual = run(pole, states, auxiliary, path, coarse)
     features = None
     if compact and policy == "test_saved":
-        _, features = scans._vertical_forward_saved(
-            pole, states, auxiliary, path, coarse, 1e-6, planar=True, precise=True,
+        _, _, features = scans._vertical_forward_saved(
+            pole, states, auxiliary, path, coarse, 1e-6,
+            planar=True, precise=True, separate=False,
         )
     actual_grads = (
         scans.vertical_backward(

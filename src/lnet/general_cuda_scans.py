@@ -2404,7 +2404,8 @@ def _vertical_forward_saved(
     epsilon: float,
     planar: bool,
     precise: bool,
-) -> tuple[Tensor, Tensor]:
+    separate: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
@@ -2414,13 +2415,18 @@ def _vertical_forward_saved(
         )
         if not isinstance(features, Tensor):
             raise TypeError("Expected normalized scan features")
-        output = states.new_empty((2, *shape) if planar else (*shape[:-1], 2 * m))
-        real, imag = output.unbind(0) if planar else output.split(m, dim=-1)
+        if separate:
+            output, secondary = states.new_empty(shape), states.new_empty(shape)
+            real, imag = output, secondary
+        else:
+            output = states.new_empty((2, *shape) if planar else (*shape[:-1], 2 * m))
+            real, imag = output.unbind(0) if planar else output.split(m, dim=-1)
+            secondary = states.new_empty((0,))
         _project_path(
             features, [param.contiguous() for param in path], real, imag,
             backward=False, precise=precise,
         )
-    return output, features
+    return output, secondary, features
 
 
 @_vertical_forward_saved.register_fake
@@ -2433,12 +2439,14 @@ def _fake_vertical_forward_saved(
     epsilon: float,  # noqa: ARG001
     planar: bool,
     precise: bool,  # noqa: ARG001
-) -> tuple[Tensor, Tensor]:
+    separate: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
     return (
-        states.new_empty((2, *shape) if planar else (*shape[:-1], 2 * m)),
+        states.new_empty(shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))),
+        states.new_empty(shape if separate else (0,)),
         states.new_empty((8, b * (h // step) * (w // step), m)),
     )
 
@@ -2448,6 +2456,7 @@ class _AutogradContext(Protocol):
     needs_input_grad: tuple[object, ...]
     coarse: bool
     epsilon: float
+    separate: bool
 
     def save_for_backward(self, *tensors: Tensor) -> None: ...
 
@@ -2495,23 +2504,26 @@ def _differentiate_vertical(ctx: _AutogradContext, grad_real: Tensor, grad_imag:
 
 
 def _save_vertical_features(
-    ctx: _AutogradContext, inputs: tuple, output: tuple[Tensor, Tensor],
+    ctx: _AutogradContext, inputs: tuple, output: tuple[Tensor, Tensor, Tensor],
 ) -> None:
-    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _planar, _precise = inputs
-    ctx.mark_non_differentiable(output[1])
-    ctx.save_for_backward(*pole, states, *auxiliary, *path, output[1])
+    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _, _, ctx.separate = inputs
+    ctx.mark_non_differentiable(*(output[2:] if ctx.separate else output[1:]))
+    ctx.save_for_backward(*pole, states, *auxiliary, *path, output[2])
 
 
 def _differentiate_vertical_features(
-    ctx: _AutogradContext, grad: Tensor, _grad_features: Tensor,
+    ctx: _AutogradContext, grad: Tensor, grad_secondary: Tensor, _grad_features: Tensor,
 ) -> tuple:
     dr, di, gr, gi, states, vx, vy, *path, features = ctx.saved_tensors
-    real, imag = grad.unbind(0) if grad.ndim == 5 else grad.chunk(2, dim=-1)
+    if ctx.separate:
+        real, imag = grad, grad_secondary
+    else:
+        real, imag = grad.unbind(0) if grad.ndim == 5 else grad.chunk(2, dim=-1)
     gradients = vertical_backward(
         [dr, di, gr, gi], states, [vx, vy], path, real, imag, ctx.coarse, ctx.epsilon,
         saved_features=features,
     )
-    return gradients[:4], gradients[4], [None, None], gradients[5:], None, None, None, None
+    return gradients[:4], gradients[4], [None, None], gradients[5:], None, None, None, None, None
 
 
 _vertical_forward_saved.register_autograd(
@@ -2530,10 +2542,11 @@ def vertical_forward(
     mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
     if mode == "cuda" and _should_save_vscan(states, coarse):
-        packed, _ = _vertical_forward_saved(
-            pole, states, auxiliary, path, coarse, epsilon, planar=True, precise=precise,
+        real, imag, _ = _vertical_forward_saved(
+            pole, states, auxiliary, path, coarse, epsilon,
+            planar=False, precise=precise, separate=True,
         )
-        return packed[0], packed[1]
+        return real, imag
     return _vertical_forward(pole, states, auxiliary, path, coarse, epsilon, precise, mode)
 
 
