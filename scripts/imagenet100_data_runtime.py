@@ -210,6 +210,7 @@ def loaders(
     data_root: Path,
     *,
     batch_size: int,
+    validation_batch_size: int | None = None,
     workers: int,
     training_generator: torch.Generator,
 ) -> tuple[DataLoader[Any], DataLoader[Any]]:
@@ -240,7 +241,7 @@ def loaders(
         validation_dataset,
         shuffle=False,
         persistent_workers=False,
-        **common,
+        **{**common, "batch_size": validation_batch_size or batch_size},
     )
     return train_loader, validation_loader
 

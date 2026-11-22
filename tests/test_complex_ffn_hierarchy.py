@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from lnet.complex_ffn import ComplexFFN
 from lnet.complex_scan import (
     AugmentedComplexTransition,
     ComplexInteractionTransition,
@@ -13,8 +14,7 @@ from lnet.complex_scan import (
     S2DPostCFFNCarryMainTransition,
     S2DPostFusionCFFNTransition,
 )
-from lnet.pac_complex_ffn import ComplexFFN
-from lnet.pac_path_cffn import FactorizedQuadrantPathModeCFFNCombiner
+from lnet.path_cffn import FactorizedQuadrantPathModeCFFNCombiner
 
 
 def test_project_cffn_modules_share_the_common_base() -> None:

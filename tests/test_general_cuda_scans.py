@@ -1,0 +1,698 @@
+"""CPU launch/dispatcher checks and opt-in CUDA numerical equivalence tests."""
+
+import warnings
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import Tensor
+from torch._inductor import config as inductor_config
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+from lnet import general_cuda_scans as scans
+from lnet import terminal_imaginary_correlation as terminal
+from lnet.general_cuda_scans import general_scans_enabled
+from lnet.product_scan_pipeline import (
+    run_product_scan_coarse_path_collapse_packed,
+    run_product_scan_coarse_path_collapse_planes_packed,
+)
+from lnet.product_scan_reference import (
+    _product_coarse4_reference,
+    _product_full4_reference,
+    _product_scans_from_tables_reference,
+    bidirectional_product_scan_reference,
+    d4_grouped_path_collapse_packed_reference,
+    static_variance_tables_reference,
+)
+
+# Register the local marker without changing the repository's pytest configuration.
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
+    _cuda = pytest.mark.cuda
+
+_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+
+
+@inductor_config.patch(emulate_precision_casts=False)
+def test_general_scans_default_and_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LNET_GENERAL_SCANS", raising=False)
+    monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
+    assert general_scans_enabled()
+    assert general_scans_enabled(forward=True)
+
+    monkeypatch.setenv("LNET_GENERAL_SCAN_REF_FWD", "1")
+    assert general_scans_enabled()
+    assert not general_scans_enabled(forward=True)
+
+    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+    assert not general_scans_enabled()
+
+
+@pytest.mark.parametrize("kb", [48, 100, 228])
+@pytest.mark.parametrize("height", [1, 7, 14, 28, 56, 64, 96, 128, 192, 193, 200, 334, 1024])
+def test_smem_budget(kb: int, height: int) -> None:
+    limit = kb * 1024
+    for backward in (False, True):
+        plans = scans._scan_plans(
+            height, limit, vertical=True, backward=backward, coarse=False, hidden=8, itemsize=2
+        )
+        assert plans
+        for plan in plans:
+            threads = plan.warps * 32
+            weights = 11 * 8 * 32 * 2 if plan.cache_weights else 0
+            line = height * threads * 8 if plan.cache_line else 0
+            acc = 94 * threads * 4 if plan.shared_acc else 0
+            boundaries = 0 if plan.global_checkpoints else (height - 1) // plan.chunk
+            scan = (
+                (plan.chunk * 24 + boundaries * 16) * threads
+                if backward else 0
+            )
+            reduction = 32 * threads * 4 if backward and plan.warps > 1 else 0
+            assert plan.smem == max(reduction, weights + line + acc + scan) <= limit
+    if height == 1024 and kb == 48:
+        assert all(plan.global_checkpoints for plan in plans)
+
+
+def test_warp_selection_and_partial_budget() -> None:
+    plans = scans._scan_plans(
+        56, 99 * 1024, vertical=False, backward=True, coarse=False, hidden=0, itemsize=2
+    )
+    assert [(plan.warps, plan.smem) for plan in plans if plan.cache_line] == [
+        (4, 57344), (3, 43008), (2, 28672), (1, 14336)
+    ]
+    compact = scans._scan_plans(
+        56, 99 * 1024, vertical=False, backward=True, coarse=False,
+        hidden=0, itemsize=2, compact=True,
+    )
+    assert [plan.smem for plan in compact if plan.cache_line] == [
+        plan.smem // 2 for plan in plans if plan.cache_line
+    ]
+    assert scans._workers(1, 48, 4, 4, 300) == 1
+    workers = scans._workers(20_000, 200, 182, 4, 1_000)
+    assert workers * 200 * 182 * 4 <= scans._MAX_PARTIAL_BYTES
+
+
+@pytest.mark.parametrize(
+    ("sms", "l2_mib", "hscan_counts", "vscan_counts"),
+    [
+        pytest.param(128, 72, (5736, 2868, 14340), (1639, 1639, 8195), id="rtx4090"),
+        pytest.param(80, 6, (3584, 1792, 8960), (1024, 1024, 5120), id="rtx3080ti"),
+    ],
+)
+def test_launch_plan_parity(
+    monkeypatch: pytest.MonkeyPatch, sms: int, l2_mib: int,
+    hscan_counts: tuple[int, int, int], vscan_counts: tuple[int, int, int],
+) -> None:
+    # Pre-cleanup launch snapshots with deterministic occupancy for both profiles.
+    monkeypatch.setattr(scans, "device_limits", lambda _: (sms, 99 * 1024, 48))
+    monkeypatch.setattr(
+        scans, "_horizontal_cache_budget", lambda _: l2_mib * 1024**2 * 7 // 8,
+    )
+    monkeypatch.setattr(
+        scans, "_resident",
+        lambda _, key, smem: min(8, 48 // key.warps, 100 * 1024 // max(1, smem)),
+    )
+    shape = (128, 56, 56, 160)
+    index_bound = 16 * torch.Size(shape).numel()
+    scans._launch_for_shape.cache_clear()
+    try:
+        hscan = scans._launch_for_shape(
+            0, torch.bfloat16, shape, index_bound, backward=True, vertical=False,
+            coarse=False, hidden=0, precise=True, compact=True,
+        )
+        vscan = scans._launch_for_shape(
+            0, torch.bfloat16, shape, index_bound, backward=False, vertical=True,
+            coarse=True, hidden=8, precise=True,
+        )
+        assert hscan is not None
+        assert vscan is not None
+        assert hscan.plan == scans.ScanPlan(2, 14336, cache_line=True)
+        assert vscan.plan == scans.ScanPlan(1, 5632, cache_weights=True)
+        for launch, counts in ((hscan, hscan_counts), (vscan, vscan_counts)):
+            grid = scans._ceil(launch.workers, launch.plan.warps) * 5
+            assert (launch.workers, launch.partials, grid) == counts
+    finally:
+        scans._launch_for_shape.cache_clear()
+
+
+@pytest.mark.parametrize("shape", [(4, 128, 192, 160), (4, 96, 128, 80), (128, 56, 56, 160)])
+@pytest.mark.parametrize("backward", [False, True])
+@pytest.mark.parametrize("coarse", [False, True])
+def test_small_l2_vertical_scratch_preserves_parallelism(
+    monkeypatch: pytest.MonkeyPatch, shape: tuple[int, int, int, int],
+    backward: bool, coarse: bool,
+) -> None:
+    scans._launch_for_shape.cache_clear()
+    sms = 80
+    cache_bytes = 6 * 1024**2 * 7 // 8
+    monkeypatch.setattr(scans, "device_limits", lambda _: (sms, 99 * 1024, 48))
+    monkeypatch.setattr(scans, "_resident", lambda _, _key, smem: (
+        min(8 if backward else 15, (99 * 1024) // max(1, smem))
+    ))
+    try:
+        launch = scans._launch_for_shape(
+            0, torch.bfloat16, shape, 4 * torch.Size(shape).numel(),
+            backward=backward, vertical=True, coarse=coarse, hidden=8, precise=True,
+        )
+        assert launch is not None
+        assert not launch.plan.cache_line
+        mode_tiles = scans._ceil(shape[-1], 32)
+        assert scans._ceil(launch.workers, launch.plan.warps) * mode_tiles >= sms
+        scratch = shape[-1] * launch.workers * scans._scratch_per_worker(
+            launch.plan, shape[1], vertical=True, coarse=coarse, backward=backward, itemsize=2,
+        )
+        assert cache_bytes < scratch <= scans._MAX_SCRATCH_BYTES
+    finally:
+        scans._launch_for_shape.cache_clear()
+
+
+@pytest.mark.parametrize("backward", [False, True])
+def test_wide_hscan_prefers_one_cached_warp(
+    monkeypatch: pytest.MonkeyPatch, backward: bool,
+) -> None:
+    scans._launch_for_shape.cache_clear()
+    sms = 80
+    monkeypatch.setattr(scans, "device_limits", lambda _: (sms, 99 * 1024, 48))
+    monkeypatch.setattr(scans, "_resident", lambda _, _key, smem: (
+        min(12, (99 * 1024) // max(1, smem))
+    ))
+    shape = (4, 128, 192, 160)
+    try:
+        launch = scans._launch_for_shape(
+            0, torch.bfloat16, shape, 4 * torch.Size(shape).numel(),
+            backward=backward, vertical=False, coarse=False, hidden=0, precise=False,
+        )
+        assert launch is not None
+        assert launch.plan.cache_line
+        assert launch.plan.warps == 1
+        assert launch.workers == shape[0] * shape[1]
+    finally:
+        scans._launch_for_shape.cache_clear()
+
+
+def test_small_scan_spreads_ctas_over_sms(monkeypatch: pytest.MonkeyPatch) -> None:
+    scans._launch_for_shape.cache_clear()
+    monkeypatch.setattr(scans, "device_limits", lambda _: (128, 99 * 1024, 48))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 3)
+    shape = (4, 16, 24, 128)
+    launch = scans._launch_for_shape(
+        0, torch.bfloat16, shape, 16 * torch.Size(shape).numel(),
+        backward=True, vertical=True, coarse=True, hidden=8, precise=False, compact=True,
+    )
+    assert launch is not None
+    assert launch.plan.warps == 1
+    assert launch.partials == launch.workers == 48
+    scans._launch_for_shape.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("shape", "coarse", "cache_line"),
+    [
+        ((4, 128, 192, 160), False, False),
+        ((4, 128, 192, 160), True, False),
+        ((4, 96, 128, 80), True, False),
+        ((4, 48, 64, 80), True, True),
+    ],
+)
+def test_long_vertical_forward_counts_mode_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, int, int, int],
+    coarse: bool,
+    cache_line: bool,
+) -> None:
+    scans._launch_for_shape.cache_clear()
+    monkeypatch.setattr(scans, "device_limits", lambda _: (128, 99 * 1024, 48))
+    monkeypatch.setattr(scans, "_resident", lambda _, _key, smem: min(15, (99 * 1024) // smem))
+    try:
+        launch = scans._launch_for_shape(
+            0, torch.bfloat16, shape, 16 * torch.Size(shape).numel(),
+            backward=False, vertical=True, coarse=coarse, hidden=8, precise=True,
+        )
+        assert launch is not None
+        assert launch.plan.cache_line == cache_line
+        if not cache_line:
+            assert launch.plan.warps == 1
+    finally:
+        scans._launch_for_shape.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_source_and_offline_nvrtc(dtype: torch.dtype) -> None:
+    keys = (
+        scans.Kernel(dtype, 4, backward=False, cache_line=True),
+        scans.Kernel(dtype, 1, backward=False, real_interleaved=True),
+        scans.Kernel(dtype, 2, backward=True, compact=True),
+        scans.Kernel(
+            dtype, 1, backward=True, vertical=True, coarse=True, hidden8=True,
+            cache_weights=True, compact=True, imag_interleaved=True,
+        ),
+        scans.Kernel(dtype, 4, backward=True, index32=False),
+        scans.Kernel(
+            dtype, 3, backward=False, vertical=True, hidden8=True, cache_weights=True,
+            real_interleaved=True, imag_interleaved=True,
+        ),
+        scans.Kernel(
+            dtype, 2, backward=True, vertical=True, shared_acc=True,
+            index32=False,
+        ),
+        scans.Kernel(
+            dtype,
+            4,
+            backward=True,
+            vertical=True,
+            index32=False,
+            shared_acc=True,
+            global_checkpoints=True,
+            cache_line=True,
+            precise=False,
+        ),
+    )
+    sources = [scans._kernel_source(key) for key in keys]
+    assert all(
+        s.startswith(scans._CUDA_SOURCE) and "int B, int H, int W, int M" in s for s in sources
+    )
+    assert len(set(sources)) == len(keys)
+    assert "long long, false, 4, 8, 0, true, false, true, true, true, false" in sources[-1]
+    assert scans._DTYPES[dtype] in sources[0]
+    try:
+        scans._nvrtc()
+    except OSError:
+        pytest.skip("NVRTC not installed for offline compilation")
+    if not scans._include_dirs():
+        pytest.skip("CUDA headers not installed for offline compilation")
+    architectures = [(8, 0), (8, 9)]
+    if dtype != torch.bfloat16:
+        architectures.insert(0, (7, 0))
+    for arch in architectures:
+        for key in keys:
+            ptx = scans._compile_ptx(key, arch)
+            assert b".entry scan(" in ptx.value
+
+
+def _inputs(
+    h: int,
+    w: int,
+    m: int,
+    hidden: int,
+    dtype: torch.dtype,
+    device: str,
+    batch: int = 1,
+) -> tuple[list[Tensor], list[Tensor], Tensor, Tensor, list[Tensor], list[Tensor]]:
+    def sample(
+        shape: tuple[int, ...], scale: float = 1.0, storage: torch.dtype = torch.float32
+    ) -> Tensor:
+        return (torch.randn(shape, device=device) * scale).to(storage).requires_grad_()
+
+    # Keep poles contractive, complex, and nonzero in both components.
+    px = [sample((1, m), 0.09) for _ in range(4)]
+    py = [sample((m,), 0.12) for _ in range(4)]
+    real = sample((batch, h, w, m), 0.4, dtype)
+    imag = sample((batch, h, w, m), 0.4, dtype)
+    auxiliary = list(static_variance_tables_reference(tuple(px), tuple(py), w, h))
+    path = [sample(s, 0.17) for s in [(m, hidden, 8), (m, hidden), (m, 2, hidden), (m, 2)]]
+    return px, py, real, imag, auxiliary, path
+
+
+def _reference_vscan(
+    py: list[Tensor],
+    states: Tensor,
+    auxiliary: list[Tensor],
+    path: list[Tensor],
+    coarse: bool,
+) -> tuple[Tensor, Tensor]:
+    pr, pi, nr, ni = states.unbind(0)
+    products = _product_scans_from_tables_reference(tuple(py), (pr, pi), (nr, ni), auxiliary[0])
+    select = _product_coarse4_reference if coarse else _product_full4_reference
+    r, i = select(products, epsilon=1e-6, gain_normalization="local")
+    packed = torch.cat((r, i), dim=-1).to(states.dtype)
+    out = d4_grouped_path_collapse_packed_reference(packed, *path)
+    return out.chunk(2, dim=-1)
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize(("h", "w", "m", "coarse"), [(7, 13, 1, False), (28, 56, 48, True)])
+def test_fake_shapes_and_autograd(dtype: torch.dtype, h: int, w: int, m: int, coarse: bool) -> None:
+    with FakeTensorMode():
+        px, py, r, i, aux, path = _inputs(h, w, m, 5, dtype, "cpu", batch=2)
+        states = scans.horizontal_forward(px, r, i)
+        assert states.shape == (4, 2, h, w, m)
+        v_real, v_imag = scans.vertical_forward(py, states, aux, path, coarse=coarse)
+        step = 2 if coarse else 1
+        assert v_real.shape == v_imag.shape == (2, h // step, w // step, m)
+        v_grads = scans.vertical_backward(py, states, aux, path, v_real, v_imag, coarse)
+        h_grads = scans.horizontal_backward(px, [r, i], states, v_grads[4])
+        assert h_grads[-1].shape == (2, h, w, 2 * m)
+        assert v_grads[4].shape == states.shape
+        assert states.dtype == v_real.dtype == v_grads[4].dtype == h_grads[-1].dtype == dtype
+        params = [r, i, *px, *py, *path]
+        gradients = torch.autograd.grad(v_real.sum(), params)
+        assert [(g.shape, g.dtype) for g in gradients] == [(p.shape, p.dtype) for p in params]
+
+
+def test_reference_forward_mode_on_cpu() -> None:
+    px, py, r, i, aux, path = _inputs(6, 10, 3, 5, torch.float32, "cpu")
+    states = scans.horizontal_forward(px, r, i, mode="reference")
+    torch.testing.assert_close(
+        states,
+        torch.stack(
+            bidirectional_product_scan_reference(
+                tuple(px),
+                (r, i),
+            )
+        ),
+    )
+    actual = scans.vertical_forward(py, states, aux, path, coarse=True, mode="reference")
+    expected = _reference_vscan(py, states, aux, path, coarse=True)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_eligibility_and_memory_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, py, r, i, aux, path = _inputs(13, 19, 16, 4, torch.float32, "cpu")
+    states = torch.empty((4, *r.shape))
+    assert not scans.can_use_general_hscan(r, i)
+    assert not scans.can_use_general_vscan(states, aux, path, pole=py)
+    assert not scans._vertical_inputs_ok(states, aux, path, coarse=True)
+    assert not scans._vertical_inputs_ok(states, aux[::-1], path, coarse=False)
+    assert not scans._shape_supported((2, 0, 13, 16))
+    assert not scans._shape_supported((2, 3, 4))
+    fake_cuda = SimpleNamespace(
+        is_cuda=True,
+        dtype=torch.float32,
+        device=SimpleNamespace(index=0),
+        shape=r.shape,
+        numel=r.numel,
+    )
+    monkeypatch.setattr(scans, "device_limits", lambda _: (100, 4096, 48))
+    calls = []
+
+    def resident(device: int, key: scans.Kernel, smem: int) -> int:
+        calls.append((device, key, smem))
+        return 0
+
+    monkeypatch.setattr(scans, "_resident", resident)
+    assert (
+        scans._plan_launch(
+            fake_cuda,
+            tuple(r.shape),
+            backward=True,
+            vertical=True,
+            coarse=False,
+            hidden=4,
+            precise=True,
+        )
+        is None
+    )
+    assert calls
+    assert all(key.vertical and not key.cache_line for _, key, _ in calls)
+    calls.clear()
+    assert not scans._eligible(
+        fake_cuda, tuple(r.shape), vertical=False, coarse=False, hidden=0, precise=True
+    )
+    assert len(calls) == 4
+    assert all(call[2] == 0 for call in calls)
+    scans._launch_for_shape.cache_clear()
+
+    def unavailable(*_args: object) -> int:
+        raise OSError("Driver unavailable")
+
+    monkeypatch.setattr(scans, "_resident", unavailable)
+    assert not scans._eligible(
+        fake_cuda, tuple(r.shape), vertical=False, coarse=False, hidden=0, precise=True
+    )
+
+
+def test_index_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scans, "device_limits", lambda _: (128, 99 * 1024, 48))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 3)
+    for shape in [(1, 7, 13, 48), (4, 200, 334, 2048)]:
+        bound = 4 * torch.Size(shape).numel()
+        launch = scans._launch_for_shape(
+            0, torch.float32, shape, bound,
+            backward=True, vertical=True, coarse=False, hidden=8, precise=True,
+        )
+        assert launch is not None
+        assert launch.key.index32 == (bound < 2**31)
+    scans._launch_for_shape.cache_clear()
+
+
+# Cover every requested value with both eager and Inductor; include checkpoint
+# boundaries, global checkpoints, a singleton shape, and lanes beyond M.
+_CASES = [
+    (1, 1, 1, False, torch.float32, 1),
+    (7, 7, 16, False, torch.bfloat16, 4),
+    (7, 9, 35, False, torch.float32, 17),
+    (14, 14, 48, False, torch.float32, 8),
+    (14, 14, 48, True, torch.float16, 8),
+    (28, 28, 96, False, torch.float16, 16),
+    (28, 28, 96, True, torch.bfloat16, 4),
+    (56, 56, 128, False, torch.bfloat16, 8),
+    (56, 56, 128, True, torch.float32, 16),
+    (13, 19, 160, False, torch.float32, 4),
+    (64, 96, 48, False, torch.float16, 16),
+    (64, 96, 48, True, torch.float32, 8),
+    (128, 192, 16, False, torch.float32, 4),
+    (128, 192, 16, True, torch.float16, 4),
+    (200, 334, 3, False, torch.float32, 5),
+    (201, 9, 17, False, torch.float32, 5),
+    (202, 10, 17, True, torch.float32, 5),
+]
+
+
+def _pipeline(
+    px: list[Tensor],
+    py: list[Tensor],
+    real: Tensor,
+    imag: Tensor,
+    auxiliary: list[Tensor],
+    path: list[Tensor],
+    coarse: bool,
+    mode: str,
+) -> tuple[Tensor, Tensor, Tensor]:
+    states = scans.horizontal_forward(px, real, imag, mode)
+    return states, *scans.vertical_forward(py, states, auxiliary, path, coarse, mode=mode)
+
+
+_compiled_pipeline = torch.compile(_pipeline, fullgraph=True, dynamic=True)
+
+
+def _compare_pipeline(
+    h: int,
+    w: int,
+    m: int,
+    coarse: bool,
+    dtype: torch.dtype,
+    hidden: int,
+    compiled: bool,
+    mode: str,
+) -> None:
+    torch.manual_seed(791)
+    args = _inputs(h, w, m, hidden, dtype, "cuda", batch=2 if h < 32 else 1)
+    px, py, real, imag, auxiliary, path = args
+    if coarse:
+        packed = torch.cat((real, imag), dim=-1).detach().requires_grad_()
+        real, imag = packed.chunk(2, dim=-1)
+        args = px, py, real, imag, auxiliary, path
+    run = _compiled_pipeline if compiled else _pipeline
+    with torch._dynamo.config.patch(recompile_limit=64):
+        actual = run(*args, coarse, mode)
+    states = torch.stack(bidirectional_product_scan_reference(tuple(px), (real, imag)))
+    expected = (states, *_reference_vscan(py, states, auxiliary, path, coarse))
+    params = [real, imag, *px, *py, *path]
+    adjoints = [torch.randn_like(output) for output in expected]
+    actual_grads = torch.autograd.grad(actual, params, adjoints)
+    expected_grads = torch.autograd.grad(expected, params, adjoints)
+    forward_tol, backward_tol = {
+        torch.float32: ((4e-5, 3e-6), (4e-4, 2e-4)),
+        torch.float16: ((8e-3, 1e-3), (5e-2, 2e-2)),
+        torch.bfloat16: ((4e-2, 5e-3), (1.2e-1, 8e-2)),
+    }[dtype]
+    for values, reference, (rtol, atol) in (
+        (actual, expected, forward_tol),
+        (actual_grads, expected_grads, backward_tol),
+    ):
+        for value, target in zip(values, reference, strict=True):
+            torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("h", "w", "m", "coarse", "dtype", "hidden"), _CASES)
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "inductor"])
+def test_cuda_reference_equivalence(
+    h: int,
+    w: int,
+    m: int,
+    coarse: bool,
+    dtype: torch.dtype,
+    hidden: int,
+    compiled: bool,
+) -> None:
+    _compare_pipeline(h, w, m, coarse, dtype, hidden, compiled, "cuda")
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "inductor"])
+@pytest.mark.parametrize("coarse", [False, True])
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_cuda_reference_forward_cuda_backward(
+    compiled: bool, coarse: bool, dtype: torch.dtype
+) -> None:
+    _compare_pipeline(14, 20, 48, coarse, dtype, 8, compiled, "reference")
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "inductor"])
+@pytest.mark.parametrize(("h", "w", "m", "coarse"), [(128, 192, 7, True), (17, 35, 33, False)])
+def test_cuda_dense_scratch_fallback(
+    monkeypatch: pytest.MonkeyPatch, compiled: bool, h: int, w: int, m: int, coarse: bool,
+) -> None:
+    sms, _, max_warps = scans.device_limits(0)
+    monkeypatch.setattr(scans, "device_limits", lambda _: (sms, 16 * 1024, max_warps))
+    original_plans = scans._scan_plans
+    monkeypatch.setattr(
+        scans, "_scan_plans",
+        lambda *args, **kwargs: [
+            p for p in original_plans(*args, **kwargs)
+            if not p.cache_line
+        ],
+    )
+    scans._launch_for_shape.cache_clear()
+    try:
+        shape = (1, h, w, m)
+        for vertical in (False, True):
+            launch = scans._launch_for_shape(
+                0, torch.float32, shape, 16 * torch.Size(shape).numel(),
+                backward=True, vertical=vertical, coarse=coarse and vertical,
+                hidden=8 if vertical else 0, precise=False,
+            )
+            assert launch is not None
+            assert not launch.plan.cache_line
+        _compare_pipeline(h, w, m, coarse=coarse, dtype=torch.float32, hidden=8,
+                          compiled=compiled, mode="cuda")
+    finally:
+        scans._launch_for_shape.cache_clear()
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("hidden", [8, 19])
+def test_cuda_mixed_parameter_storage_and_packed_outputs(hidden: int) -> None:
+    torch.manual_seed(719)
+    px, py, real, imag, auxiliary, path = _inputs(8, 10, 35, hidden, torch.float32, "cuda")
+    py = [p.to(dtype).detach().requires_grad_() for p, dtype in zip(
+        py, (*_DTYPES, torch.float32), strict=True,
+    )]
+    path = [
+        p.to(dtype).detach().requires_grad_()
+        for p, dtype in zip(path, (*_DTYPES, torch.float16), strict=True)
+    ]
+    states = scans.horizontal_forward(px, real, imag).detach().requires_grad_()
+    with torch.no_grad():
+        standalone = scans.vertical_forward(py, states, auxiliary, path, coarse=True)
+        for planar in (False, True):
+            packed = scans.vertical_forward_packed(
+                py, states, auxiliary, path, coarse=True, epsilon=1e-6, planar=planar,
+            )
+            combine = torch.stack if planar else torch.cat
+            torch.testing.assert_close(packed, combine(standalone, dim=0 if planar else -1))
+
+    gradients = torch.randn_like(torch.cat(standalone, dim=-1)).chunk(2, dim=-1)
+    result = scans.vertical_backward(py, states, auxiliary, path, *gradients, coarse=True)
+    mixed = scans.vertical_backward(
+        py, states, auxiliary, path, gradients[0].contiguous(), gradients[1], coarse=True,
+    )
+    for actual, target in zip(mixed, result, strict=True):
+        torch.testing.assert_close(actual, target)
+    repeated = scans.vertical_backward(py, states, auxiliary, path, *gradients, coarse=True)
+    for actual, again in zip(result, repeated, strict=True):
+        torch.testing.assert_close(actual, again, rtol=0, atol=0)
+    expected = torch.autograd.grad(
+        _reference_vscan(py, states, auxiliary, path, coarse=True),
+        [*py, states, *path],
+        gradients,
+    )
+    for actual, target in zip(result, expected, strict=True):
+        torch.testing.assert_close(actual, target, rtol=2e-2, atol=2e-3)
+    assert torch.count_nonzero(result[4][:2, :, :, ::2]) == 0
+    assert torch.count_nonzero(result[4][2:, :, :, 1::2]) == 0
+    compact = scans.vertical_backward(
+        py, states, auxiliary, path, *gradients, coarse=True, compact=True,
+    )
+    torch.testing.assert_close(compact[4][:2], result[4][:2, :, :, 1::2])
+    torch.testing.assert_close(compact[4][2:], result[4][2:, :, :, ::2])
+    full_h = scans.horizontal_backward(px, [real, imag], states, result[4])
+    compact_h = scans.horizontal_backward(px, [real, imag], states, compact[4], compact=True)
+    for actual, target in zip(compact_h, full_h, strict=True):
+        # Compact and dense launches may reduce their partials in different orders.
+        torch.testing.assert_close(actual, target, rtol=1e-5, atol=1e-6)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("compiled", [False, True])
+@inductor_config.patch(emulate_precision_casts=False)
+def test_cuda_terminal_dispatch(monkeypatch: pytest.MonkeyPatch, compiled: bool) -> None:
+    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+    monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
+    px, py, real, imag, _, _ = _inputs(7, 7, 35, 8, torch.float32, "cuda", batch=2)
+    px, py = ([p.reshape(1, 1, 1, -1) for p in pole] for pole in (px, py))
+    drive = torch.cat((real, imag), dim=-1)
+    inputs = [*px, *py, drive]
+    legacy = terminal.complex_correlation_descriptor(tuple(px), tuple(py), drive)
+    dg = torch.randn_like(legacy)
+    expected = torch.autograd.grad(legacy, inputs, dg)
+
+    def unexpected_legacy(*_args: object) -> None:
+        pytest.fail("Terminal scan fell back to Triton")
+
+    monkeypatch.setattr(terminal, "triton_bidirectional_product_scan", unexpected_legacy)
+    monkeypatch.delenv("LNET_GENERAL_SCANS")
+    descriptor = terminal.complex_correlation_descriptor
+    if compiled:
+        descriptor = torch.compile(descriptor, fullgraph=True)
+    actual = descriptor(tuple(px), tuple(py), drive)
+    torch.testing.assert_close(actual, legacy, atol=1e-7, rtol=1e-4)
+    actual_grad = torch.autograd.grad(actual, inputs, dg)
+    for a, e in zip(actual_grad, expected, strict=True):
+        torch.testing.assert_close(a, e, atol=1e-6, rtol=1e-4)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@inductor_config.patch(emulate_precision_casts=False)
+def test_cuda_coarse_drive_dtypes(monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype) -> None:
+    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+    monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
+    torch.manual_seed(218)
+    px, py, real, imag, auxiliary, path = _inputs(8, 10, 35, 8, dtype, "cuda", batch=2)
+    px, py = ([p.reshape(1, 1, 1, -1) for p in pole] for pole in (px, py))
+    drive = torch.cat((real, imag), dim=-1)
+    for run in (
+        run_product_scan_coarse_path_collapse_packed,
+        run_product_scan_coarse_path_collapse_planes_packed,
+    ):
+        with pytest.raises(TypeError, match="requires a BF16 CUDA drive"):
+            run(tuple(px), tuple(py), drive, tuple(path), gain_normalization="pointwise")
+
+    monkeypatch.delenv("LNET_GENERAL_SCANS")
+    out = run_product_scan_coarse_path_collapse_packed(
+        tuple(px), tuple(py), drive, tuple(path), gain_normalization="pointwise", epsilon=1e-6,
+    )
+    planes = run_product_scan_coarse_path_collapse_planes_packed(
+        tuple(px), tuple(py), drive, tuple(path), gain_normalization="pointwise", epsilon=1e-6,
+    )
+    assert out.dtype == dtype
+    torch.testing.assert_close(torch.cat(planes, dim=-1), out, atol=0, rtol=0)
+    states = torch.stack(bidirectional_product_scan_reference(tuple(px), (real, imag)))
+    expected = torch.cat(_reference_vscan(py, states, auxiliary, path, coarse=True), dim=-1)
+    torch.testing.assert_close(out, expected, atol=1e-3, rtol=8e-3)
+    dy = torch.randn_like(out)
+    params = [drive, *px, *py, *path]
+    packed_grads = torch.autograd.grad(out, params, dy, retain_graph=True)
+    plane_grads = torch.autograd.grad(planes, params, dy.chunk(2, dim=-1))
+    for actual, target in zip(plane_grads, packed_grads, strict=True):
+        torch.testing.assert_close(actual, target)

@@ -28,8 +28,8 @@ from lnet.complex_scan import (
     complex_carry_coordinates,
     pole_aligned_complex_downsample,
 )
+from lnet.directional import direction_aligned_endpoints
 from lnet.image_layers import LayerNorm2d
-from lnet.pac_directional import direction_aligned_endpoints
 
 
 def _rotate(

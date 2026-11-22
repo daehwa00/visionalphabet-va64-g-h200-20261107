@@ -56,15 +56,6 @@ ignore = [
 ]
 "src/lnet/complex_scan.py" = ["PLR0915"]
 "src/lnet/complex_scan_stage.py" = ["C901", "PLR0912", "PLR0915"]
-"src/lnet/pac_launch_tuning.py" = ["C901"]
-"src/lnet/pac_*.py" = ["SLF001"]
-"src/lnet/pac_product_scan_contracts.py" = ["C901"]
-"src/lnet/pac_product_scan_normalization.py" = ["ANN001", "ANN202", "N803"]
-"src/lnet/pac_triton_*.py" = [
-  "ANN001", "ANN202", "FBT001", "N803", "PLR0915", "SIM108", "SLF001",
-]
-"src/lnet/pac_real2d_math.py" = ["PLW0603"]
-"src/lnet/pac_recurrence.py" = ["PLW0603"]
 "tests/*.py" = [
   "ANN001", "ANN202", "FBT001", "N803", "PLR2004", "S101", "S603", "SLF001",
 ]
