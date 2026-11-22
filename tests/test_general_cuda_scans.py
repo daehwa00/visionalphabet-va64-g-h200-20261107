@@ -955,6 +955,7 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     ("coarse", "compact", "hidden", "compiled"),
     [(False, False, 8, False), (True, False, 11, True), (True, True, 5, False)],
 )
+@pytest.mark.parametrize("policy", ["force", "force_triton"])
 def test_cuda_decoupled_vscan(
     monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
@@ -962,6 +963,7 @@ def test_cuda_decoupled_vscan(
     compact: bool,
     hidden: int,
     compiled: bool,
+    policy: str,
 ) -> None:
     torch.manual_seed(791)
     _, pole, real, _, auxiliary, path = _inputs(8, 10, 35, hidden, dtype, "cuda", batch=3)
@@ -975,7 +977,7 @@ def test_cuda_decoupled_vscan(
         pole, states, auxiliary, path, *dy, coarse, compact=compact
     )
 
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "force")
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", policy)
     plan_chunk = scans._decoupled_chunk
     monkeypatch.setattr(scans, "_decoupled_chunk", lambda *args: min(2, plan_chunk(*args)))
     run = scans.vertical_forward

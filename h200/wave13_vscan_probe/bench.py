@@ -21,7 +21,7 @@ CASES = (
 )
 
 
-def probe(shape: tuple, hidden: int) -> dict:
+def probe(shape: tuple, hidden: int, policy: str = "1") -> dict:
     b, h, w, m, coarse = shape
     dtype = torch.bfloat16
     oh, ow = (h // 2, w // 2) if coarse else (h, w)
@@ -45,7 +45,7 @@ def probe(shape: tuple, hidden: int) -> dict:
         return (*out, *grads)
 
     result = {"shape": shape, "hidden": hidden}
-    for label, policy in (("fused", "0"), ("decoupled", "1")):
+    for label, policy in (("fused", "0"), ("decoupled", policy)):
         os.environ["LNET_VSCAN_DECOUPLED"] = policy
         values = step()
         if label == "fused":
@@ -79,9 +79,10 @@ def probe(shape: tuple, hidden: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--policy", choices=("1", "triton"), default="1")
     args = parser.parse_args()
     for shape in CASES:
-        row = probe(shape, 8)
+        row = probe(shape, 8, args.policy)
         with args.out.open("a", encoding="utf-8") as file:
             print(json.dumps(row), file=file)
         print(json.dumps(row), flush=True)  # noqa: T201

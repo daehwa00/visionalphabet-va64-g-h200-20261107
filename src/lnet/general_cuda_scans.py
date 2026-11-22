@@ -35,7 +35,7 @@ from .product_scan_reference import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 # Constants and types
 
@@ -429,21 +429,21 @@ template<class T, class I>
 struct Column {
     const T* states;
     const float* vy;
-    I offset_a, offset_b, plane, output;
+    I offset_a, offset_b, plane, source_plane, output;
     int H, W, M, OW, m;
     float vx_a, vx_b, eps;
 
     __device__ Quad<T> packed_source(int y) const {
         const I row = I(y) * W * M;
-        const I ia = row + offset_a, ib = row + offset_b + 2 * plane;
-        return {Pair<T>::from(states[ia], states[ia + plane]),
-                Pair<T>::from(states[ib], states[ib + plane])};
+        const I ia = row + offset_a, ib = row + offset_b + 2 * source_plane;
+        return {Pair<T>::from(states[ia], states[ia + source_plane]),
+                Pair<T>::from(states[ib], states[ib + source_plane])};
     }
 
     __device__ float4 source(int y) const {
         const I row = I(y) * W * M;
-        const Complex a = load_complex(states, row + offset_a, plane);
-        const Complex b = load_complex(states, row + offset_b + 2 * plane, plane);
+        const Complex a = load_complex(states, row + offset_a, source_plane);
+        const Complex b = load_complex(states, row + offset_b + 2 * source_plane, source_plane);
         return make_float4(a.r, a.i, b.r, b.i);
     }
 
@@ -579,7 +579,7 @@ __device__ __forceinline__ void column_backward(
     PathWeights<T, I, CACHED> path,
     const T* gr, const T* gi, T* gs, float* acc, I acc_stride,
     float4* seg, Quad<T>* seg_src, float4* ckpt, I ckpt_stride, Quad<T>* g2, I g2_stride,
-    int chunks, Complex& da, Complex& dg, I features
+    int chunks, Complex& da, Complex& dg
 ) {
     const auto ar = a.conj(), gg = g.conj();
     // CHUNK == 0 keeps the whole trajectory and needs no boundaries.
@@ -646,8 +646,10 @@ __device__ __forceinline__ void column_backward(
             const auto gp = c.gain(y, false), gn = c.gain(y - int(COARSE), true);
             float dp[8]{};
             if constexpr (PURE) {
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) dp[k] = read(gr[I(k) * features + cell]);
+                const auto real = reinterpret_cast<const Quad<T>*>(gr)[2 * cell].unpack();
+                const auto imag = reinterpret_cast<const Quad<T>*>(gr)[2 * cell + 1].unpack();
+                dp[0] = real.x; dp[1] = real.y; dp[2] = real.z; dp[3] = real.w;
+                dp[4] = imag.x; dp[5] = imag.y; dp[6] = imag.z; dp[7] = imag.w;
             } else path_mlp<T, I, HIDDEN, false, true>(
                 normalize<T>(seg[j * THREADS], gp), normalize<T>(neg, gn),
                 path, {},
@@ -746,7 +748,7 @@ __device__ __forceinline__ void vertical(
     const T* gr, const T* gi,
     T* outr, T* outi, T* gs, float* partials,
     Quad<T>* scratch, float4* global_checkpoints, int B, int H, int W, int M,
-    int workers, int hidden, int types, float eps
+    int workers, int hidden, int types, float eps, long long input_plane, long long grad_plane
 ) {
     constexpr int threads = WARPS * 32;
     extern __shared__ float4 shared[];
@@ -764,6 +766,8 @@ __device__ __forceinline__ void vertical(
     const int span = full ? H : CHUNK;
     const int chunks = full ? 1 : (H - 1) / span + 1;
     const I plane = I(B) * H * W * M;
+    const I source_plane = PURE ? I(input_plane) : plane;
+    const I target_plane = PURE && BACKWARD ? I(grad_plane) : plane;
     auto* weights_shared = reinterpret_cast<T*>(shared);
     const I weight_fields = 11 * I(size);
     if constexpr (CACHE_WEIGHT) {
@@ -831,7 +835,8 @@ __device__ __forceinline__ void vertical(
             const int x = line % ow, xa = COARSE ? 2 * x + 1 : x, xb = COARSE ? 2 * x : x;
             const I base = b * H * W * M + m;
             Column<T, I> c{states, vy, base + I(xa) * M, base + I(xb) * M,
-                           plane, (b * oh * ow + x) * M + m, H, W, M, ow, m,
+                           target_plane, source_plane, (b * oh * ow + x) * M + m,
+                           H, W, M, ow, m,
                            vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps};
             auto* buf = CACHE_LINE ? line_buf + threadIdx.x : scratch + I(worker) * M + m;
             const I stride = CACHE_LINE ? threads : I(workers) * M;
@@ -842,8 +847,7 @@ __device__ __forceinline__ void vertical(
                                 REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE>(
                     c, a, g, path, gr, gi, gs,
                     acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
-                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg,
-                    I(B) * oh * ow * M);
+                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg);
             } else {
                 float4 state{};
                 for (int y = 0; y < H; ++y) {
@@ -862,10 +866,9 @@ __device__ __forceinline__ void vertical(
                     if constexpr (PURE) {
                         const auto pos = buf[I(yo) * stride].unpack();
                         const auto neg = normalize<T>(state, c.gain(y, true));
-                        const float p[8] = {pos.x, pos.z, neg.x, neg.z, pos.y, pos.w, neg.y, neg.w};
-                        const I features = I(B) * oh * ow * M;
-                        #pragma unroll
-                        for (int k = 0; k < 8; ++k) outr[I(k) * features + cell] = write<T>(p[k]);
+                        auto* output = reinterpret_cast<Quad<T>*>(outr) + 2 * cell;
+                        output[0] = Quad<T>::pack(make_float4(pos.x, pos.z, neg.x, neg.z));
+                        output[1] = Quad<T>::pack(make_float4(pos.y, pos.w, neg.y, neg.w));
                     } else {
                         const float2 out = path_mlp<T, I, HIDDEN, PRECISE, false>(
                             buf[I(yo) * stride].unpack(), normalize<T>(state, c.gain(y, true)),
@@ -1018,11 +1021,13 @@ extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
     {io}* __restrict__ outr, {io}* __restrict__ outi, {io}* __restrict__ gs,
     float* __restrict__ partials, Quad<{io}>* __restrict__ scratch,
     float4* __restrict__ checkpoints,
-    int B, int H, int W, int M, int workers, int hidden, int types, float eps
+    int B, int H, int W, int M, int workers, int hidden, int types, float eps,
+    long long input_plane, long long grad_plane
 ) {{
     vertical<{targs}>(dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo, bo, gr, gi,
                        outr, outi,
-                       gs, partials, scratch, checkpoints, B, H, W, M, workers, hidden, types, eps);
+                       gs, partials, scratch, checkpoints, B, H, W, M, workers, hidden, types, eps,
+                       input_plane, grad_plane);
 }}
 """
     else:
@@ -1529,6 +1534,8 @@ def _plan_launch(
     # Vertical input already includes every plane. Horizontal forward takes
     # one plane and writes four. Both bounds also cover the dense outputs.
     index_bound = source.numel() * (2 if pure_vertical else 1)
+    if pure_vertical:
+        index_bound = max(index_bound, source.stride(0) * 4)
     if not vertical:
         index_bound *= 4
     return _launch_for_shape(
@@ -1791,6 +1798,7 @@ def _vscan(  # noqa: C901, PLR0912
     planar: bool = False,
     compact: bool = False,
     features: Tensor | None = None,
+    state_grad: Tensor | None = None,
     pure: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     shape = tuple(states.shape[1:])
@@ -1816,7 +1824,8 @@ def _vscan(  # noqa: C901, PLR0912
     if not pure and (chunk := _decoupled_chunk(states, hidden, coarse)):
         with torch.autocast(device_type="cuda", enabled=False):
             return _decoupled_vscan(
-                pole, states, auxiliary, path, coarse, epsilon, precise, grad,
+                pole, states, auxiliary, path, coarse, epsilon, precise,
+                (gr, gi) if grad is not None else None,
                 packed=packed, planar=planar, compact=compact, chunk=chunk,
             )
     launch = _plan_launch(
@@ -1838,7 +1847,10 @@ def _vscan(  # noqa: C901, PLR0912
             gr, gi = features, None
         outr = outi = None
         # Coarse selects odd columns from positive and even columns from negative.
-        gs = states.new_empty((4, b, h, ow if compact else w, m))
+        gs = (
+            states.new_empty((4, b, h, ow if compact else w, m))
+            if state_grad is None else state_grad
+        )
         fields = 4 if pure else 11 * hidden + 6
         partial = states.new_empty((launch.partials, fields, m), dtype=torch.float32)
         checkpoint_rows = _ceil(h, launch.plan.chunk) - 1
@@ -1848,7 +1860,7 @@ def _vscan(  # noqa: C901, PLR0912
             )
     else:
         if pure:
-            output = outr = states.new_empty((8, *out_shape))
+            output = outr = states.new_empty((*out_shape, 8))
             outi = None
         elif packed and planar:
             output = states.new_empty((2, *out_shape))
@@ -1866,7 +1878,7 @@ def _vscan(  # noqa: C901, PLR0912
     )
     inputs = (
         *(p.float().contiguous() for p in pole),
-        states.contiguous(),
+        states if pure else states.contiguous(),
         *(t.float().contiguous() for t in auxiliary),
         *(None if pure else tensor.contiguous() for tensor in path),
     )
@@ -1879,6 +1891,8 @@ def _vscan(  # noqa: C901, PLR0912
                 *shape, launch.workers, hidden, _scalar_types(path),
             )),
             ct.c_float(epsilon),
+            ct.c_longlong(states.stride(0) if pure else 0),
+            ct.c_longlong(gs.stride(0) * (1 + int(compact)) if pure and gs is not None else 0),
         ),
     )
     if output is not None:
@@ -1892,15 +1906,16 @@ def _vscan(  # noqa: C901, PLR0912
 def _decoupled_chunk(states: Tensor, hidden: int, coarse: bool) -> int:
     """Bound the recomputed scan and MLP workspace per batch chunk."""
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
-    if policy not in {"1", "force"} or not states.is_cuda:
+    if policy not in {"1", "force", "triton", "force_triton"} or not states.is_cuda:
         return 0
     device = states.device.index or 0
-    if policy != "force" and torch.cuda.get_device_capability(device)[0] < 9:
+    if policy not in {"force", "force_triton"} and torch.cuda.get_device_capability(device)[0] < 9:
         return 0
     _, b, h, w, m = states.shape
     cells = (h // 2) * (w // 2) * m if coarse else h * w * m
     # BMM layout copies, FP32 activation intermediates and scan input/output.
-    per_sample = cells * (32 * states.element_size() + 32 * hidden + 16)
+    intermediates = 4 if policy in {"triton", "force_triton"} and hidden <= 32 else 32
+    per_sample = cells * (32 * states.element_size() + intermediates * hidden + 16)
     per_sample += 8 * h * w * m * states.element_size()
     budget = min(512 * 1024**2, torch.cuda.get_device_properties(device).total_memory // 32)
     return min(b, budget // per_sample)
@@ -1912,7 +1927,52 @@ def _mlp_bmm_fp32(left: Tensor, right: Tensor) -> Tensor:
     return torch.bmm(left, right, out_dtype=torch.float32)
 
 
-def _decoupled_vscan(
+def _bmm_path_projection(
+    features: Tensor,
+    path: tuple[Tensor, Tensor, Tensor, Tensor],
+    real: Tensor,
+    imag: Tensor,
+    *,
+    backward: bool,
+) -> tuple[Tensor, tuple[Tensor, ...]] | None:
+    wi, bi, wo, bo = path
+    modes = wi.shape[0]
+    p = features.reshape(-1, modes, 8).transpose(0, 1).contiguous()
+    pre = torch.bmm(p, wi.transpose(1, 2)).add_(bi[:, None, :])
+    act = torch.nn.functional.silu(pre)
+    if not backward:
+        values = torch.bmm(act, wo.transpose(1, 2)).add_(bo[:, None, :])
+        pairs = values.transpose(0, 1).reshape(*real.shape, 2)
+        real.copy_(pairs[..., 0])
+        imag.copy_(pairs[..., 1])
+        return None
+
+    dy = torch.stack((real, imag), dim=-1).reshape(-1, modes, 2).transpose(0, 1).contiguous()
+    dz = torch.ops.aten.silu_backward(torch.bmm(dy, wo), pre)
+    dp = torch.bmm(dz, wi).transpose(0, 1).contiguous()
+    gradients = (
+        _mlp_bmm_fp32(dz.transpose(1, 2), p),
+        dz.sum(dim=1, dtype=torch.float32),
+        _mlp_bmm_fp32(dy.transpose(1, 2), act),
+        dy.sum(dim=1, dtype=torch.float32),
+    )
+    return dp, gradients
+
+
+def _select_path_projection(states: Tensor, hidden: int) -> Callable:
+    if (
+        os.environ.get("LNET_VSCAN_DECOUPLED") in {"triton", "force_triton"}
+        and states.dtype != torch.float32
+        and hidden <= 32
+        and states.shape[-1] <= 65535
+    ):
+        from .vscan_path_mlp import path_projection  # noqa: PLC0415
+
+        return path_projection
+    return _bmm_path_projection
+
+
+def _decoupled_vscan(  # noqa: C901
     pole: list[Tensor],
     states: Tensor,
     auxiliary: list[Tensor],
@@ -1929,7 +1989,9 @@ def _decoupled_vscan(
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     _, batch, height, width, modes = states.shape
     oh, ow = (height // 2, width // 2) if coarse else (height, width)
-    wi, bi, wo, bo = (parameter.to(states.dtype) for parameter in path)
+    wi, bi, wo, bo = (parameter.to(states.dtype).contiguous() for parameter in path)
+    weights = wi, bi, wo, bo
+    project = _select_path_projection(states, wi.shape[1])
     if grad is None:
         shape = (batch, oh, ow, modes)
         if packed and planar:
@@ -1946,44 +2008,27 @@ def _decoupled_vscan(
         sums = [param.new_zeros(param.shape, dtype=torch.float32) for param in [*pole, *path]]
         float_pole = [param.float() for param in pole]
 
+    states = states.contiguous()
     for begin in range(0, batch, chunk):
         part = slice(begin, begin + chunk)
-        source = states[:, part].contiguous()
+        source = states[:, part]
         features = _vscan(pole, source, auxiliary, path, coarse, epsilon, precise, pure=True)
         if not isinstance(features, Tensor):
             raise TypeError("Expected normalized scan features")
-        p = features.reshape(8, -1, modes).permute(2, 1, 0).contiguous()
-        pre = torch.bmm(p, wi.transpose(1, 2))
-        pre.add_(bi[:, None, :])
-        z = pre.float()
-        sigmoid = z.sigmoid()
-        act = (z * sigmoid).to(states.dtype)
         if grad is None:
-            values = torch.bmm(act, wo.transpose(1, 2)).add_(bo[:, None, :])
-            pairs = values.permute(1, 0, 2).reshape(-1, oh, ow, modes, 2)
-            real[part].copy_(pairs[..., 0])
-            imag[part].copy_(pairs[..., 1])
+            project(features, weights, real[part], imag[part], backward=False)
             continue
 
-        dy = torch.stack((grad[0][part], grad[1][part]), dim=-1)
-        dy = dy.reshape(-1, modes, 2).transpose(0, 1).contiguous()
-        dz = (torch.bmm(dy, wo).float() * (sigmoid * (1 + z * (1 - sigmoid)))).to(
-            states.dtype
-        )
-        dp = torch.bmm(dz, wi).permute(2, 1, 0).contiguous()
+        projected = project(features, weights, grad[0][part], grad[1][part], backward=True)
+        if projected is None:
+            raise TypeError("Expected path projection gradients")
+        dp, path_grads = projected
         gradients = _vscan(
             float_pole, source, auxiliary, path, coarse, epsilon, precise,
-            compact=compact, features=dp, pure=True,
+            compact=compact, features=dp, state_grad=gs[:, part], pure=True,
         )
         if not isinstance(gradients, list):
             raise TypeError("Expected pure scan gradients")
-        gs[:, part].copy_(gradients[4])
-        path_grads = (
-            _mlp_bmm_fp32(dz.transpose(1, 2), p),
-            dz.sum(dim=1, dtype=torch.float32),
-            _mlp_bmm_fp32(dy.transpose(1, 2), act),
-            dy.sum(dim=1, dtype=torch.float32),
-        )
         for total, value in zip(sums, (*gradients[:4], *path_grads), strict=True):
             total.add_(value.reshape_as(total))
 

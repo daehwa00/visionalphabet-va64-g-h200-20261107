@@ -37,22 +37,32 @@ if [[ -z $run_python ]]; then
         triton==3.5.1 numpy==2.4.6 pytest==9.0.3 timm==1.0.26
     ready "$run_python"
 fi
-"$run_python" h200/wave13_vscan_probe/bench.py --out "$out/isolated.jsonl" | tee "$out/isolated.log"
+policy=${2:-1}
+"$run_python" h200/wave13_vscan_probe/bench.py --policy "$policy" \
+    --out "$out/isolated.jsonl" | tee "$out/isolated.log"
 "$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \
     < "$out/isolated.jsonl" > "$out/isolated.json"
 bench=h200/liverms_v2_opt/bench_h200.py
 mkdir -p "$out/arms" "$out/infer"
-for policy in 0 1; do
-    export LNET_VSCAN_DECOUPLED=$policy
+if [[ ${1:-} == --short ]]; then
+    for arm in 0 "$policy"; do
+        LNET_VSCAN_DECOUPLED=$arm "$run_python" "$bench" train-arm \
+            --out "$out/arms/p1_b1024_${arm}.json" --variant 17-p1-nr4-1024d-v3 \
+            --batch 1024 --profile
+    done
+    exit
+fi
+for arm in 0 "$policy"; do
+    export LNET_VSCAN_DECOUPLED=$arm
     for batch in 1024 128 256 512; do
-        "$run_python" "$bench" train-arm --out "$out/arms/p1_b${batch}_${policy}.json" \
+        "$run_python" "$bench" train-arm --out "$out/arms/p1_b${batch}_${arm}.json" \
             --variant 17-p1-nr4-1024d-v3 --batch "$batch" --profile
     done
     for variant in 17-live-complex-rms-s03 17-e2-multiscale-s3s4-live-rms-v2; do
-        "$run_python" "$bench" train-arm --out "$out/arms/${variant}_b1024_${policy}.json" \
+        "$run_python" "$bench" train-arm --out "$out/arms/${variant}_b1024_${arm}.json" \
             --variant "$variant" --batch 1024
     done
-    "$run_python" "$bench" infer-fold --out "$out/infer/p1_b1024_${policy}.json" \
+    "$run_python" "$bench" infer-fold --out "$out/infer/p1_b1024_${arm}.json" \
         --variant 17-p1-nr4-1024d-v3 --batch 1024
 done
 "$run_python" "$bench" dynamo --out "$out/dynamo.json"
