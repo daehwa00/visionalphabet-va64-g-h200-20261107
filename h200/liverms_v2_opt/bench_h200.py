@@ -8,6 +8,7 @@ import ctypes
 import json
 import re
 import statistics
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -64,7 +65,8 @@ def probe(_args: argparse.Namespace) -> dict:
     if status:
         raise RuntimeError(f"CUDA L2 attribute returned {status}")
     nvrtc_major, nvrtc_minor = ctypes.c_int(), ctypes.c_int()
-    _check_nvrtc(_nvrtc().nvrtcVersion(ctypes.byref(nvrtc_major), ctypes.byref(nvrtc_minor)))
+    nvrtc = _nvrtc()
+    _check_nvrtc(nvrtc, nvrtc.nvrtcVersion(ctypes.byref(nvrtc_major), ctypes.byref(nvrtc_minor)))
     return {
         "nvrtc": [nvrtc_major.value, nvrtc_minor.value],
         "nvrtc_include_dirs": [str(path) for path in _include_dirs()],
@@ -75,6 +77,7 @@ def probe(_args: argparse.Namespace) -> dict:
         "l2_bytes": l2.value,
         "device_limits": device_limits(0),
         "horizontal_cache_budget": _horizontal_cache_budget(0),
+        "python": sys.version.split()[0],
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),

@@ -21,28 +21,43 @@ unset LNET_GENERAL_SCANS LNET_FUSED_FACTORIZED_READER LNET_GENERAL_SCAN_REF_FWD
 unset VA_REAL_MEMORY_SCAN_BATCH_PARTIALS VA_REAL_MEMORY_TRAINING_OPTIMIZATIONS
 unset LNET_DISABLE_LAUNCH_AUTOTUNE
 
+verify_environment() {
+    "$1" -c 'import sys; raise SystemExit(sys.version_info < (3, 13))' &&
+        "$1" -c 'import numpy, torch, triton, torchvision; raise SystemExit(not torch.cuda.is_available())'
+}
+
 ENV_PYTHON=
 for candidate in \
     /app/output/va-h200-effective1024-r3-combined-20261119/environment/bin/python \
     /app/output/va-h200-r4-marker-fix-20261119/environment/bin/python \
     "$(command -v python3)"; do
-    if [[ -x $candidate ]] && "$candidate" -c \
-        'import torch, triton, torchvision, numpy; raise SystemExit(not torch.cuda.is_available())'; then
+    if [[ -x $candidate ]] && verify_environment "$candidate"; then
         ENV_PYTHON=$candidate
         break
     fi
 done
 if [[ -z $ENV_PYTHON ]]; then
-    printf '%s\n' '{"status":"error","reason":"No Python environment with CUDA torch, triton, torchvision and numpy"}' > "$RUN_ROOT/setup.json"
-    exit 1
+    printf '%s\n' '{"status":"started","method":"uv Python 3.13 bootstrap"}' > "$RUN_ROOT/setup.json"
+    export UV_PYTHON_INSTALL_DIR="$RUN_ROOT/python" UV_CACHE_DIR="$RUN_ROOT/uv-cache"
+    python3 -m pip install -q --disable-pip-version-check --target "$RUN_ROOT/bootstrap" uv==0.11.26
+    uv_run() { PYTHONPATH="$RUN_ROOT/bootstrap" python3 -m uv "$@"; }
+    uv_run python install 3.13.11
+    uv_run venv --python 3.13.11 "$RUN_ROOT/environment"
+    ENV_PYTHON="$RUN_ROOT/environment/bin/python"
+    uv_run pip install --python "$ENV_PYTHON" \
+        'torch @ https://download-r2.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=63381a109a569b280ed3319da89d3afe5cf9ab5c879936382a212affb5c90552' \
+        'torchvision @ https://download-r2.pytorch.org/whl/cu128/torchvision-0.24.1%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=5f7c5e0fa08d2cbee93b6e04bbedd59b5e11462cff6cefd07949217265df2370' \
+        triton==3.5.1 numpy==2.4.6 pytest==9.0.3 timm==1.0.26
+    verify_environment "$ENV_PYTHON"
+    printf '%s\n' '{"status":"ok","method":"uv Python 3.13 bootstrap"}' > "$RUN_ROOT/setup.json"
 fi
 
 EXTRA_PYPATH=
-if ! "$ENV_PYTHON" -c 'import pytest'; then
+if ! "$ENV_PYTHON" -c 'import pytest' 2>/dev/null; then
     "$ENV_PYTHON" -m pip install --disable-pip-version-check --target "$RUN_ROOT/deps" pytest
     EXTRA_PYPATH=$RUN_ROOT/deps
 fi
-if ! "$ENV_PYTHON" -c 'import timm'; then
+if ! "$ENV_PYTHON" -c 'import timm' 2>/dev/null; then
     # Reuse the selected CUDA torch/torchvision install.
     "$ENV_PYTHON" -m pip install --disable-pip-version-check --target "$RUN_ROOT/deps" --no-deps timm
     EXTRA_PYPATH=$RUN_ROOT/deps
