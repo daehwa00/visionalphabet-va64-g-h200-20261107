@@ -939,6 +939,7 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
         torch.cuda, "get_device_properties", lambda _: SimpleNamespace(total_memory=24 * 1024**3)
     )
     states = States()
+    monkeypatch.delenv("LNET_VSCAN_DECOUPLED", raising=False)
     assert scans._decoupled_chunk(states, coarse=False) == 0
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "chunk")
     assert 0 < scans._decoupled_chunk(states, coarse=False) < states.shape[1]
