@@ -606,3 +606,68 @@ def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
     torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
     torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=0.002)
     assert torch.cuda.get_device_properties is properties
+
+
+@requires_cuda
+@pytest.mark.usefixtures("cudnn_full_precision")
+@pytest.mark.parametrize(
+    ("vec", "modes", "rank", "kernel", "dtype", "strict", "offset", "expected"),
+    [
+        (2, 66, 1, 3, torch.bfloat16, False, 0, (2, 2)),
+        (4, 68, 2, 3, torch.bfloat16, False, 0, (2, 4)),
+        (2, 66, 3, 3, torch.bfloat16, False, 0, (2, 2)),
+        (4, 160, 4, 3, torch.bfloat16, False, 0, (2, 4)),
+        (2, 67, 4, 3, torch.bfloat16, False, 0, (1, 1)),
+        (4, 66, 4, 3, torch.bfloat16, False, 0, (1, 1)),
+        (2, 66, 4, 3, torch.bfloat16, False, 1, (1, 1)),
+        (2, 66, 6, 3, torch.bfloat16, False, 0, (1, 1)),
+        (2, 66, 4, 5, torch.bfloat16, False, 0, (1, 1)),
+        (2, 66, 4, 3, torch.bfloat16, True, 0, (1, 1)),
+        (2, 66, 4, 3, torch.float32, False, 0, (1, 1)),
+        (2, 66, 4, 3, torch.float16, False, 0, (1, 1)),
+    ],
+)
+def test_reader_vector_probe_parity(
+    vec: int, modes: int, rank: int, kernel: int, dtype: torch.dtype, strict: bool,
+    offset: int, expected: tuple[int, int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if dtype == torch.bfloat16 and torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("native BF16 requires SM80 or newer")
+    monkeypatch.setenv("VA_READER_VECTOR_PROBE", str(vec))
+    torch.manual_seed(52)
+    shape = (2, 7, 11, modes * rank * (2 if strict else 1))
+    p = (torch.randn(2 * 7 * 11 * shape[-1] + offset, device="cuda", dtype=dtype) * 0.2)
+    p = p[offset:].view(shape)
+    real, imag = (tensor.contiguous() for tensor in (
+        torch.randn((2, modes, rank, kernel, kernel), device="cuda", dtype=dtype) * 0.2
+    ).unbind())
+    grad = torch.randn((2, 7, 11, modes * 2), device="cuda", dtype=dtype) * 0.2
+    assert kernels._reader_probe_vectors(p, real, grad, strict=strict) == expected
+    actual = kernels._packed_spatial(p, real, imag, strict)
+    dp, dw = kernels._packed_spatial_backward(grad, p, real, imag, strict)
+    reference = kernels._spatial_reference(p, real, imag, strict_complex=strict)
+    ref_dp, ref_dw = kernels._spatial_reference_backward(
+        grad, p, real, imag, strict_complex=strict,
+    )
+    for result, ref in zip((actual, dp, dw), (reference, ref_dp, ref_dw), strict=True):
+        ref_float = ref.float()
+        diff = result.float() - ref_float
+        assert diff.abs().max().item() <= 0.02
+        assert (diff.norm() / ref_float.norm()).item() <= 0.005
+
+
+@requires_cuda
+@pytest.mark.usefixtures("cudnn_full_precision")
+def test_reader_vector_probe_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("native BF16 requires SM80 or newer")
+    monkeypatch.setenv("VA_READER_VECTOR_PROBE", "2")
+    torch.manual_seed(231)
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    p = torch.randn((2, 7, 11, 4 * 48), **kwargs).requires_grad_()
+    w = (torch.randn((48, 2, 4, 3, 3), **kwargs) * 0.125).requires_grad_()
+    compiled = torch.compile(kernels.real_packed_spatial, fullgraph=True)
+    output = compiled(p, w)
+    reference = kernels._spatial_reference(p, *w.unbind(1), strict_complex=False)
+    torch.testing.assert_close(output, reference, atol=0.008, rtol=0.005)
+    _check_gradients(output, reference, (p, w), (p, w), rtol=0.005, atol=0.001)

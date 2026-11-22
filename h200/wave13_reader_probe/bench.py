@@ -5,6 +5,7 @@
 import argparse
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -28,8 +29,18 @@ def measure(
     return {"ms": ms, "effective_gb_s": size / (ms * 1e6), "grid": grid}
 
 
+class Geometry(NamedTuple):
+    spatial_rows: int
+    spatial_warps: int
+    rank_tile: int
+    weight_rows: int
+    weight_warps: int
+    weight_waves: int
+
+
 def candidate(
     shape: tuple[int, int, int, int], data: tuple[torch.Tensor, ...], modes_per_thread: int,
+    geometry: Geometry | None = None,
 ) -> tuple[dict, tuple[torch.Tensor, ...]]:
     batch, height, width, modes = shape
     projected, grad, real, imag = data
@@ -51,6 +62,9 @@ def candidate(
         register = keep = 0 if plan else -1
         sv = 1
     waves = plan.weight_waves if plan else 5
+    if geometry is not None:
+        sr, sw, tile, wr, ww, waves = geometry
+        register = keep = 0
     mode_tiles = reader._ceildiv(modes, 32 * modes_per_thread)
     available = reader._ceildiv(batch * reader._ceildiv(height, wr), ww)
     workers = min(available, reader._ceildiv(waves * sms, mode_tiles))
@@ -87,10 +101,26 @@ def candidate(
     return results, (out, dp, dw)
 
 
-def run(shapes: list[tuple[int, int, int, int, int]], out_path: Path) -> None:
+def run(
+    shapes: list[tuple[int, int, int, int, int]], out_path: Path, *, sweep: bool,
+) -> None:
     torch.manual_seed(52)
     torch.backends.cudnn.allow_tf32 = False
     results = {}
+    baseline = [(str(vec), vec, None) for vec in (1, 2, 4)]
+    configs = [
+        (1, Geometry(4, 4, 2, 2, 8, 20)),
+        (2, Geometry(1, 4, 1, 1, 4, 20)),
+        (2, Geometry(2, 2, 2, 1, 4, 20)),
+        (2, Geometry(2, 4, 4, 1, 4, 20)),
+        (2, Geometry(4, 2, 2, 1, 8, 20)),
+        (2, Geometry(4, 4, 2, 2, 8, 20)),
+        (4, Geometry(2, 2, 1, 1, 4, 20)),
+        (4, Geometry(4, 2, 2, 1, 4, 20)),
+    ]
+    sweeps = [
+        ("v" + str(vec) + "-" + "x".join(map(str, cfg)), vec, cfg) for vec, cfg in configs
+    ]
     for batch, height, width, modes, rank in shapes:
         key = f"{batch}x{height}x{width}x{modes}-r{rank}"
         data = (
@@ -100,11 +130,11 @@ def run(shapes: list[tuple[int, int, int, int, int]], out_path: Path) -> None:
         )
         rows = results[key] = {}
         reference = None
-        for vec in (1, 2, 4):
-            timing, tensors = candidate((batch, height, width, modes), data, vec)
+        for name, vec, config in (baseline + sweeps if sweep else baseline):
+            timing, tensors = candidate((batch, height, width, modes), data, vec, config)
             if reference is None:
                 reference = tensors
-            rows[str(vec)] = {
+            rows[name] = {
                 "stages": timing,
                 "parity": {
                     op: closeness([actual], [expected])
@@ -123,13 +153,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--max-batch", type=int, default=1024)
+    parser.add_argument("--sweep", action="store_true")
     args = parser.parse_args()
     shapes = [
         (min(args.max_batch, 1024), side, side, 128 if side == 7 else 160, 4)
         for side in (56, 28, 14, 7)
     ]
     shapes.extend(((4, 128, 192, 160, 4), (4, 512, 768, 48, 4), (4, 96, 128, 80, 2)))
-    run(shapes, args.out)
+    run(shapes, args.out, sweep=args.sweep)
 
 
 if __name__ == "__main__":
