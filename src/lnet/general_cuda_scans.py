@@ -1923,7 +1923,9 @@ def _decoupled_chunk(states: Tensor, hidden: int, coarse: bool) -> int:
     _, b, h, w, m = states.shape
     cells = (h // 2) * (w // 2) * m if coarse else h * w * m
     use_triton = _use_triton_projection(states, hidden, policy)
-    if policy == "triton" and use_triton and cells * 8 * states.element_size() > _l2_size(device):
+    # A sample needs room for both features and feature adjoints.
+    feature_bytes = cells * 8 * states.element_size()
+    if policy == "triton" and use_triton and 2 * feature_bytes > _l2_size(device):
         return 0
     # Account for output features, adjoints, projection intermediates, and
     # allocations that overlap at a chunk boundary.

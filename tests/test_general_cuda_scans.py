@@ -947,6 +947,10 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     assert 0 < scans._decoupled_chunk(states, 11, coarse=True) < states.shape[1]
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     assert scans._decoupled_chunk(states, 11, coarse=True) == 0
+    monkeypatch.setattr(scans, "_l2_size", lambda _: 60 * 1024**2)
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "triton")
+    assert scans._decoupled_chunk(states, 11, coarse=False) == 0
+    assert 0 < scans._decoupled_chunk(states, 11, coarse=True) < states.shape[1]
 
 
 @_cuda
