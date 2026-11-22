@@ -3,9 +3,12 @@
 import argparse
 import json
 import os
+import statistics
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
+from metrics import projection_metrics
 
 from lnet import general_cuda_scans as scans
 
@@ -21,7 +24,10 @@ CASES = (
 )
 
 
-def probe(shape: tuple, hidden: int, batch_divisor: int = 1) -> dict:
+def probe(  # noqa: C901, PLR0915
+    shape: tuple, hidden: int, batch_divisor: int = 1, *,
+    graph: bool = False, saved_policy: str = "saved",
+) -> dict:
     b, h, w, m, coarse = shape
     b = max(1, b // batch_divisor)
     shape = (b, h, w, m, coarse)
@@ -58,9 +64,23 @@ def probe(shape: tuple, hidden: int, batch_divisor: int = 1) -> dict:
         return (*out, *grads)
 
     result = {"shape": shape, "hidden": hidden}
-    for label, arm in (("fused", "0"), ("chunk", "chunk"), ("saved", "saved")):
+    graphs, outputs, timings = {}, {}, {}
+    for label, arm in (("fused", "0"), ("chunk", "chunk"), ("saved", saved_policy)):
         os.environ["LNET_VSCAN_DECOUPLED"] = arm
-        values = step()
+        step()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        with projection_metrics() as projection:
+            values = step()
+        torch.cuda.synchronize()
+        stats = {
+            "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+            "uses_saved_features": scans._should_save_vscan(states, coarse),  # noqa: SLF001
+            "chunk": scans._decoupled_chunk(states, coarse),  # noqa: SLF001
+            "path_mlp": projection(),
+        }
+        if stats["uses_saved_features"]:
+            stats["dp_chunk"] = scans._saved_backward_chunk(states, coarse)  # noqa: SLF001
         if label == "fused":
             # Keep small samples for parity so measured allocation excludes baseline outputs.
             expected = [value.flatten()[::max(1, value.numel() // 8192)].float()
@@ -73,30 +93,52 @@ def probe(shape: tuple, hidden: int, batch_divisor: int = 1) -> dict:
                 for a, e in zip(samples, expected, strict=True)
             ]
         del values
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(5):
-            step()
-        stop.record()
-        stop.synchronize()
-        result[label] = {
-            "ms": start.elapsed_time(stop) / 5,
-            "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
-            "uses_saved_features": scans._should_save_vscan(states, coarse),  # noqa: SLF001
-            "chunk": scans._decoupled_chunk(states, coarse),  # noqa: SLF001
-        }
+        if graph:
+            captured = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(captured):
+                outputs[label] = step()
+            graphs[label] = captured
+            timings[label] = []
+        else:
+            stats["ms"] = time_steps(step, 5)
+        result[label] = stats
+    for iteration in range(5 if graph else 0):
+        order = list(graphs)
+        split = iteration % len(order)
+        for label in order[split:] + order[:split]:
+            timings[label].append(time_steps(graphs[label].replay, 8))
+    for label, samples in timings.items():
+        result[label].update(ms=statistics.median(samples), samples=samples)
     return result
+
+
+def time_steps(step: Callable, repeats: int) -> float:
+    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(repeats):
+        step()
+    stop.record()
+    stop.synchronize()
+    return start.elapsed_time(stop) / repeats
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--batch-divisor", type=int, default=1)
+    parser.add_argument("--graph", action="store_true")
+    parser.add_argument("--test-saved", action="store_true")
+    parser.add_argument("--case-index", type=int, choices=range(len(CASES)), action="append")
+    parser.add_argument("--dp-policy", choices=("l2", "workspace", "full"), default="l2")
     args = parser.parse_args()
-    for shape in CASES:
-        row = probe(shape, 8, args.batch_divisor)
+    saved_policy = "test_saved" if args.test_saved else "saved"
+    if args.dp_policy == "workspace":
+        workspace = scans._workspace_vscan_chunk  # noqa: SLF001
+        scans._saved_backward_chunk = lambda states, coarse: max(1, workspace(states, coarse))  # noqa: SLF001
+    elif args.dp_policy == "full":
+        scans._saved_backward_chunk = lambda states, _: states.shape[1]  # noqa: SLF001
+    for shape in CASES if args.case_index is None else (CASES[i] for i in args.case_index):
+        row = probe(shape, 8, args.batch_divisor, graph=args.graph, saved_policy=saved_policy)
         with args.out.open("a", encoding="utf-8") as file:
             print(json.dumps(row), file=file)
         print(json.dumps(row), flush=True)  # noqa: T201

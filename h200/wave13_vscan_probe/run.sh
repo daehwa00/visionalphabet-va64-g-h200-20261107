@@ -3,9 +3,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 export PYTHONPATH="$PWD/src:$PWD/scripts"
 export WANDB_MODE=disabled OMP_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=4
-out=$(mktemp -d /app/output/va-t54-wave13.XXXXXX)
+out=$(mktemp -d /app/output/va-t55-wave13.XXXXXX)
 echo "output=$out"
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/va-t54-wave13.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/va-t55-wave13.XXXXXX")
 export TORCHINDUCTOR_CACHE_DIR="$scratch/inductor"
 export RUN_ROOT=$out PERSIST_ROOT=$out
 finish() {
@@ -43,6 +43,10 @@ if [[ ${1:-} != --confirm ]]; then
     "$run_python" h200/wave13_vscan_probe/bench.py --out "$out/isolated.jsonl" | tee "$out/isolated.log"
     "$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \
         < "$out/isolated.jsonl" > "$out/isolated.json"
+    "$run_python" h200/wave13_vscan_probe/projection.py --quick \
+        --variants vector vector-shared4 --out "$out/projection.jsonl"
+    "$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \
+        < "$out/projection.jsonl" > "$out/projection.json"
 fi
 # Reuse the cuDNN autotuner and loaded CUDA kernels between arms.
 "$run_python" - "$out" "${1:-}" <<'PYBENCH'
@@ -57,7 +61,11 @@ import torch
 root = Path(sys.argv[1])
 confirm = sys.argv[2] == "--confirm"
 bench_script = "h200/liverms_v2_opt/bench_h200.py"
+sys.path.insert(0, "h200/wave13_vscan_probe")
+from metrics import instrument_training
+
 main = runpy.run_path(bench_script)["main"]
+main.__globals__["profile_step"] = instrument_training(main.__globals__["profile_step"])
 arms = ("0", "chunk", "saved")
 variant = "17-p1-nr4-1024d-v3"
 

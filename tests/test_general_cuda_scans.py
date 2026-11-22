@@ -946,6 +946,10 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     assert 0 < scans._decoupled_chunk(states, coarse=True) < states.shape[1]
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     assert scans._decoupled_chunk(states, coarse=True) == 0
+    monkeypatch.setattr(scans, "_l2_size", lambda _: 48 * 1024**2)
+    # The saved input stays resident, and a single oversized sample still runs.
+    assert scans._saved_backward_chunk(states, coarse=False) == 1
+    assert scans._saved_backward_chunk(states, coarse=True) == 6
 
 
 @_cuda
@@ -980,6 +984,7 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", policy)
     plan_chunk = scans._decoupled_chunk
     monkeypatch.setattr(scans, "_decoupled_chunk", lambda *args: min(2, plan_chunk(*args)))
+    monkeypatch.setattr(scans, "_saved_backward_chunk", lambda *_: 2)
     run = scans.vertical_forward
     if compiled:
         run = torch.compile(run, fullgraph=True)

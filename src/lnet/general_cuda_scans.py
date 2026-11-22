@@ -12,7 +12,7 @@ from __future__ import annotations
 # ruff: noqa: FBT001, FBT002
 import ctypes as ct
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache, lru_cache
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
@@ -43,6 +43,7 @@ _WARP_SIZE = 32
 _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
 _MAX_CACHED_HIDDEN = 16
+_PROJECTION_SHARED_ACC_MIN_SMEM = 128 * 1024
 
 # Preserve the temporary storage budgets on devices with up to 24 GiB.
 _MAX_PARTIAL_BYTES = 64 * 1024**2
@@ -214,6 +215,7 @@ struct PathWeights;
 
 template<class T, class I>
 struct PathWeights<T, I, false> {
+    static constexpr bool vector_weights = false;
     const void* __restrict__ wi;
     const void* __restrict__ bi;
     const void* __restrict__ wo;
@@ -238,6 +240,7 @@ struct PathWeights<T, I, false> {
 
 template<class T, class I>
 struct PathWeights<T, I, true> {
+    static constexpr bool vector_weights = false;
     const Pair<T>* inputs;
     const T* cache;
     int size;
@@ -497,29 +500,46 @@ __device__ float4 normalize(float4 v, float2 gain) {
     return normalize_packed<T>(v, gain).unpack();
 }
 
-template<class T, class I, int HIDDEN, bool PRECISE, bool BACKWARD, bool CACHED>
+template<class T, class I, int HIDDEN, bool PRECISE, bool BACKWARD, int SHARED_HIDDEN = 0,
+         class Weights>
 __device__ __forceinline__ float2 path_mlp(
-    float4 pos, float4 neg, PathWeights<T, I, CACHED> path, float2 bias,
-    float2 dy, float* partial, I partial_stride, float* dp
+    float4 pos, float4 neg, Weights path, float2 bias,
+    float2 dy, float* partial, I partial_stride, float* dp,
+    float* shared_dwi = nullptr, int shared_stride = 0
 ) {
     const int size = HIDDEN ? HIDDEN : path.size;
     const float p[8] = {pos.x, pos.z, neg.x, neg.z, pos.y, pos.w, neg.y, neg.w};
     Sum<PRECISE> out_r, out_i;
     if constexpr (BACKWARD) {
-        partial[11 * I(size) * partial_stride] += dy.x;
-        partial[(11 * I(size) + 1) * partial_stride] += dy.y;
+        partial[(11 * I(size) - 8 * SHARED_HIDDEN) * partial_stride] += dy.x;
+        partial[(11 * I(size) + 1 - 8 * SHARED_HIDDEN) * partial_stride] += dy.y;
     }
     #pragma unroll
     for (int j = 0; j < size; ++j) {
         float pre = 0;
         float weights[8];
-        #pragma unroll
-        for (int k = 0; k < 8; k += 2) {
-            const auto pair = path.input_pair(4 * I(j) + k / 2);
-            weights[k] = pair.r;
-            weights[k + 1] = pair.i;
-            pre = __fmaf_rn(pair.r, p[k], pre);
-            pre = __fmaf_rn(pair.i, p[k + 1], pre);
+        if constexpr (Weights::vector_weights) {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 4) {
+                const auto v = path.input_group(2 * j + k / 4);
+                weights[k] = v.x;
+                weights[k + 1] = v.y;
+                weights[k + 2] = v.z;
+                weights[k + 3] = v.w;
+                pre = __fmaf_rn(v.x, p[k], pre);
+                pre = __fmaf_rn(v.y, p[k + 1], pre);
+                pre = __fmaf_rn(v.z, p[k + 2], pre);
+                pre = __fmaf_rn(v.w, p[k + 3], pre);
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                const auto pair = path.input_pair(4 * I(j) + k / 2);
+                weights[k] = pair.r;
+                weights[k + 1] = pair.i;
+                pre = __fmaf_rn(pair.r, p[k], pre);
+                pre = __fmaf_rn(pair.i, p[k + 1], pre);
+            }
         }
         pre = rounded<T>(rounded<T>(pre) + path.bias(j));
         const float sig = __fdividef(1.0f, 1.0f + __expf(-pre));
@@ -528,13 +548,14 @@ __device__ __forceinline__ float2 path_mlp(
         if constexpr (BACKWARD) {
             const float dz = rounded<T>(rounded<T>(dy.x * wr + dy.y * wj) *
                                          (sig * (1.0f + pre * (1.0f - sig))));
-            partial[(8 * I(size) + j) * partial_stride] += dz;
-            partial[(9 * I(size) + j) * partial_stride] += dy.x * act;
-            partial[(10 * I(size) + j) * partial_stride] += dy.y * act;
+            partial[(8 * I(size) + j - 8 * SHARED_HIDDEN) * partial_stride] += dz;
+            partial[(9 * I(size) + j - 8 * SHARED_HIDDEN) * partial_stride] += dy.x * act;
+            partial[(10 * I(size) + j - 8 * SHARED_HIDDEN) * partial_stride] += dy.y * act;
             #pragma unroll
             for (int k = 0; k < 8; ++k) {
                 dp[k] += dz * weights[k];
-                partial[(8 * I(j) + k) * partial_stride] += dz * p[k];
+                if (j < SHARED_HIDDEN) shared_dwi[(8 * j + k) * shared_stride] += dz * p[k];
+                else partial[(8 * (I(j) - SHARED_HIDDEN) + k) * partial_stride] += dz * p[k];
             }
         } else {
             out_r.add(wr * act);
@@ -927,17 +948,61 @@ __device__ __forceinline__ void vertical(
         }
     }
 }
-template<class T, int WARPS, int HIDDEN, bool CACHED, bool BACKWARD, bool PRECISE,
-         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED>
-__device__ __forceinline__ void project_path(
-    const T* features, const void* wi, const void* bi, const void* wo, const void* bo,
-    const T* gr, const T* gi, T* real, T* imag, T* dp, float* partials,
-    long long cells, int M, int hidden, int types
+struct ProjectWeights {
+    static constexpr bool vector_weights = true;
+    const float* cache;
+    int size, lane;
+
+    __device__ float4 input_group(int group) const {
+        return reinterpret_cast<const float4*>(cache)[group * 32 + lane];
+    }
+    __device__ float bias(int field) const { return cache[(8 * size + field) * 32 + lane]; }
+    __device__ float output(int field) const { return cache[(9 * size + field) * 32 + lane]; }
+    __device__ float final_bias(int field) const { return cache[(11 * size + field) * 32 + lane]; }
+};
+
+template<class T, int HIDDEN, int THREADS, bool BACKWARD>
+__device__ void load_project_weights(
+    float* __restrict__ weights, const void* __restrict__ wi, const void* __restrict__ bi,
+    const void* __restrict__ wo, const void* __restrict__ bo, int types, int mode0, int M,
+    int hidden
 ) {
-    using I = long long;
+    const int size = HIDDEN ? HIDDEN : hidden;
+    const int modes = min(32, M - mode0);
+    #pragma unroll
+    for (int matrix = 0; matrix < (BACKWARD ? 3 : 4); ++matrix) {
+        const int width = matrix == 0 ? 8 * size : matrix == 3 ? 2 : matrix * size;
+        const int field0 = matrix == 0 ? 0 : (7 + matrix + (matrix == 3)) * size;
+        const void* src = matrix == 0 ? wi : matrix == 1 ? bi : matrix == 2 ? wo : bo;
+        const int dtype = (types >> (2 * matrix)) & 3;
+        for (int idx = threadIdx.x; idx < modes * width; idx += THREADS) {
+            const int mode = idx / width, field = idx % width;
+            // Group four weights per lane so a warp can load them as float4.
+            const int slot = matrix == 0
+                ? (field / 4 * 32 + mode) * 4 + field % 4 : (field0 + field) * 32 + mode;
+            weights[slot] =
+                rounded<T>(load_scalar(src, static_cast<long long>(mode0) * width + idx, dtype));
+        }
+    }
+}
+
+template<class T, class I, int WARPS, int HIDDEN, bool CACHED, bool BACKWARD, bool PRECISE,
+         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool SHARED_ACC>
+__device__ __forceinline__ void project_path(
+    const T* __restrict__ features, const void* __restrict__ wi, const void* __restrict__ bi,
+    const void* __restrict__ wo, const void* __restrict__ bo,
+    const T* __restrict__ gr, const T* __restrict__ gi,
+    T* __restrict__ real, T* __restrict__ imag, T* __restrict__ dp,
+    float* __restrict__ partials, long long cells, long long feature_plane, int M, int hidden,
+    int types
+) {
     constexpr int threads = WARPS * 32;
     extern __shared__ float4 shared[];
-    auto* weights = reinterpret_cast<T*>(shared);
+    auto* accum = reinterpret_cast<float*>(shared);
+    constexpr int SHARED_HIDDEN = SHARED_ACC ? HIDDEN / 2 : 0;
+    constexpr int shared_fields = 8 * SHARED_HIDDEN;
+    constexpr int register_fields = BACKWARD && HIDDEN ? 11 * HIDDEN + 2 - shared_fields : 1;
+    auto* weights = accum + shared_fields * threads;
     const int size = HIDDEN ? HIDDEN : hidden;
     const int tiles = (M - 1) / 32 + 1;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -946,13 +1011,21 @@ __device__ __forceinline__ void project_path(
     const int worker = group * WARPS + warp;
     const int fields = 11 * size + 2;
     if constexpr (CACHED) {
-        load_path_weights(weights, wi, bi, wo, types, mode0, M, size, threads);
-        __syncthreads();
+        load_project_weights<T, HIDDEN, threads, BACKWARD>(
+            weights, wi, bi, wo, bo, types, mode0, M, size);
     }
-    const I plane = cells * M;
-    float local_acc[BACKWARD && HIDDEN ? 11 * HIDDEN + 2 : 1]{};
+    if constexpr (SHARED_HIDDEN) {
+        #pragma unroll
+        for (int j = 0; j < shared_fields; ++j) accum[j * threads + threadIdx.x] = 0;
+    }
+    if constexpr (CACHED) __syncthreads();
+    const I plane = I(cells) * M, source_plane = I(feature_plane);
+    float local_acc[register_fields]{};
     if (m < M) {
-        const auto path = path_weights<T, I, CACHED>(weights, wi, bi, wo, types, m, size, lane);
+        const auto path = [&] {
+            if constexpr (CACHED) return ProjectWeights{weights, size, lane};
+            else return PathWeights<T, I, false>{wi, bi, wo, types, m, size};
+        }();
         float* acc = local_acc;
         if constexpr (BACKWARD && !HIDDEN) {
             acc = partials + I(worker) * fields * M + m;
@@ -960,23 +1033,26 @@ __device__ __forceinline__ void project_path(
         }
         float2 bias{};
         if constexpr (!BACKWARD) {
-            bias = make_float2(rounded<T>(load_scalar(bo, 2 * I(m), types >> 6)),
-                               rounded<T>(load_scalar(bo, 2 * I(m) + 1, types >> 6)));
+            if constexpr (CACHED) bias = make_float2(path.final_bias(0), path.final_bias(1));
+            else bias = make_float2(rounded<T>(load_scalar(bo, 2 * I(m), types >> 6)),
+                                    rounded<T>(load_scalar(bo, 2 * I(m) + 1, types >> 6)));
         }
-        for (I cell = worker; cell < cells; cell += groups * WARPS) {
+        #pragma unroll 1
+        for (I cell = worker; cell < I(cells); cell += groups * WARPS) {
             const I offset = cell * M + m;
             const I ri = cell * M * (1 + REAL_INTERLEAVED) + m;
             const I ii = cell * M * (1 + IMAG_INTERLEAVED) + m;
             float p[8];
             #pragma unroll
-            for (int k = 0; k < 8; ++k) p[k] = read(features[I(k) * plane + offset]);
+            for (int k = 0; k < 8; ++k) p[k] = read(features[I(k) * source_plane + offset]);
             const auto pos = make_float4(p[0], p[4], p[1], p[5]);
             const auto neg = make_float4(p[2], p[6], p[3], p[7]);
             float adj[8]{};
             float2 dy{};
             if constexpr (BACKWARD) dy = make_float2(read(gr[ri]), read(gi[ii]));
-            const auto out = path_mlp<T, I, HIDDEN, PRECISE, BACKWARD>(
-                pos, neg, path, bias, dy, acc, HIDDEN ? 1 : M, adj);
+            const auto out = path_mlp<T, I, HIDDEN, PRECISE, BACKWARD, SHARED_HIDDEN>(
+                pos, neg, path, bias, dy, acc, I(HIDDEN ? 1 : M), adj,
+                accum + threadIdx.x, threads);
             if constexpr (BACKWARD) {
                 #pragma unroll
                 for (int k = 0; k < 8; ++k) dp[I(k) * plane + offset] = write<T>(adj[k]);
@@ -989,10 +1065,9 @@ __device__ __forceinline__ void project_path(
     if constexpr (BACKWARD && HIDDEN) {
         // Reuse the weight storage once all warps are done reading it.
         __syncthreads();
-        auto* accum = reinterpret_cast<float*>(shared);
         #pragma unroll
-        for (int j = 0; j < 11 * HIDDEN + 2; ++j) {
-            accum[j * threads + threadIdx.x] = local_acc[j];
+        for (int j = 0; j < register_fields; ++j) {
+            accum[(shared_fields + j) * threads + threadIdx.x] = local_acc[j];
         }
         __syncthreads();
         if (warp == 0 && m < M) {
@@ -1086,17 +1161,22 @@ extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
     if key.projection:
         flags = ", ".join(str(flag).lower() for flag in (
             key.cache_weights, key.backward, key.precise,
-            key.real_interleaved, key.imag_interleaved,
+            key.real_interleaved, key.imag_interleaved, key.shared_acc,
         ))
         hidden = _REGISTER_HIDDEN if key.hidden8 else 0
+        index = "unsigned int" if key.index32 else "long long"
         return _CUDA_SOURCE + f"""
 extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key)}(
-    const {io}* features, const void* wi, const void* bi, const void* wo, const void* bo,
-    const {io}* gr, const {io}* gi, {io}* real, {io}* imag, {io}* dp, float* partials,
-    long long cells, int M, int hidden, int types
+    const {io}* __restrict__ features, const void* __restrict__ wi, const void* __restrict__ bi,
+    const void* __restrict__ wo, const void* __restrict__ bo,
+    const {io}* __restrict__ gr, const {io}* __restrict__ gi,
+    {io}* __restrict__ real, {io}* __restrict__ imag, {io}* __restrict__ dp,
+    float* __restrict__ partials, long long cells, long long feature_plane, int M, int hidden,
+    int types
 ) {{
-    project_path<{io}, {key.warps}, {hidden}, {flags}>(
-        features, wi, bi, wo, bo, gr, gi, real, imag, dp, partials, cells, M, hidden, types);
+    project_path<{io}, {index}, {key.warps}, {hidden}, {flags}>(
+        features, wi, bi, wo, bo, gr, gi, real, imag, dp, partials,
+        cells, feature_plane, M, hidden, types);
 }}
 """
     index = "int" if key.index32 else "long long"
@@ -1176,7 +1256,7 @@ def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
             None,
         ),
     )
-    fmad = not ((key.vertical or key.projection) and not key.backward)
+    fmad = (not key.vertical or key.backward) and not (key.projection and key.precise)
     flags = [
         f"--gpu-architecture=compute_{capability[0]}{capability[1]}".encode(),
         b"--std=c++17",
@@ -1948,7 +2028,10 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     ):
         raise ValueError("Invalid saved vertical features")
     if not pure:
-        chunk = b if saved_features is not None else _decoupled_chunk(states, coarse)
+        chunk = (
+            _saved_backward_chunk(states, coarse)
+            if saved_features is not None else _decoupled_chunk(states, coarse)
+        )
         if chunk:
             with torch.autocast(device_type="cuda", enabled=False):
                 return _decoupled_vscan(
@@ -2037,6 +2120,10 @@ def _decoupled_chunk(states: Tensor, coarse: bool) -> int:
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
     if not states.is_cuda or policy not in {"chunk", "saved", "test_saved"}:
         return 0
+    return _workspace_vscan_chunk(states, coarse)
+
+
+def _workspace_vscan_chunk(states: Tensor, coarse: bool) -> int:
     _, batch, height, width, modes = states.shape
     step = 2 if coarse else 1
     per_sample = 16 * (height // step) * (width // step) * modes * states.element_size()
@@ -2046,6 +2133,14 @@ def _decoupled_chunk(states: Tensor, coarse: bool) -> int:
     # scan scratch overlaps only one plane.
     live_planes = min(budget - _MAX_PARTIAL_BYTES, 2 * (budget - 3 * _MAX_SCRATCH_BYTES))
     return min(batch, max(0, live_planes // per_sample))
+
+
+def _saved_backward_chunk(states: Tensor, coarse: bool) -> int:
+    _, batch, height, width, modes = states.shape
+    step = 2 if coarse else 1
+    dp_bytes = 8 * (height // step) * (width // step) * modes * states.element_size()
+    cache_budget = 2 * _l2_size(states.device.index or 0)
+    return min(batch, max(1, min(_workspace_vscan_chunk(states, coarse), cache_budget // dp_bytes)))
 
 
 @torch.compiler.assume_constant_result
@@ -2060,11 +2155,53 @@ def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
     vram = _total_vram(states.device)
     if policy == "saved" and vram < 48 * 1024**3:
         return False
-    # Reserve space for activations across the model and the full-size adjoint.
+    # Reserve space for activations and all of the model's saved feature planes.
     budget = vram // 12
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     return 8 * b * (h // step) * (w // step) * m * states.element_size() <= budget
+
+
+@lru_cache(maxsize=512)
+def _plan_projection(
+    device: int, base: Kernel, cells: int, modes: int, hidden: int,
+) -> tuple[Kernel, int, int]:
+    tiles = _ceil(modes, _WARP_SIZE)
+    sms, limit, _ = device_limits(device)
+    fields = 11 * hidden + 2
+    weights_bytes = (fields - 2 * base.backward) * _WARP_SIZE * 4
+    cached = weights_bytes <= min(24 * 1024, limit)
+    # A shared accumulator helps only when the extra resident warps outweigh its traffic.
+    can_share = (
+        base.backward and base.hidden8 and base.dtype != torch.float32
+        and limit >= _PROJECTION_SHARED_ACC_MIN_SMEM
+    )
+    best = None
+    for shared_acc in ((False, True) if can_share else (False,)):
+        for warps in ((2, 4, 8) if base.backward else (4, 8)):
+            threads = warps * _WARP_SIZE
+            shared_bytes = (hidden // 2) * 8 * threads * 4 if shared_acc else 0
+            smem = max(
+                (weights_bytes if cached else 0) + shared_bytes,
+                fields * threads * 4 if base.backward and base.hidden8 else 0,
+            )
+            if smem > limit:
+                continue
+            key = replace(base, warps=warps, cache_weights=cached, shared_acc=shared_acc)
+            resident = _resident(device, key, smem)
+            if not resident:
+                continue
+            groups = max(1, min(_ceil(cells, 16 * warps), _ceil(4 * sms * resident, tiles)))
+            if base.backward:
+                rows_per_group = 1 if base.hidden8 else warps
+                bytes_per_group = rows_per_group * fields * modes * 4
+                groups = min(groups, max(1, _MAX_PARTIAL_BYTES // bytes_per_group))
+            score = min(sms * resident, groups * tiles) * warps
+            if best is None or score > best[0]:
+                best = score, key, groups, smem
+    if best is None:
+        raise RuntimeError("No CUDA path projection launch fits this device")
+    return best[1:]
 
 
 def _project_path(
@@ -2073,30 +2210,22 @@ def _project_path(
 ) -> tuple[Tensor, list[Tensor]] | None:
     _, cells, modes = features.shape
     hidden = path[0].shape[1]
-    props = torch.cuda.get_device_properties(features.device)
-    warps = 2
+    feature_plane = features.stride(0)
+    base = Kernel(
+        features.dtype, 0, backward, projection=True,
+        precise=precise and not backward and features.dtype == torch.float32,
+        hidden8=hidden == _REGISTER_HIDDEN, index32=8 * feature_plane < 2**32,
+        real_interleaved=not real.is_contiguous(), imag_interleaved=not imag.is_contiguous(),
+    )
+    key, groups, smem = _plan_projection(features.device.index or 0, base, cells, modes, hidden)
     tiles = _ceil(modes, _WARP_SIZE)
-    groups = max(1, min(_ceil(cells, warps), _ceil(4 * props.multi_processor_count, tiles)))
-    weights_bytes = 11 * hidden * _WARP_SIZE * features.element_size()
-    cached = weights_bytes <= 24 * 1024
-    fast = hidden == _REGISTER_HIDDEN
-    if backward:
-        bytes_per_group = (1 if fast else warps) * (11 * hidden + 2) * modes * 4
-        groups = min(groups, max(1, _MAX_PARTIAL_BYTES // bytes_per_group))
-    adjoints = torch.empty_like(features) if backward else None
+    # Features can be a cell slice of the saved full-batch planes.
+    # The pure scan consumes densely packed output planes.
+    adjoints = features.new_empty(features.shape) if backward else None
     partial = None
     if backward:
-        rows = groups if fast else groups * warps
+        rows = groups if key.hidden8 else groups * key.warps
         partial = features.new_empty((rows, 11 * hidden + 2, modes), dtype=torch.float32)
-    smem = max(
-        weights_bytes if cached else 0,
-        (11 * hidden + 2) * warps * _WARP_SIZE * 4 if backward and fast else 0,
-    )
-    key = Kernel(
-        features.dtype, warps, backward, projection=True, precise=precise and not backward,
-        hidden8=fast, cache_weights=cached, real_interleaved=not real.is_contiguous(),
-        imag_interleaved=not imag.is_contiguous(),
-    )
     _launch_kernel(
         features, key, groups * tiles, smem,
         (
@@ -2105,6 +2234,7 @@ def _project_path(
                 None if backward else real, None if backward else imag, adjoints, partial,
             )),
             ct.c_longlong(cells),
+            ct.c_longlong(feature_plane),
             *map(ct.c_int, (modes, hidden, _scalar_types(path))),
         ),
     )
@@ -2153,9 +2283,11 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
     for begin in range(0, batch, chunk):
         part = slice(begin, begin + chunk)
         source = states[:, part]
-        features = saved_features
-        if features is None:
+        if saved_features is None:
             features = _vscan(pole, source, auxiliary, path, coarse, epsilon, precise, pure=True)
+        else:
+            area = oh * ow
+            features = saved_features[:, begin * area : min(begin + chunk, batch) * area]
         if not isinstance(features, Tensor):
             raise TypeError("Expected normalized scan features")
         if grad is None:
