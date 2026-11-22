@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import torch
-from metrics import projection_metrics
+from metrics import projection_metrics, vertical_scan_metrics
 
 from lnet import general_cuda_scans as scans
 
@@ -70,7 +70,7 @@ def probe(  # noqa: C901, PLR0915
         step()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
-        with projection_metrics() as projection:
+        with projection_metrics() as projection, vertical_scan_metrics() as scan:
             values = step()
         torch.cuda.synchronize()
         stats = {
@@ -78,6 +78,7 @@ def probe(  # noqa: C901, PLR0915
             "uses_saved_features": scans._should_save_vscan(states, coarse),  # noqa: SLF001
             "chunk": scans._decoupled_chunk(states, coarse),  # noqa: SLF001
             "path_mlp": projection(),
+            "vertical_scan_event_ms": scan(),
         }
         if stats["uses_saved_features"]:
             stats["dp_chunk"] = scans._saved_backward_chunk(states, coarse)  # noqa: SLF001

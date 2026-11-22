@@ -39,6 +39,15 @@ if [[ -z $run_python ]]; then
 fi
 bench=h200/liverms_v2_opt/bench_h200.py
 mkdir -p "$out/arms" "$out/infer"
+if [[ ${1:-} == --dp-sweep ]]; then
+    for policy in l2 workspace full; do
+        "$run_python" h200/wave13_vscan_probe/bench.py --case-index 0 --case-index 2 \
+            --dp-policy "$policy" --out "$out/dp_$policy.jsonl"
+        "$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \
+            < "$out/dp_$policy.jsonl" > "$out/dp_$policy.json"
+    done
+    exit 0
+fi
 if [[ ${1:-} != --confirm ]]; then
     "$run_python" h200/wave13_vscan_probe/bench.py --out "$out/isolated.jsonl" | tee "$out/isolated.log"
     "$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \

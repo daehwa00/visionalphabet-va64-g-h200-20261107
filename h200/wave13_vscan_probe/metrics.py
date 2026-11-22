@@ -10,6 +10,36 @@ from lnet import general_cuda_scans as scans
 
 
 @contextmanager
+def vertical_scan_metrics() -> Iterator[Callable[[], dict]]:
+    launches = []
+    original = scans._dispatch  # noqa: SLF001
+
+    def tracked(source: torch.Tensor, launch: scans.Launch | None, args: tuple) -> None:
+        if launch is None or not launch.key.vertical:
+            original(source, launch, args)
+            return
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        original(source, launch, args)
+        end.record()
+        label = "backward" if launch.key.backward else "forward"
+        launches.append((label, start, end))
+
+    def summarize() -> dict:
+        result = dict.fromkeys(("forward", "backward"), 0.0)
+        for label, start, end in launches:
+            result[label] += start.elapsed_time(end)
+        return result
+
+    scans._dispatch = tracked  # noqa: SLF001
+    try:
+        yield summarize
+    finally:
+        scans._dispatch = original  # noqa: SLF001
+
+
+@contextmanager
 def projection_metrics() -> Iterator[Callable[[], dict]]:
     launches = []
     original = scans._launch_kernel  # noqa: SLF001
