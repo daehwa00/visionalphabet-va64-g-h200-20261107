@@ -11,7 +11,7 @@ if [[ ${1:-} != --within-budget ]]; then
     export PERSIST_ROOT
     PERSIST_ROOT=$(mktemp -d /app/output/va-h200-liverms-v2.XXXXXX) || true
     trap 'python3 h200/liverms_v2_opt/export_result.py "$?"' EXIT
-    timeout --kill-after=5s "${budget}m" bash "$suite/run_h200_verify.sh" --within-budget
+    timeout --kill-after=5s "${budget}m" bash "$suite/run_h200_verify.sh" --within-budget "$@"
     exit
 fi
 
@@ -88,31 +88,33 @@ run_pytest() {
         --exit-code "$rc" --elapsed "$((SECONDS - started))"
 }
 
-run_bench probe "$RUN_ROOT/probe.json"
-run_pytest pytest_targeted 5m -v tests/test_live_complex_rms.py tests/test_p1_nr4.py \
-    tests/test_calibrated_bn_wrapper.py tests/test_eight_ablation_model.py
-run_pytest pytest_full 10m -q
-run_bench dynamo "$RUN_ROOT/dynamo.json"
-
 variants=(17-p1-nr4-1024d-v3 17-live-complex-rms-s03 17-e2-multiscale-s3s4-live-rms-v2)
 names=(p1_nr4 liverms multiscale)
-for i in "${!variants[@]}"; do
-    LNET_NR4_FUSED=0 LNET_GENERAL_SCANS=0 LNET_FUSED_FACTORIZED_READER=0 run_bench train-arm \
-        "$RUN_ROOT/arms/va17_${names[i]}_opt_off_b1024.json" --variant "${variants[i]}" --batch 1024
-done
-LNET_NR4_FUSED=0 run_bench train-arm \
-    "$RUN_ROOT/arms/va17_p1_nr4_nr4_off_b1024.json" \
-    --variant 17-p1-nr4-1024d-v3 --batch 1024
-for i in "${!variants[@]}"; do
-    run_bench train-arm "$RUN_ROOT/arms/va17_${names[i]}_opt_on_b1024.json" \
-        --variant "${variants[i]}" --batch 1024 --profile
-done
-for batch in 128 256 512; do
+run_bench probe "$RUN_ROOT/probe.json"
+if [[ ${2:-} != --infer-only ]]; then
+    run_pytest pytest_targeted 5m -v tests/test_live_complex_rms.py tests/test_p1_nr4.py \
+        tests/test_calibrated_bn_wrapper.py tests/test_eight_ablation_model.py
+    run_pytest pytest_full 10m -q
+    run_bench dynamo "$RUN_ROOT/dynamo.json"
+
     for i in "${!variants[@]}"; do
-        run_bench train-arm "$RUN_ROOT/arms/va17_${names[i]}_opt_on_b$batch.json" \
-            --variant "${variants[i]}" --batch "$batch"
+        LNET_NR4_FUSED=0 LNET_GENERAL_SCANS=0 LNET_FUSED_FACTORIZED_READER=0 run_bench train-arm \
+            "$RUN_ROOT/arms/va17_${names[i]}_opt_off_b1024.json" --variant "${variants[i]}" --batch 1024
     done
-done
+    LNET_NR4_FUSED=0 run_bench train-arm \
+        "$RUN_ROOT/arms/va17_p1_nr4_nr4_off_b1024.json" \
+        --variant 17-p1-nr4-1024d-v3 --batch 1024
+    for i in "${!variants[@]}"; do
+        run_bench train-arm "$RUN_ROOT/arms/va17_${names[i]}_opt_on_b1024.json" \
+            --variant "${variants[i]}" --batch 1024 --profile
+    done
+    for batch in 128 256 512; do
+        for i in "${!variants[@]}"; do
+            run_bench train-arm "$RUN_ROOT/arms/va17_${names[i]}_opt_on_b$batch.json" \
+                --variant "${variants[i]}" --batch "$batch"
+        done
+    done
+fi
 for batch in 128 1024; do
     for i in "${!variants[@]}"; do
         run_bench infer-fold "$RUN_ROOT/infer/va17_${names[i]}_b$batch.json" \
