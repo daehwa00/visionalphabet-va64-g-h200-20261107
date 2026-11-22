@@ -35,7 +35,7 @@ from .product_scan_reference import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
 
 # Constants and types
 
@@ -113,6 +113,8 @@ class Kernel:
     cache_line: bool = False
     shared_acc: bool = False
     precise: bool = False
+    projection: bool = False
+    projection_reduction: bool = False
     reduction: bool = False
     compact: bool = False
     real_interleaved: bool = False
@@ -253,6 +255,34 @@ __device__ auto path_weights(const T* cache, const void* wi, const void* bi,
                                        cache + lane, size};
     } else {
         return PathWeights<T, I, false>{wi, bi, wo, types, m, size};
+    }
+}
+
+template<class T, class I = long long>
+__device__ void load_path_weights(T* weights_shared, const void* wi, const void* bi,
+                                  const void* wo, int types, int mode0, int M,
+                                  int size, int threads) {
+    // Load each mode-major matrix in contiguous order, then transpose it
+    // into field-major shared storage for the scan.
+    const I tile_modes = min(32, M - mode0);
+    auto* packed_inputs = reinterpret_cast<Pair<T>*>(weights_shared);
+    for (I idx = threadIdx.x; idx < tile_modes * 4 * size; idx += threads) {
+        const I mode = idx / (4 * I(size)), pair = idx % (4 * I(size));
+        const I offset = 2 * (I(mode0) * 4 * size + idx);
+        packed_inputs[pair * 32 + mode] = Pair<T>::pack(
+            {load_scalar(wi, offset, types & 3), load_scalar(wi, offset + 1, types & 3)});
+    }
+    #pragma unroll
+    for (int matrix = 1; matrix < 3; ++matrix) {
+        const int width = matrix * size;
+        const I field0 = (7 + matrix) * I(size);
+        const void* src = matrix == 1 ? bi : wo;
+        const int dtype = (types >> (2 * matrix)) & 3;
+        for (I idx = threadIdx.x; idx < tile_modes * width; idx += threads) {
+            const I mode = idx / width, field = idx % width;
+            weights_shared[(field0 + field) * 32 + mode] =
+                write<T>(load_scalar(src, I(mode0) * width + idx, dtype));
+        }
     }
 }
 
@@ -429,7 +459,7 @@ template<class T, class I>
 struct Column {
     const T* states;
     const float* vy;
-    I offset_a, offset_b, plane, source_plane, output;
+    I offset_a, offset_b, plane, source_plane, output, feature_plane;
     int H, W, M, OW, m;
     float vx_a, vx_b, eps;
 
@@ -646,10 +676,8 @@ __device__ __forceinline__ void column_backward(
             const auto gp = c.gain(y, false), gn = c.gain(y - int(COARSE), true);
             float dp[8]{};
             if constexpr (PURE) {
-                const auto real = reinterpret_cast<const Quad<T>*>(gr)[2 * cell].unpack();
-                const auto imag = reinterpret_cast<const Quad<T>*>(gr)[2 * cell + 1].unpack();
-                dp[0] = real.x; dp[1] = real.y; dp[2] = real.z; dp[3] = real.w;
-                dp[4] = imag.x; dp[5] = imag.y; dp[6] = imag.z; dp[7] = imag.w;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) dp[k] = read(gr[I(k) * c.feature_plane + cell]);
             } else path_mlp<T, I, HIDDEN, false, true>(
                 normalize<T>(seg[j * THREADS], gp), normalize<T>(neg, gn),
                 path, {},
@@ -771,28 +799,7 @@ __device__ __forceinline__ void vertical(
     auto* weights_shared = reinterpret_cast<T*>(shared);
     const I weight_fields = 11 * I(size);
     if constexpr (CACHE_WEIGHT) {
-        // Load each mode-major matrix in contiguous order, then transpose it
-        // into field-major shared storage for the scan.
-        const I tile_modes = min(32, M - mode0);
-        auto* packed_inputs = reinterpret_cast<Pair<T>*>(weights_shared);
-        for (I idx = threadIdx.x; idx < tile_modes * 4 * size; idx += threads) {
-            const I mode = idx / (4 * I(size)), pair = idx % (4 * I(size));
-            const I offset = 2 * (I(mode0) * 4 * size + idx);
-            packed_inputs[pair * 32 + mode] = Pair<T>::pack(
-                {load_scalar(wi, offset, types & 3), load_scalar(wi, offset + 1, types & 3)});
-        }
-        #pragma unroll
-        for (int matrix = 1; matrix < 3; ++matrix) {
-            const int width = matrix * size;
-            const I field0 = (7 + matrix) * I(size);
-            const void* src = matrix == 1 ? bi : wo;
-            const int dtype = (types >> (2 * matrix)) & 3;
-            for (I idx = threadIdx.x; idx < tile_modes * width; idx += threads) {
-                const I mode = idx / width, field = idx % width;
-                weights_shared[(field0 + field) * 32 + mode] =
-                    write<T>(load_scalar(src, I(mode0) * width + idx, dtype));
-            }
-        }
+        load_path_weights<T, I>(weights_shared, wi, bi, wo, types, mode0, M, size, threads);
         __syncthreads();
     }
     const auto path = path_weights<T, I, CACHE_WEIGHT>(
@@ -836,6 +843,7 @@ __device__ __forceinline__ void vertical(
             const I base = b * H * W * M + m;
             Column<T, I> c{states, vy, base + I(xa) * M, base + I(xb) * M,
                            target_plane, source_plane, (b * oh * ow + x) * M + m,
+                           I(B) * oh * ow * M,
                            H, W, M, ow, m,
                            vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps};
             auto* buf = CACHE_LINE ? line_buf + threadIdx.x : scratch + I(worker) * M + m;
@@ -866,9 +874,11 @@ __device__ __forceinline__ void vertical(
                     if constexpr (PURE) {
                         const auto pos = buf[I(yo) * stride].unpack();
                         const auto neg = normalize<T>(state, c.gain(y, true));
-                        auto* output = reinterpret_cast<Quad<T>*>(outr) + 2 * cell;
-                        output[0] = Quad<T>::pack(make_float4(pos.x, pos.z, neg.x, neg.z));
-                        output[1] = Quad<T>::pack(make_float4(pos.y, pos.w, neg.y, neg.w));
+                        const float p[8] = {pos.x, pos.z, neg.x, neg.z, pos.y, pos.w, neg.y, neg.w};
+                        #pragma unroll
+                        for (int k = 0; k < 8; ++k) {
+                            outr[I(k) * c.feature_plane + cell] = write<T>(p[k]);
+                        }
                     } else {
                         const float2 out = path_mlp<T, I, HIDDEN, PRECISE, false>(
                             buf[I(yo) * stride].unpack(), normalize<T>(state, c.gain(y, true)),
@@ -917,13 +927,93 @@ __device__ __forceinline__ void vertical(
         }
     }
 }
+template<class T, int WARPS, int HIDDEN, bool CACHED, bool BACKWARD, bool PRECISE,
+         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED>
+__device__ __forceinline__ void project_path(
+    const T* features, const void* wi, const void* bi, const void* wo, const void* bo,
+    const T* gr, const T* gi, T* real, T* imag, T* dp, float* partials,
+    long long cells, int M, int hidden, int types
+) {
+    using I = long long;
+    constexpr int threads = WARPS * 32;
+    extern __shared__ float4 shared[];
+    auto* weights = reinterpret_cast<T*>(shared);
+    const int size = HIDDEN ? HIDDEN : hidden;
+    const int tiles = (M - 1) / 32 + 1;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int mode0 = (blockIdx.x % tiles) * 32, m = mode0 + lane;
+    const int group = blockIdx.x / tiles, groups = gridDim.x / tiles;
+    const int worker = group * WARPS + warp;
+    const int fields = 11 * size + 2;
+    if constexpr (CACHED) {
+        load_path_weights(weights, wi, bi, wo, types, mode0, M, size, threads);
+        __syncthreads();
+    }
+    const I plane = cells * M;
+    float local_acc[BACKWARD && HIDDEN ? 11 * HIDDEN + 2 : 1]{};
+    if (m < M) {
+        const auto path = path_weights<T, I, CACHED>(weights, wi, bi, wo, types, m, size, lane);
+        float* acc = local_acc;
+        if constexpr (BACKWARD && !HIDDEN) {
+            acc = partials + I(worker) * fields * M + m;
+            for (int j = 0; j < fields; ++j) acc[I(j) * M] = 0;
+        }
+        float2 bias{};
+        if constexpr (!BACKWARD) {
+            bias = make_float2(rounded<T>(load_scalar(bo, 2 * I(m), types >> 6)),
+                               rounded<T>(load_scalar(bo, 2 * I(m) + 1, types >> 6)));
+        }
+        for (I cell = worker; cell < cells; cell += groups * WARPS) {
+            const I offset = cell * M + m;
+            const I ri = cell * M * (1 + REAL_INTERLEAVED) + m;
+            const I ii = cell * M * (1 + IMAG_INTERLEAVED) + m;
+            float p[8];
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) p[k] = read(features[I(k) * plane + offset]);
+            const auto pos = make_float4(p[0], p[4], p[1], p[5]);
+            const auto neg = make_float4(p[2], p[6], p[3], p[7]);
+            float adj[8]{};
+            float2 dy{};
+            if constexpr (BACKWARD) dy = make_float2(read(gr[ri]), read(gi[ii]));
+            const auto out = path_mlp<T, I, HIDDEN, PRECISE, BACKWARD>(
+                pos, neg, path, bias, dy, acc, HIDDEN ? 1 : M, adj);
+            if constexpr (BACKWARD) {
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) dp[I(k) * plane + offset] = write<T>(adj[k]);
+            } else {
+                real[ri] = write<T>(out.x);
+                imag[ii] = write<T>(out.y);
+            }
+        }
+    }
+    if constexpr (BACKWARD && HIDDEN) {
+        // Reuse the weight storage once all warps are done reading it.
+        __syncthreads();
+        auto* accum = reinterpret_cast<float*>(shared);
+        #pragma unroll
+        for (int j = 0; j < 11 * HIDDEN + 2; ++j) {
+            accum[j * threads + threadIdx.x] = local_acc[j];
+        }
+        __syncthreads();
+        if (warp == 0 && m < M) {
+            auto* row = partials + I(group) * fields * M + m;
+            for (int j = 0; j < fields; ++j) {
+                float sum = accum[j * threads + lane];
+                #pragma unroll
+                for (int w = 1; w < WARPS; ++w) sum += accum[j * threads + lane + 32 * w];
+                row[I(j) * M] = sum;
+            }
+        }
+    }
+}
+
 __device__ void store_scalar(void* p, long long offset, int dtype, float value) {
     if (dtype == FP32) static_cast<float*>(p)[offset] = value;
     else if (dtype == FP16) static_cast<__half*>(p)[offset] = write<__half>(value);
     else static_cast<__nv_bfloat16*>(p)[offset] = write<__nv_bfloat16>(value);
 }
 
-template<bool VERTICAL>
+template<bool VERTICAL, bool PROJECTION>
 __device__ void reduce_partials(const float* partial, void* dr, void* di, void* gr, void* gi,
                                 void* wi, void* bi, void* wo, void* bo,
                                 int rows, int M, int hidden, int types) {
@@ -935,7 +1025,7 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
     const int tiles = (M - 1) / lanes + 1;
     const int m = (blockIdx.x % tiles) * lanes + lane;
     const int field = blockIdx.x / tiles;
-    const long long stride = (VERTICAL ? 11LL * hidden + 6 : 4) * M;
+    const long long stride = (VERTICAL ? 11LL * hidden + (PROJECTION ? 2 : 6) : 4) * M;
     float sum = 0;
     if (m < M) {
         const long long offset = static_cast<long long>(field) * M + m;
@@ -947,12 +1037,12 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
     #pragma unroll
     for (int r = 1; r < groups; ++r) sum += sums[r][lane];
 
-    if (field == 0) store_scalar(dr, m, types & 3, sum);
-    else if (field == 1) store_scalar(di, m, (types >> 2) & 3, sum);
-    else if (field == 2) store_scalar(gr, m, (types >> 4) & 3, sum);
-    else if (field == 3) store_scalar(gi, m, (types >> 6) & 3, sum);
+    if (!PROJECTION && field == 0) store_scalar(dr, m, types & 3, sum);
+    else if (!PROJECTION && field == 1) store_scalar(di, m, (types >> 2) & 3, sum);
+    else if (!PROJECTION && field == 2) store_scalar(gr, m, (types >> 4) & 3, sum);
+    else if (!PROJECTION && field == 3) store_scalar(gi, m, (types >> 6) & 3, sum);
     else if constexpr (VERTICAL) {
-        int index = field - 4;
+        int index = PROJECTION ? field : field - 4;
         const long long mode = m;
         if (index < 8 * hidden) {
             store_scalar(wi, mode * 8 * hidden + index, (types >> 8) & 3, sum);
@@ -971,6 +1061,10 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 # NVRTC compilation and driver launch
 
 def _kernel_name(key: Kernel) -> str:
+    if key.projection:
+        return "path_mlp_backward" if key.backward else "path_mlp_forward"
+    if key.projection_reduction:
+        return "reduce_path_mlp_partials"
     if key.reduction:
         return "reduce_vscan_partials" if key.vertical else "reduce_hscan_partials"
     return "scan"
@@ -984,11 +1078,27 @@ extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
     const float* partial, void* dr, void* di, void* gr, void* gi,
     void* wi, void* bi, void* wo, void* bo, int rows, int M, int hidden, int types
 ) {{
-    reduce_partials<{str(key.vertical).lower()}>(
+    reduce_partials<{str(key.vertical).lower()}, {str(key.projection_reduction).lower()}>(
         partial, dr, di, gr, gi, wi, bi, wo, bo, rows, M, hidden, types);
 }}
 """
     io = _DTYPES[key.dtype]
+    if key.projection:
+        flags = ", ".join(str(flag).lower() for flag in (
+            key.cache_weights, key.backward, key.precise,
+            key.real_interleaved, key.imag_interleaved,
+        ))
+        hidden = _REGISTER_HIDDEN if key.hidden8 else 0
+        return _CUDA_SOURCE + f"""
+extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key)}(
+    const {io}* features, const void* wi, const void* bi, const void* wo, const void* bo,
+    const {io}* gr, const {io}* gi, {io}* real, {io}* imag, {io}* dp, float* partials,
+    long long cells, int M, int hidden, int types
+) {{
+    project_path<{io}, {key.warps}, {hidden}, {flags}>(
+        features, wi, bi, wo, bo, gr, gi, real, imag, dp, partials, cells, M, hidden, types);
+}}
+"""
     index = "int" if key.index32 else "long long"
     backward, coarse, cache_weights, global_ckpt, cache_line, shared_acc, precise = (
         str(flag).lower()
@@ -1066,10 +1176,11 @@ def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
             None,
         ),
     )
+    fmad = not ((key.vertical or key.projection) and not key.backward)
     flags = [
         f"--gpu-architecture=compute_{capability[0]}{capability[1]}".encode(),
         b"--std=c++17",
-        b"--fmad=false" if key.vertical and not key.backward else b"--fmad=true",
+        b"--fmad=true" if fmad else b"--fmad=false",
         *(f"--include-path={path}".encode() for path in _include_dirs()),
     ]
     options = (ct.c_char_p * len(flags))(*flags)
@@ -1649,12 +1760,18 @@ def _scalar_types(tensors: list[Tensor]) -> int:
 
 
 def _reduce_partials(
-    partial: Tensor, params: list[Tensor], hidden: int = 0
+    partial: Tensor, params: list[Tensor], hidden: int = 0, *, projection: bool = False,
 ) -> list[Tensor]:
     rows, fields, modes = partial.shape
     gradients = [p.new_empty(p.shape) for p in params]
     outputs = gradients if hidden else [*gradients, None, None, None, None]
-    key = Kernel(torch.float32, 4, True, vertical=bool(hidden), reduction=True)  # noqa: FBT003
+    if projection:
+        outputs = [None] * 4 + gradients
+    types = _scalar_types(params) << (8 if projection else 0)
+    key = Kernel(
+        torch.float32, 4, backward=True, vertical=bool(hidden), reduction=True,
+        projection_reduction=projection,
+    )
     _launch_kernel(
         partial,
         key,
@@ -1662,7 +1779,7 @@ def _reduce_partials(
         0,
         (
             *map(_ptr, (partial, *outputs)),
-            *map(ct.c_int, (rows, modes, hidden, _scalar_types(params))),
+            *map(ct.c_int, (rows, modes, hidden, types)),
         ),
     )
     return gradients
@@ -1784,7 +1901,7 @@ def _vertical_adjoints(
     return _contiguous_or_interleaved(grad[0]), _contiguous_or_interleaved(grad[1])
 
 
-def _vscan(  # noqa: C901, PLR0912
+def _vscan(  # noqa: C901, PLR0912, PLR0915
     pole: list[Tensor],
     states: Tensor,
     auxiliary: list[Tensor],
@@ -1798,6 +1915,7 @@ def _vscan(  # noqa: C901, PLR0912
     planar: bool = False,
     compact: bool = False,
     features: Tensor | None = None,
+    saved_features: Tensor | None = None,
     state_grad: Tensor | None = None,
     pure: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
@@ -1821,13 +1939,16 @@ def _vscan(  # noqa: C901, PLR0912
     if grad is not None:
         gr, gi = _vertical_adjoints(grad, states, out_shape)
         interleaved = (not gr.is_contiguous(), not gi.is_contiguous())
-    if not pure and (chunk := _decoupled_chunk(states, hidden, coarse)):
-        with torch.autocast(device_type="cuda", enabled=False):
-            return _decoupled_vscan(
-                pole, states, auxiliary, path, coarse, epsilon, precise,
-                (gr, gi) if grad is not None else None,
-                packed=packed, planar=planar, compact=compact, chunk=chunk,
-            )
+    if not pure:
+        chunk = b if saved_features is not None else _decoupled_chunk(states, coarse)
+        if chunk:
+            with torch.autocast(device_type="cuda", enabled=False):
+                return _decoupled_vscan(
+                    pole, states, auxiliary, path, coarse, epsilon, precise,
+                    (gr, gi) if grad is not None else None,
+                    packed=packed, planar=planar, compact=compact, chunk=chunk,
+                    saved_features=saved_features,
+                )
     launch = _plan_launch(
         states,
         shape,
@@ -1860,7 +1981,7 @@ def _vscan(  # noqa: C901, PLR0912
             )
     else:
         if pure:
-            output = outr = states.new_empty((*out_shape, 8))
+            output = outr = states.new_empty((8, b * oh * ow, m))
             outi = None
         elif packed and planar:
             output = states.new_empty((2, *out_shape))
@@ -1903,87 +2024,82 @@ def _vscan(  # noqa: C901, PLR0912
     return [*gradients[:4], gs, *gradients[4:]]
 
 
-def _use_triton_projection(states: Tensor, hidden: int, policy: str | None) -> bool:
-    return (
-        policy in {"triton", "force_triton"}
-        and states.dtype != torch.float32
-        and hidden <= 32
-        and states.shape[-1] <= 65535
-    )
-
-
-def _decoupled_chunk(states: Tensor, hidden: int, coarse: bool) -> int:
-    """Bound the recomputed scan and MLP workspace per batch chunk."""
+def _decoupled_chunk(states: Tensor, coarse: bool) -> int:
+    """Limit ephemeral features and adjoints to the hardware workspace budget."""
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
-    if policy not in {"1", "force", "triton", "force_triton"} or not states.is_cuda:
+    if not states.is_cuda or policy not in {"chunk", "saved", "test_saved"}:
         return 0
-    device = states.device.index or 0
-    if policy not in {"force", "force_triton"} and torch.cuda.get_device_capability(device)[0] < 9:
-        return 0
+    _, batch, height, width, modes = states.shape
+    step = 2 if coarse else 1
+    per_sample = 16 * (height // step) * (width // step) * modes * states.element_size()
+    vram = torch.cuda.get_device_properties(states.device).total_memory
+    return min(batch, min(2 * 1024**3, vram // 16) // per_sample)
+
+
+@torch.compiler.assume_constant_result
+def _total_vram(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).total_memory
+
+
+def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
+    policy = os.environ.get("LNET_VSCAN_DECOUPLED")
+    if not states.is_cuda or policy not in {"saved", "test_saved"}:
+        return False
+    vram = _total_vram(states.device)
+    if policy == "saved" and vram < 48 * 1024**3:
+        return False
+    # Reserve space for activations across the model and the full-size adjoint.
+    budget = vram // 12
     _, b, h, w, m = states.shape
-    cells = (h // 2) * (w // 2) * m if coarse else h * w * m
-    use_triton = _use_triton_projection(states, hidden, policy)
-    # A sample needs room for both features and feature adjoints.
-    feature_bytes = cells * 8 * states.element_size()
-    if policy == "triton" and use_triton and 2 * feature_bytes > _l2_size(device):
-        return 0
-    # Account for output features, adjoints, projection intermediates, and
-    # allocations that overlap at a chunk boundary.
-    intermediates = 4 if use_triton else 32
-    per_sample = cells * (32 * states.element_size() + intermediates * hidden + 16)
-    per_sample += 8 * h * w * m * states.element_size()
-    vram = torch.cuda.get_device_properties(device).total_memory
-    budget = min(2 * 1024**3, vram // 64) if use_triton else min(512 * 1024**2, vram // 32)
-    return min(b, budget // per_sample)
+    step = 2 if coarse else 1
+    return 8 * b * (h // step) * (w // step) * m * states.element_size() <= budget
 
 
-def _mlp_bmm_fp32(left: Tensor, right: Tensor) -> Tensor:
-    if left.dtype == torch.float32 or not left.is_cuda:
-        return torch.bmm(left.float(), right.float())
-    return torch.bmm(left, right, out_dtype=torch.float32)
-
-
-def _bmm_path_projection(
-    features: Tensor,
-    path: tuple[Tensor, Tensor, Tensor, Tensor],
-    real: Tensor,
-    imag: Tensor,
-    *,
-    backward: bool,
-) -> tuple[Tensor, tuple[Tensor, ...]] | None:
-    wi, bi, wo, bo = path
-    modes = wi.shape[0]
-    p = features.reshape(-1, modes, 8).transpose(0, 1).contiguous()
-    pre = torch.bmm(p, wi.transpose(1, 2)).add_(bi[:, None, :])
-    act = torch.nn.functional.silu(pre)
-    if not backward:
-        values = torch.bmm(act, wo.transpose(1, 2)).add_(bo[:, None, :])
-        pairs = values.transpose(0, 1).reshape(*real.shape, 2)
-        real.copy_(pairs[..., 0])
-        imag.copy_(pairs[..., 1])
-        return None
-
-    dy = torch.stack((real, imag), dim=-1).reshape(-1, modes, 2).transpose(0, 1).contiguous()
-    dz = torch.ops.aten.silu_backward(torch.bmm(dy, wo), pre)
-    dp = torch.bmm(dz, wi).transpose(0, 1).contiguous()
-    gradients = (
-        _mlp_bmm_fp32(dz.transpose(1, 2), p),
-        dz.sum(dim=1, dtype=torch.float32),
-        _mlp_bmm_fp32(dy.transpose(1, 2), act),
-        dy.sum(dim=1, dtype=torch.float32),
+def _project_path(
+    features: Tensor, path: list[Tensor], real: Tensor, imag: Tensor, *,
+    backward: bool, precise: bool,
+) -> tuple[Tensor, list[Tensor]] | None:
+    _, cells, modes = features.shape
+    hidden = path[0].shape[1]
+    props = torch.cuda.get_device_properties(features.device)
+    warps = 2
+    tiles = _ceil(modes, _WARP_SIZE)
+    groups = max(1, min(_ceil(cells, warps), _ceil(4 * props.multi_processor_count, tiles)))
+    weights_bytes = 11 * hidden * _WARP_SIZE * features.element_size()
+    cached = weights_bytes <= 24 * 1024
+    fast = hidden == _REGISTER_HIDDEN
+    adjoints = torch.empty_like(features) if backward else None
+    partial = None
+    if backward:
+        rows = groups if fast else groups * warps
+        partial = features.new_empty((rows, 11 * hidden + 2, modes), dtype=torch.float32)
+    smem = max(
+        weights_bytes if cached else 0,
+        (11 * hidden + 2) * warps * _WARP_SIZE * 4 if backward and fast else 0,
     )
-    return dp, gradients
+    key = Kernel(
+        features.dtype, warps, backward, projection=True, precise=precise and not backward,
+        hidden8=fast, cache_weights=cached, real_interleaved=not real.is_contiguous(),
+        imag_interleaved=not imag.is_contiguous(),
+    )
+    _launch_kernel(
+        features, key, groups * tiles, smem,
+        (
+            *map(_ptr, (
+                features, *path, real if backward else None, imag if backward else None,
+                None if backward else real, None if backward else imag, adjoints, partial,
+            )),
+            ct.c_longlong(cells),
+            *map(ct.c_int, (modes, hidden, _scalar_types(path))),
+        ),
+    )
+    if partial is not None and adjoints is not None:
+        float_path = [parameter.to(dtype=torch.float32) for parameter in path]
+        return adjoints, _reduce_partials(partial, float_path, hidden, projection=True)
+    return None
 
 
-def _select_path_projection(states: Tensor, hidden: int) -> Callable:
-    if _use_triton_projection(states, hidden, os.environ.get("LNET_VSCAN_DECOUPLED")):
-        from .vscan_path_mlp import path_projection  # noqa: PLC0415
-
-        return path_projection
-    return _bmm_path_projection
-
-
-def _decoupled_vscan(  # noqa: C901
+def _decoupled_vscan(  # noqa: C901, PLR0912
     pole: list[Tensor],
     states: Tensor,
     auxiliary: list[Tensor],
@@ -1997,12 +2113,11 @@ def _decoupled_vscan(  # noqa: C901
     planar: bool,
     compact: bool,
     chunk: int,
+    saved_features: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     _, batch, height, width, modes = states.shape
     oh, ow = (height // 2, width // 2) if coarse else (height, width)
-    wi, bi, wo, bo = (parameter.to(states.dtype).contiguous() for parameter in path)
-    weights = wi, bi, wo, bo
-    project = _select_path_projection(states, wi.shape[1])
+    weights = [parameter.contiguous() for parameter in path]
     if grad is None:
         shape = (batch, oh, ow, modes)
         if packed and planar:
@@ -2023,14 +2138,20 @@ def _decoupled_vscan(  # noqa: C901
     for begin in range(0, batch, chunk):
         part = slice(begin, begin + chunk)
         source = states[:, part]
-        features = _vscan(pole, source, auxiliary, path, coarse, epsilon, precise, pure=True)
+        features = saved_features
+        if features is None:
+            features = _vscan(pole, source, auxiliary, path, coarse, epsilon, precise, pure=True)
         if not isinstance(features, Tensor):
             raise TypeError("Expected normalized scan features")
         if grad is None:
-            project(features, weights, real[part], imag[part], backward=False)
+            _project_path(
+                features, weights, real[part], imag[part], backward=False, precise=precise,
+            )
             continue
 
-        projected = project(features, weights, grad[0][part], grad[1][part], backward=True)
+        projected = _project_path(
+            features, weights, grad[0][part], grad[1][part], backward=True, precise=False,
+        )
         if projected is None:
             raise TypeError("Expected path projection gradients")
         dp, path_grads = projected
@@ -2142,7 +2263,7 @@ def _fake_hbackward(
 
 
 @torch.library.custom_op("lnet::general_vscan_forward", mutates_args=())
-def vertical_forward(
+def _vertical_forward(
     pole: list[Tensor],
     states: Tensor,
     auxiliary: list[Tensor],
@@ -2162,7 +2283,7 @@ def vertical_forward(
     return out
 
 
-@vertical_forward.register_fake
+@_vertical_forward.register_fake
 def _fake_vforward(
     pole: list[Tensor],  # noqa: ARG001
     states: Tensor,
@@ -2223,10 +2344,11 @@ def vertical_backward(
     coarse: bool = False,
     epsilon: float = 1e-6,
     compact: bool = False,
+    saved_features: Tensor | None = None,
 ) -> list[Tensor]:
     out = _vscan(
         pole, states, auxiliary, path, coarse, epsilon, False, (grad_real, grad_imag),  # noqa: FBT003
-        compact=compact,
+        compact=compact, saved_features=saved_features,
     )
     if not isinstance(out, list):
         raise TypeError("Expected vertical gradients")
@@ -2244,6 +2366,7 @@ def _fake_vbackward(
     coarse: bool = False,  # noqa: ARG001
     epsilon: float = 1e-6,  # noqa: ARG001
     compact: bool = False,
+    saved_features: Tensor | None = None,  # noqa: ARG001
 ) -> list[Tensor]:
     _, b, h, w, m = states.shape
     return [
@@ -2253,6 +2376,55 @@ def _fake_vbackward(
     ]
 
 
+@torch.library.custom_op("lnet::general_vscan_forward_saved", mutates_args=())
+def _vertical_forward_saved(
+    pole: list[Tensor],
+    states: Tensor,
+    auxiliary: list[Tensor],
+    path: list[Tensor],
+    coarse: bool,
+    epsilon: float,
+    planar: bool,
+    precise: bool,
+) -> tuple[Tensor, Tensor]:
+    _, b, h, w, m = states.shape
+    step = 2 if coarse else 1
+    shape = (b, h // step, w // step, m)
+    with torch.autocast(device_type="cuda", enabled=False):
+        features = _vscan(
+            pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise, pure=True,
+        )
+        if not isinstance(features, Tensor):
+            raise TypeError("Expected normalized scan features")
+        output = states.new_empty((2, *shape) if planar else (*shape[:-1], 2 * m))
+        real, imag = output.unbind(0) if planar else output.split(m, dim=-1)
+        _project_path(
+            features, [param.contiguous() for param in path], real, imag,
+            backward=False, precise=precise,
+        )
+    return output, features
+
+
+@_vertical_forward_saved.register_fake
+def _fake_vertical_forward_saved(
+    pole: list[Tensor],  # noqa: ARG001
+    states: Tensor,
+    auxiliary: list[Tensor],  # noqa: ARG001
+    path: list[Tensor],  # noqa: ARG001
+    coarse: bool,
+    epsilon: float,  # noqa: ARG001
+    planar: bool,
+    precise: bool,  # noqa: ARG001
+) -> tuple[Tensor, Tensor]:
+    _, b, h, w, m = states.shape
+    step = 2 if coarse else 1
+    shape = (b, h // step, w // step, m)
+    return (
+        states.new_empty((2, *shape) if planar else (*shape[:-1], 2 * m)),
+        states.new_empty((8, b * (h // step) * (w // step), m)),
+    )
+
+
 class _AutogradContext(Protocol):
     saved_tensors: tuple[Tensor, ...]
     needs_input_grad: tuple[object, ...]
@@ -2260,6 +2432,8 @@ class _AutogradContext(Protocol):
     epsilon: float
 
     def save_for_backward(self, *tensors: Tensor) -> None: ...
+
+    def mark_non_differentiable(self, *tensors: Tensor) -> None: ...
 
 
 def _save_horizontal(ctx: _AutogradContext, inputs: tuple, output: Tensor) -> None:
@@ -2302,8 +2476,51 @@ def _differentiate_vertical(ctx: _AutogradContext, grad_real: Tensor, grad_imag:
     return result[: len(ctx.needs_input_grad)]
 
 
+def _save_vertical_features(
+    ctx: _AutogradContext, inputs: tuple, output: tuple[Tensor, Tensor],
+) -> None:
+    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _planar, _precise = inputs
+    ctx.mark_non_differentiable(output[1])
+    ctx.save_for_backward(*pole, states, *auxiliary, *path, output[1])
+
+
+def _differentiate_vertical_features(
+    ctx: _AutogradContext, grad: Tensor, _grad_features: Tensor,
+) -> tuple:
+    dr, di, gr, gi, states, vx, vy, *path, features = ctx.saved_tensors
+    real, imag = grad.unbind(0) if grad.ndim == 5 else grad.chunk(2, dim=-1)
+    gradients = vertical_backward(
+        [dr, di, gr, gi], states, [vx, vy], path, real, imag, ctx.coarse, ctx.epsilon,
+        saved_features=features,
+    )
+    return gradients[:4], gradients[4], [None, None], gradients[5:], None, None, None, None
+
+
+_vertical_forward_saved.register_autograd(
+    _differentiate_vertical_features, setup_context=_save_vertical_features,
+)
+
+
+def vertical_forward(
+    pole: list[Tensor],
+    states: Tensor,
+    auxiliary: list[Tensor],
+    path: list[Tensor],
+    coarse: bool = False,
+    epsilon: float = 1e-6,
+    precise: bool = True,
+    mode: str = "cuda",
+) -> tuple[Tensor, Tensor]:
+    if mode == "cuda" and _should_save_vscan(states, coarse):
+        packed, _ = _vertical_forward_saved(
+            pole, states, auxiliary, path, coarse, epsilon, planar=True, precise=precise,
+        )
+        return packed[0], packed[1]
+    return _vertical_forward(pole, states, auxiliary, path, coarse, epsilon, precise, mode)
+
+
 horizontal_forward.register_autograd(_differentiate_horizontal, setup_context=_save_horizontal)
-vertical_forward.register_autograd(_differentiate_vertical, setup_context=_save_vertical)
+_vertical_forward.register_autograd(_differentiate_vertical, setup_context=_save_vertical)
 
 __all__ = [
     "can_use_general_hscan",

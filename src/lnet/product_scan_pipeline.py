@@ -14,6 +14,8 @@ from torch.library import triton_op
 
 from .general_cuda_scans import (
     _general_vertical_inputs,
+    _should_save_vscan,
+    _vertical_forward_saved,
     can_use_general_hscan,
     general_scans_enabled,
     horizontal_backward,
@@ -1073,6 +1075,8 @@ class _PackedAutogradContext(Protocol):
 
     def save_for_backward(self, *tensors: Tensor) -> None: ...
 
+    def mark_non_differentiable(self, *tensors: Tensor) -> None: ...
+
 
 def _packed_source_coordinates(source: Tensor) -> tuple[Tensor, Tensor]:
     if source.ndim != 4 or source.shape[-1] == 0 or source.shape[-1] % 2:
@@ -1178,7 +1182,7 @@ def _run_packed_cuda_forward(
     packed_output: bool,
     planar_output: bool,
     squeeze_collapsed: bool,
-) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+) -> tuple[Tensor, Tensor, Tensor, list[Tensor]]:
     pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
@@ -1192,25 +1196,33 @@ def _run_packed_cuda_forward(
     )
 
     if general_scans_enabled(forward=True):
-        if packed_output:
-            operands = _general_vertical_inputs(
-                pole_y, horizontal_storage, auxiliary, path, epilogue, kind, path_swiglu,
+        operands = _general_vertical_inputs(
+            pole_y, horizontal_storage, auxiliary, path, epilogue, kind, path_swiglu,
+        )
+        saved = [] if recompute else [horizontal_storage]
+        if operands is not None and _should_save_vscan(horizontal_storage, operands[-1]):
+            output, features = _vertical_forward_saved(
+                *operands, float(epsilon), planar=planar_output or not packed_output,
+                precise=True,
             )
-            if operands is not None:
-                output = vertical_forward_packed(*operands, float(epsilon), planar_output)
-                return (
-                    output,
-                    output.new_empty((0,)),
-                    output.new_empty((0,), dtype=torch.float32),
-                    None if recompute else horizontal_storage,
-                )
-        else:
+            if packed_output:
+                return output, output.new_empty((0,)), output.new_empty((0,)), [*saved, features]
+            return output[0], output[1], output.new_empty((0,)), [*saved, features]
+        if packed_output and operands is not None:
+            output = vertical_forward_packed(*operands, float(epsilon), planar_output)
+            return (
+                output,
+                output.new_empty((0,)),
+                output.new_empty((0,), dtype=torch.float32),
+                saved,
+            )
+        if not packed_output:
             result = try_general_vertical_forward(
                 pole_y, horizontal_storage, auxiliary, path, epilogue, epsilon, kind,
                 packed_output, planar_output, path_swiglu, squeeze_collapsed,
             )
             if result is not None:
-                return (*result, None if recompute else horizontal_storage)
+                return (*result, saved)
     horizontal = horizontal_storage.unbind(0)
     primary, secondary, descriptor = _launch_product_scan4_forward(
         *pole_y,
@@ -1230,7 +1242,7 @@ def _run_packed_cuda_forward(
         coarse_path=epilogue == "coarse_path",
         launch_name=_pipeline_launch_name(epilogue, bool(path), backward=False),
     )
-    return primary, secondary, descriptor, (None if recompute else horizontal_storage)
+    return primary, secondary, descriptor, ([] if recompute else [horizontal_storage])
 
 
 def _general_packed_backward(
@@ -1246,6 +1258,7 @@ def _general_packed_backward(
     epsilon: float,
     kind: int,
     path_swiglu: bool,
+    saved_features: Tensor | None,
 ) -> list[Tensor] | None:
     x_coefficients = list(pole_x)
     operands = _general_vertical_inputs(
@@ -1258,7 +1271,7 @@ def _general_packed_backward(
     py, states, tables, weights, coarse = operands
     vertical = vertical_backward(
         py, states, tables, weights, grad_real, grad_imag, coarse, float(epsilon),
-        compact=coarse,
+        compact=coarse, saved_features=saved_features,
     )
     horizontal_grads = horizontal_backward(
         x_coefficients, list(source), horizontal, vertical[4], compact=coarse,
@@ -1285,6 +1298,9 @@ def _run_packed_cuda_backward(
     pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
+    saved_features = None
+    if horizontal_states and horizontal_states[-1].ndim == 3:
+        *horizontal_states, saved_features = horizontal_states
     horizontal_storage = (
         horizontal_states[0] if horizontal_states
         else _packed_horizontal_forward(pole_x, source)
@@ -1306,7 +1322,7 @@ def _run_packed_cuda_backward(
     if general_scans_enabled():
         result = _general_packed_backward(
             pole_x, pole_y, source, horizontal_storage, auxiliary, path,
-            grad_real, grad_imag, epilogue, epsilon, kind, path_swiglu,
+            grad_real, grad_imag, epilogue, epsilon, kind, path_swiglu, saved_features,
         )
         if result is not None:
             return result
@@ -1372,7 +1388,7 @@ def _packed_pipeline_op(
         return list(_packed_reference(
             inputs, path, epilogue, epsilon, kind, path_swiglu, planar_output,
         ))
-    packed, _, descriptor, horizontal_storage = _run_packed_cuda_forward(
+    packed, _, descriptor, saved = _run_packed_cuda_forward(
         inputs,
         path,
         epilogue,
@@ -1384,7 +1400,7 @@ def _packed_pipeline_op(
         planar_output=planar_output,
         squeeze_collapsed=False,
     )
-    return [packed, descriptor, *(() if horizontal_storage is None else (horizontal_storage,))]
+    return [packed, descriptor, *saved]
 
 
 def _setup_packed_context(
@@ -1398,6 +1414,7 @@ def _setup_packed_context(
         ctx.recompute, ctx.path_swiglu, ctx.planar_output,
     ) = inputs
     ctx.path_count = len(path)
+    ctx.mark_non_differentiable(*output[2:])
     ctx.save_for_backward(*tensors, *path, output[1], *output[2:])
 
 
@@ -1540,7 +1557,7 @@ def _packed_pipeline_planes_op(
             inputs, path, epilogue, epsilon, kind, path_swiglu, True,
         )
         return [planar[0].clone(), planar[1].clone(), descriptor]
-    real, imag, descriptor, horizontal_storage = _run_packed_cuda_forward(
+    real, imag, descriptor, saved = _run_packed_cuda_forward(
         inputs,
         path,
         epilogue,
@@ -1552,7 +1569,7 @@ def _packed_pipeline_planes_op(
         planar_output=False,
         squeeze_collapsed=True,
     )
-    return [real, imag, descriptor, *(() if horizontal_storage is None else (horizontal_storage,))]
+    return [real, imag, descriptor, *saved]
 
 
 def _setup_packed_planes_context(
@@ -1567,6 +1584,7 @@ def _setup_packed_planes_context(
     ) = inputs
     ctx.planar_output = False
     ctx.path_count = len(path)
+    ctx.mark_non_differentiable(*output[3:])
     ctx.save_for_backward(*tensors, *path, output[2], *output[3:])
 
 

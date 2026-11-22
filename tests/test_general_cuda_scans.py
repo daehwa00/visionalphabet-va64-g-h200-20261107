@@ -929,7 +929,7 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
         is_cuda = True
         dtype = torch.bfloat16
         device = torch.device("cuda:0")
-        shape = (4, 20, 128, 192, 160)
+        shape = (4, 80, 128, 192, 160)
 
         @staticmethod
         def element_size() -> int:
@@ -938,19 +938,13 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda _: SimpleNamespace(total_memory=24 * 1024**3)
     )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (8, 9))
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "1")
     states = States()
-    assert scans._decoupled_chunk(states, 11, coarse=False) == 0
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
-    assert scans._decoupled_chunk(states, 11, coarse=False) == 0
-    assert 0 < scans._decoupled_chunk(states, 11, coarse=True) < states.shape[1]
+    assert scans._decoupled_chunk(states, coarse=False) == 0
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "chunk")
+    assert 0 < scans._decoupled_chunk(states, coarse=False) < states.shape[1]
+    assert 0 < scans._decoupled_chunk(states, coarse=True) < states.shape[1]
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
-    assert scans._decoupled_chunk(states, 11, coarse=True) == 0
-    monkeypatch.setattr(scans, "_l2_size", lambda _: 60 * 1024**2)
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "triton")
-    assert scans._decoupled_chunk(states, 11, coarse=False) == 0
-    assert 0 < scans._decoupled_chunk(states, 11, coarse=True) < states.shape[1]
+    assert scans._decoupled_chunk(states, coarse=True) == 0
 
 
 @_cuda
@@ -960,8 +954,8 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     ("coarse", "compact", "hidden", "compiled"),
     [(False, False, 8, False), (True, False, 11, True), (True, True, 5, False)],
 )
-@pytest.mark.parametrize("policy", ["force", "force_triton"])
-def test_cuda_decoupled_vscan(
+@pytest.mark.parametrize("policy", ["chunk", "test_saved"])
+def test_cuda_decoupled_vscan(  # noqa: C901
     monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
     coarse: bool,
@@ -989,8 +983,15 @@ def test_cuda_decoupled_vscan(
     if compiled:
         run = torch.compile(run, fullgraph=True)
     actual = run(pole, states, auxiliary, path, coarse)
+    features = None
+    if compact and policy == "test_saved":
+        _, features = scans._vertical_forward_saved(
+            pole, states, auxiliary, path, coarse, 1e-6, planar=True, precise=True,
+        )
     actual_grads = (
-        scans.vertical_backward(pole, states, auxiliary, path, *dy, coarse, compact=True)
+        scans.vertical_backward(
+            pole, states, auxiliary, path, *dy, coarse, compact=True, saved_features=features,
+        )
         if compact else torch.autograd.grad(actual, [*pole, states, *path], dy)
     )
     for planar in (False, True):

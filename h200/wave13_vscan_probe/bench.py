@@ -21,8 +21,10 @@ CASES = (
 )
 
 
-def probe(shape: tuple, hidden: int, policy: str = "1") -> dict:
+def probe(shape: tuple, hidden: int, batch_divisor: int = 1) -> dict:
     b, h, w, m, coarse = shape
+    b = max(1, b // batch_divisor)
+    shape = (b, h, w, m, coarse)
     dtype = torch.bfloat16
     oh, ow = (h // 2, w // 2) if coarse else (h, w)
 
@@ -40,12 +42,22 @@ def probe(shape: tuple, hidden: int, policy: str = "1") -> dict:
     dy = [sample((b, oh, ow, m), dtype, 0.1) for _ in range(2)]
 
     def step() -> tuple:
-        out = scans.vertical_forward(pole, states, auxiliary, path, coarse)
-        grads = scans.vertical_backward(pole, states, auxiliary, path, *dy, coarse)
+        features = None
+        if scans._should_save_vscan(states, coarse):  # noqa: SLF001
+            packed, features = scans._vertical_forward_saved(  # noqa: SLF001
+                pole, states, auxiliary, path, coarse, 1e-6, planar=True, precise=True,
+            )
+            out = packed.unbind(0)
+        else:
+            out = scans.vertical_forward(pole, states, auxiliary, path, coarse)
+        grads = scans.vertical_backward(
+            pole, states, auxiliary, path, *dy, coarse, compact=coarse,
+            saved_features=features,
+        )
         return (*out, *grads)
 
     result = {"shape": shape, "hidden": hidden}
-    for label, arm in (("fused", "0"), ("decoupled", policy)):
+    for label, arm in (("fused", "0"), ("chunk", "chunk"), ("saved", "saved")):
         os.environ["LNET_VSCAN_DECOUPLED"] = arm
         values = step()
         if label == "fused":
@@ -55,7 +67,7 @@ def probe(shape: tuple, hidden: int, policy: str = "1") -> dict:
         else:
             samples = [value.flatten()[::max(1, value.numel() // 8192)].float()
                        for value in values]
-            result["parity"] = [
+            result[f"{label}_parity"] = [
                 {"max_abs": (a - e).abs().max().item(), "max_reference": e.abs().max().item()}
                 for a, e in zip(samples, expected, strict=True)
             ]
@@ -71,7 +83,8 @@ def probe(shape: tuple, hidden: int, policy: str = "1") -> dict:
         result[label] = {
             "ms": start.elapsed_time(stop) / 5,
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
-            "chunk": scans._decoupled_chunk(states, hidden, coarse),  # noqa: SLF001
+            "uses_saved_features": scans._should_save_vscan(states, coarse),  # noqa: SLF001
+            "chunk": scans._decoupled_chunk(states, coarse),  # noqa: SLF001
         }
     return result
 
@@ -79,10 +92,10 @@ def probe(shape: tuple, hidden: int, policy: str = "1") -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--policy", choices=("1", "triton"), default="1")
+    parser.add_argument("--batch-divisor", type=int, default=1)
     args = parser.parse_args()
     for shape in CASES:
-        row = probe(shape, 8, args.policy)
+        row = probe(shape, 8, args.batch_divisor)
         with args.out.open("a", encoding="utf-8") as file:
             print(json.dumps(row), file=file)
         print(json.dumps(row), flush=True)  # noqa: T201
