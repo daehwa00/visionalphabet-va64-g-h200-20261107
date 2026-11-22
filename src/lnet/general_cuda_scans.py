@@ -1803,11 +1803,6 @@ def _vscan(  # noqa: C901, PLR0912
     ):
         raise ValueError("Invalid vertical scan inputs")
     b, h, w, m = shape
-    if not pure and (chunk := _decoupled_chunk(states, path[0].shape[1], coarse)):
-        return _decoupled_vscan(
-            pole, states, auxiliary, path, coarse, epsilon, precise, grad,
-            packed=packed, planar=planar, compact=compact, chunk=chunk,
-        )
     hidden = 0 if pure else path[0].shape[1]
     backward = grad is not None or features is not None
     oh, ow = (h // 2, w // 2) if coarse else (h, w)
@@ -1818,6 +1813,12 @@ def _vscan(  # noqa: C901, PLR0912
     if grad is not None:
         gr, gi = _vertical_adjoints(grad, states, out_shape)
         interleaved = (not gr.is_contiguous(), not gi.is_contiguous())
+    if not pure and (chunk := _decoupled_chunk(states, hidden, coarse)):
+        with torch.autocast(device_type="cuda", enabled=False):
+            return _decoupled_vscan(
+                pole, states, auxiliary, path, coarse, epsilon, precise, grad,
+                packed=packed, planar=planar, compact=compact, chunk=chunk,
+            )
     launch = _plan_launch(
         states,
         shape,
