@@ -949,8 +949,12 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     assert scans._decoupled_chunk(states, coarse=True) == 0
     monkeypatch.setattr(scans, "_l2_size", lambda _: 48 * 1024**2)
-    # The saved input stays resident, and a single oversized sample still runs.
+    assert scans._saved_backward_chunk(states, coarse=False) == scans._workspace_vscan_chunk(
+        states, coarse=False,
+    )
+    states.shape = (4, 4, 128, 192, 160)
     assert scans._saved_backward_chunk(states, coarse=False) == 1
+    states.shape = (4, 32, 128, 192, 160)
     assert scans._saved_backward_chunk(states, coarse=True) == 6
 
 

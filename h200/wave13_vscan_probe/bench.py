@@ -130,12 +130,17 @@ def main() -> None:
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--test-saved", action="store_true")
     parser.add_argument("--case-index", type=int, choices=range(len(CASES)), action="append")
-    parser.add_argument("--dp-policy", choices=("l2", "workspace", "full"), default="l2")
+    parser.add_argument("--dp-policy", choices=("auto", "l2", "workspace", "full"), default="auto")
     args = parser.parse_args()
     saved_policy = "test_saved" if args.test_saved else "saved"
+    workspace = scans._workspace_vscan_chunk  # noqa: SLF001
     if args.dp_policy == "workspace":
-        workspace = scans._workspace_vscan_chunk  # noqa: SLF001
         scans._saved_backward_chunk = lambda states, coarse: max(1, workspace(states, coarse))  # noqa: SLF001
+    elif args.dp_policy == "l2":
+        cache = scans._saved_cache_chunk  # noqa: SLF001
+        scans._saved_backward_chunk = (  # noqa: SLF001
+            lambda states, coarse: min(cache(states, coarse), max(1, workspace(states, coarse)))
+        )
     elif args.dp_policy == "full":
         scans._saved_backward_chunk = lambda states, _: states.shape[1]  # noqa: SLF001
     for shape in CASES if args.case_index is None else (CASES[i] for i in args.case_index):

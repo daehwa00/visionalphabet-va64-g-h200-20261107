@@ -43,7 +43,7 @@ _WARP_SIZE = 32
 _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
 _MAX_CACHED_HIDDEN = 16
-_PROJECTION_SHARED_ACC_MIN_SMEM = 128 * 1024
+_MAX_SAVED_DP_CACHE_CHUNKS = 8
 
 # Preserve the temporary storage budgets on devices with up to 24 GiB.
 _MAX_PARTIAL_BYTES = 64 * 1024**2
@@ -2135,12 +2135,20 @@ def _workspace_vscan_chunk(states: Tensor, coarse: bool) -> int:
     return min(batch, max(0, live_planes // per_sample))
 
 
-def _saved_backward_chunk(states: Tensor, coarse: bool) -> int:
+def _saved_cache_chunk(states: Tensor, coarse: bool) -> int:
     _, batch, height, width, modes = states.shape
     step = 2 if coarse else 1
     dp_bytes = 8 * (height // step) * (width // step) * modes * states.element_size()
     cache_budget = 2 * _l2_size(states.device.index or 0)
-    return min(batch, max(1, min(_workspace_vscan_chunk(states, coarse), cache_budget // dp_bytes)))
+    return min(batch, max(1, cache_budget // dp_bytes))
+
+
+def _saved_backward_chunk(states: Tensor, coarse: bool) -> int:
+    workspace = max(1, _workspace_vscan_chunk(states, coarse))
+    cache_chunk = min(workspace, _saved_cache_chunk(states, coarse))
+    # When L2-sized chunks would repeat the scan and reductions many times,
+    # use the bounded workspace to keep those kernels large.
+    return cache_chunk if states.shape[1] <= _MAX_SAVED_DP_CACHE_CHUNKS * cache_chunk else workspace
 
 
 @torch.compiler.assume_constant_result
@@ -2171,34 +2179,28 @@ def _plan_projection(
     fields = 11 * hidden + 2
     weights_bytes = (fields - 2 * base.backward) * _WARP_SIZE * 4
     cached = weights_bytes <= min(24 * 1024, limit)
-    # A shared accumulator helps only when the extra resident warps outweigh its traffic.
-    can_share = (
-        base.backward and base.hidden8 and base.dtype != torch.float32
-        and limit >= _PROJECTION_SHARED_ACC_MIN_SMEM
-    )
+    # Register accumulation measured faster than the shared accumulator on
+    # both Ada and Hopper, even when sharing raised the active warp count.
     best = None
-    for shared_acc in ((False, True) if can_share else (False,)):
-        for warps in ((2, 4, 8) if base.backward else (4, 8)):
-            threads = warps * _WARP_SIZE
-            shared_bytes = (hidden // 2) * 8 * threads * 4 if shared_acc else 0
-            smem = max(
-                (weights_bytes if cached else 0) + shared_bytes,
-                fields * threads * 4 if base.backward and base.hidden8 else 0,
-            )
-            if smem > limit:
-                continue
-            key = replace(base, warps=warps, cache_weights=cached, shared_acc=shared_acc)
-            resident = _resident(device, key, smem)
-            if not resident:
-                continue
-            groups = max(1, min(_ceil(cells, 16 * warps), _ceil(4 * sms * resident, tiles)))
-            if base.backward:
-                rows_per_group = 1 if base.hidden8 else warps
-                bytes_per_group = rows_per_group * fields * modes * 4
-                groups = min(groups, max(1, _MAX_PARTIAL_BYTES // bytes_per_group))
-            score = min(sms * resident, groups * tiles) * warps
-            if best is None or score > best[0]:
-                best = score, key, groups, smem
+    for warps in ((2, 4, 8) if base.backward else (4, 8)):
+        smem = max(
+            weights_bytes if cached else 0,
+            fields * warps * _WARP_SIZE * 4 if base.backward and base.hidden8 else 0,
+        )
+        if smem > limit:
+            continue
+        key = replace(base, warps=warps, cache_weights=cached)
+        resident = _resident(device, key, smem)
+        if not resident:
+            continue
+        groups = max(1, min(_ceil(cells, 16 * warps), _ceil(4 * sms * resident, tiles)))
+        if base.backward:
+            rows_per_group = 1 if base.hidden8 else warps
+            bytes_per_group = rows_per_group * fields * modes * 4
+            groups = min(groups, max(1, _MAX_PARTIAL_BYTES // bytes_per_group))
+        score = min(sms * resident, groups * tiles) * warps
+        if best is None or score > best[0]:
+            best = score, key, groups, smem
     if best is None:
         raise RuntimeError("No CUDA path projection launch fits this device")
     return best[1:]
