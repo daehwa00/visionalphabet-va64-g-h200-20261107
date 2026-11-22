@@ -716,6 +716,7 @@ def test_cuda_full_trajectory_reference(
 def test_cuda_trajectory_replay_preserves_gradients(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, coarse: bool
 ) -> None:
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     torch.manual_seed(719)
     px, py, real, imag, auxiliary, path = _inputs(h, 8, 35, 8, dtype, "cuda", batch=3)
     states = scans.horizontal_forward(px, real, imag).detach()
@@ -775,6 +776,7 @@ def test_cuda_reference_forward_cuda_backward(
 def test_cuda_dense_scratch_fallback(
     monkeypatch: pytest.MonkeyPatch, compiled: bool, h: int, w: int, m: int, coarse: bool,
 ) -> None:
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     sms, _, max_warps = scans.device_limits(0)
     monkeypatch.setattr(scans, "device_limits", lambda _: (sms, 16 * 1024, max_warps))
     original_plans = scans._scan_plans
