@@ -651,13 +651,7 @@ def reader_probe() -> dict:  # noqa: C901, PLR0915
         weight_default = reader._weight_geometry(projected, modes, rank, dtype)
         mode_tiles = div(modes, 32)
         spatial_sizes = (height, width, modes, rank)
-        alignment = (
-            reader._SPECIALIZE_MODE_ALIGNMENT if height * width >= reader._LARGE_WEIGHT_PLANE_PIXELS
-            else reader._WARP_SIZE
-        )
-        compiled_shape = shape if (
-            batch * height * width >= reader._SPECIALIZE_MIN_PIXELS and modes % alignment == 0
-        ) else (0, 0, 0, 0)
+        compiled_shape = reader._reader_compile_shape(projected, modes)
         reference = {}
         for name in ("default", *spatial_candidates, *weight_candidates):
             row = rows[name] = {"stages": {}, "parity": {}}

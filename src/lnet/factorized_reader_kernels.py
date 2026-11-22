@@ -7,6 +7,7 @@ from __future__ import annotations
 import ctypes
 from functools import cache
 from threading import local
+from typing import NamedTuple
 
 import torch
 from torch import Tensor
@@ -34,6 +35,7 @@ _SMALL_WEIGHT_PLANE_PIXELS = 256
 _LARGE_WEIGHT_PLANE_PIXELS = 262144
 _SPECIALIZE_MIN_PIXELS = 16384
 _SPECIALIZE_MODE_ALIGNMENT = 16
+_RANK_FOUR_WEIGHT_WAVES = 20
 
 
 # PyTorch references
@@ -175,12 +177,9 @@ __device__ __forceinline__ void sliding_spatial(
     constexpr int Inputs = Backward ? 2 : R * (Strict ? 2 : 1);
     // Small real filters fit alongside the low-precision window in registers.
     // Reuse them across columns without reloading taps from shared memory.
-    #if READER_REGISTER_FILTERS >= 0
-    constexpr bool RegisterFilters = !Strict && READER_REGISTER_FILTERS;
-#else
-    constexpr bool RegisterFilters = !Strict && (
-        (R <= 2 && sizeof(Input) == 2) || (Rows == 4 && Warps == 2));
-    #endif
+    constexpr bool RegisterFilters = !Strict && (READER_REGISTER_FILTERS < 0
+        ? ((R <= 2 && sizeof(Input) == 2) || (Rows == 4 && Warps == 2))
+        : READER_REGISTER_FILTERS != 0);
     constexpr bool KeepReal = RegisterFilters ||
         (Backward && (READER_KEEP_REAL < 0 ? READER_WIDTH >= 28 : READER_KEEP_REAL != 0));
     const int lane = threadIdx.x % 32;
@@ -995,25 +994,84 @@ def _weight_geometry(
     return _DEFAULT_WEIGHT_GEOMETRY
 
 
-def _reader_module_for(
-    projected: Tensor, real: Tensor, grad: Tensor | None = None, *, strict: bool,
-) -> _CudaModule:
+class _RankFourPlan(NamedTuple):
+    spatial: tuple[int, int]
+    weight: tuple[int, int, int]
+    weight_waves: int
+
+
+def _reader_compile_shape(projected: Tensor, modes: int) -> tuple[int, int, int, int]:
     batch, height, width, _ = projected.shape
-    modes, rank, kernel, _ = real.shape
     # Large planes amortize the partial mode warp of a half-warp-aligned shape.
-    mode_alignment = (
+    alignment = (
         _SPECIALIZE_MODE_ALIGNMENT if height * width >= _LARGE_WEIGHT_PLANE_PIXELS else _WARP_SIZE
     )
-    specialize = batch * height * width >= _SPECIALIZE_MIN_PIXELS and modes % mode_alignment == 0
-    shape = (batch, height, width, modes) if specialize else (0, 0, 0, 0)
+    if batch * height * width >= _SPECIALIZE_MIN_PIXELS and modes % alignment == 0:
+        return batch, height, width, modes
+    return 0, 0, 0, 0
+
+
+def _rank_four_plan(
+    projected: Tensor, real: Tensor, grad: Tensor | None = None, *, strict: bool,
+) -> _RankFourPlan | None:
+    modes, rank, kernel, _ = real.shape
+    grad_dtype = projected.dtype if grad is None else grad.dtype
+    if (
+        strict or rank != _STATIC_RANK_LIMIT or kernel != _STATIC_SPATIAL_KERNEL
+        or not (projected.dtype == real.dtype == grad_dtype == torch.bfloat16)
+    ):
+        return None
+    batch, height, width, _ = _reader_compile_shape(projected, modes)
+    # Retain the resident-filter path for compact planes. Four rows need
+    # enough vertical work to amortize loading the shared filters.
+    rows, warps = 4, 4
+    if height < 2 * rows or width <= 2 * _reader_columns(width):
+        return None
+    props = torch.cuda.get_device_properties(projected.device)
+    if props.major < 9:
+        return None
+    sms = props.multi_processor_count
+    mode_tiles = _ceildiv(modes, _WARP_SIZE)
+    row_tiles = batch * _ceildiv(height, rows)
+    if _ceildiv(row_tiles, warps) * mode_tiles < sms:
+        return None
+    # Use wider streaming CTAs only when enough independent rows fill the
+    # device at the larger split. Shorter splits keep the partials compact.
+    streaming = (
+        _ceildiv(row_tiles, _WIDE_WEIGHT_WARPS) * mode_tiles >= _RANK_FOUR_WEIGHT_WAVES * sms
+    )
+    tile = _CENTERED_WEIGHT_TILE
+    if streaming:
+        return _RankFourPlan(
+            (rows, warps), (tile, rows, _WIDE_WEIGHT_WARPS), _RANK_FOUR_WEIGHT_WAVES,
+        )
+    return _RankFourPlan((rows, warps), (tile, rows, warps), 5)
+
+
+def _reader_module_for(
+    projected: Tensor, real: Tensor, grad: Tensor | None = None, *,
+    strict: bool, rank_four_plan: _RankFourPlan | None = None,
+) -> _CudaModule:
+    _, _, width, _ = projected.shape
+    modes, rank, kernel, _ = real.shape
     dtypes = (projected.dtype, real.dtype, grad.dtype if grad is not None else projected.dtype)
+    if rank_four_plan is None:
+        spatial_geometry = _spatial_geometry(width, rank, kernel, projected.dtype, strict=strict)
+        weight_geometry = (
+            _weight_geometry(projected, modes, rank, dtypes[2])
+            if not strict and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL
+            else None
+        )
+    else:
+        spatial_geometry = rank_four_plan.spatial
+        weight_geometry = rank_four_plan.weight
     return _reader_cuda_module(
-        projected.device.index or 0, shape, _reader_columns(width),
+        projected.device.index or 0, _reader_compile_shape(projected, modes),
+        _reader_columns(width),
         rank if rank <= _STATIC_RANK_LIMIT else 0, kernel,
         tuple(_CUDA_TYPES[dtype] for dtype in dtypes), strict=strict,
-        spatial_geometry=_spatial_geometry(width, rank, kernel, projected.dtype, strict=strict),
-        weight_geometry=_weight_geometry(projected, modes, rank, dtypes[2])
-        if not strict and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL else None,
+        spatial_geometry=spatial_geometry, weight_geometry=weight_geometry,
+        register_filters=0 if rank_four_plan else -1, keep_real=0 if rank_four_plan else -1,
     )
 
 
@@ -1186,9 +1244,12 @@ def _packed_spatial(
     modes, rank, kernel, _ = real.shape
     if _use_reader_cuda(projected, real, imag):
         output = projected.new_empty((batch, height, width, 2 * modes))
+        plan = _rank_four_plan(projected, real, strict=strict_complex)
         with torch.cuda.device(projected.device):
-            module = _reader_module_for(projected, real, strict=strict_complex)
-            rows, warps = _spatial_geometry(
+            module = _reader_module_for(
+                projected, real, strict=strict_complex, rank_four_plan=plan,
+            )
+            rows, warps = plan.spatial if plan else _spatial_geometry(
                 width, rank, kernel, projected.dtype, strict=strict_complex,
             )
             stream = _reader_stream(module, projected.device)
@@ -1223,7 +1284,13 @@ def _packed_spatial_backward(
         grad_projected = torch.empty_like(projected)
         mode_tiles = _ceildiv(modes, _WARP_SIZE)
         sms = torch.cuda.get_device_properties(projected.device).multi_processor_count
-        if not strict_complex and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL:
+        plan = _rank_four_plan(projected, real, grad, strict=strict_complex)
+        if plan is not None:
+            tile, weight_rows, weight_warps = plan.weight
+            rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
+            rows = _ceildiv(height, weight_rows)
+            waves = plan.weight_waves
+        elif not strict_complex and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL:
             tile, weight_rows, weight_warps = _weight_geometry(
                 projected, modes, rank, grad.dtype,
             )
@@ -1257,7 +1324,9 @@ def _packed_spatial_backward(
         reduce_columns = _WARP_SIZE if parallel_reduce else _DEFAULT_THREADS
         reduce_op = "dweight_reduce_parallel" if parallel_reduce else "dweight_reduce"
         with torch.cuda.device(projected.device):
-            module = _reader_module_for(projected, real, grad, strict=strict_complex)
+            module = _reader_module_for(
+                projected, real, grad, strict=strict_complex, rank_four_plan=plan,
+            )
             stream = _reader_stream(module, projected.device)
             _launch_reader_cuda(
                 module, "dweight", (mode_tiles * tap_tiles, workers, rank_tiles),
@@ -1268,7 +1337,7 @@ def _packed_spatial_backward(
                 module, reduce_op, (_ceildiv(weight_grad.numel(), reduce_columns), 1, 1),
                 (partial, weight_grad), (modes, rank, workers), stream=stream,
             )
-            spatial_rows, warps = _spatial_geometry(
+            spatial_rows, warps = plan.spatial if plan else _spatial_geometry(
                 width, rank, kernel, projected.dtype, strict=strict_complex,
             )
             grid = _reader_spatial_grid(batch, height, width, modes, spatial_rows, warps)

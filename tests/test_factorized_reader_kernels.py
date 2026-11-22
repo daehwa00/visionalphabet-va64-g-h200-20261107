@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from itertools import product
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -535,3 +536,73 @@ def test_reader_cuda_graph_replay(operation) -> None:
             filters.mul_(0.75)
         graph.replay()
         torch.testing.assert_close(captured, forward_backward())
+
+
+
+@pytest.mark.parametrize(
+    ("shape", "major", "rank", "kernel", "dtype", "strict", "weight_warps"),
+    [
+        ((1024, 55, 29, 160), 9, 4, 3, torch.bfloat16, False, 8),
+        ((4, 128, 192, 160), 9, 4, 3, torch.bfloat16, False, 4),
+        ((4, 512, 768, 48), 9, 4, 3, torch.bfloat16, False, 4),
+        ((1024, 28, 28, 160), 8, 4, 3, torch.bfloat16, False, None),
+        ((1024, 28, 28, 160), 9, 2, 3, torch.bfloat16, False, None),
+        ((1024, 28, 28, 160), 9, 4, 5, torch.bfloat16, False, None),
+        ((1024, 28, 28, 160), 9, 4, 3, torch.bfloat16, True, None),
+        ((1024, 28, 28, 160), 9, 4, 3, torch.float16, False, None),
+        ((1024, 28, 28, 160), 9, 4, 3, torch.float32, False, None),
+        ((1024, 14, 14, 160), 9, 4, 3, torch.bfloat16, False, None),
+        ((4, 16, 45, 160), 9, 4, 3, torch.bfloat16, False, None),
+    ],
+)
+def test_rank_four_launch_plan(
+    monkeypatch, shape, major, rank, kernel, dtype, strict, weight_warps,
+) -> None:
+    props = SimpleNamespace(major=major, multi_processor_count=132)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: props)
+    projected = torch.empty((*shape[:3], rank * shape[3]), device="meta", dtype=dtype)
+    real = torch.empty((shape[3], rank, kernel, kernel), device="meta", dtype=dtype)
+    plan = kernels._rank_four_plan(projected, real, strict=strict)
+    if weight_warps is None:
+        assert plan is None
+    else:
+        assert plan is not None
+        assert plan.spatial == (4, 4)
+        assert plan.weight == (2, 4, weight_warps)
+        assert plan.weight_waves == (20 if weight_warps == 8 else 5)
+
+
+@requires_cuda
+@pytest.mark.parametrize("sms", [2, 20])
+def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
+    torch.manual_seed(51)
+    modes, rank = 96, 4
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    projected = torch.randn(32, 21, 27, rank * modes, **kwargs)
+    grad = torch.randn(32, 21, 27, 2 * modes, **kwargs)
+    filters = (torch.randn(2, modes, rank, 3, 3, **kwargs) * 0.125).unbind()
+    planner = kernels._rank_four_plan
+    with monkeypatch.context() as patch:
+        patch.setattr(kernels, "_rank_four_plan", lambda *_args, **_kwargs: None)
+        expected = kernels._packed_spatial(projected, *filters, strict_complex=False)
+        expected_dx, expected_dw = kernels._packed_spatial_backward(
+            grad, projected, *filters, strict_complex=False,
+        )
+    properties = torch.cuda.get_device_properties
+
+    def force_plan(projected, real, grad=None, *, strict):
+        props = SimpleNamespace(major=9, multi_processor_count=sms)
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "get_device_properties", lambda _device: props)
+            return planner(projected, real, grad, strict=strict)
+
+    plan = force_plan(projected, filters[0], grad, strict=False)
+    assert plan is not None
+    assert plan.weight[2] == (8 if sms == 2 else 4)
+    monkeypatch.setattr(kernels, "_rank_four_plan", force_plan)
+    actual = kernels._packed_spatial(projected, *filters, strict_complex=False)
+    dx, dw = kernels._packed_spatial_backward(grad, projected, *filters, strict_complex=False)
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-4)
+    torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
+    torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=0.002)
+    assert torch.cuda.get_device_properties is properties
