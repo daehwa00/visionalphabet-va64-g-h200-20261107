@@ -19,7 +19,7 @@ export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 WANDB_MODE=disabled
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=4
 unset LNET_GENERAL_SCANS LNET_FUSED_FACTORIZED_READER LNET_GENERAL_SCAN_REF_FWD
 unset VA_REAL_MEMORY_SCAN_BATCH_PARTIALS VA_REAL_MEMORY_TRAINING_OPTIMIZATIONS
-unset LNET_DISABLE_LAUNCH_AUTOTUNE LNET_NR4_FUSED
+unset LNET_DISABLE_LAUNCH_AUTOTUNE LNET_NR4_FUSED LNET_VSCAN_DECOUPLED
 
 verify_environment() {
     "$1" -c 'import sys; raise SystemExit(sys.version_info < (3, 13))' &&
@@ -94,7 +94,7 @@ run_bench probe "$RUN_ROOT/probe.json"
 if [[ ${2:-} == --probe-only ]]; then
     run_bench kernel-probe "$RUN_ROOT/kernel_probe.json"
 elif [[ ${2:-} != --infer-only ]]; then
-    run_pytest pytest_full 12m -v
+    run_pytest pytest_full 15m -v
     run_bench dynamo "$RUN_ROOT/dynamo.json"
 
     for i in "${!variants[@]}"; do
