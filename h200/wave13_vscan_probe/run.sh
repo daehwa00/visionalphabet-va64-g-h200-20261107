@@ -39,11 +39,13 @@ if [[ -z $run_python ]]; then
 fi
 bench=h200/liverms_v2_opt/bench_h200.py
 mkdir -p "$out/arms" "$out/infer"
-"$run_python" h200/wave13_vscan_probe/bench.py --out "$out/isolated.jsonl" | tee "$out/isolated.log"
-"$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \
-    < "$out/isolated.jsonl" > "$out/isolated.json"
+if [[ ${1:-} != --confirm ]]; then
+    "$run_python" h200/wave13_vscan_probe/bench.py --out "$out/isolated.jsonl" | tee "$out/isolated.log"
+    "$run_python" -c 'import json,sys; print(json.dumps([json.loads(r) for r in sys.stdin]))' \
+        < "$out/isolated.jsonl" > "$out/isolated.json"
+fi
 # Reuse the cuDNN autotuner and loaded CUDA kernels between arms.
-"$run_python" - "$out" <<'PYBENCH'
+"$run_python" - "$out" "${1:-}" <<'PYBENCH'
 import gc
 import os
 import runpy
@@ -53,6 +55,7 @@ from pathlib import Path
 import torch
 
 root = Path(sys.argv[1])
+confirm = sys.argv[2] == "--confirm"
 bench_script = "h200/liverms_v2_opt/bench_h200.py"
 main = runpy.run_path(bench_script)["main"]
 arms = ("0", "chunk", "saved")
@@ -67,13 +70,13 @@ def run(arm, command, out, *options):
     sys.argv = [bench_script, command, "--out", str(out), *options]
     main()
 
-for batch in (1024, 128, 256, 512):
+for batch in ((1024,) if confirm else (1024, 128, 256, 512)):
     for arm in arms:
         run(
             arm, "train-arm", root / "arms" / f"p1_b{batch}_{arm}.json",
             "--variant", variant, "--batch", str(batch), "--profile",
         )
-for arm in arms:
+for arm in (("saved",) if confirm else arms):
     run(
         arm, "infer-fold", root / "infer" / f"p1_b1024_{arm}.json",
         "--variant", variant, "--batch", "1024",
