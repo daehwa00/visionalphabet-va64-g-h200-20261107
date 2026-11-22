@@ -27,6 +27,7 @@ _DEFAULT_SPATIAL_GEOMETRY = (2, 4)
 _COMPACT_SPATIAL_GEOMETRY = (4, 2)
 _RESIDENT_FILTER_RANK_LIMIT = 2
 _CENTERED_WEIGHT_TILE = 2
+_VECTOR_WEIGHT_GEOMETRY = (_CENTERED_WEIGHT_TILE, 2, 4)
 _DEFAULT_WEIGHT_GEOMETRY = (_CENTERED_WEIGHT_TILE, 2, 4)
 _WIDE_WEIGHT_WARPS = 8
 _MAX_STREAMING_WEIGHT_WAVES = 40
@@ -502,7 +503,54 @@ __device__ __forceinline__ auto weight_read(const T* value) {
 
 // Center the correlation on projected pixels so each projected load serves
 // all nine taps. The horizontal window and adjacent rows also reuse grad.
-template <class T, class G, int R>
+template <int N> struct ModeValues {
+    float value[N];
+};
+
+template <int N>
+__device__ __forceinline__ ModeValues<N> fmaf(
+    ModeValues<N> a, ModeValues<N> b, ModeValues<N> c
+) {
+    #pragma unroll
+    for (int i = 0; i < N; ++i) c.value[i] = ::fmaf(a.value[i], b.value[i], c.value[i]);
+    return c;
+}
+
+template <int N, class T, bool ReadOnly = false>
+__device__ __forceinline__ ModeValues<N> mode_load(const T* ptr) {
+    ModeValues<N> result;
+    if constexpr (N == 1) {
+        result.value[0] = as_float(ReadOnly ? __ldg(ptr) : *ptr);
+    }
+#if READER_BFLOAT16
+    else {
+        static_assert(N == 2);
+        const auto* pair_ptr = reinterpret_cast<const __nv_bfloat162*>(ptr);
+        const float2 pair = __bfloat1622float2(ReadOnly ? __ldg(pair_ptr) : *pair_ptr);
+        result = {{pair.x, pair.y}};
+    }
+#endif
+    return result;
+}
+
+template <int N, class T> struct WeightWindow { using Type = ModeValues<N>; };
+template <class T> struct WeightWindow<1, T> { using Type = T; };
+
+template <int N, bool ReadOnly, bool Convert, class T>
+__device__ __forceinline__ auto weight_window_load(const T* ptr) {
+    if constexpr (N == 1) return weight_read<ReadOnly, Convert>(ptr);
+    else return mode_load<N, T, ReadOnly>(ptr);
+}
+
+template <class T>
+__device__ __forceinline__ ModeValues<1> window_values(T value) {
+    return {{as_float(value)}};
+}
+
+template <int N>
+__device__ __forceinline__ ModeValues<N> window_values(ModeValues<N> value) { return value; }
+
+template <class T, class G, int R, int Vec = READER_WEIGHT_VEC>
 __device__ __forceinline__ void real_weight_gradient_3x3(
     const T* __restrict__ projected, const G* __restrict__ grad, float* __restrict__ partial,
     int runtime_height, int runtime_width, int runtime_modes, int runtime_batch
@@ -514,17 +562,19 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
     constexpr int Warps = READER_WEIGHT_WARPS, Rows = READER_WEIGHT_ROWS;
     constexpr bool ReadOnly = READER_WIDTH >= 28 || Warps == 8;
     constexpr bool ConvertWindow = R <= 2 && sizeof(G) == 2 && READER_WIDTH > 2 * READER_COLUMNS;
-    using Window = decltype(weight_read<ReadOnly, ConvertWindow>(grad));
+    using V = ModeValues<Vec>;
+    using ScalarWindow = decltype(weight_read<ReadOnly, ConvertWindow>(grad));
+    using Window = typename WeightWindow<Vec, ScalarWindow>::Type;
     constexpr int RankTile = R < READER_WEIGHT_TILE ? R : READER_WEIGHT_TILE;
     constexpr int RankTiles = (R + RankTile - 1) / RankTile;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int mode = blockIdx.x / RankTiles * 32 + lane;
+    const int mode = (blockIdx.x / RankTiles * 32 + lane) * Vec;
     const int r0 = blockIdx.x % RankTiles * RankTile;
     const int ytiles = (height + Rows - 1) / Rows;
-    float sums_r[3][3][RankTile] = {}, sums_i[3][3][RankTile] = {};
+    V sums_r[3][3][RankTile] = {}, sums_i[3][3][RankTile] = {};
     constexpr int ReduceRanks = 1;
     constexpr int Fields = ReduceRanks * 18;
-    __shared__ float warp_sums[Warps][Fields][32];
+    __shared__ float warp_sums[Warps][Fields][Vec][32];
     if (mode < modes) {
         for (int row = blockIdx.y * Warps + warp; row < batch * ytiles;
              row += gridDim.y * Warps) {
@@ -538,8 +588,8 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                 const int gy = y + i - 1;
                 if (gy >= 0 && gy < height) {
                     const G* g = grad + (base + gy * width) * 2 * modes + mode;
-                    middle[i][0] = weight_read<ReadOnly, ConvertWindow>(g);
-                    middle[i][1] = weight_read<ReadOnly, ConvertWindow>(g + modes);
+                    middle[i][0] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g);
+                    middle[i][1] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g + modes);
                 }
             }
             for (int x = 0; x < width; ++x) {
@@ -549,34 +599,33 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                     const int gy = y + i - 1;
                     if (gy >= 0 && gy < height && x + 1 < width) {
                         const G* g = grad + (base + gy * width + x + 1) * 2 * modes + mode;
-                        right[i][0] = weight_read<ReadOnly, ConvertWindow>(g);
-                        right[i][1] = weight_read<ReadOnly, ConvertWindow>(g + modes);
+                        right[i][0] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g);
+                        right[i][1] = weight_window_load<Vec, ReadOnly, ConvertWindow>(g + modes);
                     }
                 }
                 #pragma unroll
                 for (int j = 0; j < Rows; ++j) {
                     if (y + j >= height) continue;
-                    float v[RankTile];
+                    V v[RankTile];
                     #pragma unroll
                     for (int r = 0; r < RankTile; ++r) {
                         const T* current = p + ((j * width + x) * R + r) * modes;
-                        v[r] = r0 + r < R ? as_float(weight_read<ReadOnly>(current)) : 0;
+                        v[r] = r0 + r < R ? mode_load<Vec, T, ReadOnly>(current) : V{};
                     }
                     #pragma unroll
                     for (int ky = 0; ky < 3; ++ky) {
                         const int i = j + 2 - ky;
-                        const float2 l = make_float2(as_float(left[i][0]), as_float(left[i][1]));
-                        const float2 m = make_float2(
-                            as_float(middle[i][0]), as_float(middle[i][1]));
-                        const float2 g = make_float2(as_float(right[i][0]), as_float(right[i][1]));
+                        const V l[] = {window_values(left[i][0]), window_values(left[i][1])};
+                        const V m[] = {window_values(middle[i][0]), window_values(middle[i][1])};
+                        const V g[] = {window_values(right[i][0]), window_values(right[i][1])};
                         #pragma unroll
                         for (int r = 0; r < RankTile; ++r) {
-                            sums_r[ky][0][r] = fmaf(v[r], g.x, sums_r[ky][0][r]);
-                            sums_r[ky][1][r] = fmaf(v[r], m.x, sums_r[ky][1][r]);
-                            sums_r[ky][2][r] = fmaf(v[r], l.x, sums_r[ky][2][r]);
-                            sums_i[ky][0][r] = fmaf(v[r], g.y, sums_i[ky][0][r]);
-                            sums_i[ky][1][r] = fmaf(v[r], m.y, sums_i[ky][1][r]);
-                            sums_i[ky][2][r] = fmaf(v[r], l.y, sums_i[ky][2][r]);
+                            sums_r[ky][0][r] = fmaf(v[r], g[0], sums_r[ky][0][r]);
+                            sums_r[ky][1][r] = fmaf(v[r], m[0], sums_r[ky][1][r]);
+                            sums_r[ky][2][r] = fmaf(v[r], l[0], sums_r[ky][2][r]);
+                            sums_i[ky][0][r] = fmaf(v[r], g[1], sums_i[ky][0][r]);
+                            sums_i[ky][1][r] = fmaf(v[r], m[1], sums_i[ky][1][r]);
+                            sums_i[ky][2][r] = fmaf(v[r], l[1], sums_i[ky][2][r]);
                         }
                     }
                 }
@@ -601,8 +650,12 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                 #pragma unroll
                 for (int r = 0; r < ReduceRanks; ++r) {
                     const int field = r * 9 + ky * 3 + kx;
-                    warp_sums[warp][field][lane] = sums_r[ky][kx][tile + r];
-                    warp_sums[warp][field + Fields / 2][lane] = sums_i[ky][kx][tile + r];
+                    #pragma unroll
+                    for (int v = 0; v < Vec; ++v) {
+                        warp_sums[warp][field][v][lane] = sums_r[ky][kx][tile + r].value[v];
+                        warp_sums[warp][field + Fields / 2][v][lane] =
+                            sums_i[ky][kx][tile + r].value[v];
+                    }
                 }
         __syncthreads();
         if (mode < modes) {
@@ -613,12 +666,15 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                 const long long index = (
                     (static_cast<long long>(blockIdx.y) * 2 + component) * R * 9 + rank * 9 + tap
                 ) * modes;
-                float sum = (warp_sums[0][field][lane] + warp_sums[1][field][lane])
-                          + (warp_sums[2][field][lane] + warp_sums[3][field][lane]);
-                if constexpr (Warps == 8)
-                    sum += (warp_sums[4][field][lane] + warp_sums[5][field][lane])
-                         + (warp_sums[6][field][lane] + warp_sums[7][field][lane]);
-                partial[index + mode] = sum;
+                #pragma unroll
+                for (int v = 0; v < Vec; ++v) {
+                    float sum = (warp_sums[0][field][v][lane] + warp_sums[1][field][v][lane])
+                              + (warp_sums[2][field][v][lane] + warp_sums[3][field][v][lane]);
+                    if constexpr (Warps == 8)
+                        sum += (warp_sums[4][field][v][lane] + warp_sums[5][field][v][lane])
+                             + (warp_sums[6][field][v][lane] + warp_sums[7][field][v][lane]);
+                    partial[index + mode + v] = sum;
+                }
             }
         }
         if (tile + ReduceRanks < RankTile) __syncthreads();
@@ -858,6 +914,7 @@ def _reader_cuda_module(
     weight_geometry: tuple[int, int, int] | None = None,
     register_filters: int = -1,
     keep_real: int = -1,
+    weight_vec: int = 1,
 ) -> _CudaModule:
     weight_tile, weight_rows, weight_warps = weight_geometry or _DEFAULT_WEIGHT_GEOMETRY
     macros = {
@@ -866,6 +923,7 @@ def _reader_cuda_module(
         "SPATIAL_ROWS": spatial_geometry[0], "SPATIAL_WARPS": spatial_geometry[1],
         "REGISTER_FILTERS": register_filters, "KEEP_REAL": keep_real,
         "BFLOAT16": int("__nv_bfloat16" in types),
+        "WEIGHT_VEC": weight_vec,
         "WEIGHT_TILE": weight_tile, "WEIGHT_ROWS": weight_rows, "WEIGHT_WARPS": weight_warps,
         **dict(zip(("INPUT", "WEIGHT", "GRAD"), types, strict=True)),
     }
@@ -1048,9 +1106,35 @@ def _rank_four_plan(
     return _RankFourPlan((rows, warps), (tile, rows, warps), 5)
 
 
+def _reader_weight_vector_width(
+    projected: Tensor,
+    real: Tensor,
+    grad: Tensor,
+    *,
+    strict: bool,
+    major: int,
+    sms: int,
+) -> int:
+    modes, rank, kernel, _ = real.shape
+    batch, height, width, _ = projected.shape
+    # Packed loads help compact planes with enough independent batch tiles.
+    # Larger planes favor the scalar kernel's register use and row reuse.
+    if (
+        strict or major < 9 or kernel != _STATIC_SPATIAL_KERNEL
+        or rank > _STATIC_RANK_LIMIT or modes % 2
+        or not (projected.dtype == real.dtype == grad.dtype == torch.bfloat16)
+        or height * width > _SMALL_WEIGHT_PLANE_PIXELS
+        or batch * 2 < sms
+    ):
+        return 1
+    alignment = 2 * projected.element_size()
+    return 2 if projected.data_ptr() % alignment == grad.data_ptr() % alignment == 0 else 1
+
+
 def _reader_module_for(
     projected: Tensor, real: Tensor, grad: Tensor | None = None, *,
     strict: bool, rank_four_plan: _RankFourPlan | None = None,
+    weight_vec: int = 1,
 ) -> _CudaModule:
     _, _, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
@@ -1065,6 +1149,8 @@ def _reader_module_for(
     else:
         spatial_geometry = rank_four_plan.spatial
         weight_geometry = rank_four_plan.weight
+    if weight_vec > 1:
+        weight_geometry = _VECTOR_WEIGHT_GEOMETRY
     return _reader_cuda_module(
         projected.device.index or 0, _reader_compile_shape(projected, modes),
         _reader_columns(width),
@@ -1072,6 +1158,7 @@ def _reader_module_for(
         tuple(_CUDA_TYPES[dtype] for dtype in dtypes), strict=strict,
         spatial_geometry=spatial_geometry, weight_geometry=weight_geometry,
         register_filters=0 if rank_four_plan else -1, keep_real=0 if rank_four_plan else -1,
+        weight_vec=weight_vec,
     )
 
 
@@ -1282,8 +1369,12 @@ def _packed_spatial_backward(
     if _use_reader_cuda(projected, real, imag, grad):
         grad = grad.contiguous()
         grad_projected = torch.empty_like(projected)
-        mode_tiles = _ceildiv(modes, _WARP_SIZE)
-        sms = torch.cuda.get_device_properties(projected.device).multi_processor_count
+        props = torch.cuda.get_device_properties(projected.device)
+        sms = props.multi_processor_count
+        vec = _reader_weight_vector_width(
+            projected, real, grad, strict=strict_complex, major=props.major, sms=sms,
+        )
+        mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
         plan = _rank_four_plan(projected, real, grad, strict=strict_complex)
         if plan is not None:
             tile, weight_rows, weight_warps = plan.weight
@@ -1306,6 +1397,10 @@ def _packed_spatial_backward(
             rank_tiles = _ceildiv(rank, rank_tile)
             tap_tiles = 3 if kernel == 3 else kernel**2
             rows, waves, weight_warps = height, 3, 4
+        if vec > 1:
+            tile, weight_rows, weight_warps = _VECTOR_WEIGHT_GEOMETRY
+            rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
+            rows = _ceildiv(height, weight_rows)
         available_workers = _ceildiv(batch * rows, weight_warps)
         workers = min(available_workers, _ceildiv(waves * sms, mode_tiles))
         if weight_warps == _WIDE_WEIGHT_WARPS and rank <= _CENTERED_WEIGHT_TILE:
@@ -1325,7 +1420,7 @@ def _packed_spatial_backward(
         reduce_op = "dweight_reduce_parallel" if parallel_reduce else "dweight_reduce"
         with torch.cuda.device(projected.device):
             module = _reader_module_for(
-                projected, real, grad, strict=strict_complex, rank_four_plan=plan,
+                projected, real, grad, strict=strict_complex, rank_four_plan=plan, weight_vec=vec,
             )
             stream = _reader_stream(module, projected.device)
             _launch_reader_cuda(

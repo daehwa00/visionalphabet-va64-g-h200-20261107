@@ -606,3 +606,88 @@ def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
     torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
     torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=0.002)
     assert torch.cuda.get_device_properties is properties
+
+
+@pytest.mark.parametrize(
+    ("major", "batch", "shape", "modes", "rank", "kernel", "dtype", "strict", "offset", "expected"),
+    [
+        (9, 128, (7, 11), 66, 1, 3, torch.bfloat16, False, 0, 2),
+        (9, 128, (7, 11), 68, 2, 3, torch.bfloat16, False, 0, 2),
+        (9, 128, (7, 11), 66, 3, 3, torch.bfloat16, False, 0, 2),
+        (9, 128, (7, 11), 160, 4, 3, torch.bfloat16, False, 0, 2),
+        (8, 128, (7, 11), 160, 4, 3, torch.bfloat16, False, 0, 1),
+        (9, 4, (96, 128), 80, 2, 3, torch.bfloat16, False, 0, 1),
+        (9, 2, (7, 11), 160, 4, 3, torch.bfloat16, False, 0, 1),
+        (9, 128, (7, 11), 67, 4, 3, torch.bfloat16, False, 0, 1),
+        (9, 128, (7, 11), 66, 4, 3, torch.bfloat16, False, 1, 1),
+        (9, 128, (7, 11), 66, 6, 3, torch.bfloat16, False, 0, 1),
+        (9, 128, (7, 11), 66, 4, 5, torch.bfloat16, False, 0, 1),
+        (9, 128, (7, 11), 66, 4, 3, torch.bfloat16, True, 0, 1),
+        (9, 128, (7, 11), 66, 4, 3, torch.float32, False, 0, 1),
+        (9, 128, (7, 11), 66, 4, 3, torch.float16, False, 0, 1),
+    ],
+)
+def test_reader_weight_vector_plan(
+    major: int, batch: int, shape: tuple[int, int], modes: int, rank: int,
+    kernel: int, dtype: torch.dtype, strict: bool, offset: int, expected: int,
+) -> None:
+    dims = (batch, *shape, modes * rank)
+    p = torch.empty((1 + offset,), dtype=dtype)[offset:].as_strided(dims, (0,) * 4)
+    g = torch.empty(1, dtype=dtype).as_strided((batch, *shape, modes * 2), (0,) * 4)
+    real = torch.empty((modes, rank, kernel, kernel), dtype=dtype)
+    assert kernels._reader_weight_vector_width(
+        p, real, g, strict=strict, major=major, sms=132,
+    ) == expected
+
+
+@requires_cuda
+@pytest.mark.usefixtures("cudnn_full_precision")
+@pytest.mark.parametrize("rank", [1, 2, 3, 4])
+def test_reader_weight_vector_parity(
+    rank: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("native BF16 requires SM80 or newer")
+    choose_width = kernels._reader_weight_vector_width
+
+    def force_vector(
+        p: torch.Tensor, real: torch.Tensor, grad: torch.Tensor, *,
+        strict: bool, major: int, sms: int,  # noqa: ARG001
+    ) -> int:
+        width = choose_width(p, real, grad, strict=strict, major=9, sms=1)
+        assert width == 2
+        return width
+
+    monkeypatch.setattr(kernels, "_reader_weight_vector_width", force_vector)
+    torch.manual_seed(52)
+    modes, shape = 66, (2, 7, 11)
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    p = torch.randn((*shape, rank * modes), **kwargs) * 0.2
+    real, imag = (torch.randn((2, modes, rank, 3, 3), **kwargs) * 0.2).unbind()
+    grad = torch.randn((*shape, modes * 2), **kwargs) * 0.2
+    dp, dw = kernels._packed_spatial_backward(grad, p, real, imag, strict_complex=False)
+    ref_dp, ref_dw = kernels._spatial_reference_backward(
+        grad, p, real, imag, strict_complex=False,
+    )
+    for result, reference in ((dp, ref_dp), (dw, ref_dw)):
+        ref = reference.float()
+        diff = result.float() - ref
+        assert diff.abs().max().item() <= 0.02
+        assert (diff.norm() / ref.norm()).item() <= 0.005
+
+
+@requires_cuda
+@pytest.mark.usefixtures("cudnn_full_precision")
+def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("native BF16 requires SM80 or newer")
+    monkeypatch.setattr(kernels, "_reader_weight_vector_width", lambda *_args, **_kwargs: 2)
+    torch.manual_seed(231)
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    p = torch.randn((2, 7, 11, 4 * 48), **kwargs).requires_grad_()
+    w = (torch.randn((48, 2, 4, 3, 3), **kwargs) * 0.125).requires_grad_()
+    compiled = torch.compile(kernels.real_packed_spatial, fullgraph=True)
+    output = compiled(p, w)
+    reference = kernels._spatial_reference(p, *w.unbind(1), strict_complex=False)
+    torch.testing.assert_close(output, reference, atol=0.008, rtol=0.005)
+    _check_gradients(output, reference, (p, w), (p, w), rtol=0.005, atol=0.001)
