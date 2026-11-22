@@ -1903,6 +1903,15 @@ def _vscan(  # noqa: C901, PLR0912
     return [*gradients[:4], gs, *gradients[4:]]
 
 
+def _use_triton_projection(states: Tensor, hidden: int, policy: str | None) -> bool:
+    return (
+        policy in {"triton", "force_triton"}
+        and states.dtype != torch.float32
+        and hidden <= 32
+        and states.shape[-1] <= 65535
+    )
+
+
 def _decoupled_chunk(states: Tensor, hidden: int, coarse: bool) -> int:
     """Bound the recomputed scan and MLP workspace per batch chunk."""
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
@@ -1913,11 +1922,16 @@ def _decoupled_chunk(states: Tensor, hidden: int, coarse: bool) -> int:
         return 0
     _, b, h, w, m = states.shape
     cells = (h // 2) * (w // 2) * m if coarse else h * w * m
-    # BMM layout copies, FP32 activation intermediates and scan input/output.
-    intermediates = 4 if policy in {"triton", "force_triton"} and hidden <= 32 else 32
+    use_triton = _use_triton_projection(states, hidden, policy)
+    if policy == "triton" and use_triton and cells * 8 * states.element_size() > _l2_size(device):
+        return 0
+    # Account for output features, adjoints, projection intermediates, and
+    # allocations that overlap at a chunk boundary.
+    intermediates = 4 if use_triton else 32
     per_sample = cells * (32 * states.element_size() + intermediates * hidden + 16)
     per_sample += 8 * h * w * m * states.element_size()
-    budget = min(512 * 1024**2, torch.cuda.get_device_properties(device).total_memory // 32)
+    vram = torch.cuda.get_device_properties(device).total_memory
+    budget = min(2 * 1024**3, vram // 64) if use_triton else min(512 * 1024**2, vram // 32)
     return min(b, budget // per_sample)
 
 
@@ -1960,12 +1974,7 @@ def _bmm_path_projection(
 
 
 def _select_path_projection(states: Tensor, hidden: int) -> Callable:
-    if (
-        os.environ.get("LNET_VSCAN_DECOUPLED") in {"triton", "force_triton"}
-        and states.dtype != torch.float32
-        and hidden <= 32
-        and states.shape[-1] <= 65535
-    ):
+    if _use_triton_projection(states, hidden, os.environ.get("LNET_VSCAN_DECOUPLED")):
         from .vscan_path_mlp import path_projection  # noqa: PLC0415
 
         return path_projection

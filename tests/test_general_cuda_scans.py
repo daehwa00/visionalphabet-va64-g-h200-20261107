@@ -927,6 +927,7 @@ def test_cuda_coarse_drive_dtypes(monkeypatch: pytest.MonkeyPatch, dtype: torch.
 def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     class States:
         is_cuda = True
+        dtype = torch.bfloat16
         device = torch.device("cuda:0")
         shape = (4, 20, 128, 192, 160)
 
