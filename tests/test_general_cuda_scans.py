@@ -996,6 +996,13 @@ def test_cuda_decoupled_vscan(
         forward_tol, backward_tol = (8e-3, 1e-3), (5e-2, 2e-2)
     else:
         forward_tol, backward_tol = (4e-2, 5e-3), (1.2e-1, 8e-2)
+    reference_out = _reference_vscan(pole, states, auxiliary, path, coarse)
+    for value, target in zip(actual, reference_out, strict=True):
+        torch.testing.assert_close(value, target, rtol=forward_tol[0], atol=forward_tol[1])
+    if not compact:
+        reference_grads = torch.autograd.grad(reference_out, [*pole, states, *path], dy)
+        for value, target in zip(actual_grads, reference_grads, strict=True):
+            torch.testing.assert_close(value, target, rtol=backward_tol[0], atol=backward_tol[1])
     for values, reference, (rtol, atol) in (
         (actual, expected, forward_tol),
         (actual_grads, expected_grads, backward_tol),
