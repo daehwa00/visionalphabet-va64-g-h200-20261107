@@ -33,7 +33,7 @@ if [[ -z $run_python ]]; then
     run_python="$scratch/environment/bin/python"
     uv_run pip install --python "$run_python" \
         'torch @ https://download-r2.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=63381a109a569b280ed3319da89d3afe5cf9ab5c879936382a212affb5c90552' \
-        'torchvision @ https://download-r2.pytorch.org/whl/cu128/torchvision-0.24.1%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=5f7c5e0fa08d2cbee93b6e04bbedd59b5c11462cff6cefd07949217265df2370' \
+        'torchvision @ https://download-r2.pytorch.org/whl/cu128/torchvision-0.24.1%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=5f7c5e0fa08d2cbee93b6e04bbedd59b5e11462cff6cefd07949217265df2370' \
         triton==3.5.1 numpy==2.4.6 pytest==9.0.3 timm==1.0.26
     ready "$run_python"
 fi

@@ -370,6 +370,11 @@ def test_source_and_offline_nvrtc(dtype: torch.dtype) -> None:
             dtype, 2, backward=True, vertical=True, shared_acc=True,
             index32=False,
         ),
+        scans.Kernel(dtype, 2, backward=False, vertical=True, pure_vertical=True),
+        scans.Kernel(
+            dtype, 2, backward=True, vertical=True, pure_vertical=True,
+            coarse=True, compact=True, cache_source=True, cache_line=True,
+        ),
         scans.Kernel(
             dtype,
             4,
@@ -395,7 +400,7 @@ def test_source_and_offline_nvrtc(dtype: torch.dtype) -> None:
         pytest.skip("NVRTC not installed for offline compilation")
     if not scans._include_dirs():
         pytest.skip("CUDA headers not installed for offline compilation")
-    architectures = [(8, 0), (8, 9)]
+    architectures = [(8, 0), (8, 9), (9, 0)]
     if dtype != torch.bfloat16:
         architectures.insert(0, (7, 0))
     for arch in architectures:
@@ -919,6 +924,30 @@ def test_cuda_coarse_drive_dtypes(monkeypatch: pytest.MonkeyPatch, dtype: torch.
         torch.testing.assert_close(actual, target)
 
 
+def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    class States:
+        is_cuda = True
+        device = torch.device("cuda:0")
+        shape = (4, 20, 128, 192, 160)
+
+        @staticmethod
+        def element_size() -> int:
+            return 2
+
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda _: SimpleNamespace(total_memory=24 * 1024**3)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (8, 9))
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "1")
+    states = States()
+    assert scans._decoupled_chunk(states, 11, coarse=False) == 0
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    assert scans._decoupled_chunk(states, 11, coarse=False) == 0
+    assert 0 < scans._decoupled_chunk(states, 11, coarse=True) < states.shape[1]
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    assert scans._decoupled_chunk(states, 11, coarse=True) == 0
+
+
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -953,9 +982,14 @@ def test_cuda_decoupled_vscan(
     if compiled:
         run = torch.compile(run, fullgraph=True)
     actual = run(pole, states, auxiliary, path, coarse)
-    actual_grads = scans.vertical_backward(
-        pole, states, auxiliary, path, *dy, coarse, compact=compact
+    actual_grads = (
+        scans.vertical_backward(pole, states, auxiliary, path, *dy, coarse, compact=True)
+        if compact else torch.autograd.grad(actual, [*pole, states, *path], dy)
     )
+    for planar in (False, True):
+        packed = scans.vertical_forward_packed(pole, states, auxiliary, path, coarse, 1e-6, planar)
+        target = torch.stack(actual) if planar else torch.cat(actual, dim=-1)
+        torch.testing.assert_close(packed, target)
     if dtype == torch.float32:
         forward_tol, backward_tol = (4e-5, 3e-6), (4e-4, 2e-4)
     elif dtype == torch.float16:
