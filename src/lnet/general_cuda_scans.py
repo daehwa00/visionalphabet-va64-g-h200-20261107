@@ -1939,6 +1939,14 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     if grad is not None:
         gr, gi = _vertical_adjoints(grad, states, out_shape)
         interleaved = (not gr.is_contiguous(), not gi.is_contiguous())
+    if saved_features is not None and (
+        grad is None
+        or saved_features.shape != (8, b * oh * ow, m)
+        or saved_features.device != states.device
+        or saved_features.dtype != states.dtype
+        or not saved_features.is_contiguous()
+    ):
+        raise ValueError("Invalid saved vertical features")
     if not pure:
         chunk = b if saved_features is not None else _decoupled_chunk(states, coarse)
         if chunk:
@@ -2033,7 +2041,11 @@ def _decoupled_chunk(states: Tensor, coarse: bool) -> int:
     step = 2 if coarse else 1
     per_sample = 16 * (height // step) * (width // step) * modes * states.element_size()
     vram = torch.cuda.get_device_properties(states.device).total_memory
-    return min(batch, min(2 * 1024**3, vram // 16) // per_sample)
+    budget = min(2 * 1024**3, vram // 16)
+    # Projection overlaps both feature planes with its partial reduction;
+    # scan scratch overlaps only one plane.
+    live_planes = min(budget - _MAX_PARTIAL_BYTES, 2 * (budget - 3 * _MAX_SCRATCH_BYTES))
+    return min(batch, max(0, live_planes // per_sample))
 
 
 @torch.compiler.assume_constant_result
@@ -2068,6 +2080,9 @@ def _project_path(
     weights_bytes = 11 * hidden * _WARP_SIZE * features.element_size()
     cached = weights_bytes <= 24 * 1024
     fast = hidden == _REGISTER_HIDDEN
+    if backward:
+        bytes_per_group = (1 if fast else warps) * (11 * hidden + 2) * modes * 4
+        groups = min(groups, max(1, _MAX_PARTIAL_BYTES // bytes_per_group))
     adjoints = torch.empty_like(features) if backward else None
     partial = None
     if backward:
@@ -2147,11 +2162,13 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
             _project_path(
                 features, weights, real[part], imag[part], backward=False, precise=precise,
             )
+            del features
             continue
 
         projected = _project_path(
             features, weights, grad[0][part], grad[1][part], backward=True, precise=False,
         )
+        del features
         if projected is None:
             raise TypeError("Expected path projection gradients")
         dp, path_grads = projected
@@ -2163,6 +2180,7 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
             raise TypeError("Expected pure scan gradients")
         for total, value in zip(sums, (*gradients[:4], *path_grads), strict=True):
             total.add_(value.reshape_as(total))
+        del projected, dp
 
     if grad is None:
         return output
