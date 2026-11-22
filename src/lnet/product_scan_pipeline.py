@@ -20,8 +20,8 @@ from .general_cuda_scans import (
     general_scans_enabled,
     horizontal_backward,
     horizontal_forward,
-    try_general_vertical_forward,
     vertical_backward,
+    vertical_forward,
     vertical_forward_packed,
 )
 from .product_scan_contracts import (
@@ -1215,13 +1215,11 @@ def _run_packed_cuda_forward(
                 output.new_empty((0,), dtype=torch.float32),
                 saved,
             )
-        if not packed_output:
-            result = try_general_vertical_forward(
-                pole_y, horizontal_storage, auxiliary, path, epilogue, epsilon, kind,
-                packed_output, planar_output, path_swiglu, squeeze_collapsed,
-            )
-            if result is not None:
-                return (*result, saved)
+        if operands is not None:
+            real, imag = vertical_forward(*operands, float(epsilon))
+            if not squeeze_collapsed:
+                real, imag = real.unsqueeze(-2), imag.unsqueeze(-2)
+            return real, imag, real.new_empty((0,), dtype=torch.float32), saved
     horizontal = horizontal_storage.unbind(0)
     primary, secondary, descriptor = _launch_product_scan4_forward(
         *pole_y,
