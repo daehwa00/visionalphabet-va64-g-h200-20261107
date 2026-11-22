@@ -45,8 +45,8 @@ def probe(shape: tuple, hidden: int, policy: str = "1") -> dict:
         return (*out, *grads)
 
     result = {"shape": shape, "hidden": hidden}
-    for label, policy in (("fused", "0"), ("decoupled", policy)):
-        os.environ["LNET_VSCAN_DECOUPLED"] = policy
+    for label, arm in (("fused", "0"), ("decoupled", policy)):
+        os.environ["LNET_VSCAN_DECOUPLED"] = arm
         values = step()
         if label == "fused":
             # Keep small samples for parity so measured allocation excludes baseline outputs.
