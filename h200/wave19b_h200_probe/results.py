@@ -21,6 +21,15 @@ def device(data):
     )
 
 
+def scalar_weight_launch(row):
+    # Forced vec1 bypasses the vector planner. The scalar launch grid encodes
+    # mode tiles times rank tiles. At M=640, rank 4, a grid of 40 is rank tile 2.
+    operation = row["arms"]["1"]["dweight"]
+    name, grid, threads = operation["launches"][0]
+    assert name == "dweight" and grid[0] == 40 and threads == 128, operation["launches"]
+    return {"vec": 1, "rank_tile": 2, "warps": 4, "grid": grid}
+
+
 def check(out):
     failures = []
     for batch in (1024, 128, 256, 512):
@@ -43,7 +52,8 @@ def check(out):
                 assert row["shape"] == [1024, *map(int, shape.split("x"))], row["shape"]
                 assert set(row["arms"]) == {"baseline", "auto", "1", "2"}
                 if shape.startswith("14x"):
-                    assert row["plans"]["auto"]["dweight"] and row["plans"]["1"]["dweight"]
+                    assert row["plans"]["auto"]["dweight"]
+                    scalar_weight_launch(row)
         except (AssertionError, KeyError, OSError) as exc:
             failures.append(f"reader {shape}: {exc}")
     dynamo = read(out, "dynamo")["graphs"]
@@ -81,7 +91,8 @@ def summary(out):
             row = json.loads(line)
             for arm in ("auto", "1"):
                 timing = row["arms"][arm]["dweight"]
-                plan = row.get("plans", {}).get(arm, {}).get("dweight")
+                plan = (scalar_weight_launch(row) if arm == "1"
+                        else row.get("plans", {}).get(arm, {}).get("dweight"))
                 print(f"14x14 {row['dtype']} {arm} dweight {timing['median_ms']:.6f} ms "
                       f"{timing['effective_gb_s']:.3f} GB/s plan={plan}")
 
