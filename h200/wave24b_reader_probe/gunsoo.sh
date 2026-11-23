@@ -13,15 +13,28 @@ gpu() {
     (flock -w 2400 9 && "$@") 9>/tmp/va-gpu.lock
 }
 
-train() {
+train_arm() {
     local arm=$1 order=$2
     shift 2
-    gpu env LNET_READER_W24B="$arm" "$py" "$probe/train.py" train-arm \
+    env LNET_READER_W24B="$arm" "$py" "$probe/train.py" train-arm \
         --variant 17-p1-nr4-1024d-v3 --batch 128 --profile \
         --out "$order-$arm.json" "$@" > "$order-$arm.log" 2>&1
 }
 
-case "${1:?ablate|bench|verify|train|train-base}" in
+train() {
+    gpu train_arm "$@"
+}
+
+train_paired() {
+    train_arm off paired-forward
+    train_arm on paired-forward
+    train_arm on paired-reversed
+    train_arm off paired-reversed
+    train_arm off paired-controlled --no-cudnn-benchmark
+    train_arm on paired-controlled --no-cudnn-benchmark
+}
+
+case "${1:?ablate|bench|verify|train|train-base|train-paired}" in
     ablate)
         gpu "$py" "$probe/screen.py" bench --ablate --out isolated-ablation.jsonl
         ;;
@@ -40,16 +53,19 @@ case "${1:?ablate|bench|verify|train|train-base}" in
             --out fold.json > fold.log 2>&1 || result=1
         exit "$result"
         ;;
+    train-paired)
+        gpu train_paired
+        ;;
     train-base)
         train off forward
         ;;
     train)
         test -s forward-off.json || train off forward
-        train auto forward
-        train auto reversed
+        train on forward
+        train on reversed
         train off reversed
         train off controlled --no-cudnn-benchmark
-        train auto controlled --no-cudnn-benchmark
+        train on controlled --no-cudnn-benchmark
         ;;
     *) exit 2 ;;
 esac

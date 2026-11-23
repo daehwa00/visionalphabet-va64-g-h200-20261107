@@ -1297,7 +1297,8 @@ def _traffic_score(
 
 
 def _wave24b_enabled() -> bool:
-    return os.environ.get("LNET_READER_W24B", "auto") in ("auto", "on")
+    # The full training gate left this candidate opt-in.
+    return os.environ.get("LNET_READER_W24B", "auto") == "on"
 
 
 def _wave24b_spatial_candidates(

@@ -1,6 +1,6 @@
 # Wave 24B reader verification
 
-기준은 Wave 21C 커밋 `039440f2c0a9a9d006948fcbbf45dd5c96e36efb`이다. `LNET_READER_W24B=off`는 기존 디스패치를 실행한다. `on`은 실험 경로를 선택한다. `LNET_READER_VEC` 강제 설정은 기존 경로를 유지한다.
+기준은 Wave 21C 커밋 `039440f2c0a9a9d006948fcbbf45dd5c96e36efb`이다. `LNET_READER_W24B=off`와 기본값 `auto`는 기존 디스패치를 실행한다. `on`은 실험 경로를 선택한다. `LNET_READER_VEC` 강제 설정은 기존 경로를 유지한다.
 
 ## 오프라인 리소스 확인
 
@@ -27,8 +27,10 @@ python h200/wave24b_reader_probe/weight_resources.py --out /tmp/t87-weight-resou
 cd /tmp/va-t87-gunsoo
 bash h200/wave24b_reader_probe/gunsoo.sh ablate
 bash h200/wave24b_reader_probe/gunsoo.sh bench
-bash h200/wave24b_reader_probe/gunsoo.sh train
+bash h200/wave24b_reader_probe/gunsoo.sh train-paired
 bash h200/wave24b_reader_probe/gunsoo.sh verify
 ```
 
-CUDA Graph는 순환 순서에서 CUDA 이벤트 쌍당 8번 같은 커널을 실행한다. 논리적 GB/s는 해당 런치의 텐서 바이트를 실행시간으로 나눈 값이다. `train`은 같은 시드의 독립 프로세스에서 두 실행 순서와 cuDNN 벤치마크를 끈 메모리 비교를 실행한다.
+CUDA Graph는 순환 순서에서 CUDA 이벤트 쌍당 8번 같은 커널을 실행한다. 논리적 GB/s는 해당 런치의 텐서 바이트를 실행시간으로 나눈 값이다. `train-paired`는 같은 시드의 독립 프로세스에서 두 실행 순서와 cuDNN 벤치마크를 끈 메모리 비교를 한 잠금 안에서 실행한다.
+
+학습 결과의 후보는 시험 당시 `auto`로 실행했다. 게이트 판정 후 `on`으로 같은 후보를 재현할 수 있다.
