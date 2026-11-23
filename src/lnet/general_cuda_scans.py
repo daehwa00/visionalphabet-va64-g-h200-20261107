@@ -124,6 +124,7 @@ class Kernel:
     real_transposed: bool = False
     imag_transposed: bool = False
     vector_weights: bool = False
+    spatial: bool = False
 
 
 class Launch(NamedTuple):
@@ -793,6 +794,441 @@ __device__ __forceinline__ void column_backward(
 }
 
 // Tile the CTA reduction so all scan warps can share one small staging buffer.
+constexpr unsigned tc_mask = 0xffffffff;
+constexpr int tc_columns = 16;
+
+template<class T> constexpr bool tc_half = false;
+template<> constexpr bool tc_half<__half> = true;
+
+template<class T> __device__ unsigned tc_pack(float x, float y) {
+    if constexpr (tc_half<T>) {
+        const __half2_raw raw = __floats2half2_rn(x, y);
+        return unsigned(raw.x) | (unsigned(raw.y) << 16);
+    } else {
+        const __nv_bfloat162_raw raw = __floats2bfloat162_rn(x, y);
+        return unsigned(raw.x) | (unsigned(raw.y) << 16);
+    }
+}
+
+template<class T> __device__ Complex tc_unpack(unsigned bits) {
+    if constexpr (tc_half<T>) {
+        const __half2_raw raw{static_cast<unsigned short>(bits),
+                               static_cast<unsigned short>(bits >> 16)};
+        return Pair<T>{__half2(raw)}.unpack();
+    } else {
+        const __nv_bfloat162_raw raw{static_cast<unsigned short>(bits),
+                                      static_cast<unsigned short>(bits >> 16)};
+        return Pair<T>{__nv_bfloat162(raw)}.unpack();
+    }
+}
+
+__device__ unsigned tc_join(unsigned a, unsigned b, int high) {
+    return ((a >> (16 * high)) & 65535u) | ((b >> (16 * high)) << 16);
+}
+
+template<class T>
+__device__ float4 tc_mma8(unsigned a0, unsigned a1, unsigned b) {
+    float4 d{};
+    if constexpr (tc_half<T>) {
+        asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3},{%4,%5},{%6},{%0,%1,%2,%3};"
+            : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w) : "r"(a0), "r"(a1), "r"(b));
+    } else {
+        asm("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3},{%4,%5},{%6},{%0,%1,%2,%3};"
+            : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w) : "r"(a0), "r"(a1), "r"(b));
+    }
+    return d;
+}
+
+template<class T>
+__device__ void tc_mma16(unsigned a0, unsigned a2, unsigned b0, unsigned b1,
+                          float& dw0, float& dw1) {
+    float discard0, discard1;
+    const unsigned zero = 0;
+    const float fzero = 0;
+    if constexpr (tc_half<T>) {
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3},{%4,%5,%6,%5},{%7,%8},{%0,%1,%9,%9};"
+            : "+f"(dw0), "+f"(dw1), "=f"(discard0), "=f"(discard1)
+            : "r"(a0), "r"(zero), "r"(a2), "r"(b0), "r"(b1), "f"(fzero));
+    } else {
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3},{%4,%5,%6,%5},{%7,%8},{%0,%1,%9,%9};"
+            : "+f"(dw0), "+f"(dw1), "=f"(discard0), "=f"(discard1)
+            : "r"(a0), "r"(zero), "r"(a2), "r"(b0), "r"(b1), "f"(fzero));
+    }
+}
+
+// Input/output fragment layout: group = row mod 8, pair = feature / 2.
+__device__ unsigned tc_features(unsigned pos, unsigned neg, int row, int pair) {
+    const auto pa = __shfl_sync(tc_mask, pos, 2 * row);
+    const auto pb = __shfl_sync(tc_mask, pos, 2 * row + 1);
+    const auto na = __shfl_sync(tc_mask, neg, 2 * row);
+    const auto nb = __shfl_sync(tc_mask, neg, 2 * row + 1);
+    return (pair & 1) ? tc_join(na, nb, pair >> 1) : tc_join(pa, pb, pair >> 1);
+}
+
+__device__ unsigned tc_transpose(unsigned p, int group, int pair) {
+    const int lane = 8 * pair + group / 2;
+    return tc_join(__shfl_sync(tc_mask, p, lane),
+                   __shfl_sync(tc_mask, p, lane + 4), group & 1);
+}
+
+__device__ float tc_row_sum(float value) {
+    value += __shfl_xor_sync(tc_mask, value, 1);
+    return value + __shfl_xor_sync(tc_mask, value, 2);
+}
+
+__device__ float tc_column_sum(float value) {
+    value += __shfl_xor_sync(tc_mask, value, 4);
+    value += __shfl_xor_sync(tc_mask, value, 8);
+    return value + __shfl_xor_sync(tc_mask, value, 16);
+}
+
+template<class T>
+__device__ float tc_activate(float pre, float bias, float& derivative) {
+    pre = rounded<T>(rounded<T>(pre) + bias);
+    const float sig = __fdividef(1.0f, 1.0f + __expf(-pre));
+    derivative = sig * (1.0f + pre * (1.0f - sig));
+    return rounded<T>(pre * sig);
+}
+
+template<class T>
+__device__ unsigned tc_normalize(Complex state, float gain) {
+    return tc_pack<T>(rounded<T>(state.r) * gain, rounded<T>(state.i) * gain);
+}
+
+template<class T, class I, int WARPS, bool COARSE, bool COMPACT, bool REAL, bool IMAG>
+struct SpatialColumn {
+    static constexpr int pitch = WARPS + 1;
+    const T* states;
+    const float* vy;
+    T* gs;
+    unsigned* tile;
+    I line, io_line, plane;
+    int H, W, M, ow, oh, mode0, lane, warp, direction;
+    float vx, eps;
+
+    __device__ int col() const { return lane / 2; }
+    __device__ int m() const { return mode0 + warp; }
+    __device__ bool valid(int c, int mode) const { return line + c < io_line && mode < M; }
+    __device__ I cell(int y, int c, int mode) const {
+        const I bx = line + c;
+        return ((bx / ow * oh + y) * ow + bx % ow) * M + mode;
+    }
+    template<bool GRAD>
+    __device__ I offset(int y, int c, int mode, int dir) const {
+        const I bx = line + c;
+        const I batch = bx / ow, x = bx % ow;
+        const I row = batch * H + y;
+        if constexpr (GRAD && COMPACT) return (row * ow + x) * M + mode;
+        return (row * W + (COARSE ? 2 * x + 1 - dir : x)) * M + mode;
+    }
+    __device__ Complex source(int y) const {
+        const int k = threadIdx.x / WARPS, mode = threadIdx.x % WARPS;
+        const int col = k / 2, dir = k & 1;
+        unsigned value = 0;
+        if (valid(col, mode0 + mode)) {
+            const I at = offset<false>(y, col, mode0 + mode, dir) + 2 * dir * plane;
+            const auto z = load_complex(states, at, plane);
+            value = tc_pack<T>(z.r, z.i);
+        }
+        tile[k * pitch + mode] = value;
+        __syncthreads();
+        const unsigned packed = tile[lane * pitch + warp];
+        __syncthreads();
+        return tc_unpack<T>(packed);
+    }
+    __device__ float gain(int y, bool reverse) const {
+        const float v = lane == 0 && m() < M ? vy[(I(reverse) * H + y) * M + m()] : 0;
+        const float broadcast = __shfl_sync(tc_mask, v, 0);
+        return rsqrtf(fmaxf(vx * broadcast, eps));
+    }
+    __device__ float2 incoming(int y, int c, const T* gr, const T* gi) const {
+        const int j = threadIdx.x / WARPS, mode = threadIdx.x % WARPS;
+        float2 d{};
+        if (j < tc_columns && valid(j, mode0 + mode)) {
+            const I at = cell(y, j, mode0 + mode);
+            d = make_float2(read(gr[(at - mode0 - mode) * (1 + REAL) + mode0 + mode]),
+                            read(gi[(at - mode0 - mode) * (1 + IMAG) + mode0 + mode]));
+        }
+        tile[j * pitch + mode] = tc_pack<T>(d.x, d.y);
+        __syncthreads();
+        const auto a = tc_unpack<T>(tile[c * pitch + warp]);
+        const auto b = tc_unpack<T>(tile[(c + 8) * pitch + warp]);
+        __syncthreads();
+        return lane & 1 ? make_float2(a.i, b.i) : make_float2(a.r, b.r);
+    }
+    __device__ void output(int y, float2 a, float2 b, T* outr, T* outi) const {
+        const int group = lane / 4;
+        if (!(lane & 3)) {
+            tile[group * pitch + warp] = tc_pack<T>(a.x, a.y);
+            tile[(group + 8) * pitch + warp] = tc_pack<T>(b.x, b.y);
+        }
+        __syncthreads();
+        const int c = threadIdx.x / WARPS, mode = mode0 + threadIdx.x % WARPS;
+        if (c < tc_columns && valid(c, mode)) {
+            const auto z = tc_unpack<T>(tile[c * pitch + threadIdx.x % WARPS]);
+            const I at = cell(y, c, mode);
+            outr[(at - mode) * (1 + REAL) + mode] = write<T>(z.r);
+            outi[(at - mode) * (1 + IMAG) + mode] = write<T>(z.i);
+        }
+        __syncthreads();
+    }
+    template<bool REVERSE>
+    __device__ void gradient(int y, Complex delta) const {
+        tile[lane * pitch + warp] = tc_pack<T>(delta.r, delta.i);
+        __syncthreads();
+        const int k = threadIdx.x / WARPS, mode = threadIdx.x % WARPS;
+        const int c = k / 2, dir = k & 1;
+        if (valid(c, mode0 + mode)) {
+            const I stride = COMPACT ? plane / 2 : plane;
+            const I at = offset<true>(y, c, mode0 + mode, dir) + 2 * dir * stride;
+            auto z = tc_unpack<T>(tile[k * pitch + mode]);
+            if constexpr (REVERSE) z = z + load_complex(gs, at, stride);
+            store_complex(gs, at, stride, z);
+            if constexpr (REVERSE && COARSE && !COMPACT) {
+                store_complex(gs, at + I(2 * dir - 1) * M, stride, {});
+            }
+        }
+        __syncthreads();
+    }
+};
+
+struct SpatialPath {
+    unsigned wi, wt;
+    float2 bi, wr, wi_out, bo;
+};
+
+struct SpatialPathGrad {
+    float2 dw{}, db{}, dr{}, di{}, dbo{};
+};
+
+template<class T>
+__device__ float4 tc_project(unsigned p0, unsigned p1, SpatialPath path) {
+    const float4 pre = tc_mma8<T>(p0, p1, path.wi);
+    float discard;
+    return make_float4(tc_activate<T>(pre.x, path.bi.x, discard),
+                       tc_activate<T>(pre.y, path.bi.y, discard),
+                       tc_activate<T>(pre.z, path.bi.x, discard),
+                       tc_activate<T>(pre.w, path.bi.y, discard));
+}
+
+template<class T>
+__device__ float4 tc_project_backward(
+    unsigned p0, unsigned p1, SpatialPath path, float2 dy0, float2 dy1,
+    SpatialPathGrad& grad, int group, int pair
+) {
+    const float4 pre = tc_mma8<T>(p0, p1, path.wi);
+    float4 der;
+    const float ax = tc_activate<T>(pre.x, path.bi.x, der.x);
+    const float ay = tc_activate<T>(pre.y, path.bi.y, der.y);
+    const float az = tc_activate<T>(pre.z, path.bi.x, der.z);
+    const float aw = tc_activate<T>(pre.w, path.bi.y, der.w);
+    grad.dr.x += dy0.x * ax + dy1.x * az;
+    grad.dr.y += dy0.x * ay + dy1.x * aw;
+    grad.di.x += dy0.y * ax + dy1.y * az;
+    grad.di.y += dy0.y * ay + dy1.y * aw;
+    grad.dbo.x += dy0.x + dy1.x;
+    grad.dbo.y += dy0.y + dy1.y;
+    const auto dz0 = tc_pack<T>(rounded<T>(dy0.x * path.wr.x + dy0.y * path.wi_out.x) * der.x,
+                                rounded<T>(dy0.x * path.wr.y + dy0.y * path.wi_out.y) * der.y);
+    const auto dz1 = tc_pack<T>(rounded<T>(dy1.x * path.wr.x + dy1.y * path.wi_out.x) * der.z,
+                                rounded<T>(dy1.x * path.wr.y + dy1.y * path.wi_out.y) * der.w);
+    const auto z0 = tc_unpack<T>(dz0), z1 = tc_unpack<T>(dz1);
+    grad.db.x += z0.r + z1.r;
+    grad.db.y += z0.i + z1.i;
+    tc_mma16<T>(tc_transpose(dz0, group, pair), tc_transpose(dz1, group, pair),
+                tc_transpose(p0, group, pair), tc_transpose(p1, group, pair),
+                grad.dw.x, grad.dw.y);
+    return tc_mma8<T>(dz0, dz1, path.wt);
+}
+
+template<bool REVERSE, class T, class Column>
+__device__ void tc_adjoint(
+    Column c, int y, Complex prev, Complex s, Complex inject, Complex a, Complex g,
+    Complex& adj, Complex& da, Complex& dg
+) {
+    adj = a.conj() * adj + inject;
+    pole_grad(adj, prev, s, da, dg, REVERSE);
+    c.template gradient<REVERSE>(y, g.conj() * adj);
+}
+
+template<class T, class I, bool COARSE, int WARPS, bool BACKWARD, bool COMPACT, bool REAL,
+         bool IMAG>
+__device__ void vertical_spatial(
+    const float* dr, const float* di, const float* decay_gr, const float* decay_gi,
+    const T* states, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo, const void* bo, const T* gr, const T* gi,
+    T* outr, T* outi, T* gs, float* partial, int B, int H, int W, int M, int workers,
+    int types, float eps
+) {
+    extern __shared__ float4 shared[];
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid & 31;
+    const int col = lane / 2, dir = lane & 1, group = lane / 4, pair = lane & 3;
+    const int tiles = (M - 1) / WARPS + 1;
+    const int mode0 = (blockIdx.x % tiles) * WARPS, m = mode0 + warp;
+    const int worker = blockIdx.x / tiles;
+    const int ow = W / (1 + COARSE), oh = H / (1 + COARSE);
+    const I lines = I(B) * ow, plane = I(B) * H * W * M;
+    auto* seg = reinterpret_cast<Complex*>(shared);
+    auto* buf = reinterpret_cast<unsigned*>(seg + (BACKWARD ? I(H) * WARPS * 32 : 0));
+    auto* tile = buf + I(oh) * WARPS * 32;
+    constexpr int stride = WARPS * 32;
+    Complex a{}, g{}, da{}, dg{};
+    SpatialPath path{};
+    SpatialPathGrad grad{};
+    if (m < M) {
+        a = {dr[m], di[m]};
+        g = {decay_gr[m], decay_gi[m]};
+        const auto w = [&](int j, int k) {
+            return load_scalar(wi, I(m) * 64 + 8 * j + k, types & 3);
+        };
+        path.wi = tc_pack<T>(w(group, 2 * pair), w(group, 2 * pair + 1));
+        if constexpr (BACKWARD) path.wt = tc_pack<T>(w(2 * pair, group), w(2 * pair + 1, group));
+        const int j = 2 * pair;
+        path.bi = make_float2(rounded<T>(load_scalar(bi, I(m) * 8 + j, (types >> 2) & 3)),
+                              rounded<T>(load_scalar(bi, I(m) * 8 + j + 1, (types >> 2) & 3)));
+        path.wr = make_float2(rounded<T>(load_scalar(wo, I(m) * 16 + j, (types >> 4) & 3)),
+                              rounded<T>(load_scalar(wo, I(m) * 16 + j + 1, (types >> 4) & 3)));
+        path.wi_out = make_float2(
+            rounded<T>(load_scalar(wo, I(m) * 16 + 8 + j, (types >> 4) & 3)),
+            rounded<T>(load_scalar(wo, I(m) * 16 + 9 + j, (types >> 4) & 3)));
+        if constexpr (!BACKWARD) {
+            path.bo = make_float2(rounded<T>(load_scalar(bo, I(m) * 2, types >> 6)),
+                                  rounded<T>(load_scalar(bo, I(m) * 2 + 1, types >> 6)));
+        }
+    }
+    const auto ar = a.conj(), gg = g.conj();
+    for (I line = I(worker) * tc_columns; line < lines; line += I(workers) * tc_columns) {
+        const int x = (line + col) % ow;
+        float v = 0;
+        if (line + col < lines && m < M) {
+            const int xh = COARSE ? 2 * x + 1 - dir : x;
+            v = vx[(I(dir) * W + xh) * M + m];
+        }
+        SpatialColumn<T, I, WARPS, COARSE, COMPACT, REAL, IMAG> c{
+            states, vy, gs, tile, line, lines, plane, H, W, M, ow, oh, mode0, lane, warp, dir,
+            v, eps};
+        Complex pos{}, neg{};
+        for (int y = 0; y < H; ++y) {
+            pos = a * pos + g * c.source(y);
+            if constexpr (BACKWARD) {
+                seg[I(y) * stride + tid] = pos;
+            } else if (!COARSE || (y & 1)) {
+                buf[I(y / (1 + COARSE)) * stride + tid] = tc_normalize<T>(pos, c.gain(y, false));
+            }
+        }
+        Complex adj{};
+        for (int y = H - 1; y >= 0; y -= 1 + COARSE) {
+            const auto s = c.source(y);
+            const auto next = neg;
+            neg = ar * neg + gg * s;
+            auto se = s;
+            const auto next_even = neg;
+            if constexpr (COARSE) {
+                se = c.source(y - 1);
+                neg = ar * neg + gg * se;
+            }
+            const int yo = y / (1 + COARSE);
+            const I slot = I(yo) * stride + tid;
+            unsigned pp;
+            float gp;
+            if constexpr (BACKWARD) {
+                gp = c.gain(y, false);
+                pp = tc_normalize<T>(seg[I(y) * stride + tid], gp);
+            } else {
+                pp = buf[slot];
+            }
+            const float gn = c.gain(y - COARSE, true);
+            const unsigned pn = tc_normalize<T>(neg, gn);
+            const unsigned p0 = tc_features(pp, pn, group, pair);
+            const unsigned p1 = tc_features(pp, pn, group + 8, pair);
+            if constexpr (BACKWARD) {
+                const auto dy = c.incoming(yo, group, gr, gi);
+                // Each hidden pair uses both Cartesian output adjoints.
+                const float2 dy0 = make_float2(__shfl_sync(tc_mask, dy.x, lane & ~1),
+                                               __shfl_sync(tc_mask, dy.x, lane | 1));
+                const float2 dy1 = make_float2(__shfl_sync(tc_mask, dy.y, lane & ~1),
+                                               __shfl_sync(tc_mask, dy.y, lane | 1));
+                const auto dp = tc_project_backward<T>(p0, p1, path, dy0, dy1, grad, group, pair);
+                const unsigned dp0 = tc_pack<T>(dp.x, dp.y), dp1 = tc_pack<T>(dp.z, dp.w);
+                const int src = 4 * (col & 7);
+                const auto feature = [&](int k) {
+                    const unsigned lo = __shfl_sync(tc_mask, dp0, src + k);
+                    const unsigned hi = __shfl_sync(tc_mask, dp1, src + k);
+                    const auto d = tc_unpack<T>(col < 8 ? lo : hi);
+                    return dir ? d.i : d.r;
+                };
+                const Complex ip = tc_unpack<T>(tc_pack<T>(feature(0) * gp, feature(2) * gp));
+                buf[slot] = tc_pack<T>(feature(1) * gn, feature(3) * gn);
+                const I at = I(y) * stride + tid;
+                tc_adjoint<false, T>(c, y, y ? seg[at - stride] : Complex{},
+                                     s, ip, a, g, adj, da, dg);
+                seg[at] = next;
+                if constexpr (COARSE) {
+                    tc_adjoint<false, T>(c, y - 1, y > 1 ? seg[at - 2 * stride] : Complex{},
+                                         se, {}, a, g, adj, da, dg);
+                    seg[at - stride] = next_even;
+                }
+            } else {
+                const auto z = tc_project<T>(p0, p1, path);
+                c.output(yo, make_float2(
+                    rounded<T>(tc_row_sum(path.wr.x * z.x + path.wr.y * z.y)) + path.bo.x,
+                    rounded<T>(tc_row_sum(path.wi_out.x * z.x + path.wi_out.y * z.y)) + path.bo.y),
+                    make_float2(
+                    rounded<T>(tc_row_sum(path.wr.x * z.z + path.wr.y * z.w)) + path.bo.x,
+                    rounded<T>(tc_row_sum(path.wi_out.x * z.z + path.wi_out.y * z.w)) + path.bo.y),
+                    outr, outi);
+            }
+        }
+        if constexpr (BACKWARD) {
+            adj = {};
+            for (int y = 0; y < H; ++y) {
+                const Complex inject = !COARSE || !(y & 1)
+                    ? tc_unpack<T>(buf[I(y / (1 + COARSE)) * stride + tid]) : Complex{};
+                tc_adjoint<true, T>(c, y, seg[I(y) * stride + tid], c.source(y), inject,
+                                     ar, gg, adj, da, dg);
+            }
+        }
+    }
+    if constexpr (BACKWARD) {
+        // Each warp owns a unique (partial row, mode) pair, including the mode tail.
+        if (m >= M) return;
+        float* row = partial + I(worker) * 94 * M + m;
+        row[(8 * group + 2 * pair + 4) * I(M)] = grad.dw.x;
+        row[(8 * group + 2 * pair + 5) * I(M)] = grad.dw.y;
+        const float db0 = tc_column_sum(grad.db.x), db1 = tc_column_sum(grad.db.y);
+        const float dr0 = tc_column_sum(grad.dr.x), dr1 = tc_column_sum(grad.dr.y);
+        const float di0 = tc_column_sum(grad.di.x), di1 = tc_column_sum(grad.di.y);
+        const float dbo0 = tc_column_sum(grad.dbo.x), dbo1 = tc_column_sum(grad.dbo.y);
+        if (!group) {
+            row[(68 + 2 * pair) * I(M)] = db0;
+            row[(69 + 2 * pair) * I(M)] = db1;
+            row[(76 + 2 * pair) * I(M)] = dr0;
+            row[(77 + 2 * pair) * I(M)] = dr1;
+            row[(84 + 2 * pair) * I(M)] = di0;
+            row[(85 + 2 * pair) * I(M)] = di1;
+        }
+        #pragma unroll
+        for (int delta = 16; delta; delta /= 2) {
+            da.r += __shfl_xor_sync(tc_mask, da.r, delta);
+            da.i += __shfl_xor_sync(tc_mask, da.i, delta);
+            dg.r += __shfl_xor_sync(tc_mask, dg.r, delta);
+            dg.i += __shfl_xor_sync(tc_mask, dg.i, delta);
+        }
+        if (!lane) {
+            row[0] = da.r;
+            row[M] = da.i;
+            row[2 * I(M)] = dg.r;
+            row[3 * I(M)] = dg.i;
+            row[92 * I(M)] = dbo0;
+            row[93 * I(M)] = dbo1;
+        }
+    }
+}
+
 constexpr int vscan_reduce_tile = 32;
 
 template<int WARPS, int FIELDS, class I>
@@ -1212,6 +1648,17 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
             f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}"
         )
+        implementation = (
+            f"vertical_spatial<{io}, {index}, {coarse}, {key.warps}, "
+            f"{backward}, {compact}, {layout}>"
+            "(dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo, bo, gr, gi, "
+            "outr, outi, gs, partials, B, H, W, M, workers, types, eps);"
+            if key.spatial else
+            f"vertical<{targs}>(dr, di, decay_gr, decay_gi, states, vx, vy, "
+            "wi, bi, wo, bo, gr, gi, "
+            "outr, outi, gs, partials, scratch, checkpoints, B, H, W, M, workers, hidden, types, "
+            "eps, input_plane, grad_plane);"
+        )
         wrapper = f"""
 {bounds}(
     const float* __restrict__ dr, const float* __restrict__ di,
@@ -1227,10 +1674,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     int B, int H, int W, int M, int workers, int hidden, int types, float eps,
     long long input_plane, long long grad_plane
 ) {{
-    vertical<{targs}>(dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo, bo, gr, gi,
-                       outr, outi,
-                       gs, partials, scratch, checkpoints, B, H, W, M, workers, hidden, types, eps,
-                       input_plane, grad_plane);
+    {implementation}
 }}
 """
     else:
@@ -1269,7 +1713,7 @@ def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
             None,
         ),
     )
-    fmad = (not key.vertical or key.backward or key.vector_weights) and not (
+    fmad = (not key.vertical or key.backward or key.vector_weights or key.spatial) and not (
         key.projection and key.precise
     )
     flags = [
@@ -1386,7 +1830,10 @@ def _dispatch(source: Tensor, launch: Launch | None, args: tuple) -> None:
     if launch is None:
         raise RuntimeError("CUDA scan is ineligible on this device")
     plan, key, workers, _ = launch
-    grid = _ceil(source.shape[-1], _WARP_SIZE) * _ceil(workers, plan.warps)
+    if key.spatial:
+        grid = _ceil(source.shape[-1], plan.warps) * workers
+    else:
+        grid = _ceil(source.shape[-1], _WARP_SIZE) * _ceil(workers, plan.warps)
     _launch_kernel(source, key, grid, plan.smem, args)
 
 
@@ -2042,6 +2489,45 @@ def _vertical_adjoints(
     return _contiguous_or_interleaved(grad[0]), _contiguous_or_interleaved(grad[1])
 
 
+@lru_cache(maxsize=256)
+def _spatial_launch(
+    device: int, shape: tuple[int, ...], baseline: Launch,
+    requested_warps: str,
+) -> Launch | None:
+    if torch.cuda.get_device_capability(device)[0] < 8:
+        return None
+    b, h, w, m = shape
+    sms, limit, _ = device_limits(device)
+    old_plan, old_key, _, old_rows = baseline
+    step = 1 + int(old_key.coarse)
+    columns = _ceil(b * (w // step), 16)
+    choices = []
+    for warps in (4, 8):
+        if requested_warps not in ("auto", str(warps)):
+            continue
+        smem = (h * 8 * old_key.backward + (h // step) * 4) * warps * 32
+        smem += 32 * (warps + 1) * 4
+        if smem > limit:
+            continue
+        key = replace(old_key, spatial=True, warps=warps, vector_weights=False)
+        resident = _resident(device, key, smem)
+        if not resident:
+            continue
+        modes = _ceil(m, warps)
+        workers = min(columns, _ceil(sms * resident * _VSCAN_WAVES, modes))
+        if key.backward:
+            # Bound parameter partials by the existing allocation.
+            workers = min(workers, old_rows)
+        if workers * modes >= 2**31:
+            continue
+        score = (min(workers * modes, resident * sms) * warps, min(workers * modes, sms))
+        plan = old_plan._replace(
+            warps=warps, smem=smem, cache_line=True, global_checkpoints=False,
+        )
+        choices.append((score, Launch(plan, key, workers, workers)))
+    return max(choices, key=lambda item: item[0])[1] if choices else None
+
+
 def _vscan(  # noqa: C901, PLR0912, PLR0915
     pole: list[Tensor],
     states: Tensor,
@@ -2115,6 +2601,12 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
+    spatial = os.environ.get("LNET_VSCAN_SPATIAL", "")
+    if (
+        spatial and not (pure or precise)
+        and hidden == _REGISTER_HIDDEN and states.element_size() == 2
+    ):
+        launch = _spatial_launch(states.device.index or 0, shape, launch, spatial) or launch
     if backward:
         if pure:
             gr, gi = features, None

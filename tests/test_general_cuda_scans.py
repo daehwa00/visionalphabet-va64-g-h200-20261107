@@ -1067,3 +1067,74 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     ):
         for value, target in zip(values, reference, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("batch", "h", "w", "m", "coarse", "compact"),
+    [
+        (1, 5, 7, 1, False, False),
+        (3, 13, 15, 17, False, False),
+        (7, 17, 19, 32, False, False),
+        (3, 56, 56, 48, True, True),
+        (1, 56, 56, 160, True, False),
+    ],
+)
+def test_cuda_spatial_vscan(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    batch: int,
+    h: int,
+    w: int,
+    m: int,
+    coarse: bool,
+    compact: bool,
+) -> None:
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("SM 8.0 required")
+    torch.manual_seed(416)
+    _, pole, real, imag, auxiliary, path = _inputs(h, w, m, 8, dtype, "cuda", batch)
+    states = torch.stack((real, imag, imag, real))
+    shape = (batch, h // (1 + coarse), w // (1 + coarse), 2 * m)
+    dy = torch.randn(shape, device="cuda", dtype=dtype).chunk(2, dim=-1)
+    monkeypatch.delenv("LNET_VSCAN_SPATIAL", raising=False)
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    baseline = scans._vscan(pole, states, auxiliary, path, coarse, 1e-6, precise=False)
+    baseline_grad = scans.vertical_backward(
+        pole, states, auxiliary, path, *dy, coarse, compact=compact,
+    )
+    reference = scans._reference_vertical(pole, states, auxiliary, path, coarse, 1e-6)
+    reference_grad = list(torch.autograd.grad(reference, [*pole, states, *path], dy))
+    if compact:
+        gs = reference_grad[4]
+        reference_grad[4] = torch.cat((gs[:2, :, :, 1::2], gs[2:, :, :, ::2]))
+    monkeypatch.setenv("LNET_VSCAN_SPATIAL", "4")
+    dispatch = scans._dispatch
+    keys = []
+
+    def track(source: Tensor, launch: scans.Launch, args: tuple) -> None:
+        keys.append(launch.key)
+        dispatch(source, launch, args)
+
+    monkeypatch.setattr(scans, "_dispatch", track)
+    actual = scans._vscan(pole, states, auxiliary, path, coarse, 1e-6, precise=False, packed=True)
+    actual_grad = scans.vertical_backward(
+        pole, states, auxiliary, path, *dy, coarse, compact=compact,
+    )
+    assert [key.spatial for key in keys] == [True, True]
+
+    forward_tol, backward_tol = (
+        ((8e-3, 1e-3), (5e-2, 2e-2)) if dtype == torch.float16
+        else ((4e-2, 5e-3), (1.2e-1, 8e-2))
+    )
+    assert isinstance(actual, Tensor)
+    for values, targets, (rtol, atol) in (
+        (actual.chunk(2, dim=-1), baseline, forward_tol),
+        (actual.chunk(2, dim=-1), reference, forward_tol),
+        (actual_grad, baseline_grad, backward_tol),
+        (actual_grad, reference_grad, backward_tol),
+    ):
+        for value, target in zip(values, targets, strict=True):
+            torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
