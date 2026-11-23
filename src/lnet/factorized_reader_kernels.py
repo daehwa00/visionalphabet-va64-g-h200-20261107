@@ -1296,13 +1296,11 @@ def _prefer_scalar_weight(
     packed_tiles = _ceildiv(modes, _WARP_SIZE * vec)
     if packed_tiles < warps and packed_tiles * _WARP_SIZE * vec != modes:
         return True
-    if architecture_major < 9:
-        return False
-    # Compact Hopper rows favor scalar weight tiles. Keep the packed
-    # single-column path when it has enough independent mode partitions.
+    # A short packed grid increases the number of partial rows per mode.
+    # Keep scalar splits on single-column planes with few packed partitions.
     column_warps = _ceildiv(width, _reader_columns(width))
-    return column_warps == _COMPACT_SPATIAL_GEOMETRY[1] or (
-        column_warps == 1 and packed_tiles < warps
+    return (column_warps == 1 and packed_tiles < warps) or (
+        architecture_major >= 9 and column_warps == _COMPACT_SPATIAL_GEOMETRY[1]
     )
 
 

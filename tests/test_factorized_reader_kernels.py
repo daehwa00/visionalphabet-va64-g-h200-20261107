@@ -648,7 +648,7 @@ def test_reader_vector_plan(
         (14, 14, 160, 8, True),
         (14, 14, 640, 9, True),
         (7, 7, 128, 9, True),
-        (7, 7, 128, 8, False),
+        (7, 7, 128, 8, True),
         (28, 28, 160, 9, False),
     ],
 )
