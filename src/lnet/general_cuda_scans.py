@@ -125,6 +125,8 @@ class Kernel:
     imag_transposed: bool = False
     vector_weights: bool = False
     batch_path: bool = False
+    register_path: bool = False
+    horizontal_unroll8: bool = False
 
 
 class Launch(NamedTuple):
@@ -299,7 +301,8 @@ __device__ void pole_grad(Complex adj, Complex prev, Complex source, Complex& da
 }
 
 template<class T, class I, int WARPS, bool BACKWARD, bool CACHE, bool COMPACT,
-         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool REAL_TRANSPOSED, bool IMAG_TRANSPOSED>
+         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool REAL_TRANSPOSED, bool IMAG_TRANSPOSED,
+         int BACKWARD_UNROLL = 4>
 __device__ __forceinline__ void horizontal(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -357,7 +360,7 @@ __device__ __forceinline__ void horizontal(
                 Complex right{}, left{}, neg{};
                 const I grad_plane = COMPACT ? plane / 2 : plane;
                 const I grad_base = COMPACT ? line * (W / 2) * M + m : base;
-                #pragma unroll 4
+                #pragma unroll BACKWARD_UNROLL
                 for (int x = 0; x < W; ++x) {
                     const I i = base + I(x) * M;
                     const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
@@ -369,7 +372,7 @@ __device__ __forceinline__ void horizontal(
                         buf[I(x / (1 + COMPACT)) * stride] = Pair<float>::pack(right);
                     }
                 }
-                #pragma unroll 4
+                #pragma unroll BACKWARD_UNROLL
                 for (int x = W - 1; x >= 0; --x) {
                     const I i = base + I(x) * M;
                     const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
@@ -872,10 +875,46 @@ __device__ __forceinline__ void write_vscan_partial(
     }
 }
 
+template<class T>
+struct RegisterPathWeights {
+    static constexpr bool vector_weights = false;
+    int size = 8;
+    Pair<T> pairs[44];
+
+    __device__ Complex input_pair(int j) const { return pairs[j].unpack(); }
+    __device__ float bias(int j) const {
+        const auto p = pairs[32 + j / 2].unpack();
+        return j % 2 ? p.i : p.r;
+    }
+    __device__ float output(int j) const {
+        const auto p = pairs[36 + j / 2].unpack();
+        return j % 2 ? p.i : p.r;
+    }
+};
+
+template<class T, class I>
+__device__ __forceinline__ auto load_register_path_weights(
+    const void* wi, const void* bi, const void* wo, int types, int m, bool active
+) {
+    const PathWeights<T, I, false> source{wi, bi, wo, types, m, 8};
+    RegisterPathWeights<T> weights;
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) weights.pairs[j] = Pair<T>::pack(source.input_pair(j));
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            weights.pairs[32 + j] = Pair<T>::pack({source.bias(2 * j), source.bias(2 * j + 1)});
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            weights.pairs[36 + j] = Pair<T>::pack({source.output(2 * j), source.output(2 * j + 1)});
+    }
+    return weights;
+}
+
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS, bool BATCH_PATH>
+         bool VECTOR_WEIGHTS, bool BATCH_PATH, bool REGISTER_PATH = false>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -907,17 +946,20 @@ __device__ __forceinline__ void vertical(
     const I target_plane = PURE && BACKWARD ? I(grad_plane) : plane;
     auto* weights_shared = reinterpret_cast<T*>(shared);
     const I weight_fields = 11 * I(size);
-    if constexpr (VECTOR_WEIGHTS) {
+    if constexpr (VECTOR_WEIGHTS && !REGISTER_PATH) {
         static_assert(CACHE_WEIGHT);
         load_project_weights<T, HIDDEN, threads, true>(
             reinterpret_cast<float*>(shared), wi, bi, wo, nullptr, types, mode0, M, size);
         __syncthreads();
-    } else if constexpr (CACHE_WEIGHT) {
+    } else if constexpr (CACHE_WEIGHT && !REGISTER_PATH) {
         load_path_weights<T, I>(weights_shared, wi, bi, wo, types, mode0, M, size, threads);
         __syncthreads();
     }
     const auto path = [&] {
-        if constexpr (VECTOR_WEIGHTS) {
+        if constexpr (REGISTER_PATH) {
+            static_assert(!BACKWARD && !PURE && HIDDEN == 8 && BATCH_PATH && sizeof(T) == 2);
+            return load_register_path_weights<T, I>(wi, bi, wo, types, m, active);
+        } else if constexpr (VECTOR_WEIGHTS) {
             return ProjectWeights{reinterpret_cast<const float*>(shared), size, lane};
         } else {
             return path_weights<T, I, CACHE_WEIGHT>(
@@ -925,7 +967,8 @@ __device__ __forceinline__ void vertical(
         }
     }();
     constexpr int weight_itemsize = VECTOR_WEIGHTS ? sizeof(float) : sizeof(T);
-    auto* seg = shared + (CACHE_WEIGHT ? weight_fields * 32 * weight_itemsize / 16 : 0);
+    auto* seg = shared + (CACHE_WEIGHT && !REGISTER_PATH
+        ? weight_fields * 32 * weight_itemsize / 16 : 0);
     auto* ckpt = seg + (BACKWARD ? span * threads : 0);
     auto* seg_src = reinterpret_cast<Quad<T>*>(
         ckpt + (BACKWARD && !GLOBAL_CKPT ? I(chunks - 1) * threads : 0));
@@ -1295,7 +1338,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
             f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
-            f"{str(key.batch_path).lower()}"
+            f"{str(key.batch_path).lower()}{', true' if key.register_path else ''}"
         )
         wrapper = f"""
 {bounds}(
@@ -1320,6 +1363,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
 """
     else:
         transposed = f"{str(key.real_transposed).lower()}, {str(key.imag_transposed).lower()}"
+        unroll = ", 8" if key.horizontal_unroll8 else ""
         wrapper = f"""
 {bounds}(
     const float* __restrict__ dr, const float* __restrict__ di,
@@ -1331,7 +1375,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     int B, int H, int W, int M, int workers
 ) {{
     horizontal<{io}, {index}, {key.warps}, {backward}, {cache_line},
-               {compact}, {layout}, {transposed}>(
+               {compact}, {layout}, {transposed}{unroll}>(
         dr, di, decay_gr, decay_gi, sr, si, states, grad, out, partials, scratch,
         B, H, W, M, workers);
 }}
@@ -1455,7 +1499,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     blocks = ct.c_int()
     with torch.cuda.device(device):
         _ensure_context(driver, device)
-        if key.batch_path:
+        if key.batch_path or key.horizontal_unroll8:
             local = ct.c_int()
             _check_cu(
                 driver.cuFuncGetAttribute(ct.byref(local), 3, func),
@@ -1860,6 +1904,31 @@ def _launch_for_shape(
     return _with_vector_path_weights(device, best, modes=m, hidden=hidden, wave_limit=wave_limit)
 
 
+def _with_wave24a(launch: Launch, device: int, shape: tuple[int, int, int, int]) -> Launch:
+    plan, key, _, _ = launch
+    if (
+        os.environ.get("LNET_SCAN_W24A", "auto") not in {"auto", "on"}
+        or shape[1:] != (56, 56, 160) or key.dtype.itemsize != 2 or not key.index32
+    ):
+        return launch
+    if not key.vertical and key.backward and key.cache_line and not key.compact and key.warps == 1:
+        candidate = replace(key, horizontal_unroll8=True)
+        if _resident(device, candidate, plan.smem) >= _resident(device, key, plan.smem):
+            return launch._replace(key=candidate)
+        return launch
+    if key.coarse or not key.batch_path:
+        return launch
+    # Retain vector_weights in the key so NVRTC keeps the baseline FMA policy.
+    candidate = replace(key, register_path=True, cache_weights=False)
+    weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (
+        4 if key.vector_weights else key.dtype.itemsize
+    )
+    smem = plan.smem - weight_bytes
+    if _resident(device, candidate, smem) == 0:
+        return launch
+    return launch._replace(key=candidate, plan=plan._replace(smem=smem, cache_weights=False))
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -1894,6 +1963,8 @@ def _plan_launch(
     if launch is None or os.environ.get("LNET_GENERAL_SCAN_OPT", "auto") == "off":
         return launch
     plan, key, workers, _ = launch
+    if not key.vertical:
+        return _with_wave24a(launch, device, shape)
     # Use the batched path for bandwidth-heavy forward plans that already
     # keep weights in shared memory and stage the trajectory outside the CTA.
     if (
@@ -1910,7 +1981,7 @@ def _plan_launch(
     queued = _ceil(workers * _ceil(shape[-1], _WARP_SIZE), sms)
     if resident < min(max_warps // 4, original) or queued < 2 * resident:
         return launch
-    return launch._replace(key=candidate)
+    return _with_wave24a(launch._replace(key=candidate), device, shape)
 
 
 # Custom ops and public API

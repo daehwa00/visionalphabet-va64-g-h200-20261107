@@ -50,6 +50,43 @@ def test_general_scans_default_and_opt_out(monkeypatch: pytest.MonkeyPatch) -> N
     assert not general_scans_enabled()
 
 
+@pytest.mark.parametrize(("policy", "enabled"), [("off", False), ("auto", True), ("on", True)])
+def test_wave24a_register_path_policy(
+    monkeypatch: pytest.MonkeyPatch, policy: str, enabled: bool,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W24A", policy)
+    monkeypatch.setattr(scans, "_resident", lambda *_args: 8)
+    key = scans.Kernel(
+        torch.bfloat16, 1, backward=False, vertical=True, hidden8=True,
+        cache_weights=True, vector_weights=True, batch_path=True,
+    )
+    baseline = scans.Launch(scans.ScanPlan(1, 11264, cache_weights=True), key, 936, 936)
+    observed = scans._with_wave24a(baseline, 0, (128, 56, 56, 160))
+    assert observed.key.register_path is enabled
+    assert observed.plan.smem == (0 if enabled else 11264)
+    assert observed.workers == baseline.workers
+    assert observed.partials == baseline.partials
+    assert scans._with_wave24a(baseline, 0, (128, 37, 53, 53)) == baseline
+
+
+def test_wave24a_horizontal_unroll_keeps_geometry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_SCAN_W24A", "auto")
+    monkeypatch.setattr(scans, "_resident", lambda *_args: 6)
+    key = scans.Kernel(torch.float16, 1, backward=True, cache_line=True)
+    baseline = scans.Launch(scans.ScanPlan(1, 14336, cache_line=True), key, 1536, 1536)
+    shape = (128, 56, 56, 160)
+    result = scans._with_wave24a(baseline, 0, shape)
+    assert result == baseline._replace(key=replace(key, horizontal_unroll8=True))
+
+    compact = baseline._replace(key=replace(key, compact=True))
+    assert scans._with_wave24a(compact, 0, shape) == compact
+
+    monkeypatch.setattr(
+        scans, "_resident", lambda _, key, _smem: 5 if key.horizontal_unroll8 else 6,
+    )
+    assert scans._with_wave24a(baseline, 0, shape) == baseline
+
+
 @pytest.mark.parametrize("kb", [48, 100, 228])
 @pytest.mark.parametrize("height", [1, 7, 14, 28, 56, 64, 96, 128, 192, 193, 200, 334, 1024])
 def test_smem_budget(kb: int, height: int) -> None:
@@ -720,6 +757,80 @@ def test_cuda_batched_forward_path(
     monkeypatch.setattr(scans, "_dispatch", with_batched_path)
     actual = scans._vscan(py, states, auxiliary, path, coarse, 1e-6, precise=True, packed=True)
     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("vector", [False, True], ids=["scalar-weights", "vector-weights"])
+def test_cuda_register_path_exact(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, vector: bool,
+) -> None:
+    torch.manual_seed(791)
+    px, py, real, imag, auxiliary, path = _inputs(56, 56, 160, 8, dtype, "cuda", batch=2)
+    states = scans.horizontal_forward(px, real, imag)
+    launch = scans._plan_launch
+
+    def force_path(
+        source: Tensor, shape: tuple[int, int, int, int], **options: object,
+    ) -> scans.Launch:
+        base = launch(source, shape, **options)
+        assert base is not None
+        weights = 11 * 8 * 32 * (4 if vector else 2)
+        key = replace(
+            base.key, warps=1, cache_line=False, cache_weights=True, vector_weights=vector,
+            batch_path=True,
+        )
+        plan = scans.ScanPlan(1, weights, cache_weights=True)
+        baseline = scans.Launch(plan, key, base.workers, base.partials)
+        selected = scans._with_wave24a(baseline, source.device.index or 0, shape)
+        assert selected.key.register_path == (policy != "off")
+        return selected
+
+    monkeypatch.setattr(scans, "_plan_launch", force_path)
+    outputs = []
+    for policy in ("off", "on"):
+        monkeypatch.setenv("LNET_SCAN_W24A", policy)
+        outputs.append(scans.vertical_forward_packed(
+            py, states, auxiliary, path, coarse=False, epsilon=1e-6, planar=True,
+        ))
+    torch.testing.assert_close(*outputs, atol=0, rtol=0)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("h", "w", "coarse"), [(37, 53, False), (38, 54, True)])
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_wave24a_odd_modes_against_fp32_reference(
+    monkeypatch: pytest.MonkeyPatch, h: int, w: int, coarse: bool, dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(501)
+    px, py, real, imag, aux, path = _inputs(h, w, 53, 8, dtype, "cuda")
+    params = [real, imag, *px, *py, *path]
+    reference_states = torch.stack(
+        bidirectional_product_scan_reference(tuple(px), (real.float(), imag.float())),
+    )
+    reference = (reference_states, *_reference_vscan(py, reference_states, aux, path, coarse))
+    dy = [torch.randn_like(value) for value in reference]
+    reference_grads = torch.autograd.grad(reference, params, dy, retain_graph=True)
+    results = []
+    for policy in ("off", "auto"):
+        monkeypatch.setenv("LNET_SCAN_W24A", policy)
+        actual = _pipeline(px, py, real, imag, aux, path, coarse, "cuda")
+        grads = torch.autograd.grad(actual, params, dy, retain_graph=True)
+        results.append((*actual, *grads))
+
+    tolerance = {
+        torch.float32: ((4e-5, 3e-6), (4e-4, 2e-4)),
+        torch.float16: ((8e-3, 1e-3), (5e-2, 2e-2)),
+        torch.bfloat16: ((4e-2, 5e-3), (1.2e-1, 8e-2)),
+    }[dtype]
+    for index, (off, auto, expected) in enumerate(
+        zip(*results, (*reference, *reference_grads), strict=True),
+    ):
+        torch.testing.assert_close(auto, off, rtol=0, atol=0)
+        rtol, atol = tolerance[index >= len(reference)]
+        torch.testing.assert_close(auto.float(), expected.float(), rtol=rtol, atol=atol)
 
 
 @_cuda
