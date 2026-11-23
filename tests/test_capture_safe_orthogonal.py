@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ from torch.nn.utils.parametrizations import orthogonal
 
 from lnet.capture_safe_orthogonal import (
     CaptureSafeMatrixExpOrthogonal,
+    fixed_taylor_matrix_exp,
     prepare_capture_safe_orthogonal_,
 )
 
@@ -205,3 +207,23 @@ def test_capture_safe_map_captures_forward_and_backward_in_cuda_graph(
     assert static_output.dtype == torch.float32
     assert original.grad is not None
     assert torch.isfinite(original.grad).all()
+
+
+
+def test_fixed_taylor_controls_error_on_concentrated_skew() -> None:
+    # At the same Frobenius norm, this block has a much larger spectral norm
+    # than a dense random skew matrix. Shorter Taylor polynomials can miss it.
+    matrix = torch.zeros(64, 64)
+    matrix[1, 0] = 10 / math.sqrt(2)
+    matrix[0, 1] = -matrix[1, 0]
+    matrix.requires_grad_()
+    reference_input = matrix.detach().double().requires_grad_()
+    probe = torch.randn(64, 64, generator=torch.Generator().manual_seed(501))
+
+    actual = fixed_taylor_matrix_exp(matrix)
+    expected = torch.matrix_exp(reference_input)
+    (actual_grad,) = torch.autograd.grad(actual, matrix, probe)
+    (expected_grad,) = torch.autograd.grad(expected, reference_input, probe.double())
+
+    torch.testing.assert_close(actual.double(), expected, atol=3e-6, rtol=0)
+    torch.testing.assert_close(actual_grad.double(), expected_grad, atol=4e-6, rtol=0)
