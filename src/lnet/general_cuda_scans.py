@@ -107,6 +107,8 @@ class Kernel:
     coarse: bool = False
     hidden8: bool = False
     pure_vertical: bool = False
+    cell_major: bool = False
+    packed_features: bool = False
     index32: bool = True
     chunk: int = _CHECKPOINT_CHUNK
     cache_weights: bool = False
@@ -115,6 +117,7 @@ class Kernel:
     shared_acc: bool = False
     precise: bool = False
     projection: bool = False
+    projection_tc: bool = False
     projection_reduction: bool = False
     reduction: bool = False
     compact: bool = False
@@ -146,6 +149,42 @@ template<> __device__ float read(__nv_bfloat16 x) { return __bfloat162float(x); 
 template<> __device__ __half write(float x) { return __float2half_rn(x); }
 template<> __device__ __nv_bfloat16 write(float x) { return __float2bfloat16_rn(x); }
 template<class T> __device__ float rounded(float x) { return read(write<T>(x)); }
+
+template<class T>
+__device__ unsigned tc_pair(T lo, T hi) {
+    return unsigned(__half_as_ushort(lo)) | (unsigned(__half_as_ushort(hi)) << 16);
+}
+
+template<>
+__device__ unsigned tc_pair(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+    return unsigned(__bfloat16_as_ushort(lo)) | (unsigned(__bfloat16_as_ushort(hi)) << 16);
+}
+
+template<class T> __device__ T feature_from_bits(unsigned short value) {
+    return __ushort_as_half(value);
+}
+
+template<> __device__ __nv_bfloat16 feature_from_bits(unsigned short value) {
+    return __ushort_as_bfloat16(value);
+}
+
+template<class T>
+__device__ __forceinline__ void unpack_features(uint4 value, T (&p)[8]) {
+    p[0] = feature_from_bits<T>(value.x);
+    p[1] = feature_from_bits<T>(value.x >> 16);
+    p[2] = feature_from_bits<T>(value.y);
+    p[3] = feature_from_bits<T>(value.y >> 16);
+    p[4] = feature_from_bits<T>(value.z);
+    p[5] = feature_from_bits<T>(value.z >> 16);
+    p[6] = feature_from_bits<T>(value.w);
+    p[7] = feature_from_bits<T>(value.w >> 16);
+}
+
+template<class T>
+__device__ __forceinline__ uint4 pack_features(const T (&p)[8]) {
+    return make_uint4(tc_pair(p[0], p[1]), tc_pair(p[2], p[3]),
+                      tc_pair(p[4], p[5]), tc_pair(p[6], p[7]));
+}
 
 enum ScalarType { FP32, FP16, BF16 };
 
@@ -481,9 +520,20 @@ struct Column {
         return make_float4(a.r, a.i, b.r, b.i);
     }
 
+    template<bool REUSE = false>
     __device__ float2 gain(int y, bool reverse) const {
         float v = vy[(I(reverse) * H + y) * M + m];
-        return make_float2(rsqrtf(fmaxf(vx_a * v, eps)), rsqrtf(fmaxf(vx_b * v, eps)));
+        const float a = rsqrtf(fmaxf(vx_a * v, eps));
+        if constexpr (REUSE) {
+            if (vx_a == vx_b) return make_float2(a, a);
+        }
+        return make_float2(a, rsqrtf(fmaxf(vx_b * v, eps)));
+    }
+
+    template<bool CELL_MAJOR>
+    __device__ I feature(I cell, int k) const {
+        if constexpr (CELL_MAJOR) return (cell - m) * 8 + I(k) * M + m;
+        return I(k) * feature_plane + cell;
     }
 
     __device__ I cell(int y) const { return output + I(y) * OW * M; }
@@ -663,7 +713,7 @@ __device__ void load_project_weights(
 
 template<class T, class I, bool COARSE, int CHUNK, int THREADS, int HIDDEN,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE,
-         bool PURE, class Weights>
+         bool PURE, bool CELL_MAJOR, bool PACKED_FEATURES, class Weights>
 __device__ __forceinline__ void column_backward(
     Column<T, I> c, Complex a, Complex g, Weights path,
     const T* gr, const T* gi, T* gs, float* acc, I acc_stride,
@@ -671,6 +721,7 @@ __device__ __forceinline__ void column_backward(
     int chunks, Complex& da, Complex& dg
 ) {
     const auto ar = a.conj(), gg = g.conj();
+    constexpr bool reuse_gain = (CELL_MAJOR || PACKED_FEATURES) && !COARSE;
     // CHUNK == 0 keeps the whole trajectory and needs no boundaries.
     constexpr bool full = CHUNK == 0;
     static_assert(!full || CACHE_SOURCE);
@@ -732,11 +783,21 @@ __device__ __forceinline__ void column_backward(
             }
             const int yo = COARSE ? y / 2 : y;
             const I cell = c.cell(yo);
-            const auto gp = c.gain(y, false), gn = c.gain(y - int(COARSE), true);
+            const auto gp = c.template gain<reuse_gain>(y, false);
+            const auto gn = c.template gain<reuse_gain>(y - int(COARSE), true);
             float dp[8]{};
             if constexpr (PURE) {
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) dp[k] = read(gr[I(k) * c.feature_plane + cell]);
+                if constexpr (PACKED_FEATURES) {
+                    T p[8];
+                    unpack_features(reinterpret_cast<const uint4*>(gr)[cell], p);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) dp[k] = read(p[k]);
+                } else {
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        dp[k] = read(gr[c.template feature<CELL_MAJOR>(cell, k)]);
+                    }
+                }
             } else path_mlp<T, I, HIDDEN, false, true>(
                 normalize<T>(seg[j * THREADS], gp), normalize<T>(neg, gn),
                 path, {},
@@ -826,7 +887,7 @@ __device__ __forceinline__ void write_vscan_partial(
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS>
+         bool VECTOR_WEIGHTS, bool CELL_MAJOR, bool PACKED_FEATURES>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -845,6 +906,7 @@ __device__ __forceinline__ void vertical(
     const int mode0 = (blockIdx.x % tiles) * 32, m = mode0 + lane;
     const int group = blockIdx.x / tiles, worker = group * WARPS + warp;
     constexpr bool register_acc = BACKWARD && HIDDEN && !SHARED_ACC;
+    constexpr bool reuse_gain = (CELL_MAJOR || PACKED_FEATURES) && !COARSE;
     constexpr bool reduce = (PURE || SHARED_ACC || register_acc) && WARPS > 1;
     const bool active = m < M && worker < workers;
     const int size = HIDDEN ? HIDDEN : hidden;
@@ -924,7 +986,8 @@ __device__ __forceinline__ void vertical(
                 auto* boundaries = GLOBAL_CKPT
                     ? global_checkpoints + I(worker) * M + m : ckpt + threadIdx.x;
                 column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
-                                REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE>(
+                                REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE,
+                                CELL_MAJOR, PACKED_FEATURES>(
                     c, a, g, path, gr, gi, gs,
                     acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
                     GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg);
@@ -934,7 +997,8 @@ __device__ __forceinline__ void vertical(
                     state = advance(state, c.source(y), a, g);
                     if (!COARSE || (y & 1)) {
                         buf[I(COARSE ? y / 2 : y) * stride] =
-                            normalize_packed<T>(state, c.gain(y, false));
+                            normalize_packed<T>(
+                                state, c.template gain<reuse_gain>(y, false));
                     }
                 }
                 state = {};
@@ -945,11 +1009,19 @@ __device__ __forceinline__ void vertical(
                     const I cell = c.cell(yo);
                     if constexpr (PURE) {
                         const auto pos = buf[I(yo) * stride].unpack();
-                        const auto neg = normalize<T>(state, c.gain(y, true));
+                        const auto neg = normalize<T>(
+                            state, c.template gain<reuse_gain>(y, true));
                         const float p[8] = {pos.x, pos.z, neg.x, neg.z, pos.y, pos.w, neg.y, neg.w};
-                        #pragma unroll
-                        for (int k = 0; k < 8; ++k) {
-                            outr[I(k) * c.feature_plane + cell] = write<T>(p[k]);
+                        if constexpr (PACKED_FEATURES) {
+                            T q[8];
+                            #pragma unroll
+                            for (int k = 0; k < 8; ++k) q[k] = write<T>(p[k]);
+                            reinterpret_cast<uint4*>(outr)[cell] = pack_features(q);
+                        } else {
+                            #pragma unroll
+                            for (int k = 0; k < 8; ++k) {
+                                outr[c.template feature<CELL_MAJOR>(cell, k)] = write<T>(p[k]);
+                            }
                         }
                     } else {
                         const float2 out = path_mlp<T, I, HIDDEN, PRECISE, false>(
@@ -1095,6 +1167,225 @@ __device__ __forceinline__ void project_path(
     }
 }
 
+// Ampere MMA maps one mode and sixteen cells to a warp. Stage through the
+// mode-contiguous tile so global transfers stay coalesced even at odd M.
+template<class T> constexpr bool tc_half = false;
+template<> constexpr bool tc_half<__half> = true;
+
+template<class T>
+__device__ __forceinline__ void tc_mma(float4& d, unsigned a0, unsigned a1,
+                                       unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    if constexpr (tc_half<T>) {
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    } else {
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    }
+}
+
+template<class T, class I, int WARPS, bool BACKWARD, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED,
+         bool PACKED_FEATURES>
+__device__ __forceinline__ void project_path_tc(
+    const T* __restrict__ features, const void* __restrict__ wi, const void* __restrict__ bi,
+    const void* __restrict__ wo, const void* __restrict__ bo,
+    const T* __restrict__ gr, const T* __restrict__ gi,
+    T* __restrict__ real, T* __restrict__ imag, T* __restrict__ dp,
+    float* __restrict__ partials, long long cells, long long feature_plane, int M, int,
+    int types
+) {
+    constexpr int threads = 32 * WARPS;
+    constexpr int tile_modes = WARPS;
+    extern __shared__ float4 shared[];
+    auto* tile = reinterpret_cast<T*>(shared);
+    auto* scratch = tile + 16 * 10 * tile_modes;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int tiles = (M - 1) / tile_modes + 1;
+    const int mode0 = (blockIdx.x % tiles) * tile_modes, m = mode0 + warp;
+    const int group = blockIdx.x / tiles, groups = gridDim.x / tiles;
+    const int row = lane / 4, k = 2 * (lane % 4);
+    const T zero = write<T>(0), one = write<T>(1);
+    const PathWeights<T, I, false> path{wi, bi, wo, types, m, 8};
+    auto input = [&](int j, int f) -> T {
+        return m < M ? write<T>(path.input(8 * j + f)) : zero;
+    };
+    auto output = [&](int j, int f) -> T {
+        return m < M ? write<T>(path.output(8 * f + j)) : zero;
+    };
+    const unsigned w = tc_pair(input(row, k), input(row, k + 1));
+    const unsigned wt = BACKWARD ? tc_pair(input(k, row), input(k + 1, row)) : 0;
+    const unsigned u = BACKWARD
+        ? (k == 0 ? tc_pair(output(row, 0), output(row, 1)) : 0)
+        : (row < 2 ? tc_pair(output(k, row), output(k + 1, row)) : 0);
+    const float b0 = m < M ? path.bias(k) : 0, b1 = m < M ? path.bias(k + 1) : 0;
+    const float bias_r = !BACKWARD && m < M
+        ? rounded<T>(load_scalar(bo, 2 * I(m), types >> 6)) : 0;
+    const float bias_i = !BACKWARD && m < M
+        ? rounded<T>(load_scalar(bo, 2 * I(m) + 1, types >> 6)) : 0;
+    auto* local = scratch + warp * 16 * 8;
+    const I plane = I(cells) * M;
+    const bool cell_major = feature_plane == M;
+    auto at = [&](int cell, int field) -> T& {
+        return tile[(field * 16 + cell) * tile_modes + warp];
+    };
+    auto pair = [&](int cell, int feature) {
+        return tc_pair(at(cell, feature), at(cell, feature + 1));
+    };
+    float4 dwi{}, dwo{};
+    for (long long start = 16LL * group; start < cells; start += 16LL * groups) {
+        if constexpr (PACKED_FEATURES) {
+            if (threadIdx.x < 16 * tile_modes) {
+                const auto cell = start + threadIdx.x / tile_modes;
+                const int mode = mode0 + threadIdx.x % tile_modes;
+                uint4 value{};
+                if (cell < cells && mode < M) {
+                    value = reinterpret_cast<const uint4*>(features)[I(cell) * M + mode];
+                }
+                T p[8];
+                unpack_features(value, p);
+                #pragma unroll
+                for (int f = 0; f < 8; ++f) tile[f * 16 * tile_modes + threadIdx.x] = p[f];
+            }
+        }
+        constexpr int first_field = PACKED_FEATURES ? 8 : 0;
+        for (int i = first_field * 16 * tile_modes + threadIdx.x;
+             i < (BACKWARD ? 10 : 8) * 16 * tile_modes; i += threads) {
+            const int field = i / (16 * tile_modes);
+            const long long cell = start + (i / tile_modes) % 16;
+            const int mode = mode0 + i % tile_modes;
+            T value = zero;
+            if (cell < cells && mode < M) {
+                const I offset = I(cell) * M + mode;
+                if (field < 8) {
+                    const I index = cell_major
+                        ? (I(cell) * 8 + field) * M + mode : I(field) * I(feature_plane) + offset;
+                    value = features[index];
+                }
+                else if (field == 8) value = gr[I(cell) * M * (1 + REAL_INTERLEAVED) + mode];
+                else value = gi[I(cell) * M * (1 + IMAG_INTERLEAVED) + mode];
+            }
+            tile[i] = value;
+        }
+        __syncthreads();
+
+        float4 z{};
+        tc_mma<T>(z, pair(row, k), pair(row + 8, k), 0, 0, w, 0);
+        z.x = rounded<T>(rounded<T>(z.x) + b0);
+        z.y = rounded<T>(rounded<T>(z.y) + b1);
+        z.z = rounded<T>(rounded<T>(z.z) + b0);
+        z.w = rounded<T>(rounded<T>(z.w) + b1);
+        const float4 sig = make_float4(
+            __fdividef(1.f, 1.f + __expf(-z.x)), __fdividef(1.f, 1.f + __expf(-z.y)),
+            __fdividef(1.f, 1.f + __expf(-z.z)), __fdividef(1.f, 1.f + __expf(-z.w)));
+        const T h0 = write<T>(z.x * sig.x), h1 = write<T>(z.y * sig.y);
+        const T h2 = write<T>(z.z * sig.z), h3 = write<T>(z.w * sig.w);
+        if constexpr (BACKWARD) {
+            local[row * 8 + k] = h0;
+            local[row * 8 + k + 1] = h1;
+            local[(row + 8) * 8 + k] = h2;
+            local[(row + 8) * 8 + k + 1] = h3;
+            __syncwarp();
+            const unsigned dh0 = k == 0 ? pair(row, 8) : 0;
+            const unsigned dh1 = k == 0 ? pair(row + 8, 8) : 0;
+            auto transposed = [&](int cell, int feature) -> unsigned {
+                if (feature < 8) {
+                    return tc_pair(local[cell * 8 + feature], local[(cell + 1) * 8 + feature]);
+                }
+                return feature == 8 ? tc_pair(one, one) : 0;
+            };
+            const unsigned dy0 = row < 2 ? tc_pair(at(k, 8 + row), at(k + 1, 8 + row)) : 0;
+            const unsigned dy1 = row < 2 ? tc_pair(at(k + 8, 8 + row), at(k + 9, 8 + row)) : 0;
+            tc_mma<T>(dwo, transposed(k, row), transposed(k, row + 8),
+                      transposed(k + 8, row), transposed(k + 8, row + 8), dy0, dy1);
+            float4 dh{};
+            tc_mma<T>(dh, dh0, dh1, 0, 0, u, 0);
+            auto dz = [&](float h, float pre, float s) -> T {
+                return write<T>(rounded<T>(h) * (s * (1.f + pre * (1.f - s))));
+            };
+            const T dz0 = dz(dh.x, z.x, sig.x), dz1 = dz(dh.y, z.y, sig.y);
+            const T dz2 = dz(dh.z, z.z, sig.z), dz3 = dz(dh.w, z.w, sig.w);
+            __syncwarp();
+            local[row * 8 + k] = dz0;
+            local[row * 8 + k + 1] = dz1;
+            local[(row + 8) * 8 + k] = dz2;
+            local[(row + 8) * 8 + k + 1] = dz3;
+            __syncwarp();
+            const unsigned z0 = tc_pair(local[k * 8 + row], local[(k + 1) * 8 + row]);
+            const unsigned z1 = tc_pair(local[(k + 8) * 8 + row], local[(k + 9) * 8 + row]);
+            tc_mma<T>(dwi, tc_pair(at(k, row), at(k + 1, row)), row == 0 ? tc_pair(one, one) : 0,
+                      tc_pair(at(k + 8, row), at(k + 9, row)), row == 0 ? tc_pair(one, one) : 0,
+                      z0, z1);
+            float4 dx{};
+            tc_mma<T>(dx, tc_pair(dz0, dz1), tc_pair(dz2, dz3), 0, 0, wt, 0);
+            __syncwarp();
+            at(row, k) = write<T>(dx.x);
+            at(row, k + 1) = write<T>(dx.y);
+            at(row + 8, k) = write<T>(dx.z);
+            at(row + 8, k + 1) = write<T>(dx.w);
+        } else {
+            float4 y{};
+            tc_mma<T>(y, tc_pair(h0, h1), tc_pair(h2, h3), 0, 0, u, 0);
+            __syncwarp();
+            if (k == 0) {
+                at(row, 0) = write<T>(rounded<T>(y.x) + bias_r);
+                at(row, 1) = write<T>(rounded<T>(y.y) + bias_i);
+                at(row + 8, 0) = write<T>(rounded<T>(y.z) + bias_r);
+                at(row + 8, 1) = write<T>(rounded<T>(y.w) + bias_i);
+            }
+        }
+        __syncthreads();
+        if constexpr (PACKED_FEATURES && BACKWARD) {
+            if (threadIdx.x < 16 * tile_modes) {
+                const auto cell = start + threadIdx.x / tile_modes;
+                const int mode = mode0 + threadIdx.x % tile_modes;
+                if (cell < cells && mode < M) {
+                    T p[8];
+                    #pragma unroll
+                    for (int f = 0; f < 8; ++f) p[f] = tile[f * 16 * tile_modes + threadIdx.x];
+                    reinterpret_cast<uint4*>(dp)[I(cell) * M + mode] = pack_features(p);
+                }
+            }
+        } else for (int i = threadIdx.x; i < (BACKWARD ? 8 : 2) * 16 * tile_modes; i += threads) {
+            const int field = i / (16 * tile_modes);
+            const long long cell = start + (i / tile_modes) % 16;
+            const int mode = mode0 + i % tile_modes;
+            if (cell < cells && mode < M) {
+                if constexpr (BACKWARD) {
+                    const I index = cell_major
+                        ? (I(cell) * 8 + field) * M + mode : I(field) * plane + I(cell) * M + mode;
+                    dp[index] = tile[i];
+                }
+                else if (field == 0) real[I(cell) * M * (1 + REAL_INTERLEAVED) + mode] = tile[i];
+                else imag[I(cell) * M * (1 + IMAG_INTERLEAVED) + mode] = tile[i];
+            }
+        }
+        __syncthreads();
+    }
+    if constexpr (BACKWARD) {
+        if (m < M) {
+            auto* out = partials + I(group) * 90 * M + m;
+            out[(8 * k + row) * I(M)] = dwi.x;
+            out[(8 * (k + 1) + row) * I(M)] = dwi.y;
+            if (row == 0) {
+                out[(64 + k) * I(M)] = dwi.z;
+                out[(65 + k) * I(M)] = dwi.w;
+            }
+            if (k == 0) {
+                out[(72 + row) * I(M)] = dwo.x;
+                out[(80 + row) * I(M)] = dwo.y;
+                if (row == 0) {
+                    out[88 * I(M)] = dwo.z;
+                    out[89 * I(M)] = dwo.w;
+                }
+            }
+        }
+    }
+}
+
 __device__ void store_scalar(void* p, long long offset, int dtype, float value) {
     if (dtype == FP32) static_cast<float*>(p)[offset] = value;
     else if (dtype == FP16) static_cast<__half*>(p)[offset] = write<__half>(value);
@@ -1149,6 +1440,8 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 # NVRTC compilation and driver launch
 
 def _kernel_name(key: Kernel) -> str:
+    if key.projection_tc:
+        return "project_path_tc_backward" if key.backward else "project_path_tc_forward"
     if key.projection:
         return "path_mlp_backward" if key.backward else "path_mlp_forward"
     if key.projection_reduction:
@@ -1172,14 +1465,22 @@ extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
 """
     io = _DTYPES[key.dtype]
     if key.projection:
+        index = "unsigned int" if key.index32 else "long long"
         flags = ", ".join(str(flag).lower() for flag in (
             key.cache_weights, key.backward, key.precise,
             key.real_interleaved, key.imag_interleaved, key.shared_acc,
         ))
-        hidden = _REGISTER_HIDDEN if key.hidden8 else 0
-        index = "unsigned int" if key.index32 else "long long"
+        if key.projection_tc:
+            flags = ", ".join(str(flag).lower() for flag in (
+                key.backward, key.real_interleaved, key.imag_interleaved, key.packed_features,
+            ))
+            call = f"project_path_tc<{io}, {index}, {key.warps}, {flags}>"
+        else:
+            hidden = _REGISTER_HIDDEN if key.hidden8 else 0
+            call = f"project_path<{io}, {index}, {key.warps}, {hidden}, {flags}>"
         return _CUDA_SOURCE + f"""
-extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key)}(
+extern "C" __global__ __launch_bounds__({key.warps * 32}{", 1" if key.projection_tc else ""})
+void {_kernel_name(key)}(
     const {io}* __restrict__ features, const void* __restrict__ wi, const void* __restrict__ bi,
     const void* __restrict__ wo, const void* __restrict__ bo,
     const {io}* __restrict__ gr, const {io}* __restrict__ gi,
@@ -1187,7 +1488,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     float* __restrict__ partials, long long cells, long long feature_plane, int M, int hidden,
     int types
 ) {{
-    project_path<{io}, {index}, {key.warps}, {hidden}, {flags}>(
+    {call}(
         features, wi, bi, wo, bo, gr, gi, real, imag, dp, partials,
         cells, feature_plane, M, hidden, types);
 }}
@@ -1200,7 +1501,9 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             key.cache_line, key.shared_acc, key.precise,
         )
     )
-    bounds = f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}) void scan'
+    min_blocks = ", 1" if key.cell_major or key.packed_features else ""
+    launch_bounds = f"__launch_bounds__({key.warps * _WARP_SIZE}{min_blocks})"
+    bounds = f'extern "C" __global__ {launch_bounds} void scan'
     compact = str(key.compact).lower()
     layout = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
     if key.vertical:
@@ -1210,7 +1513,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{io}, {index}, {coarse}, {key.warps}, {key.chunk}, {hidden}, "
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
-            f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}"
+            f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
+            f"{str(key.cell_major).lower()}, {str(key.packed_features).lower()}"
         )
         wrapper = f"""
 {bounds}(
@@ -1620,6 +1924,8 @@ def _launch_for_shape(
     interleaved: tuple[bool, bool] = (False, False),
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
+    cell_major: bool = False,
+    packed_features: bool = False,
 ) -> Launch | None:
     b, h, w, m = shape
     sms, limit, max_warps_per_sm = device_limits(device)
@@ -1704,6 +2010,7 @@ def _launch_for_shape(
             coarse=coarse,
             hidden8=hidden == _REGISTER_HIDDEN,
             pure_vertical=pure_vertical,
+            cell_major=cell_major, packed_features=packed_features,
             index32=bound < 2**31,
             # This variant takes its full-column span from runtime H.
             chunk=0 if plan.full_trajectory else plan.chunk,
@@ -1780,6 +2087,8 @@ def _plan_launch(
     interleaved: tuple[bool, bool] = (False, False),
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
+    cell_major: bool = False,
+    packed_features: bool = False,
 ) -> Launch | None:
     if not source.is_cuda or source.dtype not in _DTYPES:
         return None
@@ -1794,7 +2103,7 @@ def _plan_launch(
         source.device.index or 0, source.dtype, shape, index_bound,
         backward=backward, vertical=vertical, coarse=coarse, hidden=hidden, precise=precise,
         compact=compact, interleaved=interleaved, transposed=transposed,
-        pure_vertical=pure_vertical,
+        pure_vertical=pure_vertical, cell_major=cell_major, packed_features=packed_features,
     )
 
 
@@ -2059,6 +2368,8 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     saved_features: Tensor | None = None,
     state_grad: Tensor | None = None,
     pure: bool = False,
+    cell_major: bool = False,
+    packed_features: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     shape = tuple(states.shape[1:])
     if (
@@ -2085,21 +2396,36 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or saved_features.shape != (8, b * oh * ow, m)
         or saved_features.device != states.device
         or saved_features.dtype != states.dtype
-        or not saved_features.is_contiguous()
+        or not (saved_features.is_contiguous() or saved_features.transpose(0, 1).is_contiguous())
     ):
         raise ValueError("Invalid saved vertical features")
     if not pure:
+        if saved_features is None:
+            tc = _use_tc_projection(states, hidden)
+        else:
+            tc = saved_features.stride(1) == 8 * m
+            if tc and not _supports_tc_projection(states, hidden):
+                raise ValueError("Invalid Tensor Core saved vertical features")
         chunk = (
             _saved_backward_chunk(states, coarse)
             if saved_features is not None else _decoupled_chunk(states, coarse)
         )
+        if os.environ.get("LNET_VSCAN_DECOUPLED") == "chunk_tc" and not tc:
+            chunk = 0
+        if tc and saved_features is not None and _total_vram(states.device) >= _TC_SAVED_VRAM:
+            _, _, height, width, modes = states.shape
+            per_sample = (
+                8 * (height // (1 + coarse)) * (width // (1 + coarse))
+                * modes * states.element_size()
+            )
+            chunk = min(b, max(chunk, (_total_vram(states.device) // 16) // per_sample))
         if chunk:
             with torch.autocast(device_type="cuda", enabled=False):
                 return _decoupled_vscan(
                     pole, states, auxiliary, path, coarse, epsilon, precise,
                     (gr, gi) if grad is not None else None,
                     packed=packed, planar=planar, compact=compact, chunk=chunk,
-                    saved_features=saved_features,
+                    saved_features=saved_features, projection_tc=tc,
                 )
     launch = _plan_launch(
         states,
@@ -2111,7 +2437,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         precise=precise,
         compact=compact,
         interleaved=interleaved,
-        pure_vertical=pure,
+        pure_vertical=pure, cell_major=cell_major, packed_features=packed_features,
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
@@ -2133,7 +2459,9 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
             )
     else:
         if pure:
-            output = outr = states.new_empty((8, b * oh * ow, m))
+            output = outr = _empty_features(
+                states, b * oh * ow, m, cell_major=cell_major, packed=packed_features,
+            )
             outi = None
         elif packed and planar:
             output = states.new_empty((2, *out_shape))
@@ -2179,7 +2507,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
 def _decoupled_chunk(states: Tensor, coarse: bool) -> int:
     """Limit ephemeral features and adjoints to the hardware workspace budget."""
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
-    if not states.is_cuda or policy not in {"chunk", "saved", "test_saved"}:
+    if not states.is_cuda or policy not in {"chunk", "saved", "test_saved", "chunk_tc"}:
         return 0
     return _workspace_vscan_chunk(states, coarse)
 
@@ -2217,9 +2545,38 @@ def _total_vram(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).total_memory
 
 
-def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
-    policy = os.environ.get("LNET_VSCAN_DECOUPLED")
-    if not states.is_cuda or policy not in {"saved", "test_saved"}:
+_TC_SAVED_VRAM = 80 * 1024**3
+
+
+@torch.compiler.assume_constant_result
+def _cuda_major(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).major
+
+
+def _supports_tc_projection(states: Tensor, hidden: int) -> bool:
+    return (
+        states.is_cuda and states.dtype in (torch.float16, torch.bfloat16)
+        and hidden == _REGISTER_HIDDEN and _cuda_major(states.device) >= 8
+    )
+
+
+def _use_tc_projection(states: Tensor, hidden: int) -> bool:
+    policy = os.environ.get("LNET_VSCAN_DECOUPLED", "auto")
+    if policy not in {"auto", "saved_tc", "test_saved_tc", "chunk_tc"}:
+        return False
+    if not _supports_tc_projection(states, hidden):
+        return False
+    return policy in {"test_saved_tc", "chunk_tc"} or _total_vram(states.device) >= _TC_SAVED_VRAM
+
+
+def _should_save_vscan(states: Tensor, coarse: bool, hidden: int) -> bool:
+    policy = os.environ.get("LNET_VSCAN_DECOUPLED", "auto")
+    if not states.is_cuda:
+        return False
+    if policy in {"auto", "saved_tc", "test_saved_tc"}:
+        if not _use_tc_projection(states, hidden):
+            return False
+    elif policy not in {"saved", "test_saved"}:
         return False
     vram = _total_vram(states.device)
     if policy == "saved" and vram < 48 * 1024**3:
@@ -2231,10 +2588,36 @@ def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
     return 8 * b * (h // step) * (w // step) * m * states.element_size() <= budget
 
 
+def _plan_tc_projection(
+    device: int, base: Kernel, cells: int, modes: int,
+) -> tuple[Kernel, int, int]:
+    sms, limit, _ = device_limits(device)
+    fields = 11 * _REGISTER_HIDDEN + 2
+    best = None
+    for warps in (4, 8):
+        smem = _tc_smem(warps, base.backward)
+        key = replace(base, warps=warps)
+        resident = _resident(device, key, smem) if smem <= limit else 0
+        if not resident:
+            continue
+        mode_tiles = _ceil(modes, warps)
+        groups = max(1, min(_ceil(cells, 16), _ceil(4 * sms * resident, mode_tiles)))
+        if base.backward:
+            groups = min(groups, max(1, _MAX_PARTIAL_BYTES // (fields * modes * 4)))
+        score = min(sms * resident, groups * mode_tiles) * min(warps, modes)
+        if best is None or score > best[0]:
+            best = score, key, groups, smem
+    if best is None:
+        raise RuntimeError("No CUDA Tensor Core projection launch fits this device")
+    return best[1:]
+
+
 @lru_cache(maxsize=512)
 def _plan_projection(
     device: int, base: Kernel, cells: int, modes: int, hidden: int,
 ) -> tuple[Kernel, int, int]:
+    if base.projection_tc:
+        return _plan_tc_projection(device, base, cells, modes)
     tiles = _ceil(modes, _WARP_SIZE)
     sms, limit, _ = device_limits(device)
     fields = 11 * hidden + 2
@@ -2267,24 +2650,45 @@ def _plan_projection(
     return best[1:]
 
 
+def _tc_smem(warps: int, backward: bool) -> int:
+    return 16 * warps * (18 if backward else 10) * 2
+
+
+def _empty_features(
+    source: Tensor, cells: int, modes: int, *, cell_major: bool, packed: bool = False,
+) -> Tensor:
+    if packed:
+        return source.new_empty((cells, modes, 8)).permute(2, 0, 1)
+    if cell_major:
+        return source.new_empty((cells, 8, modes)).transpose(0, 1)
+    return source.new_empty((8, cells, modes))
+
+
 def _project_path(
     features: Tensor, path: list[Tensor], real: Tensor, imag: Tensor, *,
-    backward: bool, precise: bool,
+    backward: bool, precise: bool, projection_tc: bool = False,
 ) -> tuple[Tensor, list[Tensor]] | None:
     _, cells, modes = features.shape
     hidden = path[0].shape[1]
     feature_plane = features.stride(0)
+    packed = projection_tc and feature_plane == 1 and features.stride(2) == 8
+    cell_major = projection_tc and feature_plane == modes and not packed
     base = Kernel(
-        features.dtype, 0, backward, projection=True,
+        features.dtype, 0, backward, projection=True, projection_tc=projection_tc,
+        packed_features=packed,
         precise=precise and not backward and features.dtype == torch.float32,
-        hidden8=hidden == _REGISTER_HIDDEN, index32=8 * feature_plane < 2**32,
+        hidden8=hidden == _REGISTER_HIDDEN,
+        index32=max(features.numel(), 8 * feature_plane) <= 2**32,
         real_interleaved=not real.is_contiguous(), imag_interleaved=not imag.is_contiguous(),
     )
     key, groups, smem = _plan_projection(features.device.index or 0, base, cells, modes, hidden)
-    tiles = _ceil(modes, _WARP_SIZE)
+    tiles = _ceil(modes, key.warps if projection_tc else _WARP_SIZE)
     # Features can be a cell slice of the saved full-batch planes.
     # The pure scan consumes densely packed output planes.
-    adjoints = features.new_empty(features.shape) if backward else None
+    adjoints = (
+        _empty_features(features, cells, modes, cell_major=cell_major, packed=packed)
+        if backward else None
+    )
     partial = None
     if backward:
         rows = groups if key.hidden8 else groups * key.warps
@@ -2322,6 +2726,7 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
     compact: bool,
     chunk: int,
     saved_features: Tensor | None = None,
+    projection_tc: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     _, batch, height, width, modes = states.shape
     oh, ow = (height // 2, width // 2) if coarse else (height, width)
@@ -2347,7 +2752,10 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
         part = slice(begin, begin + chunk)
         source = states[:, part]
         if saved_features is None:
-            features = _vscan(pole, source, auxiliary, path, coarse, epsilon, precise, pure=True)
+            features = _vscan(
+                pole, source, auxiliary, path, coarse, epsilon, precise,
+                pure=True, cell_major=projection_tc,
+            )
         else:
             area = oh * ow
             features = saved_features[:, begin * area : min(begin + chunk, batch) * area]
@@ -2356,12 +2764,14 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
         if grad is None:
             _project_path(
                 features, weights, real[part], imag[part], backward=False, precise=precise,
+                projection_tc=projection_tc,
             )
             del features
             continue
 
         projected = _project_path(
             features, weights, grad[0][part], grad[1][part], backward=True, precise=False,
+            projection_tc=projection_tc,
         )
         del features
         if projected is None:
@@ -2370,6 +2780,7 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
         gradients = _vscan(
             float_pole, source, auxiliary, path, coarse, epsilon, precise,
             compact=compact, features=dp, state_grad=gs[:, part], pure=True,
+            cell_major=projection_tc and dp.stride(0) == modes,
         )
         if not isinstance(gradients, list):
             raise TypeError("Expected pure scan gradients")
@@ -2604,9 +3015,11 @@ def _vertical_forward_saved(
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
+    tc = _use_tc_projection(states, path[0].shape[1])
     with torch.autocast(device_type="cuda", enabled=False):
         features = _vscan(
-            pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise, pure=True,
+            pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise,
+            pure=True, cell_major=tc,
         )
         if not isinstance(features, Tensor):
             raise TypeError("Expected normalized scan features")
@@ -2620,6 +3033,7 @@ def _vertical_forward_saved(
         _project_path(
             features, [param.contiguous() for param in path], real, imag,
             backward=False, precise=precise,
+            projection_tc=tc,
         )
     return output, secondary, features
 
@@ -2629,7 +3043,7 @@ def _fake_vertical_forward_saved(
     pole: list[Tensor],  # noqa: ARG001
     states: Tensor,
     auxiliary: list[Tensor],  # noqa: ARG001
-    path: list[Tensor],  # noqa: ARG001
+    path: list[Tensor],
     coarse: bool,
     epsilon: float,  # noqa: ARG001
     planar: bool,
@@ -2642,7 +3056,10 @@ def _fake_vertical_forward_saved(
     return (
         states.new_empty(shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))),
         states.new_empty(shape if separate else (0,)),
-        states.new_empty((8, b * (h // step) * (w // step), m)),
+        _empty_features(
+            states, b * (h // step) * (w // step), m,
+            cell_major=_use_tc_projection(states, path[0].shape[1]),
+        ),
     )
 
 
@@ -2736,7 +3153,7 @@ def vertical_forward(
     precise: bool = True,
     mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
-    if mode == "cuda" and _should_save_vscan(states, coarse):
+    if mode == "cuda" and _should_save_vscan(states, coarse, path[0].shape[1]):
         real, imag, _ = _vertical_forward_saved(
             pole, states, auxiliary, path, coarse, epsilon,
             planar=False, precise=precise, separate=True,

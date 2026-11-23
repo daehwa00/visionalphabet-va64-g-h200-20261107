@@ -1000,9 +1000,12 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(
     ("coarse", "compact", "hidden", "compiled"),
-    [(False, False, 8, False), (True, False, 11, True), (True, True, 5, False)],
+    [
+        (False, False, 8, False), (True, False, 11, True),
+        (True, True, 5, False), (True, True, 8, True),
+    ],
 )
-@pytest.mark.parametrize("policy", ["chunk", "test_saved"])
+@pytest.mark.parametrize("policy", ["chunk", "test_saved", "chunk_tc", "test_saved_tc"])
 def test_cuda_decoupled_vscan(  # noqa: C901
     monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
@@ -1030,10 +1033,11 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     monkeypatch.setattr(scans, "_saved_backward_chunk", lambda *_: 2)
     run = scans.vertical_forward
     if compiled:
+        torch._dynamo.reset()
         run = torch.compile(run, fullgraph=True)
     actual = run(pole, states, auxiliary, path, coarse)
     features = None
-    if compact and policy == "test_saved":
+    if compact and policy in {"test_saved", "test_saved_tc"}:
         _, _, features = scans._vertical_forward_saved(
             pole, states, auxiliary, path, coarse, 1e-6,
             planar=True, precise=True, separate=False,
@@ -1047,6 +1051,11 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     for planar in (False, True):
         packed = scans.vertical_forward_packed(pole, states, auxiliary, path, coarse, 1e-6, planar)
         target = torch.stack(actual) if planar else torch.cat(actual, dim=-1)
+        if policy == "test_saved_tc" and scans._use_tc_projection(states, hidden):
+            packed, _, _ = scans._vertical_forward_saved(
+                pole, states, auxiliary, path, coarse, 1e-6,
+                planar=planar, precise=True, separate=False,
+            )
         torch.testing.assert_close(packed, target)
     if dtype == torch.float32:
         forward_tol, backward_tol = (4e-5, 3e-6), (4e-4, 2e-4)
@@ -1067,3 +1076,39 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     ):
         for value, target in zip(values, reference, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    ("policy", "major", "gib", "hidden", "dtype", "saved"),
+    [
+        (None, 8, 12, 8, torch.bfloat16, False),
+        ("auto", 8, 24, 8, torch.float16, False),
+        ("auto", 8, 79, 8, torch.bfloat16, False),
+        ("auto", 8, 80, 8, torch.bfloat16, True),
+        (None, 9, 141, 8, torch.bfloat16, True),
+        ("auto", 7, 141, 8, torch.bfloat16, False),
+        ("auto", 9, 141, 5, torch.bfloat16, False),
+        ("auto", 9, 141, 8, torch.float32, False),
+        ("off", 9, 141, 8, torch.bfloat16, False),
+        ("saved_tc", 8, 12, 8, torch.bfloat16, False),
+        ("test_saved_tc", 8, 12, 8, torch.bfloat16, True),
+        ("chunk_tc", 8, 12, 8, torch.bfloat16, False),
+        ("saved", 8, 12, 8, torch.bfloat16, False),
+        ("test_saved", 8, 12, 8, torch.float32, True),
+    ],
+)
+def test_saved_vscan_policy(
+    monkeypatch: pytest.MonkeyPatch, policy: str | None, major: int, gib: int,
+    hidden: int, dtype: torch.dtype, saved: bool,
+) -> None:
+    if policy is None:
+        monkeypatch.delenv("LNET_VSCAN_DECOUPLED", raising=False)
+    else:
+        monkeypatch.setenv("LNET_VSCAN_DECOUPLED", policy)
+    monkeypatch.setattr(scans, "_cuda_major", lambda _: major)
+    monkeypatch.setattr(scans, "_total_vram", lambda _: gib * 1024**3)
+    source = SimpleNamespace(
+        is_cuda=True, device=torch.device("cuda"), dtype=dtype, shape=(4, 1, 7, 11, 17),
+        element_size=lambda: dtype.itemsize,
+    )
+    assert scans._should_save_vscan(source, coarse=False, hidden=hidden) is saved

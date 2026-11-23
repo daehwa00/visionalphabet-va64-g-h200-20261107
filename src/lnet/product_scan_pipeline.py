@@ -1200,7 +1200,9 @@ def _run_packed_cuda_forward(
             pole_y, horizontal_storage, auxiliary, path, epilogue, kind, path_swiglu,
         )
         saved = [] if recompute else [horizontal_storage]
-        if operands is not None and _should_save_vscan(horizontal_storage, operands[-1]):
+        if operands is not None and _should_save_vscan(
+            horizontal_storage, operands[-1], operands[-2][0].shape[1],
+        ):
             output, secondary, features = _vertical_forward_saved(
                 *operands, float(epsilon), planar=planar_output,
                 precise=True, separate=not packed_output,
