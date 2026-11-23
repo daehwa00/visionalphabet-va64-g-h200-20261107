@@ -641,6 +641,23 @@ def test_reader_vector_plan(
     assert kernels._reader_vector_width(p, real, g, strict=strict) == expected
 
 
+@pytest.mark.parametrize(
+    ("height", "width", "modes", "major", "expected"),
+    [
+        (14, 14, 160, 9, True),
+        (14, 14, 160, 8, True),
+        (14, 14, 640, 9, True),
+        (7, 7, 128, 9, True),
+        (7, 7, 128, 8, False),
+        (28, 28, 160, 9, False),
+    ],
+)
+def test_compact_weight_vector_preference(
+    height: int, width: int, modes: int, major: int, expected: bool,
+) -> None:
+    assert kernels._prefer_scalar_weight(height, width, modes, 4, 2, major) == expected
+
+
 @requires_cuda
 @pytest.mark.usefixtures("cudnn_full_precision")
 @pytest.mark.parametrize(("rank", "vec", "dtype"), product(
