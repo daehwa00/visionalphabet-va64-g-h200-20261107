@@ -5,6 +5,7 @@ from __future__ import annotations
 # Custom op schemas use positional flags.
 # ruff: noqa: FBT001, FBT002
 import ctypes
+import os
 from functools import cache
 from threading import local
 from typing import NamedTuple
@@ -19,6 +20,11 @@ _CUDA_TYPES = {torch.float32: "float", torch.float16: "__half", torch.bfloat16: 
 _MAX_CUDA_GRID_DIM = 65535
 _WARP_SIZE = 32
 _DEFAULT_THREADS = 128
+_MMA_MODES = 16
+_MMA_ROWS = 4
+_MMA_PIXELS = 16
+_MMA_SHIFTS = 4
+_MMA_THREADS = _MMA_MODES * _WARP_SIZE
 _STATIC_RANK_LIMIT = 4
 _STATIC_SPATIAL_KERNEL = 3
 _COMPACT_COLUMNS = 7
@@ -156,6 +162,274 @@ template <> __device__ __forceinline__ __nv_bfloat16 from_float(float value) {
 using Input = READER_INPUT;
 using Weight = READER_WEIGHT;
 using Grad = READER_GRAD;
+"""
+
+
+_READER_MMA_CUDA = r"""
+// One warp per mode. Adjacent modes fill a global memory sector.
+constexpr int ModesPerBlock = READER_MMA_MODES;
+constexpr int Pixels = READER_MMA_PIXELS;
+constexpr int HaloWidth = Pixels + 2;
+constexpr int Rank = READER_RANK;
+constexpr int RowsPerBlock = READER_MMA_ROWS;
+constexpr int SpatialShifts = Rank <= 4 ? READER_MMA_SHIFTS : READER_MMA_SHIFTS / 2;
+constexpr int Kernel = READER_KERNEL;
+
+template <class T>
+__device__ __forceinline__ unsigned pair_bits(T low, T high) {
+#if READER_BFLOAT16
+    return unsigned(__bfloat16_as_ushort(low)) | unsigned(__bfloat16_as_ushort(high)) << 16;
+#else
+    return unsigned(__half_as_ushort(low)) | unsigned(__half_as_ushort(high)) << 16;
+#endif
+}
+
+template <class T, int Channels, int Width = HaloWidth>
+__device__ __forceinline__ void stage_row(
+    T* tile, const T* input, long long image, int y, int x, int h, int w, int m
+) {
+    for (int i = threadIdx.x; i < Channels * Width * ModesPerBlock; i += blockDim.x) {
+        const int mode = blockIdx.x * ModesPerBlock + i % ModesPerBlock;
+        const int column = x + i / ModesPerBlock % Width - 1;
+        const int channel = i / (ModesPerBlock * Width);
+        T value{};
+        if (y >= 0 && y < h && column >= 0 && column < w && mode < m)
+            value = input[((image + static_cast<long long>(y) * w + column) * Channels
+                          + channel) * m + mode];
+        tile[(i % ModesPerBlock) * Channels * Width + i / ModesPerBlock] = value;
+    }
+}
+
+template <class T, int Channels>
+__device__ __forceinline__ T patch(
+    const T* tile, int pixel, int field, int warp, int top
+) {
+    const int tap = field / Channels;
+    const int channel = field % Channels;
+    return field < Channels * 9
+        ? tile[((((top + tap / 3) % 3 * ModesPerBlock + warp) * Channels + channel)
+                * HaloWidth) + pixel + tap % 3]
+        : T{};
+}
+
+__device__ __forceinline__ void mma(
+    float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+    unsigned b0, unsigned b1
+) {
+#if READER_BFLOAT16
+#define MMA_TYPE "bf16"
+#else
+#define MMA_TYPE "f16"
+#endif
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32." MMA_TYPE "." MMA_TYPE ".f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#undef MMA_TYPE
+}
+
+template <bool Backward, int Shifts>
+__device__ __forceinline__ Weight filter(
+    const Weight* real, const Weight* imag, int mode, int k, int n, int modes
+) {
+    constexpr int In = Backward ? 2 : Rank, Out = Backward ? Rank : 2;
+    constexpr int PatchWidth = Shifts + 2;
+    if (mode >= modes || k >= In * 3 * PatchWidth || n >= Out * Shifts) return Weight{};
+    const int field = k / In, channel = k % In;
+    const int column = field % PatchWidth - n / Out;
+    if (column < 0 || column >= 3) return Weight{};
+    const int tap = field / PatchWidth * 3 + column;
+    const int r = Backward ? n : channel;
+    const int component = Backward ? channel : n % Out;
+    return (component == 0 ? real : imag)[(mode * Rank + r) * 9 + (Backward ? 8 - tap : tap)];
+}
+
+template <bool Backward, int Shifts = 1, class T>
+__device__ __forceinline__ void mma_spatial(
+    const T* input, const Weight* real, const Weight* imag, Input* output,
+    int runtime_h, int runtime_w, int runtime_m
+) {
+    const int h = READER_HEIGHT ? READER_HEIGHT : runtime_h;
+    const int w = READER_WIDTH ? READER_WIDTH : runtime_w;
+    const int m = READER_MODES ? READER_MODES : runtime_m;
+    constexpr int In = Backward ? 2 : Rank, Out = Backward ? Rank : 2;
+    // A shifted forward tile maps several output pixels into the N
+    // columns of each accumulator row. B zeros the weights outside each output's 3x3 window.
+    constexpr int TilePixels = Pixels * Shifts, TileWidth = TilePixels + 2;
+    constexpr int PatchWidth = Shifts + 2, Fields = 3 * PatchWidth * In;
+    constexpr int RowSize = In * TileWidth * ModesPerBlock;
+    __shared__ T tile[3 * RowSize];
+    __shared__ Input results[Out * TilePixels * ModesPerBlock];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int group = lane / 4, pair = 2 * (lane % 4);
+    const int mode = blockIdx.x * ModesPerBlock + warp;
+    const int xtiles = (w + TilePixels - 1) / TilePixels;
+    const int x = blockIdx.y % xtiles * TilePixels, y0 = blockIdx.y / xtiles * RowsPerBlock;
+    const long long image = static_cast<long long>(blockIdx.z) * h * w;
+    unsigned b0[(Fields + 15) / 16], b1[(Fields + 15) / 16];
+    #pragma unroll
+    for (int k = 0; k < Fields; k += 16) {
+        b0[k / 16] = pair_bits(filter<Backward, Shifts>(real, imag, mode, k + pair, group, m),
+                              filter<Backward, Shifts>(real, imag, mode, k + pair + 1, group, m));
+        b1[k / 16] = pair_bits(filter<Backward, Shifts>(real, imag, mode, k + pair + 8, group, m),
+                              filter<Backward, Shifts>(real, imag, mode, k + pair + 9, group, m));
+    }
+    for (int y = y0; y < h && y < y0 + RowsPerBlock; ++y) {
+        // Reuse the last two halo rows with a three-row ring buffer.
+        if (y == y0) {
+            stage_row<T, In, TileWidth>(tile, input, image, y - 1, x, h, w, m);
+            stage_row<T, In, TileWidth>(tile + RowSize, input, image, y, x, h, w, m);
+        }
+        const int top = (y - y0) % 3;
+        stage_row<T, In, TileWidth>(
+            tile + ((top + 2) % 3) * RowSize, input, image, y + 1, x, h, w, m);
+        __syncthreads();
+        float c[4] = {};
+        #pragma unroll
+        for (int k = 0; k < Fields; k += 16) {
+            unsigned a[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int pixel = (group + 8 * (i % 2)) * Shifts;
+                const int field = k + pair + 8 * (i / 2);
+                T values[2] = {};
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int f = field + j;
+                    if (f < Fields) {
+                        const int tap = f / In;
+                        const int row = (top + tap / PatchWidth) % 3;
+                        const int index = (((row * ModesPerBlock + warp) * In + f % In)
+                                           * TileWidth) + pixel + tap % PatchWidth;
+                        values[j] = tile[index];
+                    }
+                }
+                a[i] = pair_bits(values[0], values[1]);
+            }
+            mma(c, a[0], a[1], a[2], a[3], b0[k / 16], b1[k / 16]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int column = pair + i % 2;
+            const int pixel = (group + 8 * (i / 2)) * Shifts + column / Out;
+            if (column < Out * Shifts)
+                results[(pixel * Out + column % Out) * ModesPerBlock + warp] =
+                    from_float<Input>(c[i]);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < Out * TilePixels * ModesPerBlock; i += blockDim.x) {
+            const int pixel = x + i / (Out * ModesPerBlock), channel = i / ModesPerBlock % Out;
+            const int output_mode = blockIdx.x * ModesPerBlock + i % ModesPerBlock;
+            if (pixel < w && output_mode < m)
+                output[((image + static_cast<long long>(y) * w + pixel) * Out + channel) * m
+                       + output_mode] = results[i];
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void reader_mma_forward(
+    const Input* input, const Weight* real, const Weight* imag, Input* output,
+    int h, int w, int m, int rank
+) {
+    mma_spatial<false>(input, real, imag, output, h, w, m);
+}
+
+extern "C" __global__ void reader_mma_shift_forward(
+    const Input* input, const Weight* real, const Weight* imag, Input* output,
+    int h, int w, int m, int rank
+) {
+    mma_spatial<false, SpatialShifts>(input, real, imag, output, h, w, m);
+}
+
+extern "C" __global__ void reader_mma_dinput(
+    const Grad* input, const Weight* real, const Weight* imag, Input* output,
+    int h, int w, int m, int rank
+) {
+    mma_spatial<true>(input, real, imag, output, h, w, m);
+}
+
+extern "C" __global__ void reader_mma_dweight(
+    const Input* input, const Grad* grad, float* partial,
+    int runtime_h, int runtime_w, int runtime_m, int runtime_batch, int rank
+) {
+    const int h = READER_HEIGHT ? READER_HEIGHT : runtime_h;
+    const int w = READER_WIDTH ? READER_WIDTH : runtime_w;
+    const int m = READER_MODES ? READER_MODES : runtime_m;
+    const int batch = READER_BATCH ? READER_BATCH : runtime_batch;
+    constexpr int Fields = Rank * 9, FieldTiles = (Fields + 15) / 16;
+    constexpr int RowSize = Rank * HaloWidth * ModesPerBlock;
+    __shared__ Input tile[3 * RowSize];
+    __shared__ Grad doutput[2 * HaloWidth * ModesPerBlock];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int group = lane / 4, pair = 2 * (lane % 4);
+    const int mode = blockIdx.x * ModesPerBlock + warp;
+    const int xtiles = (w + Pixels - 1) / Pixels;
+    const long long count = static_cast<long long>(batch) * h * xtiles;
+    const long long begin = count * blockIdx.y / gridDim.y;
+    const long long end = count * (blockIdx.y + 1) / gridDim.y;
+    float c[FieldTiles][4] = {}, totals[FieldTiles][4] = {};
+    int top = 0;
+    for (long long work = begin; work < end; ++work) {
+        const long long column = work / h;
+        const int x = column % xtiles * Pixels, y = work % h;
+        const long long image = column / xtiles * h * w;
+        if (work == begin || y == 0) {
+            top = 0;
+            stage_row<Input, Rank>(tile, input, image, y - 1, x, h, w, m);
+            stage_row<Input, Rank>(tile + RowSize, input, image, y, x, h, w, m);
+        }
+        stage_row<Input, Rank>(tile + ((top + 2) % 3) * RowSize, input, image, y + 1, x, h, w, m);
+        stage_row<Grad, 2>(doutput, grad, image, y, x, h, w, m);
+        __syncthreads();
+        unsigned b0 = 0, b1 = 0;
+        if (group < 2) {
+            const int offset = (warp * 2 + group) * HaloWidth + pair + 1;
+            b0 = pair_bits(doutput[offset], doutput[offset + 1]);
+            b1 = pair_bits(doutput[offset + 8], doutput[offset + 9]);
+        }
+        #pragma unroll
+        for (int k = 0; k < FieldTiles; ++k) {
+            unsigned a[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int field = k * 16 + group + 8 * (i % 2);
+                const int pixel = pair + 8 * (i / 2);
+                a[i] = pair_bits(patch<Input, Rank>(tile, pixel, field, warp, top),
+                                 patch<Input, Rank>(tile, pixel + 1, field, warp, top));
+            }
+            mma(c[k], a[0], a[1], a[2], a[3], b0, b1);
+        }
+        // Bound the Tensor Core accumulation chain before FP32 summation.
+        if ((work - begin + 1) % 16 == 0) {
+            #pragma unroll
+            for (int k = 0; k < FieldTiles; ++k) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    totals[k][i] += c[k][i];
+                    c[k][i] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        top = (top + 1) % 3;
+    }
+    if (pair == 0 && mode < m) {
+        #pragma unroll
+        for (int k = 0; k < FieldTiles; ++k) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int f = k * 16 + group + 8 * (i / 2);
+                if (f < Fields) {
+                    const int field = (i % 2) * Fields + (f % Rank) * 9 + f / Rank;
+                    partial[(static_cast<long long>(blockIdx.y) * 2 * Fields + field) * m + mode]
+                        = totals[k][i] + c[k][i];
+                }
+            }
+        }
+    }
+}
+
 """
 
 
@@ -719,6 +993,9 @@ extern "C" __global__ void reader_dweight(
             projected, grad, partial, h, w, m, batch, rank);
 }
 
+"""
+
+_READER_REDUCE_CUDA = r"""
 extern "C" __global__ void reader_dweight_reduce(
     const float* __restrict__ partial, float* __restrict__ output,
     int modes, int rank, int workers
@@ -910,6 +1187,7 @@ def _reader_cuda_module(
     *,
     strict: bool,
     normalize: bool = False,
+    mma: bool = False,
     spatial_geometry: tuple[int, int] = _DEFAULT_SPATIAL_GEOMETRY,
     weight_geometry: tuple[int, int, int] | None = None,
     register_filters: int = -1,
@@ -923,7 +1201,8 @@ def _reader_cuda_module(
         "SPATIAL_ROWS": spatial_geometry[0], "SPATIAL_WARPS": spatial_geometry[1],
         "REGISTER_FILTERS": register_filters, "KEEP_REAL": keep_real,
         "BFLOAT16": int("__nv_bfloat16" in types),
-        "WEIGHT_VEC": weight_vec,
+        "WEIGHT_VEC": weight_vec, "MMA_MODES": _MMA_MODES,
+        "MMA_ROWS": _MMA_ROWS, "MMA_PIXELS": _MMA_PIXELS, "MMA_SHIFTS": _MMA_SHIFTS,
         "WEIGHT_TILE": weight_tile, "WEIGHT_ROWS": weight_rows, "WEIGHT_WARPS": weight_warps,
         **dict(zip(("INPUT", "WEIGHT", "GRAD"), types, strict=True)),
     }
@@ -935,6 +1214,13 @@ def _reader_cuda_module(
             ("forward", "dinput", "dweight", "dweight_reduce", "dweight_reduce_parallel"),
         )
     )
+    if not normalize:
+        if mma:
+            source = _READER_MMA_CUDA
+            operations = (
+                "mma_forward", "mma_shift_forward", "mma_dinput", "mma_dweight", *operations[3:],
+            )
+        source += _READER_REDUCE_CUDA
     # Reuse the CUDA launch interface with Reader-specific PTX and entry points.
     nvrtc = _nvrtc()
     program = ctypes.c_void_p()
@@ -1131,11 +1417,42 @@ def _reader_weight_vector_width(
     return 2 if projected.data_ptr() % alignment == grad.data_ptr() % alignment == 0 else 1
 
 
+def _use_reader_mma(
+    projected: Tensor, real: Tensor, grad: Tensor | None, strict: bool,
+) -> bool:
+    # Keep the production baseline until forced-path measurements qualify an architecture.
+    if strict or os.environ.get("VA_READER_MMA") not in {"force", "shift"}:
+        return False
+    _, height, width, _ = projected.shape
+    _, rank, kernel, _ = real.shape
+    dtype = projected.dtype
+    return (
+        kernel == 3 and rank in (2, 4, 8)
+        and dtype in (torch.bfloat16, torch.float16)
+        and real.dtype == dtype and (grad is None or grad.dtype == dtype)
+        and _ceildiv(height, _MMA_ROWS) * _ceildiv(width, _MMA_PIXELS) <= _MAX_CUDA_GRID_DIM
+        and torch.cuda.get_device_capability(projected.device) >= (8, 0)
+    )
+
+
+def _reader_mma_grid(
+    batch: int, height: int, width: int, modes: int, shifts: int = 1,
+) -> tuple[int, int, int]:
+    tiles = _ceildiv(height, _MMA_ROWS) * _ceildiv(width, _MMA_PIXELS * shifts)
+    return _ceildiv(modes, _MMA_MODES), tiles, batch
+
+
 def _reader_module_for(
     projected: Tensor, real: Tensor, grad: Tensor | None = None, *,
     strict: bool, rank_four_plan: _RankFourPlan | None = None,
-    weight_vec: int = 1,
+    weight_vec: int = 1, mma: bool = False,
 ) -> _CudaModule:
+    if mma:
+        return _reader_cuda_module(
+            projected.device.index or 0, _reader_compile_shape(projected, real.shape[0]),
+            _MMA_PIXELS, real.shape[1], _STATIC_SPATIAL_KERNEL,
+            (_CUDA_TYPES[projected.dtype],) * 3, strict=False, mma=True,
+        )
     _, _, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
     dtypes = (projected.dtype, real.dtype, grad.dtype if grad is not None else projected.dtype)
@@ -1330,20 +1647,29 @@ def _packed_spatial(
     batch, height, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
     if _use_reader_cuda(projected, real, imag):
+        mma = _use_reader_mma(projected, real, None, strict_complex)
+        shifted = mma and os.environ.get("VA_READER_MMA") == "shift"
         output = projected.new_empty((batch, height, width, 2 * modes))
         plan = _rank_four_plan(projected, real, strict=strict_complex)
         with torch.cuda.device(projected.device):
             module = _reader_module_for(
-                projected, real, strict=strict_complex, rank_four_plan=plan,
+                projected, real, strict=strict_complex, rank_four_plan=plan, mma=mma,
             )
             rows, warps = plan.spatial if plan else _spatial_geometry(
                 width, rank, kernel, projected.dtype, strict=strict_complex,
             )
             stream = _reader_stream(module, projected.device)
+            if mma:
+                shifts = _MMA_SHIFTS if rank <= 4 else _MMA_SHIFTS // 2
+                grid = _reader_mma_grid(batch, height, width, modes, shifts if shifted else 1)
+                operation = "mma_shift_forward" if shifted else "mma_forward"
+            else:
+                grid = _reader_spatial_grid(batch, height, width, modes, rows, warps)
+                operation = "forward"
             _launch_reader_cuda(
-                module, "forward", _reader_spatial_grid(batch, height, width, modes, rows, warps),
+                module, operation, grid,
                 (projected, real, imag, output), (height, width, modes, rank),
-                stream=stream, threads=warps * _WARP_SIZE,
+                stream=stream, threads=_MMA_THREADS if mma else warps * _WARP_SIZE,
             )
         return output
     return _spatial_reference(projected, real, imag, strict_complex=strict_complex)
@@ -1368,6 +1694,7 @@ def _packed_spatial_backward(
     modes, rank, kernel, _ = real.shape
     if _use_reader_cuda(projected, real, imag, grad):
         grad = grad.contiguous()
+        mma = _use_reader_mma(projected, real, grad, strict_complex)
         grad_projected = torch.empty_like(projected)
         props = torch.cuda.get_device_properties(projected.device)
         sms = props.multi_processor_count
@@ -1420,13 +1747,18 @@ def _packed_spatial_backward(
         reduce_op = "dweight_reduce_parallel" if parallel_reduce else "dweight_reduce"
         with torch.cuda.device(projected.device):
             module = _reader_module_for(
-                projected, real, grad, strict=strict_complex, rank_four_plan=plan, weight_vec=vec,
+                projected, real, grad, strict=strict_complex, rank_four_plan=plan,
+                weight_vec=vec, mma=mma,
             )
             stream = _reader_stream(module, projected.device)
+            weight_grid = (
+                (_ceildiv(modes, _MMA_MODES), workers, 1) if mma
+                else (mode_tiles * tap_tiles, workers, rank_tiles)
+            )
             _launch_reader_cuda(
-                module, "dweight", (mode_tiles * tap_tiles, workers, rank_tiles),
+                module, "mma_dweight" if mma else "dweight", weight_grid,
                 (projected, grad, partial), (height, width, modes, batch, rank),
-                stream=stream, threads=weight_warps * _WARP_SIZE,
+                stream=stream, threads=_MMA_THREADS if mma else weight_warps * _WARP_SIZE,
             )
             _launch_reader_cuda(
                 module, reduce_op, (_ceildiv(weight_grad.numel(), reduce_columns), 1, 1),
@@ -1435,10 +1767,14 @@ def _packed_spatial_backward(
             spatial_rows, warps = plan.spatial if plan else _spatial_geometry(
                 width, rank, kernel, projected.dtype, strict=strict_complex,
             )
-            grid = _reader_spatial_grid(batch, height, width, modes, spatial_rows, warps)
+            grid = (
+                _reader_mma_grid(batch, height, width, modes) if mma
+                else _reader_spatial_grid(batch, height, width, modes, spatial_rows, warps)
+            )
             _launch_reader_cuda(
-                module, "dinput", grid, (grad, real, imag, grad_projected),
-                (height, width, modes, rank), stream=stream, threads=warps * _WARP_SIZE,
+                module, "mma_dinput" if mma else "dinput", grid, (grad, real, imag, grad_projected),
+                (height, width, modes, rank), stream=stream,
+                threads=_MMA_THREADS if mma else warps * _WARP_SIZE,
             )
         return grad_projected, weight_grad
 

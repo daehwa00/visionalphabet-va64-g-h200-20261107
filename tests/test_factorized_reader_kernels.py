@@ -691,3 +691,35 @@ def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None
     reference = kernels._spatial_reference(p, *w.unbind(1), strict_complex=False)
     torch.testing.assert_close(output, reference, atol=0.008, rtol=0.005)
     _check_gradients(output, reference, (p, w), (p, w), rtol=0.005, atol=0.001)
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("batch", "height", "width", "modes", "rank"),
+    [(1, 5, 7, 1, 2), (3, 13, 15, 17, 4), (3, 17, 19, 48, 8)],
+)
+@pytest.mark.parametrize("policy", ["force", "shift"])
+def test_real_reader_mma_odd_edges(
+    dtype, batch, height, width, modes, rank, policy, monkeypatch,
+) -> None:
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("Tensor Core reader requires SM 8.0")
+    generator = torch.Generator(device="cuda").manual_seed(61)
+    kwargs = {"device": "cuda", "dtype": dtype, "generator": generator}
+    x = torch.randn(batch, height, width, rank * modes, **kwargs)
+    real = torch.randn(modes, rank, 3, 3, **kwargs) * 0.15
+    imag = torch.randn(modes, rank, 3, 3, **kwargs) * 0.15
+    dy = torch.randn(batch, height, width, 2 * modes, **kwargs) * 0.125
+    monkeypatch.setenv("VA_READER_MMA", policy)
+    assert kernels._use_reader_mma(x, real, dy, strict=False)
+    y = kernels._packed_spatial(x, real, imag, strict_complex=False)
+    dx, dw = kernels._packed_spatial_backward(dy, x, real, imag, strict_complex=False)
+    expected = kernels._spatial_reference(x, real, imag, strict_complex=False)
+    expected_dx, expected_dw = kernels._spatial_reference_backward(
+        dy, x, real, imag, strict_complex=False,
+    )
+    rtol = 0.008 if dtype == torch.bfloat16 else 0.001
+    torch.testing.assert_close(y, expected, rtol=rtol, atol=2e-4)
+    torch.testing.assert_close(dx, expected_dx, rtol=rtol, atol=2e-4)
+    torch.testing.assert_close(dw, expected_dw, rtol=3e-5, atol=0.002)
