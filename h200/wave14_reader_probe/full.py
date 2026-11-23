@@ -23,7 +23,8 @@ POLICY_OPS = ("forward", "dinput", "dweight")
 
 def select_policy(path: Path) -> dict:
     rows = json.loads(path.read_text(encoding="utf-8"))["shapes"]
-    policy = {}
+    policy: dict[str, dict[str, str]] = {}
+    alternatives: list[tuple[float, str, str, str]] = []
     for shape, row in rows.items():
         _, h, w, modes, rank = map(int, shape.split("x"))
         if rank != 4:
@@ -45,8 +46,18 @@ def select_policy(path: Path) -> dict:
                 and timing["wave13_parity"]["outside_tolerance"] == 0
                 and timing["pytorch_parity"]["outside_tolerance"] == 0
             ]
-            if valid:
-                policy[key][op] = min(valid, key=cost)
+            if not valid:
+                continue
+            name = min(valid, key=cost)
+            delta = cost("wave13") - cost(name)
+            alternatives.append((delta, key, op, name))
+            if cost(name) < 0.98 * cost("wave13"):
+                policy[key][op] = name
+    if alternatives and not any(policy.values()):
+        # Still exercise a candidate in the integrated experiment if none
+        # wins the isolated screen. Favor the smallest absolute loss.
+        _, key, op, name = max(alternatives)
+        policy[key][op] = name
     return policy
 
 
