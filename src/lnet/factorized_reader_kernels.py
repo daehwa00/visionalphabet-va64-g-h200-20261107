@@ -28,7 +28,9 @@ _DEFAULT_SPATIAL_GEOMETRY = (2, 4)
 _COMPACT_SPATIAL_GEOMETRY = (4, 2)
 _RESIDENT_FILTER_RANK_LIMIT = 2
 _CENTERED_WEIGHT_TILE = 2
-_VECTOR_WEIGHT_GEOMETRY = (1, 1, 4)
+_VEC2_SPATIAL_GEOMETRY = (4, 2)
+_VEC2_WEIGHT_GEOMETRY = (2, 4, 4)
+_VEC4_WEIGHT_GEOMETRY = (1, 1, 4)
 _DEFAULT_WEIGHT_GEOMETRY = (_CENTERED_WEIGHT_TILE, 2, 4)
 _WIDE_WEIGHT_WARPS = 8
 _MAX_STREAMING_WEIGHT_WAVES = 40
@@ -1178,57 +1180,62 @@ def _rank_four_plan(
     return _RankFourPlan((rows, warps), (tile, rows, warps), 5)
 
 
+def _reader_vector_columns(width: int, vec: int) -> int:
+    wide_columns = _COMPACT_COLUMNS * 2
+    if vec == 2:
+        return wide_columns if width % wide_columns == 0 else _DEFAULT_COLUMNS
+    return _reader_columns(width)
+
+
 def _reader_vector_width(
     projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
 ) -> int:
     choice = os.environ.get("LNET_READER_VEC", "auto")
+    vec = {"auto": 2, "2": 2, "4": 4}.get(choice, 1)
     modes, rank, kernel, _ = real.shape
     if (
-        choice == "1" or strict or kernel != _STATIC_SPATIAL_KERNEL or rank > _STATIC_RANK_LIMIT
-        or projected.dtype not in (torch.float16, torch.bfloat16)
+        vec == 1 or strict or kernel != _STATIC_SPATIAL_KERNEL or rank > _STATIC_RANK_LIMIT
+        or modes % vec or projected.dtype not in (torch.float16, torch.bfloat16)
         or (grad is not None and projected.dtype != grad.dtype)
     ):
         return 1
+    alignment = vec * projected.element_size()
+    if projected.data_ptr() % alignment or (grad is not None and grad.data_ptr() % alignment):
+        return 1
     props = torch.cuda.get_device_properties(projected.device)
     batch, height, width, _ = projected.shape
-    columns = _reader_columns(width)
-    y_tiles = height * _ceildiv(width, columns * 4)
-    if y_tiles > _MAX_CUDA_GRID_DIM:
+    rows, warps = _VEC2_SPATIAL_GEOMETRY if vec == 2 else (1, 4)
+    columns = _reader_vector_columns(width, vec)
+    tiles = _ceildiv(height, rows) * _ceildiv(width, warps * columns)
+    scratch = max(2 * rank * 9 * _WARP_SIZE, 4 * 18 * _WARP_SIZE) * vec * 4
+    if tiles > _MAX_CUDA_GRID_DIM or scratch > props.shared_memory_per_block:
         return 1
-    # Screen the default against available CTAs and static scratch per block.
-    # The forced widths bypass the throughput heuristic, but retain alignment checks.
-    for vec in (4, 2):
-        if choice not in ("auto", str(vec)) or modes % vec:
-            continue
-        alignment = vec * projected.element_size()
-        if projected.data_ptr() % alignment or (grad is not None and grad.data_ptr() % alignment):
-            continue
-        scratch = max(2 * rank * 9 * _WARP_SIZE, 4 * 18 * _WARP_SIZE) * vec * 4
-        if scratch > props.shared_memory_per_block:
-            continue
-        if choice == "auto":
-            threads = _DEFAULT_THREADS
-            # The vec2 kernels use at most about 96 registers in the screened geometry.
-            active_blocks = min(
-                props.max_threads_per_multi_processor // threads,
-                props.regs_per_multiprocessor // (96 * threads),
-                props.shared_memory_per_multiprocessor // scratch,
-            )
-            blocks = batch * y_tiles * _ceildiv(modes, _WARP_SIZE * vec)
-            if (
-                props.major < 9 or vec != 2 or active_blocks < 2
-                or blocks < active_blocks * props.multi_processor_count or width < 2 * columns
-            ):
-                continue
+    if choice != "auto":
         return vec
-    return 1
+    # The long tile pays off when its two warps each have a full column range
+    # and multiple row tiles. SM 8.9 keeps scalar dispatch pending GPU screening.
+    screened_arch = (props.major, props.minor) == (8, 6) or props.major == 9
+    if not screened_arch or height < 2 * rows or width < warps * columns:
+        return 1
+    threads = _DEFAULT_THREADS
+    # The rank-2 tile used by dWeight has the higher register demand.
+    active_blocks = min(
+        props.max_threads_per_multi_processor // threads,
+        props.regs_per_multiprocessor // (160 * threads),
+        props.shared_memory_per_multiprocessor // scratch,
+    )
+    blocks = batch * tiles * _ceildiv(modes, _WARP_SIZE * vec)
+    enough_blocks = blocks >= 2 * active_blocks * props.multi_processor_count
+    return vec if active_blocks >= 2 and enough_blocks else 1
 
 
 def _reader_spatial_geometry(
     projected: Tensor, rank: int, kernel: int, *, strict: bool,
     plan: _RankFourPlan | None, vec: int,
 ) -> tuple[int, int]:
-    if vec > 1:
+    if vec == 2:
+        return _VEC2_SPATIAL_GEOMETRY
+    if vec == 4:
         return 1, 4
     if plan is not None:
         return plan.spatial
@@ -1252,15 +1259,15 @@ def _reader_module_for(
     elif not strict and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL:
         weight_geometry = _weight_geometry(projected, modes, rank, dtypes[2])
     if weight_vec > 1:
-        weight_geometry = _VECTOR_WEIGHT_GEOMETRY
+        weight_geometry = _VEC2_WEIGHT_GEOMETRY if weight_vec == 2 else _VEC4_WEIGHT_GEOMETRY
     return _reader_cuda_module(
         projected.device.index or 0, _reader_compile_shape(projected, modes),
-        _reader_columns(width),
+        _reader_vector_columns(width, spatial_vec),
         rank if rank <= _STATIC_RANK_LIMIT else 0, kernel,
         tuple(_CUDA_TYPES[dtype] for dtype in dtypes), strict=strict,
         spatial_geometry=spatial_geometry, weight_geometry=weight_geometry,
         register_filters=0 if rank_four_plan else -1, keep_real=0 if rank_four_plan else -1,
-        weight_vec=weight_vec, spatial_vec=spatial_vec,
+        weight_vec=weight_vec, spatial_vec=spatial_vec, weight_read_only=weight_vec != 2,
     )
 
 
@@ -1421,7 +1428,7 @@ def real_gram_normalize_spatial(
 def _reader_spatial_grid(
     batch: int, height: int, width: int, modes: int, rows: int, warps: int, vec: int = 1,
 ) -> tuple[int, int, int]:
-    tiles = _ceildiv(height, rows) * _ceildiv(width, warps * _reader_columns(width))
+    tiles = _ceildiv(height, rows) * _ceildiv(width, warps * _reader_vector_columns(width, vec))
     return _ceildiv(modes, _WARP_SIZE * vec), tiles, batch
 
 
@@ -1479,7 +1486,13 @@ def _packed_spatial_backward(
         vec = _reader_vector_width(projected, real, grad, strict=strict_complex)
         mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
         plan = _rank_four_plan(projected, real, grad, strict=strict_complex)
-        if plan is not None:
+        if vec > 1:
+            geometry = _VEC2_WEIGHT_GEOMETRY if vec == 2 else _VEC4_WEIGHT_GEOMETRY
+            tile, weight_rows, weight_warps = geometry
+            rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
+            rows = _ceildiv(height, weight_rows)
+            waves = 5
+        elif plan is not None:
             tile, weight_rows, weight_warps = plan.weight
             rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
             rows = _ceildiv(height, weight_rows)
@@ -1500,10 +1513,6 @@ def _packed_spatial_backward(
             rank_tiles = _ceildiv(rank, rank_tile)
             tap_tiles = 3 if kernel == 3 else kernel**2
             rows, waves, weight_warps = height, 3, 4
-        if vec > 1:
-            tile, weight_rows, weight_warps = _VECTOR_WEIGHT_GEOMETRY
-            rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
-            rows = _ceildiv(height, weight_rows)
         available_workers = _ceildiv(batch * rows, weight_warps)
         workers = min(available_workers, _ceildiv(waves * sms, mode_tiles))
         if weight_warps == _WIDE_WEIGHT_WARPS and rank <= _CENTERED_WEIGHT_TILE:

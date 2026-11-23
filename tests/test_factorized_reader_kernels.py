@@ -609,33 +609,34 @@ def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("choice", "major", "modes", "dtype", "strict", "offset", "expected"),
+    ("choice", "sm", "modes", "dtype", "strict", "offset", "expected"),
     [
-        ("auto", 9, 160, torch.bfloat16, False, 0, 2),
-        ("auto", 8, 160, torch.bfloat16, False, 0, 1),
-        ("1", 9, 160, torch.bfloat16, False, 0, 1),
-        ("2", 8, 34, torch.float16, False, 0, 2),
-        ("2", 9, 17, torch.bfloat16, False, 0, 1),
-        ("4", 8, 48, torch.bfloat16, False, 0, 4),
-        ("4", 9, 30, torch.float16, False, 0, 1),
-        ("4", 9, 48, torch.float16, False, 1, 1),
-        ("4", 9, 48, torch.float32, False, 0, 1),
-        ("4", 9, 48, torch.float16, True, 0, 1),
+        ("auto", 90, 160, torch.bfloat16, False, 0, 2),
+        ("auto", 86, 160, torch.bfloat16, False, 0, 2),
+        ("auto", 89, 160, torch.bfloat16, False, 0, 1),
+        ("1", 90, 160, torch.bfloat16, False, 0, 1),
+        ("2", 86, 34, torch.float16, False, 0, 2),
+        ("2", 90, 17, torch.bfloat16, False, 0, 1),
+        ("4", 86, 48, torch.bfloat16, False, 0, 4),
+        ("4", 90, 30, torch.float16, False, 0, 1),
+        ("4", 90, 48, torch.float16, False, 1, 1),
+        ("4", 90, 48, torch.float32, False, 0, 1),
+        ("4", 90, 48, torch.float16, True, 0, 1),
     ],
 )
 def test_reader_vector_plan(
-    choice: str, major: int, modes: int, dtype: torch.dtype, strict: bool,
+    choice: str, sm: int, modes: int, dtype: torch.dtype, strict: bool,
     offset: int, expected: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("LNET_READER_VEC", choice)
     props = SimpleNamespace(
-        major=major, multi_processor_count=132, shared_memory_per_block=49152,
+        major=sm // 10, minor=sm % 10, multi_processor_count=132, shared_memory_per_block=49152,
         shared_memory_per_multiprocessor=229376, max_threads_per_multi_processor=2048,
         regs_per_multiprocessor=65536,
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
-    p = torch.empty((1 + offset,), dtype=dtype)[offset:].as_strided((128, 17, 19, modes), (0,) * 4)
-    g = torch.empty(1, dtype=dtype).as_strided((128, 17, 19, modes * 2), (0,) * 4)
+    p = torch.empty((1 + offset,), dtype=dtype)[offset:].as_strided((128, 56, 56, modes), (0,) * 4)
+    g = torch.empty(1, dtype=dtype).as_strided((128, 56, 56, modes * 2), (0,) * 4)
     real = torch.empty((modes, 1, 3, 3), dtype=dtype)
     assert kernels._reader_vector_width(p, real, g, strict=strict) == expected
 
