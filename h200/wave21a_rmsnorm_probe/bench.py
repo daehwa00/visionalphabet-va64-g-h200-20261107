@@ -1,5 +1,5 @@
 """Measure the Wave 17B, native ATen, and custom RMSNorm candidates."""
-# ruff: noqa: PLC0415
+# ruff: noqa: PLC0415, SLF001
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ import bench_h200 as baseline
 def shapes(batch: int) -> list[dict]:
     from torch import nn
 
+    from lnet import complex_scan
+
     model = baseline.build_model(baseline.VARIANTS[0])
     result = []
 
@@ -39,8 +41,23 @@ def shapes(batch: int) -> list[dict]:
     for name, module in model.named_modules():
         if isinstance(module, (ChannelRMSNorm, nn.RMSNorm)):
             module.register_forward_pre_hook(lambda m, x, name=name: hook(name, m, x))
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        model(baseline.setup(batch))
+    dtype_aligned = complex_scan._dtype_aligned_rms_norm
+
+    def track(inputs: torch.Tensor, norm: nn.Module) -> torch.Tensor:
+        if (
+            isinstance(norm, nn.RMSNorm)
+            and norm.weight is not None
+            and inputs.dtype != norm.weight.dtype
+        ):
+            hook("stem_input_rmsnorm (functional)", norm, (inputs,))
+        return dtype_aligned(inputs, norm)
+
+    complex_scan._dtype_aligned_rms_norm = track
+    try:
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            model(baseline.setup(batch))
+    finally:
+        complex_scan._dtype_aligned_rms_norm = dtype_aligned
     return result
 
 
@@ -70,7 +87,7 @@ def isolated(batch: int, out: Path, shard: int) -> None:
     calls = shapes(2)
     cases = {
         (batch * (torch.Size(r["shape"]).numel() // (2 * r["shape"][-1])),
-         r["shape"][-1], r["eps"])
+         r["shape"][-1], r["eps"] if r["eps"] is not None else torch.finfo(torch.float32).eps)
         for r in calls if r["shape"][0] == 2 and len(r["shape"]) > 1
     }
     cases.update((1027, c, 1e-6) for c in (47, 64, 160, 320, 640, 1024))
@@ -99,11 +116,21 @@ def isolated(batch: int, out: Path, shard: int) -> None:
                     y = compiled(x, w)
 
                     forward_ms = graph_time(lambda fn=compiled, x=x, w=w: fn(x, w))
-                    backward_ms = graph_time(
-                        lambda y=y, x=x, w=w, dy=dy: torch.autograd.grad(
-                            y, (x, w), dy, retain_graph=True
-                        )
-                    )
+                    def backward(
+                        y: torch.Tensor = y, x: torch.Tensor = x,
+                        w: torch.Tensor = w, dy: torch.Tensor = dy,
+                    ) -> tuple[torch.Tensor, ...]:
+                        return torch.autograd.grad(y, (x, w), dy, retain_graph=True)
+
+                    backward_ms = graph_time(backward)
+                    kernel_names = {}
+                    if n == 401408 and c == 64 and dtype == torch.bfloat16:
+                        kernel_names = {
+                            "forward_kernel_names": cuda_kernel_names(
+                                lambda fn=compiled, x=x, w=w: fn(x, w)
+                            ),
+                            "backward_kernel_names": cuda_kernel_names(backward),
+                        }
                     bytes_x = x.numel() * x.element_size()
                     log.write(json.dumps({
                         "n": n, "c": c, "eps": eps, "dtype": str(dtype), "arm": name,
@@ -111,9 +138,20 @@ def isolated(batch: int, out: Path, shard: int) -> None:
                         "total_ms": forward_ms + backward_ms,
                         "forward_effective_gbs": 2 * bytes_x / forward_ms / 1e6,
                         "backward_effective_gbs": 3 * bytes_x / backward_ms / 1e6,
+                        **kernel_names,
                     }) + "\n")
                     log.flush()
                     del y
+
+
+def cuda_kernel_names(step: Callable) -> list[str]:
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        step()
+        torch.cuda.synchronize()
+    return [
+        event.key for event in profile.key_averages()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
 
 
 def profile_step(step: Callable) -> dict:
