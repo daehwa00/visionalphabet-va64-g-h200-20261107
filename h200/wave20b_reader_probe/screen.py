@@ -9,7 +9,7 @@ import statistics
 from pathlib import Path
 
 import torch
-from bench import PROBE_EDGES, inputs, load_baseline, parity_case, record_launches
+from bench import PROBE_EDGES, STANDARD, inputs, load_baseline, parity_case, record_launches
 
 from lnet import factorized_reader_kernels as reader
 
@@ -106,6 +106,7 @@ def main() -> None:
 
         cases = (bench_case(shape, dtype) for shape, dtype in itertools.product(shapes, dtypes))
     else:
+        shapes = tuple(dict.fromkeys((*REAL, *STANDARD)))
         edges = tuple((5 + i % 3, 7 + i % 3, m, 1 + i % 4) for i, m in enumerate(PROBE_EDGES))
         cases = (
             parity(shape, dtype, strict, wave17)
