@@ -2391,18 +2391,17 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     if grad is not None:
         gr, gi = _vertical_adjoints(grad, states, out_shape)
         interleaved = (not gr.is_contiguous(), not gi.is_contiguous())
-    if saved_features is not None and (
-        grad is None
-        or saved_features.shape != (8, b * oh * ow, m)
-        or saved_features.device != states.device
-        or saved_features.dtype != states.dtype
-        or not (
-            saved_features.is_contiguous()
-            or saved_features.transpose(0, 1).is_contiguous()
-            or saved_features.permute(1, 2, 0).is_contiguous()
-        )
-    ):
-        raise ValueError("Invalid saved vertical features")
+    saved_packed = saved_features is not None and saved_features.ndim == 4
+    if saved_features is not None:
+        saved_shape = (1, b * oh * ow, m, 8) if saved_packed else (8, b * oh * ow, m)
+        if (
+            grad is None or saved_features.shape != saved_shape
+            or saved_features.device != states.device or saved_features.dtype != states.dtype
+            or not saved_features.is_contiguous()
+        ):
+            raise ValueError("Invalid saved vertical features")
+        if saved_packed:
+            saved_features = saved_features[0].permute(2, 0, 1)
     if not pure:
         if saved_features is None:
             chunk = _decoupled_chunk(states, coarse)
@@ -2412,7 +2411,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
                 if not tc:
                     chunk = 0
         else:
-            tc = saved_features.stride(1) == 8 * m or _features_packed(saved_features)
+            tc = saved_packed
             chunk = _saved_backward_chunk(states, coarse)
             if tc:
                 if not _supports_tc_projection(states, hidden):
@@ -3012,7 +3011,7 @@ def _fake_vbackward(
 
 
 @torch.library.custom_op("lnet::general_vscan_forward_saved", mutates_args=())
-def _vertical_forward_saved(
+def _vertical_forward_saved_op(
     pole: list[Tensor],
     states: Tensor,
     auxiliary: list[Tensor],
@@ -3022,11 +3021,11 @@ def _vertical_forward_saved(
     planar: bool,
     precise: bool,
     separate: bool,
+    tc: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
-    tc = _use_tc_projection(states, path[0].shape[1])
     with torch.autocast(device_type="cuda", enabled=False):
         features = _vscan(
             pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise,
@@ -3046,31 +3045,52 @@ def _vertical_forward_saved(
             backward=False, precise=precise,
             projection_tc=tc,
         )
+    if tc:
+        # Export the contiguous physical layout. The leading axis distinguishes
+        # it from legacy planes even when all three feature dimensions are 8.
+        features = features.permute(1, 2, 0).unsqueeze(0)
     return output, secondary, features
 
 
-@_vertical_forward_saved.register_fake
+@_vertical_forward_saved_op.register_fake
 def _fake_vertical_forward_saved(
     pole: list[Tensor],  # noqa: ARG001
     states: Tensor,
     auxiliary: list[Tensor],  # noqa: ARG001
-    path: list[Tensor],
+    path: list[Tensor],  # noqa: ARG001
     coarse: bool,
     epsilon: float,  # noqa: ARG001
     planar: bool,
     precise: bool,  # noqa: ARG001
     separate: bool,
+    tc: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
+    cells = b * (h // step) * (w // step)
+    feature_shape = (1, cells, m, 8) if tc else (8, cells, m)
     return (
         states.new_empty(shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))),
         states.new_empty(shape if separate else (0,)),
-        _empty_features(
-            states, b * (h // step) * (w // step), m,
-            cell_major=False, packed=_use_tc_projection(states, path[0].shape[1]),
-        ),
+        states.new_empty(feature_shape),
+    )
+
+
+def _vertical_forward_saved(
+    pole: list[Tensor],
+    states: Tensor,
+    auxiliary: list[Tensor],
+    path: list[Tensor],
+    coarse: bool,
+    epsilon: float,
+    planar: bool,
+    precise: bool,
+    separate: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    tc = _use_tc_projection(states, path[0].shape[1])
+    return _vertical_forward_saved_op(
+        pole, states, auxiliary, path, coarse, epsilon, planar, precise, separate, tc,
     )
 
 
@@ -3129,7 +3149,7 @@ def _differentiate_vertical(ctx: _AutogradContext, grad_real: Tensor, grad_imag:
 def _save_vertical_features(
     ctx: _AutogradContext, inputs: tuple, output: tuple[Tensor, Tensor, Tensor],
 ) -> None:
-    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _, _, ctx.separate = inputs
+    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _, _, ctx.separate, _ = inputs
     ctx.mark_non_differentiable(*(output[2:] if ctx.separate else output[1:]))
     ctx.save_for_backward(*pole, states, *auxiliary, *path, output[2])
 
@@ -3146,10 +3166,10 @@ def _differentiate_vertical_features(
         [dr, di, gr, gi], states, [vx, vy], path, real, imag, ctx.coarse, ctx.epsilon,
         saved_features=features,
     )
-    return gradients[:4], gradients[4], [None, None], gradients[5:], None, None, None, None, None
+    return gradients[:4], gradients[4], [None, None], gradients[5:], *(None,) * 6
 
 
-_vertical_forward_saved.register_autograd(
+_vertical_forward_saved_op.register_autograd(
     _differentiate_vertical_features, setup_context=_save_vertical_features,
 )
 

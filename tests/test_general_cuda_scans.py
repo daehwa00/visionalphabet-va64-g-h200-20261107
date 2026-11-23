@@ -1056,7 +1056,8 @@ def test_cuda_decoupled_vscan(  # noqa: C901
                 pole, states, auxiliary, path, coarse, 1e-6,
                 planar=planar, precise=True, separate=False,
             )
-            assert scans._features_packed(saved)
+            assert saved.shape == (1, actual[0].numel() // actual[0].shape[-1], 35, 8)
+            assert saved.is_contiguous()
         torch.testing.assert_close(packed, target)
     if dtype == torch.float32:
         forward_tol, backward_tol = (4e-5, 3e-6), (4e-4, 2e-4)

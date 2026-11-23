@@ -1298,7 +1298,7 @@ def _run_packed_cuda_backward(
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
     saved_features = None
-    if horizontal_states and horizontal_states[-1].ndim == 3:
+    if horizontal_states and horizontal_states[-1].ndim in (3, 4):
         *horizontal_states, saved_features = horizontal_states
     horizontal_storage = (
         horizontal_states[0] if horizontal_states
