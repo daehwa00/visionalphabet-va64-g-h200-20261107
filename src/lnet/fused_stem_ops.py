@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 # Custom op schemas use positional flags.
-# ruff: noqa: FBT001
+# ruff: noqa: ANN001, FBT001, N803
 import ctypes as ct
 from functools import cache
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 from torch.nn import functional
+from triton.language.extra.cuda import libdevice
 
 from .cuda_nvrtc import _check_cu, _check_nvrtc, _CudaModule, _ensure_context, _include_dirs, _nvrtc
 
@@ -525,14 +528,14 @@ def _backward_fake(
     return torch.empty_like(x), torch.empty_like(w), torch.empty_like(b), dcb
 
 
-def _save(ctx, inputs, output) -> None:  # noqa: ANN001, ARG001
+def _save(ctx, inputs, output) -> None:  # noqa: ARG001
     x, w, b, cb, ctx.eps, _, ctx.round_affine = inputs
     ctx.set_materialize_grads(False)
     ctx.save_for_backward(x, w, b, cb)
 
 
 def _autograd_backward(
-    ctx,  # noqa: ANN001
+    ctx,
     dy: Tensor | None,
 ) -> tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None, None, None, None]:
     if dy is None:
@@ -893,13 +896,229 @@ def _conv_launch_setup(
     return module, stream, n, sizes
 
 
+@triton.jit
+def _tensor_core_patch(  # noqa: ANN202
+    pixel,
+    k,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    CI: tl.constexpr,
+    CL: tl.constexpr,
+):
+    oh: tl.constexpr = (H + 1) // 2
+    ow: tl.constexpr = (W + 1) // 2
+    batch = pixel // (oh * ow)
+    row = 2 * (pixel // ow % oh) - 1
+    col = 2 * (pixel % ow) - 1
+    # HWC patch order makes adjacent K lanes coalesced for training images.
+    i = row[:, None] + (k // (3 * CI))[None, :]
+    j = col[:, None] + (k // CI % 3)[None, :]
+    ch = k % CI
+    if CL:
+        offset = ((batch[:, None] * H + i) * W + j) * CI + ch[None, :]
+    else:
+        offset = ((batch[:, None] * CI + ch[None, :]) * H + i) * W + j
+    valid = (i >= 0) & (i < H) & (j >= 0) & (j < W) & (k[None, :] < 9 * CI)
+    return offset, valid
+
+
+@triton.jit
+def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
+    X,
+    KERNEL,
+    G,
+    B,
+    CB,
+    Y,
+    DY,
+    STAT,
+    PART,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    CI: tl.constexpr,
+    CO: tl.constexpr,
+    N: tl.constexpr,
+    EP: tl.constexpr,
+    CL: tl.constexpr,
+    BIAS: tl.constexpr,
+    BWD: tl.constexpr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    TILE_REDUCE: tl.constexpr,
+):
+    k = tl.arange(0, K)
+    c = tl.arange(0, CO)
+    m = tl.arange(0, M)
+    worker = tl.program_id(0)
+    weights = tl.load(KERNEL + k[:, None] * CO + c[None, :], k[:, None] < 9 * CI, 0)
+    gamma = tl.load(G + c)
+    beta = tl.load(B + c)
+    if BIAS:
+        bias = tl.load(CB + c)
+    if BWD:
+        dw = tl.full((K, CO), 0, tl.float32)
+        if TILE_REDUCE:
+            dg = tl.full((M, CO), 0, tl.float32)
+            db = tl.full((M, CO), 0, tl.float32)
+            dc = tl.full((M, CO), 0, tl.float32)
+        else:
+            dg = tl.full((CO,), 0, tl.float32)
+            db = tl.full((CO,), 0, tl.float32)
+            dc = tl.full((CO,), 0, tl.float32)
+        stride = tl.num_programs(0) * M
+    else:
+        stride = N
+    for start in range(worker * M, N, stride):
+        pixel = start + m
+        offset, valid = _tensor_core_patch(pixel, k, H, W, CI, CL)
+        a = tl.load(X + offset, valid & (pixel[:, None] < N), 0)
+        values = tl.dot(a, weights).to(X.dtype.element_ty).to(tl.float32)
+        if BIAS:
+            values += bias[None, :]
+        if BWD:
+            mean = tl.load(STAT + 2 * pixel, pixel < N, 0)
+            inv = tl.load(STAT + 2 * pixel + 1, pixel < N, 0)
+            centered = values - mean[:, None]
+        else:
+            mean = tl.sum(values, 1) / CO
+            centered = values - mean[:, None]
+            inv = tl.rsqrt(tl.sum(centered * centered, 1) / CO + EP)
+            tl.store(STAT + 2 * pixel, mean, pixel < N)
+            tl.store(STAT + 2 * pixel + 1, inv, pixel < N)
+        norm = centered * inv[:, None]
+        affine = tl.fma(norm, gamma[None, :], beta[None, :])
+        cdf = 0.5 * (1.0 + libdevice.erf(affine * 0.7071067811865476))
+        output_offsets = pixel[:, None] * CO + c[None, :]
+        if BWD:
+            dy = tl.load(DY + output_offsets, pixel[:, None] < N, 0).to(tl.float32)
+            grad = dy * (cdf + affine * 0.3989422804014327 * tl.exp(-0.5 * affine * affine))
+            projected = grad * gamma[None, :]
+            v = (
+                projected
+                - tl.sum(projected, 1)[:, None] / CO
+                - norm * (tl.sum(projected * norm, 1)[:, None] / CO)
+            ) * inv[:, None]
+            dw = tl.dot(tl.trans(a), v.to(X.dtype.element_ty), dw)
+            if TILE_REDUCE:
+                dg += grad * norm
+                db += grad
+                if BIAS:
+                    dc += v
+            else:
+                dg += tl.sum(grad * norm, 0)
+                db += tl.sum(grad, 0)
+                if BIAS:
+                    dc += tl.sum(v, 0)
+        else:
+            tl.store(Y + output_offsets, affine * cdf, pixel[:, None] < N)
+    if BWD:
+        fields: tl.constexpr = 9 * CI + 2 + BIAS
+        dst = PART + worker * fields * CO
+        tl.store(dst + k[:, None] * CO + c[None, :], dw, k[:, None] < 9 * CI)
+        tl.store(dst + 9 * CI * CO + c, tl.sum(dg, 0) if TILE_REDUCE else dg)
+        tl.store(dst + (9 * CI + 1) * CO + c, tl.sum(db, 0) if TILE_REDUCE else db)
+        if BIAS:
+            tl.store(dst + (9 * CI + 2) * CO + c, tl.sum(dc, 0) if TILE_REDUCE else dc)
+
+
+@triton.jit
+def stem_conv_tensor_reduce(  # noqa: ANN201
+    P,
+    DW,
+    DG,
+    DB,
+    DC,
+    CI: tl.constexpr,
+    CO: tl.constexpr,
+    BIAS: tl.constexpr,
+    WORKERS: tl.constexpr,
+    R: tl.constexpr,
+):
+    fields: tl.constexpr = 9 * CI + 2 + BIAS
+    k = tl.program_id(0)
+    worker = tl.arange(0, R)
+    c = tl.arange(0, CO)
+    v = tl.sum(
+        tl.load(P + (worker[:, None] * fields + k) * CO + c[None, :], worker[:, None] < WORKERS, 0),
+        0,
+    )
+    if k < CI * 9:
+        tl.store(DW + k * CO + c, v)
+    elif k == CI * 9:
+        tl.store(DG + c, v)
+    elif k == CI * 9 + 1:
+        tl.store(DB + c, v)
+    elif BIAS:
+        tl.store(DC + c, v)
+
+
+def _launch_tensor_core_stem(
+    x: Tensor,
+    w: Tensor,
+    g: Tensor,
+    b: Tensor,
+    cb: Tensor | None,
+    y: Tensor,
+    dy: Tensor,
+    stats: Tensor,
+    part: Tensor,
+    eps: float,
+    workers: int,
+    *,
+    backward: bool,
+    block: int = 32,
+    warps: int = 4,
+    tile_reduce: bool = True,
+) -> None:
+    ci, h, width = x.shape[1:]
+    co = w.shape[-1]
+    n = x.shape[0] * ((h + 1) // 2) * ((width + 1) // 2)
+    cl = x.is_contiguous(memory_format=torch.channels_last)
+    stem_conv_tensor_stages[(workers,)](
+        x,
+        w,
+        g,
+        b,
+        cb if cb is not None else g,
+        y,
+        dy,
+        stats,
+        part,
+        h,
+        width,
+        ci,
+        co,
+        n,
+        eps,
+        cl,
+        cb is not None,
+        backward,
+        block,
+        triton.next_power_of_2(ci * 9),
+        tile_reduce,
+        num_warps=warps,
+    )
+
+
+def _use_tensor_core_stem(x: Tensor, w: Tensor) -> bool:
+    # This geometry is the first block in the three target models.
+    return x.shape[1] == 3 and w.shape[-1] == 32
+
+
 @torch.library.custom_op("va_stem::conv_forward", mutates_args=(), device_types="cuda")
 def _conv_forward(
     x: Tensor, w: Tensor, g: Tensor, b: Tensor, cb: Tensor | None, eps: float
 ) -> tuple[Tensor, Tensor]:
     y, stats = _conv_forward_fake(x, w, g, b, cb, eps)
-    if y.numel():
-        with torch.cuda.device(x.device):
+    if not y.numel():
+        return y, stats
+    with torch.cuda.device(x.device):
+        if _use_tensor_core_stem(x, w):
+            workers = triton.cdiv(stats.numel() // 2, 32)
+            _launch_tensor_core_stem(
+                x, w, g, b, cb, y, y, stats, stats, eps, workers, backward=False
+            )
+        else:
             module, stream, n, sizes = _conv_launch_setup(x, w, cb, eps)
             blocks = min(_MAX_FORWARD_BLOCKS, (n + 3) // 4)
             _launch(module, stream, "conv_stem_forward", blocks, (x, w, g, b, cb, y, stats), *sizes)
@@ -931,6 +1150,54 @@ def _conv_workers(module: _CudaModule, device: torch.device) -> int:
     return resident.value * torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def _tensor_core_conv_backward(
+    x: Tensor,
+    w: Tensor,
+    g: Tensor,
+    b: Tensor,
+    cb: Tensor | None,
+    dy: Tensor,
+    stats: Tensor,
+    eps: float,
+    dw: Tensor,
+    dg: Tensor,
+    db: Tensor,
+    dc: Tensor,
+) -> None:
+    block = 64
+    workers = min(1024, triton.cdiv(stats.numel() // 2, block))
+    ci, co = x.shape[1], g.numel()
+    fields = ci * 9 + 2 + int(cb is not None)
+    part = g.new_empty((workers, fields, co))
+    _launch_tensor_core_stem(
+        x,
+        w,
+        g,
+        b,
+        cb,
+        dy,
+        dy,
+        stats,
+        part,
+        eps,
+        workers,
+        backward=True,
+        block=block,
+    )
+    stem_conv_tensor_reduce[(fields,)](
+        part,
+        dw,
+        dg,
+        db,
+        dc,
+        ci,
+        co,
+        cb is not None,
+        workers,
+        triton.next_power_of_2(workers),
+    )
+
+
 @torch.library.custom_op("va_stem::conv_backward", mutates_args=(), device_types="cuda")
 def _conv_backward(
     x: Tensor,
@@ -951,6 +1218,9 @@ def _conv_backward(
         )
     dw, dg, db, dc = _conv_backward_fake(x, w, g, b, cb, dy, stats, eps)
     with torch.cuda.device(x.device):
+        if _use_tensor_core_stem(x, w):
+            _tensor_core_conv_backward(x, w, g, b, cb, dy, stats, eps, dw, dg, db, dc)
+            return dw, dg, db, dc
         module, stream, n, sizes = _conv_launch_setup(x, w, cb, eps)
         blocks = min(_conv_workers(module, x.device), (n + 3) // 4)
         workers = blocks * 4
@@ -994,7 +1264,7 @@ def _conv_backward_fake(
     )
 
 
-def _conv_save(ctx, inputs, output) -> None:  # noqa: ANN001
+def _conv_save(ctx, inputs, output) -> None:
     x, w, g, b, cb, ctx.eps = inputs
     _, stats = output
     ctx.mark_non_differentiable(stats)
@@ -1003,7 +1273,7 @@ def _conv_save(ctx, inputs, output) -> None:  # noqa: ANN001
 
 
 def _conv_autograd(
-    ctx,  # noqa: ANN001
+    ctx,
     dy: Tensor | None,
     dstats: Tensor | None,  # noqa: ARG001
 ) -> tuple[None, Tensor | None, Tensor | None, Tensor | None, Tensor | None, None]:
