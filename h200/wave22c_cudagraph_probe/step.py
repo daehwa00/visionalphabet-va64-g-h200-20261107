@@ -9,6 +9,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -16,7 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "liverms_v2_opt"))
 from bench_h200 import VARIANTS, build_model, setup
 from va_model_builder import build_optimizer
 
-from lnet.capture_safe_orthogonal import prepare_capture_safe_orthogonal_
+from lnet import capture_safe_orthogonal
+from lnet.capture_safe_orthogonal import (
+    fixed_taylor_matrix_exp,
+    prepare_capture_safe_orthogonal_,
+)
+
+
+def autocast_disabled_exp(matrix: torch.Tensor, **options: object) -> torch.Tensor:
+    with torch.autocast(matrix.device.type, enabled=False):
+        return fixed_taylor_matrix_exp(matrix, **options)
 
 
 def raw_time() -> float:
@@ -154,6 +164,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: C901, PLR0915
         "arm": args.arm,
         "batch": args.batch,
         "seed": 501,
+        "exp_fp32": args.exp_fp32,
         "warmup": args.warmup,
         "first_step_s": first_step_s,
         "capture_s": capture_s,
@@ -202,4 +213,16 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--trace", type=Path)
-    run(parser.parse_args())
+    parser.add_argument(
+        "--exp-fp32",
+        action="store_true",
+        help="Disable BF16 autocast inside the Taylor exponential only",
+    )
+    args = parser.parse_args()
+    if args.exp_fp32:
+        with patch.object(
+            capture_safe_orthogonal, "fixed_taylor_matrix_exp", autocast_disabled_exp
+        ):
+            run(args)
+    else:
+        run(args)

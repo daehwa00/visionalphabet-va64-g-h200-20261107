@@ -42,3 +42,9 @@ builders, and compares dense and concentrated skew matrices at fixed norms.
 Microbenchmark timing includes first-order differentiation and uses eager
 execution. The polynomial variants are diagnostic candidates contained in
 the probe.
+
+Use `step.py --exp-fp32` to isolate the Taylor exponential from BF16
+autocast while preserving it for the surrounding projection and model.
+Use `gates.py --gate dynamo --output results/dynamo.json` for the existing
+six-configuration Dynamo audit. For folding, use `gates.py --gate fold
+--variant VARIANT --output results/fold.json` for each of the three models.
