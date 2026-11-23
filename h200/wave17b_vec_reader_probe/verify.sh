@@ -23,11 +23,13 @@ run_candidate() {
 }
 
 LNET_READER_VEC=1 PYTHONPATH="$tmp/src:$tmp/scripts" "$py" "$bench" train-arm \
-    --variant "$variant" --batch "$batch" --out "$out/train-baseline.json"
-for arm in 1 2 4 auto; do
+    --variant "$variant" --batch "$batch" --profile --out "$out/train-baseline.json"
+for arm in 1 2 4; do
     LNET_READER_VEC=$arm run_candidate "$bench" train-arm \
         --variant "$variant" --batch "$batch" --out "$out/train-$arm.json"
 done
+LNET_READER_VEC=auto run_candidate "$bench" train-arm \
+    --variant "$variant" --batch "$batch" --profile --out "$out/train-auto.json"
 run_candidate "$probe" bench --batch "$batch" \
     --baseline "$tmp/src/lnet/factorized_reader_kernels.py" --out "$out/reader.jsonl"
 run_candidate "$probe" parity \

@@ -339,10 +339,10 @@ __device__ __forceinline__ void sliding_spatial(
         }
     }
     const long long input_step = static_cast<long long>(Inputs) * modes;
-    const T* next = input + (base + x0 + 1) * input_step + mode;
+    long long next = (base + x0 + 1) * input_step + mode;
     constexpr int Outputs = Backward ? R * (Strict ? 2 : 1) : 2;
     const long long output_step = static_cast<long long>(Outputs) * modes;
-    O* destination = output + (base + x0) * output_step + mode;
+    long long destination = (base + x0) * output_step + mode;
     for (int x = x0; x < x0 + Columns && x < width;
          ++x, next += input_step, destination += output_step) {
         Window right[Rows + 2][Inputs] = {};
@@ -353,7 +353,7 @@ __device__ __forceinline__ void sliding_spatial(
             #pragma unroll
             for (int i = 0; i < Inputs; ++i)
                 right[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, true>(
-                    next + py * width * input_step + i * modes);
+                    input + (next + py * width * input_step + i * modes));
         }
         V ar[Rows] = {}, ai[Rows] = {};
         #pragma unroll
@@ -417,7 +417,7 @@ __device__ __forceinline__ void sliding_spatial(
                 #pragma unroll
                 for (int y = 0; y < Rows; ++y) {
                     if (y0 + y >= height) continue;
-                    O* out = destination + (y0 + y) * width * output_step + r * modes;
+                    O* out = output + (destination + (y0 + y) * width * output_step + r * modes);
                     mode_store<Vec>(out, ar[y]);
                     if (Strict) mode_store<Vec>(out + R * modes, ai[y]);
                     ar[y] = ai[y] = {};
@@ -428,7 +428,7 @@ __device__ __forceinline__ void sliding_spatial(
             #pragma unroll
             for (int y = 0; y < Rows; ++y) {
                 if (y0 + y >= height) continue;
-                O* out = destination + (y0 + y) * width * output_step;
+                O* out = output + (destination + (y0 + y) * width * output_step);
                 mode_store<Vec>(out, ar[y]);
                 mode_store<Vec>(out + modes, ai[y]);
             }
