@@ -35,6 +35,7 @@ finish() {
     exit "$status"
 }
 trap finish EXIT
+trap 'exit 124' TERM
 ready() {
     test -x "$1" && "$1" -c 'import sys, torch, torchvision, timm, pytest; raise SystemExit(sys.version_info < (3, 13) or not torch.cuda.is_available())'
 }
