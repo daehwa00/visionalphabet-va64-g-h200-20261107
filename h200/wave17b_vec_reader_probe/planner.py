@@ -116,7 +116,17 @@ def replay(job):
                         width, rank, 3, dtype, strict=False,
                     )
                     tile = rank
-                launch = reader._VectorLaunch(1, reader._reader_columns(width), rows, warps, tile)
+                register_filters = scalar_plan is None and (
+                    rank <= reader._RESIDENT_FILTER_RANK_LIMIT
+                    or (rows, warps) == reader._COMPACT_SPATIAL_GEOMETRY
+                )
+                keep_real = op != "dweight" and (register_filters or (
+                    scalar_plan is None and op == "dinput"
+                    and compile_shape[2] >= 4 * reader._COMPACT_COLUMNS
+                ))
+                launch = reader._VectorLaunch(
+                    1, reader._reader_columns(width), rows, warps, tile, keep_real,
+                )
             active = resident(module, op, launch.warps)
             if op == "dweight":
                 mode_tiles = reader._ceildiv(modes, reader._WARP_SIZE * launch.vec)
