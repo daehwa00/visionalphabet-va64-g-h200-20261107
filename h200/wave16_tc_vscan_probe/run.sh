@@ -22,10 +22,14 @@ nvidia-smi > "$out/nvidia-smi.txt"
     --batch "$batch" --out "$out/isolated.jsonl" --variants "${graph_variants[@]}" |
     tee "$out/isolated.log"
 if [[ ${COMBINED_SCAN:-0} == 1 ]]; then
-    "$python_bin" h200/wave16_tc_vscan_probe/bench.py --combined --batch "$batch"         --variants "$variant" --out "$out/combined.jsonl" | tee "$out/combined.log"
+    "$python_bin" h200/wave16_tc_vscan_probe/bench.py --combined --batch "$batch" \
+        --variants "$variant" --out "$out/combined.jsonl" | tee "$out/combined.log"
 fi
-"$python_bin" h200/wave16_tc_vscan_probe/validate.py     --batch "${REFERENCE_BATCH:-128}" --variant "$variant" --out "$out/parity.jsonl" |
-    tee "$out/parity.log"
+if [[ ${REFERENCE_CHECK:-1} == 1 ]]; then
+    "$python_bin" h200/wave16_tc_vscan_probe/validate.py \
+        --batch "${REFERENCE_BATCH:-128}" --variant "$variant" --out "$out/parity.jsonl" |
+        tee "$out/parity.log"
+fi
 
 for model_batch in ${MODEL_BATCHES:-128}; do
     for arm in baseline spatial; do

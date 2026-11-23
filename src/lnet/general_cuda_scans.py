@@ -125,6 +125,7 @@ class Kernel:
     imag_transposed: bool = False
     vector_weights: bool = False
     spatial: bool = False
+    batched_io: bool = False
 
 
 class Launch(NamedTuple):
@@ -899,13 +900,17 @@ __device__ unsigned tc_normalize(Complex state, float gain) {
     return tc_pack<T>(rounded<T>(state.r) * gain, rounded<T>(state.i) * gain);
 }
 
-template<class T, class I, int WARPS, bool COARSE, bool COMPACT, bool REAL, bool IMAG>
+template<class T, class I, int WARPS, bool COARSE, bool COMPACT, bool REAL, bool IMAG,
+         int BATCH_ROWS>
 struct SpatialColumn {
     static constexpr int pitch = WARPS + 1;
+    static constexpr int step = 1 + COARSE;
+    static constexpr int threads = WARPS * 32;
     const T* states;
     const float* vy;
     T* gs;
     unsigned* tile;
+    Complex* states_grad;
     I line, lines, plane, source0, output0, gradient0, row_stride, out_stride;
     int H, M, warp, lane, mode0;
     bool source_valid, output_valid;
@@ -914,19 +919,56 @@ struct SpatialColumn {
     __device__ int col() const { return lane / 2; }
     __device__ int m() const { return mode0 + warp; }
     __device__ bool valid(int c, int mode) const { return line + c < lines && mode < M; }
-    __device__ Complex source(int y) const {
-        const int k = threadIdx.x / WARPS, mode = threadIdx.x % WARPS;
-        unsigned value = 0;
-        if (source_valid) {
-            const I at = source0 + I(y) * row_stride;
-            const auto z = load_complex(states, at, plane);
-            value = tc_pack<T>(z.r, z.i);
+    __device__ unsigned* source_row(int y) const {
+        return tile + (BATCH_ROWS ? y % (BATCH_ROWS + !BATCH_ROWS) * 32 * pitch : 0);
+    }
+    __device__ unsigned* output_row(int y) const {
+        if constexpr (BATCH_ROWS) {
+            return tile + (32 * BATCH_ROWS + 16 * (y % (BATCH_ROWS / step))) * pitch;
         }
-        tile[k * pitch + mode] = value;
-        __syncthreads();
-        const unsigned packed = tile[lane * pitch + warp];
-        __syncthreads();
+        return tile;
+    }
+    __device__ unsigned load_source(int y) const {
+        if (!source_valid) return 0;
+        const I at = source0 + I(y) * row_stride;
+        const auto z = load_complex(states, at, plane);
+        return tc_pack<T>(z.r, z.i);
+    }
+    __device__ Complex source(int y) const {
+        auto* row = source_row(y);
+        if constexpr (!BATCH_ROWS) {
+            row[(threadIdx.x / WARPS) * pitch + threadIdx.x % WARPS] = load_source(y);
+            __syncthreads();
+        }
+        const unsigned packed = row[lane * pitch + warp];
+        if constexpr (!BATCH_ROWS) __syncthreads();
         return tc_unpack<T>(packed);
+    }
+    __device__ unsigned load_incoming(int y, const T* gr, const T* gi) const {
+        if (!output_valid) return 0;
+        const int mode = mode0 + threadIdx.x % WARPS;
+        const I at = output0 + I(y) * out_stride;
+        return tc_pack<T>(read(gr[(at - mode) * (1 + REAL) + mode]),
+                          read(gi[(at - mode) * (1 + IMAG) + mode]));
+    }
+    template<bool GRADIENT>
+    __device__ void stage(int begin, int length, const T* gr, const T* gi) const {
+        if constexpr (BATCH_ROWS) {
+            __syncthreads();
+            const int j = threadIdx.x / WARPS, mode = threadIdx.x % WARPS;
+            const int offset = j * pitch + mode;
+            for (int y = begin; y < begin + length; ++y) {
+                source_row(y)[offset] = load_source(y);
+            }
+            if constexpr (GRADIENT) {
+                if (j < 16) {
+                    for (int y = begin / step; y < (begin + length) / step; ++y) {
+                        output_row(y)[offset] = load_incoming(y, gr, gi);
+                    }
+                }
+            }
+            __syncthreads();
+        }
     }
     __device__ float gain(int y, bool reverse) const {
         const float v = lane == 0 && m() < M ? vy[(I(reverse) * H + y) * M + m()] : 0;
@@ -934,54 +976,86 @@ struct SpatialColumn {
         return rsqrtf(fmaxf(vx * broadcast, eps));
     }
     __device__ float4 incoming(int y, int c, const T* gr, const T* gi) const {
-        const int j = threadIdx.x / WARPS, mode = threadIdx.x % WARPS;
-        float2 d{};
-        if (output_valid) {
-            const I at = output0 + I(y) * out_stride;
-            d = make_float2(read(gr[(at - mode0 - mode) * (1 + REAL) + mode0 + mode]),
-                            read(gi[(at - mode0 - mode) * (1 + IMAG) + mode0 + mode]));
+        auto* row = output_row(y);
+        if constexpr (!BATCH_ROWS) {
+            row[(threadIdx.x / WARPS) * pitch + threadIdx.x % WARPS] = load_incoming(y, gr, gi);
+            __syncthreads();
         }
-        tile[j * pitch + mode] = tc_pack<T>(d.x, d.y);
-        __syncthreads();
-        const auto a = tc_unpack<T>(tile[c * pitch + warp]);
-        const auto b = tc_unpack<T>(tile[(c + 8) * pitch + warp]);
-        __syncthreads();
+        const auto a = tc_unpack<T>(row[c * pitch + warp]);
+        const auto b = tc_unpack<T>(row[(c + 8) * pitch + warp]);
+        if constexpr (!BATCH_ROWS) __syncthreads();
         return make_float4(a.r, a.i, b.r, b.i);
+    }
+    __device__ void write_output(int y, T* outr, T* outi) const {
+        if (!output_valid) return;
+        const int c = threadIdx.x / WARPS, mode = mode0 + threadIdx.x % WARPS;
+        const auto z = tc_unpack<T>(output_row(y)[c * pitch + threadIdx.x % WARPS]);
+        const I at = output0 + I(y) * out_stride;
+        outr[(at - mode) * (1 + REAL) + mode] = write<T>(z.r);
+        outi[(at - mode) * (1 + IMAG) + mode] = write<T>(z.i);
     }
     __device__ void output(int y, float2 a, float2 b, T* outr, T* outi) const {
         const int group = lane / 4;
         if (!(lane & 3)) {
-            tile[group * pitch + warp] = tc_pack<T>(a.x, a.y);
-            tile[(group + 8) * pitch + warp] = tc_pack<T>(b.x, b.y);
+            auto* row = output_row(y);
+            row[group * pitch + warp] = tc_pack<T>(a.x, a.y);
+            row[(group + 8) * pitch + warp] = tc_pack<T>(b.x, b.y);
         }
-        __syncthreads();
-        const int c = threadIdx.x / WARPS, mode = mode0 + threadIdx.x % WARPS;
-        if (output_valid) {
-            const auto z = tc_unpack<T>(tile[c * pitch + threadIdx.x % WARPS]);
-            const I at = output0 + I(y) * out_stride;
-            outr[(at - mode) * (1 + REAL) + mode] = write<T>(z.r);
-            outi[(at - mode) * (1 + IMAG) + mode] = write<T>(z.i);
+        if constexpr (!BATCH_ROWS) {
+            __syncthreads();
+            write_output(y, outr, outi);
+            __syncthreads();
         }
-        __syncthreads();
+    }
+    __device__ float& adjoint_slot(int y, int tid) const {
+        auto* slot = states_grad + (y % (BATCH_ROWS + !BATCH_ROWS)) * threads + tid;
+        return slot->r;
+    }
+    template<bool REVERSE>
+    __device__ void write_gradient(int y, unsigned packed) const {
+        if (!source_valid) return;
+        const int dir = (threadIdx.x / WARPS) & 1;
+        const I stride = COMPACT ? plane / 2 : plane;
+        const I at = gradient0 + I(y) * (COMPACT ? out_stride : row_stride);
+        auto z = tc_unpack<T>(packed);
+        if constexpr (REVERSE) z = z + load_complex(gs, at, stride);
+        store_complex(gs, at, stride, z);
+        if constexpr (REVERSE && COARSE && !COMPACT) {
+            store_complex(gs, at + I(2 * dir - 1) * M, stride, {});
+        }
     }
     template<bool REVERSE>
     __device__ void gradient(int y, Complex delta) const {
-        tile[lane * pitch + warp] = tc_pack<T>(delta.r, delta.i);
-        __syncthreads();
-        const int k = threadIdx.x / WARPS, mode = threadIdx.x % WARPS;
-        const int dir = k & 1;
-        if (source_valid) {
-            const I stride = COMPACT ? plane / 2 : plane;
-            const I at = gradient0 + I(y) * (COMPACT ? out_stride : row_stride);
-            auto z = tc_unpack<T>(tile[k * pitch + mode]);
-            if constexpr (REVERSE) z = z + load_complex(gs, at, stride);
-            store_complex(gs, at, stride, z);
-            if constexpr (REVERSE && COARSE && !COMPACT) {
-                store_complex(gs, at + I(2 * dir - 1) * M, stride, {});
+        const unsigned packed = tc_pack<T>(delta.r, delta.i);
+        if constexpr (BATCH_ROWS) {
+            // A recurrence lane has already consumed its own trajectory slot.
+            adjoint_slot(y, threadIdx.x) = __uint_as_float(packed);
+        } else {
+            tile[lane * pitch + warp] = packed;
+            __syncthreads();
+            write_gradient<REVERSE>(y, tile[(threadIdx.x / WARPS) * pitch + threadIdx.x % WARPS]);
+            __syncthreads();
+        }
+    }
+    template<bool BACKWARD, bool REVERSE = false>
+    __device__ void flush(int begin, int length, T* outr, T* outi) const {
+        if constexpr (BATCH_ROWS) {
+            __syncthreads();
+            const int tid = (threadIdx.x % WARPS) * 32 + threadIdx.x / WARPS;
+            if constexpr (BACKWARD) {
+                if (source_valid) {
+                    for (int y = begin; y < begin + length; ++y) {
+                        write_gradient<REVERSE>(y, __float_as_uint(adjoint_slot(y, tid)));
+                    }
+                }
+            } else if (output_valid) {
+                for (int y = begin / step; y < (begin + length) / step; ++y) {
+                    write_output(y, outr, outi);
+                }
             }
         }
-        __syncthreads();
     }
+
 };
 
 struct SpatialPath {
@@ -1047,7 +1121,7 @@ __device__ void tc_adjoint(
 }
 
 template<class T, class I, bool COARSE, int WARPS, bool BACKWARD, bool COMPACT, bool REAL,
-         bool IMAG, int CHUNK, bool CACHE_LINE, bool CACHE_SOURCE>
+         bool IMAG, int CHUNK, bool CACHE_LINE, bool CACHE_SOURCE, bool BATCH_IO>
 __device__ void vertical_spatial(
     const float* dr, const float* di, const float* decay_gr, const float* decay_gi,
     const T* states, const float* vx, const float* vy,
@@ -1056,6 +1130,7 @@ __device__ void vertical_spatial(
     int workers, int types, float eps
 ) {
     extern __shared__ float4 shared[];
+    static_assert(!BATCH_IO || (CHUNK && !CACHE_SOURCE));
     const int tid = threadIdx.x, warp = tid / 32, lane = tid & 31;
     const int col = lane / 2, dir = lane & 1, group = lane / 4, pair = lane & 3;
     const int tiles = (M - 1) / WARPS + 1;
@@ -1111,8 +1186,8 @@ __device__ void vertical_spatial(
         const I output_line = line + io;
         const I output0 = (output_line / ow * oh * ow + output_line % ow) * M + mode;
         const I gradient0 = COMPACT ? (batch * H * ow + cx) * M + mode + side * plane : source0;
-        SpatialColumn<T, I, WARPS, COARSE, COMPACT, REAL, IMAG> c{
-            states, vy, gs, tile, line, lines, plane, source0, output0, gradient0,
+        SpatialColumn<T, I, WARPS, COARSE, COMPACT, REAL, IMAG, BATCH_IO ? CHUNK : 0> c{
+            states, vy, gs, tile, seg, line, lines, plane, source0, output0, gradient0,
             I(W) * M, I(ow) * M, H, M, warp, lane, mode0,
             bx < lines && mode < M, io < tc_columns && output_line < lines && mode < M, v, eps};
         const auto source_at = [&](int y) {
@@ -1124,6 +1199,7 @@ __device__ void vertical_spatial(
             const int y0 = block * span;
             const int length = min(span, H - y0);
             const bool last = block == chunks - 1;
+            c.template stage<false>(y0, length, gr, gi);
             for (int j = 0; j < length; ++j) {
                 const int y = y0 + j;
                 const auto source = c.source(y);
@@ -1146,6 +1222,7 @@ __device__ void vertical_spatial(
         for (int block = chunks - 1; block >= 0; --block) {
             const int y0 = block * span;
             const int length = min(span, H - y0);
+            c.template stage<BACKWARD>(y0, length, gr, gi);
             Complex before{};
             if constexpr (BACKWARD && CHUNK) {
                 if (block) before = boundaries[I(block - 1) * stride + tid];
@@ -1219,12 +1296,14 @@ __device__ void vertical_spatial(
                     c.output(yo, project_pair(z.x, z.y), project_pair(z.z, z.w), outr, outi);
                 }
             }
+            c.template flush<BACKWARD>(y0, length, outr, outi);
         }
         if constexpr (BACKWARD) {
             adj = {};
             for (int block = 0; block < chunks; ++block) {
                 const int y0 = block * span;
                 const int length = min(span, H - y0);
+                c.template stage<false>(y0, length, gr, gi);
                 if constexpr (CHUNK) {
                     neg = block + 1 < chunks ? boundaries[I(block) * stride + tid] : Complex{};
                     for (int j = length - 1; j >= 0; --j) {
@@ -1239,6 +1318,7 @@ __device__ void vertical_spatial(
                     tc_adjoint<true, T>(c, y, seg[I(j) * stride + tid], source_at(y), inject,
                                          ar, gg, adj, da, dg);
                 }
+                c.template flush<true, true>(y0, length, outr, outi);
             }
         }
     }
@@ -1703,7 +1783,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         )
         implementation = (
             f"vertical_spatial<{io}, {index}, {coarse}, {key.warps}, "
-            f"{backward}, {compact}, {layout}, {key.chunk}, {cache_line}, {cache_source}>"
+            f"{backward}, {compact}, {layout}, {key.chunk}, {cache_line}, {cache_source}, "
+            f"{str(key.batched_io).lower()}>"
             "(dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo, bo, gr, gi, "
             "outr, outi, gs, partials, reinterpret_cast<unsigned*>(scratch), "
             "B, H, W, M, workers, types, eps);"
@@ -2548,7 +2629,8 @@ def _spatial_launch(  # noqa: C901, PLR0912
     device: int, shape: tuple[int, ...], baseline: Launch,
     requested_warps: str,
 ) -> Launch | None:
-    if torch.cuda.get_device_capability(device)[0] < 8:
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] < 8 or (capability == (8, 6) and requested_warps == "auto"):
         return None
     b, h, w, m = shape
     sms, limit, _ = device_limits(device)
@@ -2559,26 +2641,29 @@ def _spatial_launch(  # noqa: C901, PLR0912
     if requested_warps == "auto" and columns * _ceil(m, 4) < sms:
         return None
     flags = options.split("-") if options else []
+    batched = "batched" in flags
     choices = []
     old_scratch = old_workers * m * _scratch_per_worker(
         old_plan, h, vertical=True, coarse=old_key.coarse, backward=old_key.backward, itemsize=2,
     )
-    for warps in (4, 8):
-        for chunk in ((0, 8, 16) if old_key.backward else (0,)):
+    warp_counts = (4, 8, 16) if batched else (4, 8)
+    chunks = (4, 8, 14) if batched else (0, 8, 16) if old_key.backward else (0,)
+    for warps in warp_counts:
+        for chunk in chunks:
             variant = str(warps) if not chunk else f"{warps}x{chunk}"
             if requested_warps not in ("auto", variant) or chunk >= h:
                 continue
             span = chunk or h
             stored = span + _ceil(h, span) - 1 if old_key.backward else 0
-            base_smem = stored * 8 * warps * 32 + 128 * (warps + 1)
+            transpose_rows = chunk * (32 + 16 // step) if batched else 32
+            base_smem = stored * 8 * warps * 32 + 4 * (warps + 1) * transpose_rows
             modes = _ceil(m, warps)
             for cache_line, cache_source in ((True, False), (True, True), (False, False)):
                 memory = "shared" if cache_line else "global"
                 if ("shared" in flags or "global" in flags) and memory not in flags:
                     continue
-                if flags and cache_source != ("cached" in flags):
-                    continue
-                if not cache_line and not old_scratch:
+                if ((flags and cache_source != ("cached" in flags))
+                        or (not cache_line and not old_scratch)):
                     continue
                 line_smem = (h // step) * 4 * cache_line + h * 4 * cache_source
                 smem = base_smem + line_smem * warps * 32
@@ -2586,7 +2671,7 @@ def _spatial_launch(  # noqa: C901, PLR0912
                     continue
                 key = replace(
                     old_key, spatial=True, warps=warps, vector_weights=False, chunk=chunk,
-                    cache_line=cache_line, cache_source=cache_source,
+                    cache_line=cache_line, cache_source=cache_source, batched_io=batched,
                 )
                 resident = _resident(device, key, smem)
                 if not resident:

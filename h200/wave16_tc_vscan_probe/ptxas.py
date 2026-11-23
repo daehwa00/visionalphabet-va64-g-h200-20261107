@@ -18,23 +18,27 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--extended-layouts", action="store_true")
+    parser.add_argument("--batched", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
+    warps_options = (4, 8, 16) if args.batched else (4, 8)
     cases = itertools.product(
-        (86, 89, 90), (torch.bfloat16, torch.float16), (False, True), (False, True), (4, 8),
+        (86, 89, 90), (torch.bfloat16, torch.float16), (False, True), (False, True), warps_options,
     )
     layouts = [(True, True, False), (False, False, False), (True, True, True)]
-    if args.extended_layouts:
+    if args.batched:
+        layouts = [(True, True, False), (False, True, False), (False, False, False)]
+    elif args.extended_layouts:
         layouts += [(True, False, False), (False, True, False), (True, False, True)]
     rows = [
         compile_case(
             args.out, sm, dtype, warps, chunk,
             coarse=coarse, backward=backward, cached=cached, index32=index32,
-            cache_source=cache_source,
+            cache_source=cache_source, batched=args.batched,
         )
         for sm, dtype, coarse, backward, warps in cases
-        for chunk in ((0, 8, 16) if backward else (0,))
+        for chunk in ((4, 8, 14) if args.batched else (0, 8, 16) if backward else (0,))
         for cached, index32, cache_source in layouts
     ]
 
@@ -52,7 +56,7 @@ def main() -> None:
 
 def compile_case(
     out: Path, sm: int, dtype: torch.dtype, warps: int, chunk: int, *,
-    coarse: bool, backward: bool, cached: bool, index32: bool, cache_source: bool,
+    coarse: bool, backward: bool, cached: bool, index32: bool, cache_source: bool, batched: bool,
 ) -> dict:
     variant = f"sm{sm}-{str(dtype)[6:]}-{int(coarse)}-{int(backward)}-w{warps}-c{chunk}"
 
@@ -62,6 +66,8 @@ def compile_case(
         variant += "-i64"
     if cache_source:
         variant += "-cached-source"
+    if batched:
+        variant += "-batched"
     root = out / variant
     ptx = root.with_suffix(".ptx")
     cubin = root.with_suffix(".cubin")
@@ -69,6 +75,7 @@ def compile_case(
         dtype, warps, backward, vertical=True, coarse=coarse, compact=coarse and backward,
         hidden8=True, spatial=True, chunk=chunk, cache_line=cached, index32=index32,
         real_interleaved=not index32, imag_interleaved=not index32, cache_source=cache_source,
+        batched_io=batched,
     )
     ptx.write_bytes(scans._compile_ptx(key, divmod(sm, 10)).value)
     compiled = subprocess.run(
@@ -87,7 +94,8 @@ def compile_case(
     span = chunk or h
     stored = span + (h - 1) // span if backward else 0
     per_lane = stored * 8 + h // (1 + coarse) * 4 * cached + h * 4 * cache_source
-    smem = per_lane * warps * 32 + 128 * (warps + 1)
+    transpose_rows = chunk * (32 + 16 // (1 + coarse)) if batched else 32
+    smem = per_lane * warps * 32 + 4 * (warps + 1) * transpose_rows
     row = {
         "backward": backward,
         "variant": variant,

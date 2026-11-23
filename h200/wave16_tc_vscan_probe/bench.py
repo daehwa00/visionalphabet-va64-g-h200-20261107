@@ -134,10 +134,16 @@ def probe(case: tuple, dtype: torch.dtype, args: argparse.Namespace) -> dict:
         results = {}
         baseline = capture(operation, "")
         for variant in args.variants:
-            candidate = capture(operation, variant)
-            results[variant] = compare_pair(baseline, candidate, args.repeats)
+            try:
+                candidate = capture(operation, variant)
+                results[variant] = compare_pair(baseline, candidate, args.repeats)
+            except torch.AcceleratorError as exc:
+                msg = f"Graph failure on {dtype} {row['shape']} {direction} with {variant}"
+                raise RuntimeError(msg) from exc
             del candidate
+            torch.cuda.empty_cache()
         del baseline
+        torch.cuda.empty_cache()
         row["results"][direction] = results
     return row
 

@@ -1082,7 +1082,7 @@ def test_cuda_decoupled_vscan(  # noqa: C901
         (1, 56, 56, 160, True, False),
     ],
 )
-@pytest.mark.parametrize("variant", ["4", "4x8"])
+@pytest.mark.parametrize("variant", ["4", "4x8", "4x4-batched", "16x4-batched"])
 def test_cuda_spatial_vscan(
     monkeypatch: pytest.MonkeyPatch,
     variant: str,
@@ -1098,6 +1098,8 @@ def test_cuda_spatial_vscan(
         pytest.skip("SM 8.0 required")
     if variant == "4x8" and h <= 8:
         variant = "8"
+    if variant == "16x4-batched" and h == 56:
+        variant = "8x4-batched"
     torch.manual_seed(416)
     _, pole, real, imag, auxiliary, path = _inputs(h, w, m, 8, dtype, "cuda", batch)
     states = torch.stack((real, imag, imag, real))
@@ -1127,9 +1129,11 @@ def test_cuda_spatial_vscan(
     actual_grad = scans.vertical_backward(
         pole, states, auxiliary, path, *dy, coarse, compact=compact,
     )
-    expected_spatial = "x" not in variant
+    batched = variant.endswith("-batched")
+    expected_spatial = batched or "x" not in variant
     assert [key.spatial for key in keys] == [expected_spatial, True]
-    assert keys[1].chunk == (8 if "x" in variant else 0)
+    assert [key.batched_io for key in keys] == [batched, batched]
+    assert keys[1].chunk == int(variant.partition("x")[2].partition("-")[0] or 0)
 
     forward_tol, backward_tol = (
         ((8e-3, 1e-3), (5e-2, 2e-2)) if dtype == torch.float16
