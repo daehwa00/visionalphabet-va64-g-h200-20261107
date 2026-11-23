@@ -1,6 +1,7 @@
 """CPU launch/dispatcher checks and opt-in CUDA numerical equivalence tests."""
 
 import warnings
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -695,6 +696,30 @@ def _compare_pipeline(
     ):
         for value, target in zip(values, reference, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("h", "w", "coarse"), [(37, 53, False), (34, 46, True)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cuda_batched_forward_path(
+    monkeypatch: pytest.MonkeyPatch, h: int, w: int, coarse: bool, dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(791)
+    px, py, real, imag, auxiliary, path = _inputs(h, w, 35, 8, dtype, "cuda")
+    states = scans.horizontal_forward(px, real, imag)
+    monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", "off")
+    reference = scans._vscan(py, states, auxiliary, path, coarse, 1e-6, precise=True, packed=True)
+    dispatch = scans._dispatch
+
+    def with_batched_path(
+        source: Tensor, launch: scans.Launch, args: tuple,
+    ) -> None:
+        dispatch(source, launch._replace(key=replace(launch.key, batch_path=True)), args)
+
+    monkeypatch.setattr(scans, "_dispatch", with_batched_path)
+    actual = scans._vscan(py, states, auxiliary, path, coarse, 1e-6, precise=True, packed=True)
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 @_cuda
