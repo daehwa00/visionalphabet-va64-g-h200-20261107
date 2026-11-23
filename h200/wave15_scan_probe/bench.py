@@ -1,10 +1,12 @@
-# ruff: noqa: SLF001, FBT003, ANN001, ANN201, ANN202, B023, PLR0915, T201, E501
+# ruff: noqa: SLF001, FBT003, ANN001, ANN201, ANN202, T201, E501
 """Measure candidate layouts in a single graph with Wave 14A as the control."""
 
 import argparse
 import inspect
 import json
 import statistics
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +27,10 @@ ARMS = {
     "scratch": (0, True, False, False),
     "row": (1, False, False, False),
     "column": (2, False, False, False),
+    "column-shared2": (2, False, False, False),
+    "column-shared4": (2, False, False, False),
+    "column-2warps": (2, False, False, False),
+    "column-4warps": (2, False, False, False),
     "single": (2, True, True, False),
     "drop-source": (2, True, True, True),
 }
@@ -53,6 +59,29 @@ def compare(outputs, expected):
     ]
 
 
+@contextmanager
+def horizontal_warps(name):
+    if name not in ("column-2warps", "column-4warps"):
+        yield
+        return
+
+    warps = int(name.split("-")[1][0])
+    original = scans._scan_plans
+
+    def plans(*args: int, **kwargs: bool | int):
+        result = original(*args, **kwargs)
+        if kwargs["vertical"]:
+            return result
+        return [plan for plan in result if plan.warps == warps] or result
+
+    scans._launch_for_shape.cache_clear()
+    try:
+        with patch.object(scans, "_scan_plans", plans):
+            yield
+    finally:
+        scans._launch_for_shape.cache_clear()
+
+
 def probe(case, args):
     h, w, modes, coarse = case
     b = args.batch if h <= 56 else 4
@@ -68,78 +97,90 @@ def probe(case, args):
     expected = None
     results = {}
     for name in args.arms:
-        layout, scratch, single, drop_source = ARMS[name]
-        options = {
-            "state_layout": layout, "local_scratch": scratch,
-            "single_store": single, "drop_source": drop_source,
-        }
-
-        horizontal_options = {"state_layout": layout} if TRIAL_ENABLED else {}
-        options = options if TRIAL_ENABLED else {}
-
-        def operation():
-            states, _ = scans._hscan(px, *source, **horizontal_options)
-            output = scans._vscan(py, states, aux, path, coarse, 1e-6, True, **options)
-            vertical = scans._vscan(
-                py, states, aux, path, coarse, 1e-6, False, tuple(dy),
-                compact=coarse, **options,
+        with horizontal_warps(name):
+            results[name], expected = measure_arm(
+                name, h, modes, coarse, dtype, source, px, py, aux, path, dy,
+                expected, args.repeats,
             )
-            dx, pole = scans._hscan(
-                px, *source, states, vertical[4], compact=coarse, **horizontal_options,
-            )
-            return [*output, dx, *pole, *vertical[:4], *vertical[5:]]
-
-        warm = operation()
-        torch.cuda.synchronize()
-        values = signature(warm)
-        expected = values if expected is None else expected
-        parity = compare(values, expected)
-        del warm
-        plans = {}
-        events = {}
-
-        def track(source, launch, arguments):
-            key = launch.key
-            phase = ("vscan" if key.vertical else "hscan") + ("_bwd" if key.backward else "_fwd")
-            start, stop = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
-            plans[phase] = {
-                **launch.plan._asdict(), "workers": launch.workers,
-                "estimated_scratch_bytes": (
-                    0 if not key.vertical or launch.plan.cache_line else
-                    launch.workers * modes * dtype.itemsize * (8 * h if getattr(key, "single_store", False) else 4 * oh)
-                ),
-            }
-            events[phase] = start, stop
-            start.record()
-            dispatch(source, launch, arguments)
-            stop.record()
-
-        graph = torch.cuda.CUDAGraph()
-        dispatch = scans._dispatch
-        torch.cuda.reset_peak_memory_stats()
-        with patch.object(scans, "_dispatch", track), torch.cuda.graph(graph):
-            outputs = operation()
-        peak = torch.cuda.max_memory_allocated()
-        graph.replay()
-        torch.cuda.synchronize()
-        start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        samples = {phase: [] for phase in (*events, "combined")}
-        for _ in range(args.repeats):
-            start.record()
-            for _ in range(5):
-                graph.replay()
-            stop.record()
-            stop.synchronize()
-            samples["combined"].append(start.elapsed_time(stop) / 5)
-            for phase, (before, after) in events.items():
-                samples[phase].append(before.elapsed_time(after))
-        results[name] = {
-            "samples_ms": samples,
-            "median_ms": {phase: statistics.median(times) for phase, times in samples.items()},
-            "plan": plans, "sampled_parity": parity, "peak_allocated_bytes": peak,
-        }
-        del outputs, graph
     return {"shape": [b, h, w, modes, coarse], "dtype": args.dtype, "results": results}
+
+
+def measure_arm(name, h, modes, coarse, dtype, source, px, py, aux, path, dy, expected, repeats):
+    oh = h // (1 + coarse)
+    layout, scratch, single, drop_source = ARMS[name]
+    options = {
+        "state_layout": layout, "local_scratch": scratch,
+        "single_store": single, "drop_source": drop_source,
+        "shared_hidden": int(name[-1]) if name.startswith("column-shared") else 0,
+    }
+
+    horizontal_options = {"state_layout": layout} if TRIAL_ENABLED else {}
+    options = options if TRIAL_ENABLED else {}
+
+    def operation():
+        states, _ = scans._hscan(px, *source, **horizontal_options)
+        output = scans._vscan(py, states, aux, path, coarse, 1e-6, True, **options)
+        vertical = scans._vscan(
+            py, states, aux, path, coarse, 1e-6, False, tuple(dy),
+            compact=coarse, **options,
+        )
+        dx, pole = scans._hscan(
+            px, *source, states, vertical[4], compact=coarse, **horizontal_options,
+        )
+        return [*output, dx, *pole, *vertical[:4], *vertical[5:]]
+
+    warm = operation()
+    torch.cuda.synchronize()
+    values = signature(warm)
+    expected = values if expected is None else expected
+    parity = compare(values, expected)
+    del warm
+    plans = {}
+    events = {}
+
+    def track(source, launch, arguments):
+        key = launch.key
+        phase = ("vscan" if key.vertical else "hscan") + ("_bwd" if key.backward else "_fwd")
+        start, stop = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
+        plans[phase] = {
+            **launch.plan._asdict(), "workers": launch.workers,
+            "kernel": {k: v for k, v in asdict(launch.key).items() if k != "dtype"},
+            "estimated_scratch_bytes": (
+                0 if not key.vertical or launch.plan.cache_line else
+                launch.workers * modes * dtype.itemsize * (8 * h if getattr(key, "single_store", False) else 4 * oh)
+            ),
+        }
+        events[phase] = start, stop
+        start.record()
+        dispatch(source, launch, arguments)
+        stop.record()
+
+    graph = torch.cuda.CUDAGraph()
+    dispatch = scans._dispatch
+    torch.cuda.reset_peak_memory_stats()
+    with patch.object(scans, "_dispatch", track), torch.cuda.graph(graph):
+        outputs = operation()
+    peak = torch.cuda.max_memory_allocated()
+    graph.replay()
+    torch.cuda.synchronize()
+    start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    samples = {phase: [] for phase in (*events, "combined")}
+    for _ in range(repeats):
+        start.record()
+        for _ in range(5):
+            graph.replay()
+        stop.record()
+        stop.synchronize()
+        samples["combined"].append(start.elapsed_time(stop) / 5)
+        for phase, (before, after) in events.items():
+            samples[phase].append(before.elapsed_time(after))
+    result = {
+        "samples_ms": samples,
+        "median_ms": {phase: statistics.median(times) for phase, times in samples.items()},
+        "plan": plans, "sampled_parity": parity, "peak_allocated_bytes": peak,
+    }
+    del outputs, graph
+    return result, expected
 
 
 def main():
@@ -152,7 +193,7 @@ def main():
     parser.add_argument("--cases", type=int, nargs="+", default=list(range(len(CASES))))
     args = parser.parse_args()
     torch.manual_seed(731)
-    print(torch.cuda.get_device_name(), torch.__version__, flush=True)
+    print(torch.cuda.get_device_name(), torch.__version__, scans._l2_size(0), flush=True)
     with args.out.open("w") as out:
         for index in args.cases:
             row = probe(CASES[index], args)

@@ -1176,12 +1176,13 @@ def _packed_horizontal_forward(
     return _horizontal_forward_planes_op(*pole, *source)
 
 
-def _wave15_options() -> tuple[int, bool, bool, bool]:
+def _wave15_options() -> tuple[int, bool, bool, bool, int]:
     return (
         int(os.getenv("VA_WAVE15_LAYOUT", "0")),
         os.getenv("VA_WAVE15_SCRATCH") == "1",
         os.getenv("VA_WAVE15_SINGLE_STORE") == "1",
         os.getenv("VA_WAVE15_DROP_SOURCE") == "1",
+        int(os.getenv("VA_WAVE15_SHARED_HIDDEN", "0")),
     )
 
 
@@ -1255,13 +1256,13 @@ def _fake_wave15_forward(
 def _wave15_backward(
     px: list[Tensor], source: list[Tensor], py: list[Tensor], aux: list[Tensor],
     path: list[Tensor], saved: list[Tensor], dy: list[Tensor], coarse: bool, epsilon: float,
-    layout: int, scratch: bool, single: bool, drop_source: bool,
+    layout: int, scratch: bool, single: bool, drop_source: bool, shared_hidden: int,
 ) -> list[Tensor]:
     states = saved[0] if saved else _hscan(px, *source, state_layout=layout)[0]
     vertical = _vscan(
         py, states, aux, path, coarse, epsilon, False, (dy[0], dy[1]),
         compact=coarse, state_layout=layout, local_scratch=scratch,
-        single_store=single, drop_source=drop_source,
+        single_store=single, drop_source=drop_source, shared_hidden=shared_hidden,
     )
     if not isinstance(vertical, list):
         raise TypeError("Expected vertical scan gradients")
@@ -1275,7 +1276,7 @@ def _wave15_backward(
 def _fake_wave15_backward(
     px: list[Tensor], source: list[Tensor], py: list[Tensor], aux: list[Tensor],  # noqa: ARG001
     path: list[Tensor], saved: list[Tensor], dy: list[Tensor], coarse: bool, epsilon: float,  # noqa: ARG001
-    layout: int, scratch: bool, single: bool, drop_source: bool,  # noqa: ARG001
+    layout: int, scratch: bool, single: bool, drop_source: bool, shared_hidden: int,  # noqa: ARG001
 ) -> list[Tensor]:
     real = source[0]
     return [
@@ -1309,8 +1310,8 @@ def _run_packed_cuda_forward(
         gain_kind=kind,
     )
 
-    layout, scratch, single, drop_source = _wave15_options()
-    if layout or scratch or single or drop_source:
+    layout, scratch, single, drop_source, shared_hidden = _wave15_options()
+    if layout or scratch or single or drop_source or shared_hidden:
         trial = _wave15_operands(
             pole_x, pole_y, source, auxiliary, path, epilogue, kind, path_swiglu, layout,
         )
@@ -1437,8 +1438,8 @@ def _run_packed_cuda_backward(
         epsilon=epsilon,
         gain_kind=kind,
     )
-    layout, scratch, single, drop_source = _wave15_options()
-    if layout or scratch or single or drop_source:
+    layout, scratch, single, drop_source, shared_hidden = _wave15_options()
+    if layout or scratch or single or drop_source or shared_hidden:
         trial = _wave15_operands(
             pole_x, pole_y, source, auxiliary, path, epilogue, kind, path_swiglu, layout,
         )
@@ -1449,6 +1450,7 @@ def _run_packed_cuda_backward(
             return _wave15_backward(
                 list(pole_x), list(source), py, tables, weights, horizontal_states,
                 [grad_real, grad_imag], coarse, epsilon, layout, scratch, single, drop_source,
+                shared_hidden,
             )
     horizontal_storage = (
         horizontal_states[0] if horizontal_states

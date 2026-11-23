@@ -127,6 +127,7 @@ class Kernel:
     state_layout: int = 0
     local_scratch: bool = False
     single_store: bool = False
+    shared_hidden: int = 0
 
 
 class Launch(NamedTuple):
@@ -314,6 +315,41 @@ template<class T> struct Quad {
 
 template<class T> struct alignas(4 * sizeof(T)) PackedQuad : Quad<T> {};
 
+template<class Object>
+__device__ __forceinline__ Object load_vector(const void* address) {
+    Object result;
+    if constexpr (sizeof(Object) == 8) {
+        uint2 raw;
+        asm volatile("ld.global.v2.b32 {%0,%1}, [%2];"
+                     : "=r"(raw.x), "=r"(raw.y) : "l"(address) : "memory");
+        memcpy(&result, &raw, sizeof(result));
+    } else {
+        static_assert(sizeof(Object) == 16);
+        uint4 raw;
+        asm volatile("ld.global.v4.b32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(raw.x), "=r"(raw.y), "=r"(raw.z), "=r"(raw.w)
+                     : "l"(address) : "memory");
+        memcpy(&result, &raw, sizeof(result));
+    }
+    return result;
+}
+
+template<class Object>
+__device__ __forceinline__ void store_vector(void* address, Object value) {
+    if constexpr (sizeof(Object) == 8) {
+        uint2 raw;
+        memcpy(&raw, &value, sizeof(raw));
+        asm volatile("st.global.v2.b32 [%0], {%1,%2};"
+                     :: "l"(address), "r"(raw.x), "r"(raw.y) : "memory");
+    } else {
+        static_assert(sizeof(Object) == 16);
+        uint4 raw;
+        memcpy(&raw, &value, sizeof(raw));
+        asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};"
+                     :: "l"(address), "r"(raw.x), "r"(raw.y), "r"(raw.z), "r"(raw.w) : "memory");
+    }
+}
+
 template<int LAYOUT, class I>
 __device__ I state_index(I line, int H, int W, int M, int x, int m) {
     if constexpr (LAYOUT == 2) return ((line / H * W + x) * H + line % H) * M + m;
@@ -385,8 +421,9 @@ __device__ __forceinline__ void horizontal(
                     neg = a.conj() * neg + g.conj() * s;
                     if constexpr (LAYOUT) {
                         auto* packed = reinterpret_cast<PackedQuad<T>*>(out);
-                        packed[state_index<LAYOUT>(line, H, W, M, x, m)] =
-                            {{positives[I(x) * threads], Pair<T>::pack(neg)}};
+                        store_vector(
+                            packed + state_index<LAYOUT>(line, H, W, M, x, m),
+                            Quad<T>{positives[I(x) * threads], Pair<T>::pack(neg)});
                     } else store_complex(out, 2 * plane + base + I(x) * M, plane, neg);
                 }
             } else {
@@ -509,7 +546,7 @@ struct Column {
             const I row = I(y) * (LAYOUT == 2 ? 1 : W) * M;
             const auto* input = reinterpret_cast<const PackedQuad<T>*>(states);
             if constexpr (COARSE) return {input[row + packed_a].a, input[row + packed_b].b};
-            else return input[row + packed_a];
+            else return load_vector<Quad<T>>(input + row + packed_a);
         }
         const I row = I(y) * W * M;
         const I ia = row + offset_a, ib = row + offset_b + 2 * source_plane;
@@ -638,11 +675,11 @@ __device__ __forceinline__ void write_column_gradient(
         auto* packed = reinterpret_cast<PackedQuad<T>*>(gs) + c.packed_grad
             + I(y) * (LAYOUT == 2 ? 1 : c.OW) * c.M;
         if constexpr (REVERSE) {
-            const Quad<T> pos = ACCUMULATE ? static_cast<Quad<T>>(*packed) : positive;
+            const Quad<T> pos = ACCUMULATE ? load_vector<Quad<T>>(packed) : positive;
             ds_a = Pair<T>::pack(ds_a).unpack() + pos.a.unpack();
             ds_b = Pair<T>::pack(ds_b).unpack() + pos.b.unpack();
         }
-        *packed = {{Pair<T>::pack(ds_a), Pair<T>::pack(ds_b)}};
+        store_vector(packed, Quad<T>{Pair<T>::pack(ds_a), Pair<T>::pack(ds_b)});
         return;
     }
     const I row = I(y) * c.W * c.M;
@@ -684,6 +721,18 @@ template<class T> struct alignas(8 * sizeof(T)) ColumnAdjoints {
     Quad<T> inject, positive;
 };
 
+template<bool CACHE_LINE, class T>
+__device__ void store_adjoints(ColumnAdjoints<T>* address, ColumnAdjoints<T> value) {
+    if constexpr (CACHE_LINE || sizeof(T) == 4) *address = value;
+    else store_vector(address, value);
+}
+
+template<bool CACHE_LINE, class T>
+__device__ ColumnAdjoints<T> load_adjoints(const ColumnAdjoints<T>* address) {
+    if constexpr (CACHE_LINE || sizeof(T) == 4) return *address;
+    else return load_vector<ColumnAdjoints<T>>(address);
+}
+
 struct ProjectWeights {
     static constexpr bool vector_weights = true;
     const float* __restrict__ cache;
@@ -724,12 +773,13 @@ __device__ void load_project_weights(
 
 template<class T, class I, bool COARSE, int CHUNK, int THREADS, int HIDDEN,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE,
-         bool PURE, bool SINGLE_STORE, int LAYOUT, class Weights>
+         bool PURE, bool SINGLE_STORE, bool CACHE_LINE, int LAYOUT, int SHARED_HIDDEN,
+         class Weights>
 __device__ __forceinline__ void column_backward(
     Column<T, I, LAYOUT, COARSE> c, Complex a, Complex g, Weights path,
     const T* gr, const T* gi, T* gs, float* acc, I acc_stride,
     float4* seg, Quad<T>* seg_src, float4* ckpt, I ckpt_stride, Quad<T>* g2, I g2_stride,
-    int chunks, Complex& da, Complex& dg
+    int chunks, Complex& da, Complex& dg, float* shared_dwi
 ) {
     const auto ar = a.conj(), gg = g.conj();
     // CHUNK == 0 keeps the whole trajectory and needs no boundaries.
@@ -799,12 +849,12 @@ __device__ __forceinline__ void column_backward(
             if constexpr (PURE) {
                 #pragma unroll
                 for (int k = 0; k < 8; ++k) dp[k] = read(gr[I(k) * c.feature_plane + cell]);
-            } else path_mlp<T, I, HIDDEN, false, true>(
+            } else path_mlp<T, I, HIDDEN, false, true, SHARED_HIDDEN>(
                 normalize<T>(seg[j * THREADS], gp), normalize<T>(neg, gn),
                 path, {},
                 make_float2(read(gr[(cell - c.m) * (1 + REAL_INTERLEAVED) + c.m]),
                             read(gi[(cell - c.m) * (1 + IMAG_INTERLEAVED) + c.m])),
-                acc, acc_stride, dp);
+                acc, acc_stride, dp, shared_dwi, THREADS);
             const auto ip = normalize<T>(make_float4(dp[0], dp[4], dp[1], dp[5]), gp);
             const auto inject = normalize_packed<T>(
                 make_float4(dp[2], dp[6], dp[3], dp[7]), gn);
@@ -812,7 +862,9 @@ __device__ __forceinline__ void column_backward(
             const auto positive = column_adjoint_step<false>(
                 previous, s, ip, a, g, adj_a, adj_b, da, dg);
             if constexpr (SINGLE_STORE) {
-                staged[I(y) * g2_stride] = {COARSE ? Quad<T>{} : inject, Quad<T>::pack(positive)};
+                store_adjoints<CACHE_LINE>(
+                    staged + I(y) * g2_stride,
+                    {COARSE ? Quad<T>{} : inject, Quad<T>::pack(positive)});
             } else {
                 g2[I(yo) * g2_stride] = inject;
                 write_column_gradient<false, COMPACT>(c, y, positive, gs);
@@ -822,7 +874,8 @@ __device__ __forceinline__ void column_backward(
                     j > 1 ? seg[(j - 2) * THREADS] : before, se, {}, a, g,
                     adj_a, adj_b, da, dg);
                 if constexpr (SINGLE_STORE) {
-                    staged[I(y - 1) * g2_stride] = {inject, Quad<T>::pack(even)};
+                    store_adjoints<CACHE_LINE>(
+                        staged + I(y - 1) * g2_stride, {inject, Quad<T>::pack(even)});
                 } else write_column_gradient<false, COMPACT>(c, y - 1, even, gs);
             }
             if constexpr (full) {
@@ -854,7 +907,7 @@ __device__ __forceinline__ void column_backward(
             const int y = y0 + j;
             const auto source = source_cache[j * THREADS].unpack();
             if constexpr (SINGLE_STORE) {
-                const auto row = staged[I(y) * g2_stride];
+                const auto row = load_adjoints<CACHE_LINE>(staged + I(y) * g2_stride);
                 const auto ds = column_adjoint_step<true>(
                     seg[j * THREADS], source, row.inject.unpack(), ar, gg,
                     adj_a, adj_b, da, dg);
@@ -873,9 +926,10 @@ __device__ __forceinline__ void column_backward(
 // Tile the CTA reduction so all scan warps can share one small staging buffer.
 constexpr int vscan_reduce_tile = 32;
 
-template<int WARPS, int FIELDS, class I>
+template<int WARPS, int FIELDS, class I, int SHARED_FIELDS = 0>
 __device__ __forceinline__ void write_vscan_partial(
-    float* shared, float* row, const float* gradients, Complex da, Complex dg, int m, int M
+    float* shared, float* row, const float* gradients, Complex da, Complex dg, int m, int M,
+    const float* shared_dwi = nullptr
 ) {
     constexpr int threads = WARPS * 32;
     const float pole[4] = {da.r, da.i, dg.r, dg.i};
@@ -885,7 +939,9 @@ __device__ __forceinline__ void write_vscan_partial(
         #pragma unroll
         for (int j = 0; j < vscan_reduce_tile && begin + j < FIELDS; ++j) {
             const int field = begin + j;
-            shared[j * threads + threadIdx.x] = field < 4 ? pole[field] : gradients[field - 4];
+            const int i = field - 4 - SHARED_FIELDS;
+            shared[j * threads + threadIdx.x] = field < 4 ? pole[field]
+                : i < 0 ? shared_dwi[(field - 4) * threads] : gradients[i];
         }
         __syncthreads();
         if (threadIdx.x < 32 && m < M) {
@@ -904,7 +960,7 @@ __device__ __forceinline__ void write_vscan_partial(
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS, int LAYOUT, bool LOCAL_SCRATCH, bool SINGLE_STORE>
+         bool VECTOR_WEIGHTS, int LAYOUT, bool LOCAL_SCRATCH, bool SINGLE_STORE, int SHARED_HIDDEN>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -923,6 +979,7 @@ __device__ __forceinline__ void vertical(
     const int mode0 = (blockIdx.x % tiles) * 32, m = mode0 + lane;
     const int group = blockIdx.x / tiles, worker = group * WARPS + warp;
     constexpr bool register_acc = BACKWARD && HIDDEN && !SHARED_ACC;
+    constexpr int shared_fields = 8 * SHARED_HIDDEN;
     constexpr bool reduce = (PURE || SHARED_ACC || register_acc) && WARPS > 1;
     const bool active = m < M && worker < workers;
     const int size = HIDDEN ? HIDDEN : hidden;
@@ -961,12 +1018,22 @@ __device__ __forceinline__ void vertical(
     auto* acc_base = reinterpret_cast<float*>(
         seg_src + (BACKWARD ? I(CACHE_SOURCE ? H : span) * threads : 0));
     auto* line_buf = reinterpret_cast<Quad<T>*>(acc_base + (SHARED_ACC ? fields * threads : 0));
-    if constexpr (SINGLE_STORE) {
+    if constexpr (SINGLE_STORE && CACHE_LINE) {
         if (reinterpret_cast<size_t>(line_buf) % alignof(ColumnAdjoints<T>))
             line_buf += 1;
     }
     float* row = partials;
-    float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};
+    float local_acc[register_acc ? 11 * HIDDEN + 2 - shared_fields : 1]{};
+    float* shared_dwi = nullptr;
+    if constexpr (SHARED_HIDDEN) {
+        const int rows = SINGLE_STORE ? H : oh;
+        auto* line_end = reinterpret_cast<float*>(
+            line_buf + (CACHE_LINE ? rows * threads * (1 + SINGLE_STORE) : 0));
+        auto* reduction_end = reinterpret_cast<float*>(shared) + 32 * threads;
+        shared_dwi = (reduce && reduction_end > line_end ? reduction_end : line_end) + threadIdx.x;
+        #pragma unroll
+        for (int j = 0; j < shared_fields; ++j) shared_dwi[j * threads] = 0;
+    }
     float* acc = acc_base + threadIdx.x;
     const I acc_stride = register_acc ? 1 : SHARED_ACC ? threads : M;
     if constexpr (BACKWARD) {
@@ -1016,10 +1083,11 @@ __device__ __forceinline__ void vertical(
                     ? global_checkpoints + I(worker) * M + m : ckpt + threadIdx.x;
                 column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
                                 REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE,
-                                PURE, SINGLE_STORE, LAYOUT>(
+                                PURE, SINGLE_STORE, CACHE_LINE, LAYOUT, SHARED_HIDDEN>(
                     c, a, g, path, gr, gi, gs,
                     acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
-                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg);
+                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg,
+                    shared_dwi);
             } else {
                 float4 state{};
                 for (int y = 0; y < H; ++y) {
@@ -1060,8 +1128,8 @@ __device__ __forceinline__ void vertical(
             write_vscan_partial<WARPS, 4, I>(
                 reinterpret_cast<float*>(shared), row, nullptr, da, dg, m, M);
         } else if constexpr (register_acc && reduce) {
-            write_vscan_partial<WARPS, 11 * HIDDEN + 6, I>(
-                reinterpret_cast<float*>(shared), row, local_acc, da, dg, m, M);
+            write_vscan_partial<WARPS, 11 * HIDDEN + 6, I, shared_fields>(
+                reinterpret_cast<float*>(shared), row, local_acc, da, dg, m, M, shared_dwi);
         } else if constexpr (SHARED_ACC) {
             acc -= 4 * threads;
             acc[0] = da.r;
@@ -1086,7 +1154,10 @@ __device__ __forceinline__ void vertical(
             row[3 * I(M)] = dg.i;
             if constexpr (register_acc) {
                 #pragma unroll
-                for (int j = 0; j < 11 * HIDDEN + 2; ++j) row[(4 + I(j)) * M] = local_acc[j];
+                for (int j = 0; j < 11 * HIDDEN + 2; ++j) {
+                    row[(4 + I(j)) * M] = j < shared_fields ? shared_dwi[j * threads]
+                        : local_acc[j - shared_fields];
+                }
             }
         }
     }
@@ -1303,7 +1374,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
             f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
-            f"{key.state_layout}, {str(key.local_scratch).lower()}, {str(key.single_store).lower()}"
+            f"{key.state_layout}, {str(key.local_scratch).lower()}, "
+            f"{str(key.single_store).lower()}, {key.shared_hidden}"
         )
         wrapper = f"""
 {bounds}(
@@ -1539,6 +1611,7 @@ def _scan_plans(  # noqa: C901
     state_layout: int = 0,
     single_store: bool = False,
     drop_source: bool = False,
+    shared_hidden: int = 0,
 ) -> list[ScanPlan]:
     plans = []
     chunk = _SHORT_CHECKPOINT_CHUNK if length <= _SHORT_SCAN else _CHECKPOINT_CHUNK
@@ -1565,7 +1638,9 @@ def _scan_plans(  # noqa: C901
         acc = (11 * hidden + 6) * threads * 4
         cache_options = (True, False) if hidden <= _MAX_CACHED_HIDDEN else (False,)
         for cache_weights in ((False,) if pure_vertical else cache_options):
-            for shared_acc in ((True, False) if backward and not pure_vertical else (False,)):
+            for shared_acc in (
+                (True, False) if backward and not pure_vertical and not shared_hidden else (False,)
+            ):
                 fixed = (weights if cache_weights else 0) + (acc if shared_acc else 0)
                 reduction = (
                     (4 if pure_vertical else _WARP_SIZE) * threads * 4
@@ -1580,6 +1655,7 @@ def _scan_plans(  # noqa: C901
                     storage = fixed + seg + (0 if global_ckpt else boundaries)
                     for cache_line in (True, False):
                         smem = max(reduction, storage + (line if cache_line else 0))
+                        smem += shared_hidden * 8 * threads * 4
                         if smem <= limit:
                             plans.append(ScanPlan(
                                 warps, smem, span, cache_weights, global_ckpt, cache_line,
@@ -1724,6 +1800,7 @@ def _launch_for_shape(  # noqa: C901, PLR0915
     local_scratch: bool = False,
     single_store: bool = False,
     drop_source: bool = False,
+    shared_hidden: int = 0,
 ) -> Launch | None:
     b, h, w, m = shape
     sms, limit, max_warps_per_sm = device_limits(device)
@@ -1735,6 +1812,7 @@ def _launch_for_shape(  # noqa: C901, PLR0915
         cache_trajectories=limit >= _TRAJECTORY_MIN_SMEM,
         pure_vertical=pure_vertical,
         state_layout=state_layout, single_store=single_store, drop_source=drop_source,
+        shared_hidden=shared_hidden,
     )
     fields = ((11 * hidden + 6) if vertical and not pure_vertical else 4) if backward else 0
     lines = b * ((w // 2 if coarse else w) if vertical else h)
@@ -1772,7 +1850,7 @@ def _launch_for_shape(  # noqa: C901, PLR0915
     def locality(plan: ScanPlan) -> tuple[bool, bool, bool]:
         acc_local = not backward or not vertical or plan.shared_acc != (hidden == _REGISTER_HIDDEN)
         preferred_line = (
-            (vertical and backward and not single_store) or horizontal_scratch or plan.cache_line
+            (vertical and backward) or horizontal_scratch or plan.cache_line
         )
         if forward_scratch:
             preferred_line = not plan.cache_line and plan.warps == 1
@@ -1826,6 +1904,7 @@ def _launch_for_shape(  # noqa: C901, PLR0915
             real_transposed=transposed[0],
             imag_transposed=transposed[1],
             state_layout=state_layout, local_scratch=local_scratch, single_store=single_store,
+            shared_hidden=shared_hidden,
         )
         resident = _resident(device, key, plan.smem)
         active_warps = resident * plan.warps
@@ -1899,6 +1978,7 @@ def _plan_launch(
     local_scratch: bool = False,
     single_store: bool = False,
     drop_source: bool = False,
+    shared_hidden: int = 0,
 ) -> Launch | None:
     if not source.is_cuda or source.dtype not in _DTYPES:
         return None
@@ -1914,7 +1994,7 @@ def _plan_launch(
         backward=backward, vertical=vertical, coarse=coarse, hidden=hidden, precise=precise,
         compact=compact, interleaved=interleaved, transposed=transposed,
         pure_vertical=pure_vertical, state_layout=state_layout, local_scratch=local_scratch,
-        single_store=single_store, drop_source=drop_source,
+        single_store=single_store, drop_source=drop_source, shared_hidden=shared_hidden,
     )
 
 
@@ -2194,6 +2274,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     local_scratch: bool = False,
     single_store: bool = False,
     drop_source: bool = False,
+    shared_hidden: int = 0,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     if state_layout:
         b, first, second, m, _ = states.shape
@@ -2255,6 +2336,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         pure_vertical=pure,
         state_layout=state_layout, local_scratch=local_scratch, single_store=single_store,
         drop_source=backward and drop_source,
+        shared_hidden=shared_hidden if backward and hidden == _REGISTER_HIDDEN else 0,
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")

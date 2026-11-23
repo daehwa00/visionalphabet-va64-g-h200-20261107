@@ -68,6 +68,8 @@ def cases():
                 packed = replace(key, state_layout=layout)
                 yield arch, f"layout{layout}", packed
                 if backward:
+                    for shared in (2, 4):
+                        yield arch, f"shared{layout}-{shared}", replace(packed, shared_hidden=shared)
                     single = replace(packed, local_scratch=True, single_store=True)
                     yield arch, f"single{layout}", single
                     yield arch, f"drop{layout}", replace(single, cache_source=False)

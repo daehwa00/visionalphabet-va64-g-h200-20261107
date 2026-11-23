@@ -1073,9 +1073,11 @@ def test_cuda_decoupled_vscan(  # noqa: C901
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(("h", "w", "coarse"), [(15, 19, False), (14, 28, True)])
-@pytest.mark.parametrize(("layout", "single"), [(1, False), (2, False), (2, True)])
+@pytest.mark.parametrize(("layout", "single", "shared"), [
+    (1, False, 0), (2, False, 0), (2, True, 0), (2, False, 2), (2, False, 4),
+])
 def test_wave15_packed_scan_equivalence(
-    dtype: torch.dtype, h: int, w: int, coarse: bool, layout: int, single: bool,
+    dtype: torch.dtype, h: int, w: int, coarse: bool, layout: int, single: bool, shared: int,
 ) -> None:
     torch.manual_seed(902)
     px, py, real, imag, auxiliary, path = _inputs(h, w, 35, 8, dtype, "cuda", batch=3)
@@ -1091,7 +1093,7 @@ def test_wave15_packed_scan_equivalence(
     torch.testing.assert_close(forward, out, rtol=0, atol=0)
     dv = scans._vscan(
         py, packed, aux, path, coarse, 1e-6, precise=False, grad=tuple(weights),
-        compact=coarse, state_layout=layout, single_store=single,
+        compact=coarse, state_layout=layout, single_store=single, shared_hidden=shared,
     )
     dh, dx = scans._hscan(px, real, imag, packed, dv[4], compact=coarse, state_layout=layout)
     expected = _reference_vscan(
