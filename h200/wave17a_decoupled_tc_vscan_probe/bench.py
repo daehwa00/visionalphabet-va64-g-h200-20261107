@@ -95,7 +95,7 @@ def stats(a: Tensor, b: Tensor) -> dict:
 
 
 def parity(
-    shape: tuple[int, int, int, int, bool], dtype: torch.dtype, *, edge: bool,
+    shape: tuple[int, int, int, int, bool], dtype: torch.dtype,
 ) -> Iterator[dict]:
     b, h, w, m, coarse = shape
     pole, states, aux, path, dy = inputs(shape, dtype)
@@ -119,7 +119,7 @@ def parity(
         tolerances = ((4e-2, 5e-3), (1.2e-1, 8e-2))
     for policy in ("test_saved_tc", "chunk_tc"):
         os.environ[POLICY] = policy
-        for layout in (("separate", "planar", "interleaved") if edge else ("separate",)):
+        for layout in ("separate", "planar", "interleaved"):
             saved = None
             dy_used = dy
             if layout == "interleaved":
@@ -137,7 +137,7 @@ def parity(
             else:
                 out = scans.vertical_forward_packed(*args, 1e-6, layout == "planar")
                 pair = out.unbind(0) if layout == "planar" else out.split(m, dim=-1)
-            for compact in ((False, True) if edge and coarse else (False,)):
+            for compact in ((False, True) if coarse else (False,)):
                 actual = (*pair, *scans.vertical_backward(
                     *args[:4], *dy_used, coarse, compact=compact, saved_features=saved,
                 ))
@@ -231,8 +231,15 @@ def micro(shape: tuple[int, int, int, int, bool], dtype: torch.dtype, repeats: i
         result["saved_features_active"] = saved is not None
         row["end_to_end"][policy] = result
         if policy == "test_saved_tc" and saved is not None:
-            with patch.object(scans, "_saved_backward_chunk", return_value=b):
-                row["saved_tc_backward_full_chunk"] = graph(backward, repeats)
+            workspace = max(1, scans._workspace_vscan_chunk(states, coarse))
+            # Bypass the high-VRAM override so that the workspace and full-batch
+            # arms actually launch with the intended, independently chosen sizes.
+            with patch.object(scans, "_TC_SAVED_VRAM", 1 << 63):
+                for label, chunk in (("full", b), ("workspace", workspace)):
+                    with patch.object(scans, "_saved_backward_chunk", return_value=chunk):
+                        row[f"saved_tc_backward_{label}_chunk"] = {
+                            "chunk": chunk, **graph(backward, repeats),
+                        }
         del saved, backward
         torch.cuda.empty_cache()
     return row
@@ -267,7 +274,7 @@ def main() -> None:
         for shape in shapes:
             print(shape, dtype, flush=True)
             if args.mode == "parity":
-                for row in parity(shape, dtype, edge=args.edge):
+                for row in parity(shape, dtype):
                     print(json.dumps(row), file=out, flush=True)
                     failed |= bool(row["errors"])
                 continue

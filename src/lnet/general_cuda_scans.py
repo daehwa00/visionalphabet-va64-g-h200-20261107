@@ -118,6 +118,7 @@ class Kernel:
     precise: bool = False
     projection: bool = False
     projection_tc: bool = False
+    projection_cells: int = 32
     projection_reduction: bool = False
     reduction: bool = False
     compact: bool = False
@@ -1188,7 +1189,8 @@ __device__ __forceinline__ void tc_mma(float4& d, unsigned a0, unsigned a1,
     }
 }
 
-template<class T, class I, int WARPS, bool BACKWARD, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED,
+template<class T, class I, int WARPS, int CELLS, bool BACKWARD,
+         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED,
          bool PACKED_FEATURES>
 __device__ __forceinline__ void project_path_tc(
     const T* __restrict__ features, const void* __restrict__ wi, const void* __restrict__ bi,
@@ -1201,8 +1203,14 @@ __device__ __forceinline__ void project_path_tc(
     constexpr int threads = 32 * WARPS;
     constexpr int tile_modes = WARPS;
     extern __shared__ float4 shared[];
-    auto* tile = reinterpret_cast<T*>(shared);
-    auto* scratch = tile + 16 * 10 * tile_modes;
+    auto* features_tile = reinterpret_cast<uint4*>(shared);
+    auto* gradients = reinterpret_cast<unsigned*>(features_tile + CELLS * tile_modes);
+    auto* scratch = reinterpret_cast<T*>(gradients + (BACKWARD ? CELLS * tile_modes : 0));
+    // One 16-byte slot per cell and mode. XOR permutes mode slots within
+    // each row, spreading a warp's fixed-mode reads across shared banks.
+    auto slot = [](int cell, int mode) {
+        return cell * tile_modes + (mode ^ (cell & 7));
+    };
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int tiles = (M - 1) / tile_modes + 1;
     const int mode0 = (blockIdx.x % tiles) * tile_modes, m = mode0 + warp;
@@ -1229,138 +1237,146 @@ __device__ __forceinline__ void project_path_tc(
     auto* local = scratch + warp * 16 * 8;
     const I plane = I(cells) * M;
     const bool cell_major = feature_plane == M;
-    auto at = [&](int cell, int field) -> T& {
-        return tile[(field * 16 + cell) * tile_modes + warp];
-    };
-    auto pair = [&](int cell, int feature) {
-        return tc_pair(at(cell, feature), at(cell, feature + 1));
-    };
     float4 dwi{}, dwo{};
-    for (long long start = 16LL * group; start < cells; start += 16LL * groups) {
-        if constexpr (PACKED_FEATURES) {
-            if (threadIdx.x < 16 * tile_modes) {
-                const auto cell = start + threadIdx.x / tile_modes;
-                const int mode = mode0 + threadIdx.x % tile_modes;
-                uint4 value{};
-                if (cell < cells && mode < M) {
-                    value = reinterpret_cast<const uint4*>(features)[I(cell) * M + mode];
-                }
-                T p[8];
-                unpack_features(value, p);
-                #pragma unroll
-                for (int f = 0; f < 8; ++f) tile[f * 16 * tile_modes + threadIdx.x] = p[f];
-            }
-        }
-        constexpr int first_field = PACKED_FEATURES ? 8 : 0;
-        for (int i = first_field * 16 * tile_modes + threadIdx.x;
-             i < (BACKWARD ? 10 : 8) * 16 * tile_modes; i += threads) {
-            const int field = i / (16 * tile_modes);
-            const long long cell = start + (i / tile_modes) % 16;
-            const int mode = mode0 + i % tile_modes;
-            T value = zero;
+    for (long long start = I(CELLS) * group; start < cells; start += I(CELLS) * groups) {
+        #pragma unroll
+        for (int i = threadIdx.x; i < CELLS * tile_modes; i += threads) {
+            const int c = i / tile_modes, mode = mode0 + i % tile_modes;
+            const auto cell = start + c;
+            const int index = slot(c, i % tile_modes);
+            uint4 value{};
+            unsigned dy = 0;
             if (cell < cells && mode < M) {
-                const I offset = I(cell) * M + mode;
-                if (field < 8) {
-                    const I index = cell_major
-                        ? (I(cell) * 8 + field) * M + mode : I(field) * I(feature_plane) + offset;
-                    value = features[index];
+                if constexpr (PACKED_FEATURES) {
+                    value = reinterpret_cast<const uint4*>(features)[I(cell) * M + mode];
+                } else {
+                    T p[8];
+                    #pragma unroll
+                    for (int f = 0; f < 8; ++f) {
+                        const I offset = cell_major
+                            ? (I(cell) * 8 + f) * M + mode
+                            : I(f) * I(feature_plane) + I(cell) * M + mode;
+                        p[f] = features[offset];
+                    }
+                    value = pack_features(p);
                 }
-                else if (field == 8) value = gr[I(cell) * M * (1 + REAL_INTERLEAVED) + mode];
-                else value = gi[I(cell) * M * (1 + IMAG_INTERLEAVED) + mode];
+                if constexpr (BACKWARD) {
+                    dy = tc_pair(gr[I(cell) * M * (1 + REAL_INTERLEAVED) + mode],
+                                 gi[I(cell) * M * (1 + IMAG_INTERLEAVED) + mode]);
+                }
             }
-            tile[i] = value;
+            features_tile[index] = value;
+            if constexpr (BACKWARD) gradients[index] = dy;
         }
         __syncthreads();
 
-        float4 z{};
-        tc_mma<T>(z, pair(row, k), pair(row + 8, k), 0, 0, w, 0);
-        z.x = rounded<T>(rounded<T>(z.x) + b0);
-        z.y = rounded<T>(rounded<T>(z.y) + b1);
-        z.z = rounded<T>(rounded<T>(z.z) + b0);
-        z.w = rounded<T>(rounded<T>(z.w) + b1);
-        const float4 sig = make_float4(
-            __fdividef(1.f, 1.f + __expf(-z.x)), __fdividef(1.f, 1.f + __expf(-z.y)),
-            __fdividef(1.f, 1.f + __expf(-z.z)), __fdividef(1.f, 1.f + __expf(-z.w)));
-        const T h0 = write<T>(z.x * sig.x), h1 = write<T>(z.y * sig.y);
-        const T h2 = write<T>(z.z * sig.z), h3 = write<T>(z.w * sig.w);
-        if constexpr (BACKWARD) {
-            local[row * 8 + k] = h0;
-            local[row * 8 + k + 1] = h1;
-            local[(row + 8) * 8 + k] = h2;
-            local[(row + 8) * 8 + k + 1] = h3;
-            __syncwarp();
-            const unsigned dh0 = k == 0 ? pair(row, 8) : 0;
-            const unsigned dh1 = k == 0 ? pair(row + 8, 8) : 0;
-            auto transposed = [&](int cell, int feature) -> unsigned {
-                if (feature < 8) {
-                    return tc_pair(local[cell * 8 + feature], local[(cell + 1) * 8 + feature]);
+        #pragma unroll 1
+        for (int base = 0; base < CELLS; base += 16) {
+            const auto pair = [&](int cell, int feature) {
+                const int index = slot(base + cell, warp);
+                return reinterpret_cast<unsigned*>(shared)[4 * index + feature / 2];
+            };
+            const auto feature_at = [&](int cell, int feature) {
+                return reinterpret_cast<T*>(shared)[8 * slot(base + cell, warp) + feature];
+            };
+            const auto grad_at = [&](int cell, int component) {
+                return reinterpret_cast<T*>(gradients)[2 * slot(base + cell, warp) + component];
+            };
+            const auto grad_pair = [&](int cell) {
+                return gradients[slot(base + cell, warp)];
+            };
+            const auto store_pair = [&](int cell, unsigned value) {
+                reinterpret_cast<unsigned*>(shared)[4 * slot(base + cell, warp) + k / 2] = value;
+            };
+            float4 z{};
+            tc_mma<T>(z, pair(row, k), pair(row + 8, k), 0, 0, w, 0);
+            z.x = rounded<T>(rounded<T>(z.x) + b0);
+            z.y = rounded<T>(rounded<T>(z.y) + b1);
+            z.z = rounded<T>(rounded<T>(z.z) + b0);
+            z.w = rounded<T>(rounded<T>(z.w) + b1);
+            const float4 sig = make_float4(
+                __fdividef(1.f, 1.f + __expf(-z.x)), __fdividef(1.f, 1.f + __expf(-z.y)),
+                __fdividef(1.f, 1.f + __expf(-z.z)), __fdividef(1.f, 1.f + __expf(-z.w)));
+            const T h0 = write<T>(z.x * sig.x), h1 = write<T>(z.y * sig.y);
+            const T h2 = write<T>(z.z * sig.z), h3 = write<T>(z.w * sig.w);
+            if constexpr (BACKWARD) {
+                local[row * 8 + k] = h0;
+                local[row * 8 + k + 1] = h1;
+                local[(row + 8) * 8 + k] = h2;
+                local[(row + 8) * 8 + k + 1] = h3;
+                __syncwarp();
+                const unsigned dh0 = k == 0 ? grad_pair(row) : 0;
+                const unsigned dh1 = k == 0 ? grad_pair(row + 8) : 0;
+                auto transposed = [&](int cell, int feature) -> unsigned {
+                    if (feature < 8) {
+                        return tc_pair(local[cell * 8 + feature], local[(cell + 1) * 8 + feature]);
+                    }
+                    return feature == 8 ? tc_pair(one, one) : 0;
+                };
+                const unsigned dy0 = row < 2 ? tc_pair(grad_at(k, row), grad_at(k + 1, row)) : 0;
+                const unsigned dy1 = row < 2
+                    ? tc_pair(grad_at(k + 8, row), grad_at(k + 9, row)) : 0;
+                tc_mma<T>(dwo, transposed(k, row), transposed(k, row + 8),
+                          transposed(k + 8, row), transposed(k + 8, row + 8), dy0, dy1);
+                float4 dh{};
+                tc_mma<T>(dh, dh0, dh1, 0, 0, u, 0);
+                auto dz = [&](float h, float pre, float s) -> T {
+                    return write<T>(rounded<T>(h) * (s * (1.f + pre * (1.f - s))));
+                };
+                const T dz0 = dz(dh.x, z.x, sig.x), dz1 = dz(dh.y, z.y, sig.y);
+                const T dz2 = dz(dh.z, z.z, sig.z), dz3 = dz(dh.w, z.w, sig.w);
+                __syncwarp();
+                local[row * 8 + k] = dz0;
+                local[row * 8 + k + 1] = dz1;
+                local[(row + 8) * 8 + k] = dz2;
+                local[(row + 8) * 8 + k + 1] = dz3;
+                __syncwarp();
+                const unsigned z0 = tc_pair(local[k * 8 + row], local[(k + 1) * 8 + row]);
+                const unsigned z1 = tc_pair(local[(k + 8) * 8 + row], local[(k + 9) * 8 + row]);
+                const unsigned bias = row == 0 ? tc_pair(one, one) : 0;
+                tc_mma<T>(dwi, tc_pair(feature_at(k, row), feature_at(k + 1, row)), bias,
+                          tc_pair(feature_at(k + 8, row), feature_at(k + 9, row)), bias,
+                          z0, z1);
+                float4 dx{};
+                tc_mma<T>(dx, tc_pair(dz0, dz1), tc_pair(dz2, dz3), 0, 0, wt, 0);
+                __syncwarp();
+                store_pair(row, tc_pair(write<T>(dx.x), write<T>(dx.y)));
+                store_pair(row + 8, tc_pair(write<T>(dx.z), write<T>(dx.w)));
+            } else {
+                float4 y{};
+                tc_mma<T>(y, tc_pair(h0, h1), tc_pair(h2, h3), 0, 0, u, 0);
+                __syncwarp();
+                if (k == 0) {
+                    store_pair(row, tc_pair(write<T>(rounded<T>(y.x) + bias_r),
+                                           write<T>(rounded<T>(y.y) + bias_i)));
+                    store_pair(row + 8, tc_pair(write<T>(rounded<T>(y.z) + bias_r),
+                                               write<T>(rounded<T>(y.w) + bias_i)));
                 }
-                return feature == 8 ? tc_pair(one, one) : 0;
-            };
-            const unsigned dy0 = row < 2 ? tc_pair(at(k, 8 + row), at(k + 1, 8 + row)) : 0;
-            const unsigned dy1 = row < 2 ? tc_pair(at(k + 8, 8 + row), at(k + 9, 8 + row)) : 0;
-            tc_mma<T>(dwo, transposed(k, row), transposed(k, row + 8),
-                      transposed(k + 8, row), transposed(k + 8, row + 8), dy0, dy1);
-            float4 dh{};
-            tc_mma<T>(dh, dh0, dh1, 0, 0, u, 0);
-            auto dz = [&](float h, float pre, float s) -> T {
-                return write<T>(rounded<T>(h) * (s * (1.f + pre * (1.f - s))));
-            };
-            const T dz0 = dz(dh.x, z.x, sig.x), dz1 = dz(dh.y, z.y, sig.y);
-            const T dz2 = dz(dh.z, z.z, sig.z), dz3 = dz(dh.w, z.w, sig.w);
-            __syncwarp();
-            local[row * 8 + k] = dz0;
-            local[row * 8 + k + 1] = dz1;
-            local[(row + 8) * 8 + k] = dz2;
-            local[(row + 8) * 8 + k + 1] = dz3;
-            __syncwarp();
-            const unsigned z0 = tc_pair(local[k * 8 + row], local[(k + 1) * 8 + row]);
-            const unsigned z1 = tc_pair(local[(k + 8) * 8 + row], local[(k + 9) * 8 + row]);
-            tc_mma<T>(dwi, tc_pair(at(k, row), at(k + 1, row)), row == 0 ? tc_pair(one, one) : 0,
-                      tc_pair(at(k + 8, row), at(k + 9, row)), row == 0 ? tc_pair(one, one) : 0,
-                      z0, z1);
-            float4 dx{};
-            tc_mma<T>(dx, tc_pair(dz0, dz1), tc_pair(dz2, dz3), 0, 0, wt, 0);
-            __syncwarp();
-            at(row, k) = write<T>(dx.x);
-            at(row, k + 1) = write<T>(dx.y);
-            at(row + 8, k) = write<T>(dx.z);
-            at(row + 8, k + 1) = write<T>(dx.w);
-        } else {
-            float4 y{};
-            tc_mma<T>(y, tc_pair(h0, h1), tc_pair(h2, h3), 0, 0, u, 0);
-            __syncwarp();
-            if (k == 0) {
-                at(row, 0) = write<T>(rounded<T>(y.x) + bias_r);
-                at(row, 1) = write<T>(rounded<T>(y.y) + bias_i);
-                at(row + 8, 0) = write<T>(rounded<T>(y.z) + bias_r);
-                at(row + 8, 1) = write<T>(rounded<T>(y.w) + bias_i);
             }
         }
         __syncthreads();
-        if constexpr (PACKED_FEATURES && BACKWARD) {
-            if (threadIdx.x < 16 * tile_modes) {
-                const auto cell = start + threadIdx.x / tile_modes;
-                const int mode = mode0 + threadIdx.x % tile_modes;
-                if (cell < cells && mode < M) {
-                    T p[8];
-                    #pragma unroll
-                    for (int f = 0; f < 8; ++f) p[f] = tile[f * 16 * tile_modes + threadIdx.x];
-                    reinterpret_cast<uint4*>(dp)[I(cell) * M + mode] = pack_features(p);
-                }
-            }
-        } else for (int i = threadIdx.x; i < (BACKWARD ? 8 : 2) * 16 * tile_modes; i += threads) {
-            const int field = i / (16 * tile_modes);
-            const long long cell = start + (i / tile_modes) % 16;
+        #pragma unroll
+        for (int i = threadIdx.x; i < CELLS * tile_modes; i += threads) {
+            const auto cell = start + i / tile_modes;
             const int mode = mode0 + i % tile_modes;
             if (cell < cells && mode < M) {
-                if constexpr (BACKWARD) {
-                    const I index = cell_major
-                        ? (I(cell) * 8 + field) * M + mode : I(field) * plane + I(cell) * M + mode;
-                    dp[index] = tile[i];
+                const int index = slot(i / tile_modes, i % tile_modes);
+                if constexpr (BACKWARD && PACKED_FEATURES) {
+                    reinterpret_cast<uint4*>(dp)[I(cell) * M + mode] = features_tile[index];
+                } else if constexpr (BACKWARD) {
+                    T p[8];
+                    unpack_features(features_tile[index], p);
+                    #pragma unroll
+                    for (int f = 0; f < 8; ++f) {
+                        const I offset = cell_major
+                            ? (I(cell) * 8 + f) * M + mode : I(f) * plane + I(cell) * M + mode;
+                        dp[offset] = p[f];
+                    }
+                } else {
+                    const T* output = reinterpret_cast<T*>(features_tile + index);
+                    real[I(cell) * M * (1 + REAL_INTERLEAVED) + mode] = output[0];
+                    imag[I(cell) * M * (1 + IMAG_INTERLEAVED) + mode] = output[1];
                 }
-                else if (field == 0) real[I(cell) * M * (1 + REAL_INTERLEAVED) + mode] = tile[i];
-                else imag[I(cell) * M * (1 + IMAG_INTERLEAVED) + mode] = tile[i];
             }
         }
         __syncthreads();
@@ -1474,7 +1490,7 @@ extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
             flags = ", ".join(str(flag).lower() for flag in (
                 key.backward, key.real_interleaved, key.imag_interleaved, key.packed_features,
             ))
-            call = f"project_path_tc<{io}, {index}, {key.warps}, {flags}>"
+            call = f"project_path_tc<{io}, {index}, {key.warps}, {key.projection_cells}, {flags}>"
         else:
             hidden = _REGISTER_HIDDEN if key.hidden8 else 0
             call = f"project_path<{io}, {index}, {key.warps}, {hidden}, {flags}>"
@@ -2598,14 +2614,14 @@ def _plan_tc_projection(
     sms, limit, _ = device_limits(device)
     fields = 11 * _REGISTER_HIDDEN + 2
     best = None
-    for warps in (4, 8):
-        smem = _tc_smem(warps, base.backward)
-        key = replace(base, warps=warps)
+    for warps, cell_tile in ((16, 32), (8, 32)):
+        smem = _tc_smem(warps, base.backward, cell_tile)
+        key = replace(base, warps=warps, projection_cells=cell_tile)
         resident = _resident(device, key, smem) if smem <= limit else 0
         if not resident:
             continue
         mode_tiles = _ceil(modes, warps)
-        groups = max(1, min(_ceil(cells, 16), _ceil(4 * sms * resident, mode_tiles)))
+        groups = max(1, min(_ceil(cells, cell_tile), _ceil(4 * sms * resident, mode_tiles)))
         if base.backward:
             groups = min(groups, max(1, _MAX_PARTIAL_BYTES // (fields * modes * 4)))
         score = min(sms * resident, groups * mode_tiles) * min(warps, modes)
@@ -2654,8 +2670,8 @@ def _plan_projection(
     return best[1:]
 
 
-def _tc_smem(warps: int, backward: bool) -> int:
-    return 16 * warps * (18 if backward else 10) * 2
+def _tc_smem(warps: int, backward: bool, cells: int = 32) -> int:
+    return warps * (cells * (20 if backward else 16) + (256 if backward else 0))
 
 
 def _empty_features(

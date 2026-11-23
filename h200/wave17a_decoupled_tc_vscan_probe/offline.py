@@ -16,17 +16,20 @@ from lnet import general_cuda_scans as scans
 # ruff: noqa: SLF001, S603
 
 
-def variants(arch: int) -> dict[scans.Kernel, int]:
+def variants(arch: int, *, projection_only: bool) -> dict[scans.Kernel, int]:
     cases = {}
     types = (torch.float16, torch.bfloat16)
-    for dtype, backward, warps, index32, real, imag, packed in itertools.product(
-        types, (False, True), (4, 8), *((False, True),) * 4,
+    for dtype, backward, warps, cells, index32, real, imag, packed in itertools.product(
+        types, (False, True), (8, 16), (16, 32, 64), *((False, True),) * 4,
     ):
         key = scans.Kernel(
             dtype, warps, backward, projection=True, projection_tc=True, hidden8=True,
             index32=index32, real_interleaved=real, imag_interleaved=imag, packed_features=packed,
+            projection_cells=cells,
         )
-        cases[key] = scans._tc_smem(warps, backward)
+        cases[key] = scans._tc_smem(warps, backward, cells)
+    if projection_only:
+        return cases
     limit = {86: 99, 89: 99, 90: 227}[arch] * 1024
     for dtype, coarse, backward in itertools.product(
         (*types, torch.float32), (False, True), (False, True),
@@ -74,19 +77,23 @@ def compile_case(
     stack, spill_store, spill_load = map(int, re.search(
         r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads", log,
     ).groups())
-    sass = []
+    sass, vector_io = [], []
     if key.projection_tc:
         result = subprocess.run(
             [str(cuda_bin / "cuobjdump"), "--dump-sass", str(cubin)],
             capture_output=True, text=True, check=True,
         )
-        sass = [line.strip() for line in result.stdout.splitlines() if "HMMA.168" in line]
+        lines = result.stdout.splitlines()
+        sass = [line.strip() for line in lines if "HMMA.16816.F32" in line]
+        vector_io = sorted(set(re.findall(r"\b(?:LDG|STG)\.E(?:\.[A-Z]+)*\.128\b",
+                                         result.stdout)))
     return {
         "arch": arch, "key": str(key), "projection": key.projection_tc,
         "dtype": str(key.dtype), "backward": key.backward, "warps": key.warps,
         "registers": int(re.search(r"Used (\d+) registers", log)[1]), "launch_smem": smem,
         "stack": stack, "spill_store": spill_store, "spill_load": spill_load,
-        "ptxas": log, "sass": sass,
+        "ptxas": log, "sass": sass, "vector_io": vector_io,
+        "packed": key.packed_features, "projection_cells": key.projection_cells,
     }
 
 
@@ -95,13 +102,18 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--cuda-bin", type=Path, default=Path("/usr/local/cuda/bin"))
     parser.add_argument("--jobs", type=int, default=8)
+    parser.add_argument("--projection-only", action="store_true")
     args = parser.parse_args()
 
     def run(item: tuple[int, scans.Kernel, int]) -> dict:
         with TemporaryDirectory(prefix="wave17a-ptxas-") as folder:
             return compile_case(*item, Path(folder), cuda_bin=args.cuda_bin)
 
-    tasks = [(arch, key, smem) for arch in (86, 89, 90) for key, smem in variants(arch).items()]
+    tasks = [
+        (arch, key, smem)
+        for arch in (86, 89, 90)
+        for key, smem in variants(arch, projection_only=args.projection_only).items()
+    ]
     failed = 0
     with ThreadPoolExecutor(args.jobs) as pool, args.out.open("w", encoding="utf-8") as log:
         for result in pool.map(run, tasks):
@@ -109,6 +121,11 @@ def main() -> None:
             failed += bool(
                 result["stack"] or result["spill_store"] or result["spill_load"]
                 or (result["projection"] and not result["sass"])
+                or (result["projection"] and result["packed"] and (
+                    not any(op.startswith("LDG") for op in result["vector_io"])
+                    or (result["backward"]
+                        and not any(op.startswith("STG") for op in result["vector_io"]))
+                ))
             )
     print(f"{len(tasks)} variants, {failed} failed resource or HMMA checks")  # noqa: T201
     raise SystemExit(bool(failed))
