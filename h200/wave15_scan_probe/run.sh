@@ -8,6 +8,12 @@ export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=4
 unset LNET_GENERAL_SCANS LNET_FUSED_FACTORIZED_READER LNET_GENERAL_SCAN_REF_FWD
 unset VA_REAL_MEMORY_SCAN_BATCH_PARTIALS VA_REAL_MEMORY_TRAINING_OPTIMIZATIONS
 unset LNET_DISABLE_LAUNCH_AUTOTUNE LNET_NR4_FUSED LNET_VSCAN_DECOUPLED
+unset VA_WAVE15_LAYOUT VA_WAVE15_SCRATCH VA_WAVE15_SINGLE_STORE
+unset VA_WAVE15_DROP_SOURCE VA_WAVE15_SHARED_HIDDEN
+model_arms=(wave13 wave14 row column)
+if [[ ${VA_WAVE15_H200_REFINED:-0} == 1 ]]; then
+    model_arms=(wave13 wave14 column-shared2)
+fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/va-t59-h200.XXXXXX")
 export RUN_ROOT PERSIST_ROOT
@@ -53,7 +59,11 @@ for revision in "$wave13" "$wave14"; do
     mkdir "$work/$revision"
     git archive "$revision" src scripts | tar -x -C "$work/$revision"
 done
-"$run_python" "$suite/bench.py" --batch 1024 --out "$RUN_ROOT/ablation.jsonl"     | tee "$RUN_ROOT/ablation.log"
+"$run_python" "$suite/bench.py" --batch 1024 --repeats 5 --out "$RUN_ROOT/ablation.jsonl"     | tee "$RUN_ROOT/ablation.log"
+if [[ ${VA_WAVE15_H200_REFINED:-0} == 1 ]]; then
+    "$run_python" "$suite/plans.py" > "$RUN_ROOT/occupancy.jsonl"
+    "$run_python" "$suite/bench.py" --batch 1024 --reference-only         --arms baseline row column column-shared2 --out "$RUN_ROOT/torch-reference.jsonl"
+fi
 for revision in "$wave13" "$wave14"; do
     PYTHONPATH="$work/$revision/src:$work/$revision/scripts"         "$run_python" "$suite/bench.py" --batch 1024 --arms baseline         --out "$RUN_ROOT/$revision.jsonl" | tee "$RUN_ROOT/$revision.log"
 done
@@ -62,24 +72,35 @@ import json
 import sys
 from pathlib import Path
 for path in Path(sys.argv[1]).glob("*.jsonl"):
-    path.with_suffix(".json").write_text(json.dumps([json.loads(l) for l in path.read_text().splitlines()]))
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in rows:
+        for arm in row.get("results", {}).values():
+            arm.pop("sampled_parity", None)
+            for plan in arm["plan"].values():
+                plan.pop("kernel", None)
+    path.with_suffix(".json").write_text(json.dumps(rows))
 PY
 
 bench=h200/liverms_v2_opt/bench_h200.py
 variant=17-p1-nr4-1024d-v3
 status=0
 for batch in 128 256 512 1024; do
-    for arm in wave13 wave14 row column; do
+    for arm in "${model_arms[@]}"; do
+        shared=0
         case $arm in
             wave13) checkout="$work/$wave13"; layout=0 ;;
             wave14) checkout="$work/$wave14"; layout=0 ;;
             row) checkout="$repo"; layout=1 ;;
             column) checkout="$repo"; layout=2 ;;
+            column-shared2) checkout="$repo"; layout=2; shared=2 ;;
         esac
-        PYTHONPATH="$checkout/src:$checkout/scripts" VA_WAVE15_LAYOUT=$layout             "$run_python" "$bench" train-arm --variant "$variant" --batch "$batch" --profile             --out "$RUN_ROOT/arms/b${batch}_${arm}.json" || status=1
+        PYTHONPATH="$checkout/src:$checkout/scripts" VA_WAVE15_LAYOUT=$layout VA_WAVE15_SHARED_HIDDEN=$shared             "$run_python" "$bench" train-arm --variant "$variant" --batch "$batch" --profile             --out "$RUN_ROOT/arms/b${batch}_${arm}.json" || status=1
     done
 done
 export VA_WAVE15_LAYOUT=2
+if [[ ${VA_WAVE15_H200_REFINED:-0} == 1 ]]; then
+    export VA_WAVE15_SHARED_HIDDEN=2
+fi
 "$run_python" "$bench" dynamo --out "$RUN_ROOT/infer/dynamo.json" || status=1
 "$run_python" "$bench" infer-fold --variant "$variant" --batch 1024     --out "$RUN_ROOT/infer/fold.json" || status=1
 pytest_status=0
@@ -89,14 +110,14 @@ timeout --foreground --kill-after=5s 13m "$run_python" -m pytest -q     tests/te
 if [[ $pytest_status != 0 ]]; then
     status=1
 fi
-"$run_python" - "$RUN_ROOT" <<'PY_CHECK' || status=1
+"$run_python" - "$RUN_ROOT" "${#model_arms[@]}" <<'PY_CHECK' || status=1
 import json
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
 arms = [json.loads(path.read_text()) for path in (root / "arms").glob("*.json")]
-assert len(arms) == 16
+assert len(arms) == 4 * int(sys.argv[2])
 assert all(row["status"] == "ok" and row["finite_losses"] and row["finite_gradients"] for row in arms)
 dynamo = json.loads((root / "infer/dynamo.json").read_text())
 assert [pair for rows in dynamo["graphs"].values() for pair in rows.values()] == [[1, 0]] * 18

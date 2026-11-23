@@ -140,14 +140,14 @@ def probe(case, args):
     dy = [sample((b, oh, ow, modes), dtype, 0.1) for _ in range(2)]
     expected = None
     results = {}
-    for name in args.arms:
+    for name in ([] if args.reference_only else args.arms):
         with horizontal_warps(name):
             results[name], expected = measure_arm(
                 name, h, modes, coarse, dtype, source, px, py, aux, path, dy,
                 expected, args.repeats,
             )
     row = {"shape": [b, h, w, modes, coarse], "dtype": args.dtype, "results": results}
-    if args.reference:
+    if args.reference or args.reference_only:
         row["torch_reference"] = torch_reference(source, px, py, aux, path, dy, coarse, dtype, args.arms)
     return row
 
@@ -237,6 +237,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--reference", action="store_true")
+    parser.add_argument("--reference-only", action="store_true")
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
     parser.add_argument("--cases", type=int, nargs="+", default=list(range(len(CASES))))
     args = parser.parse_args()
