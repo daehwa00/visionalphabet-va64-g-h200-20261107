@@ -35,7 +35,11 @@ def raw_time() -> float:
 
 def trace_summary(path: Path) -> dict:
     events = json.loads(path.read_text())["traceEvents"]
-    (marker,) = [event for event in events if event.get("name") == "wave22c.step"]
+    (marker,) = [
+        event
+        for event in events
+        if event.get("name") == "wave22c.step" and event.get("cat") == "user_annotation"
+    ]
     begin, end = marker["ts"], marker["ts"] + marker["dur"]
     runtime = Counter(
         event["name"]
