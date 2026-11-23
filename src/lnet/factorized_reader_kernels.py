@@ -353,7 +353,7 @@ __device__ __forceinline__ void sliding_spatial(
             #pragma unroll
             for (int i = 0; i < Inputs; ++i)
                 right[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, true>(
-                    input + (Vec == 1
+                    input + (Vec == 1 && !Backward
                         ? ((base + py * width + x + 1) * Inputs + i) * modes + mode
                         : next + py * width * input_step + i * modes));
         }
@@ -419,9 +419,7 @@ __device__ __forceinline__ void sliding_spatial(
                 #pragma unroll
                 for (int y = 0; y < Rows; ++y) {
                     if (y0 + y >= height) continue;
-                    O* out = output + (Vec == 1
-                        ? ((base + (y0 + y) * width + x) * Outputs + r) * modes + mode
-                        : destination + (y0 + y) * width * output_step + r * modes);
+                    O* out = output + (destination + (y0 + y) * width * output_step + r * modes);
                     mode_store<Vec>(out, ar[y]);
                     if (Strict) mode_store<Vec>(out + R * modes, ai[y]);
                     ar[y] = ai[y] = {};
