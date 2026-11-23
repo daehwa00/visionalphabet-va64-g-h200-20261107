@@ -124,6 +124,7 @@ class Kernel:
     real_transposed: bool = False
     imag_transposed: bool = False
     vector_weights: bool = False
+    batch_path: bool = False
 
 
 class Launch(NamedTuple):
@@ -570,6 +571,54 @@ __device__ __forceinline__ float2 path_mlp(
     return dy;
 }
 
+template<class T, class I, int HIDDEN, bool PRECISE, int K,
+         class Weights>
+__device__ __forceinline__ void path_mlp_batch(
+    const float (&p)[K][8], Weights path, float2 bias, float2 (&out)[K]
+) {
+    const int size = HIDDEN ? HIDDEN : path.size;
+    Sum<PRECISE> out_r[K], out_i[K];
+    #pragma unroll
+    for (int j = 0; j < size; ++j) {
+        float weights[8];
+        if constexpr (Weights::vector_weights) {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 4) {
+                const auto v = path.input_group(2 * j + k / 4);
+                weights[k] = v.x;
+                weights[k + 1] = v.y;
+                weights[k + 2] = v.z;
+                weights[k + 3] = v.w;
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                const auto pair = path.input_pair(4 * I(j) + k / 2);
+                weights[k] = pair.r;
+                weights[k + 1] = pair.i;
+            }
+        }
+        const float b = path.bias(j);
+        const float wr = path.output(j), wj = path.output(I(size) + j);
+        #pragma unroll
+        for (int t = 0; t < K; ++t) {
+            float pre = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) pre = __fmaf_rn(weights[k], p[t][k], pre);
+            pre = rounded<T>(rounded<T>(pre) + b);
+            const float sig = __fdividef(1.0f, 1.0f + __expf(-pre));
+            const float act = rounded<T>(pre * sig);
+            out_r[t].add(wr * act);
+            out_i[t].add(wj * act);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < K; ++t) {
+        out[t] = make_float2(rounded<T>(out_r[t].value) + bias.x,
+                             rounded<T>(out_i[t].value) + bias.y);
+    }
+}
+
 template<bool REVERSE>
 __device__ __forceinline__ float4 column_adjoint_step(
     float4 prev, float4 source, float4 inject,
@@ -826,7 +875,7 @@ __device__ __forceinline__ void write_vscan_partial(
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS>
+         bool VECTOR_WEIGHTS, bool BATCH_PATH>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -938,7 +987,42 @@ __device__ __forceinline__ void vertical(
                     }
                 }
                 state = {};
-                for (int y = H - 1; y >= 0; --y) {
+                int remaining = H;
+                // The vertical recurrence depends on the source alone. Prepare
+                // four cells before loading each row of path weights once.
+                if constexpr (BATCH_PATH) {
+                    for (; remaining >= 4 * (1 + COARSE); remaining -= 4 * (1 + COARSE)) {
+                        float p[4][8];
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) {
+                            const int y = remaining - 1 - t * (1 + COARSE) - COARSE;
+                            if constexpr (COARSE) {
+                                state = advance(state, c.source(y + 1), a.conj(), g.conj());
+                            }
+                            state = advance(state, c.source(y), a.conj(), g.conj());
+                            const auto pos = buf[I(COARSE ? y / 2 : y) * stride].unpack();
+                            const auto neg = normalize<T>(state, c.gain(y, true));
+                            p[t][0] = pos.x;
+                            p[t][1] = pos.z;
+                            p[t][2] = neg.x;
+                            p[t][3] = neg.z;
+                            p[t][4] = pos.y;
+                            p[t][5] = pos.w;
+                            p[t][6] = neg.y;
+                            p[t][7] = neg.w;
+                        }
+                        float2 out[4];
+                        path_mlp_batch<T, I, HIDDEN, PRECISE, 4>(p, path, bias, out);
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t) {
+                            const int yo = remaining / (1 + COARSE) - 1 - t;
+                            const I cell = c.cell(yo);
+                            outr[(cell - m) * (1 + REAL_INTERLEAVED) + m] = write<T>(out[t].x);
+                            outi[(cell - m) * (1 + IMAG_INTERLEAVED) + m] = write<T>(out[t].y);
+                        }
+                    }
+                }
+                for (int y = remaining - 1; y >= 0; --y) {
                     state = advance(state, c.source(y), a.conj(), g.conj());
                     if (COARSE && (y & 1)) continue;
                     const int yo = COARSE ? y / 2 : y;
@@ -1210,7 +1294,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{io}, {index}, {coarse}, {key.warps}, {key.chunk}, {hidden}, "
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
-            f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}"
+            f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
+            f"{str(key.batch_path).lower()}"
         )
         wrapper = f"""
 {bounds}(
@@ -1370,6 +1455,14 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     blocks = ct.c_int()
     with torch.cuda.device(device):
         _ensure_context(driver, device)
+        if key.batch_path:
+            local = ct.c_int()
+            _check_cu(
+                driver.cuFuncGetAttribute(ct.byref(local), 3, func),
+                "cuFuncGetAttribute(LOCAL_SIZE_BYTES)",
+            )
+            if local.value:
+                return 0
         _check_cu(
             driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
                 ct.byref(blocks),
@@ -1790,12 +1883,34 @@ def _plan_launch(
         index_bound = max(index_bound, source.stride(0) * 4)
     if not vertical:
         index_bound *= 4
-    return _launch_for_shape(
-        source.device.index or 0, source.dtype, shape, index_bound,
+    device = source.device.index or 0
+    launch = _launch_for_shape(
+        device, source.dtype, shape, index_bound,
         backward=backward, vertical=vertical, coarse=coarse, hidden=hidden, precise=precise,
         compact=compact, interleaved=interleaved, transposed=transposed,
         pure_vertical=pure_vertical,
     )
+
+    if launch is None or os.environ.get("LNET_GENERAL_SCAN_OPT", "auto") == "off":
+        return launch
+    plan, key, workers, _ = launch
+    # Use the batched path for bandwidth-heavy forward plans that already
+    # keep weights in shared memory and stage the trajectory outside the CTA.
+    if (
+        not key.vertical or key.backward or key.pure_vertical or not key.hidden8
+        or key.dtype.itemsize != 2 or not key.index32
+        or not plan.cache_weights or plan.cache_line or plan.warps != 1
+        or shape[1] < 8 * (1 + key.coarse)
+    ):
+        return launch
+    candidate = replace(key, batch_path=True)
+    sms, _, max_warps = device_limits(device)
+    resident = _resident(device, candidate, plan.smem)
+    original = _resident(device, key, plan.smem)
+    queued = _ceil(workers * _ceil(shape[-1], _WARP_SIZE), sms)
+    if resident < min(max_warps // 4, original) or queued < 2 * resident:
+        return launch
+    return launch._replace(key=candidate)
 
 
 # Custom ops and public API
