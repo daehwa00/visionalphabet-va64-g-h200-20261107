@@ -20,15 +20,17 @@ def main() -> None:
     parser.add_argument("--cuda-bin", type=Path, default=Path("/usr/local/cuda/bin"))
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    cases = [
-        (sm, dtype, channels, vector)
-        for sm, dtype, channels in product(
-            ((8, 6), (8, 9), (9, 0)),
-            (torch.bfloat16, torch.float16, torch.float32),
-            (1, 47, 64, 96, 128, 160, 192, 256, 320, 384, 512, 640, 768, 1024),
-        )
-        for vector in ((1, 4 if dtype == torch.float32 else 8) if channels % 8 == 0 else (1,))
-    ]
+    # Cover every register pack count and lane count, plus masked scalar tails.
+    widths = sorted({1, 2, 3, 4, 7, 8, 12, 16, 24, 33, 47, 1023, *range(32, 1025, 32)})
+    cases = []
+    for sm, dtype, channels in product(
+        ((8, 6), (8, 9), (9, 0)), (torch.bfloat16, torch.float16, torch.float32), widths
+    ):
+        cases.append((sm, dtype, channels, 1))
+        vector = 4 if dtype == torch.float32 else 8
+        if channels % vector == 0:
+            cases.append((sm, dtype, channels, vector))
+
 
     def compile_case(case: tuple[tuple[int, int], torch.dtype, int, int]) -> tuple[str, bool]:
         sm, dtype, channels, vector = case
