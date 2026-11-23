@@ -351,6 +351,43 @@ def test_long_vertical_forward_counts_mode_tiles(
         scans._launch_for_shape.cache_clear()
 
 
+@pytest.mark.parametrize(
+    ("limit", "dtype", "backward", "coarse", "line", "modes", "resident", "vector"),
+    [
+        (227 * 1024, torch.bfloat16, False, False, False, 160, 8, True),
+        (227 * 1024, torch.float16, True, True, False, 160, 8, True),
+        (227 * 1024, torch.bfloat16, False, True, False, 160, 8, False),
+        (227 * 1024, torch.bfloat16, True, False, True, 48, 8, False),
+        (227 * 1024, torch.bfloat16, False, False, True, 160, 1, False),
+        (227 * 1024, torch.float32, False, False, True, 160, 8, False),
+        (99 * 1024, torch.bfloat16, False, False, True, 160, 8, False),
+    ],
+)
+def test_vector_path_launch_policy(
+    monkeypatch: pytest.MonkeyPatch, limit: int, dtype: torch.dtype,
+    backward: bool, coarse: bool, line: bool, modes: int, resident: int, vector: bool,
+) -> None:
+    key = scans.Kernel(
+        dtype, 2, backward, vertical=True, coarse=coarse, hidden8=True,
+        cache_weights=True, cache_line=line, precise=not backward,
+    )
+    plan = scans.ScanPlan(2, 32 * 1024, cache_weights=True, cache_line=line)
+    original = scans.Launch(plan, key, 2048, 1024 if backward else 2048)
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, limit, 64))
+    monkeypatch.setattr(
+        scans, "_resident", lambda _, key, __: resident if key.vector_weights else 8,
+    )
+    selected = scans._with_vector_path_weights(0, original, modes=modes, hidden=8, wave_limit=8)
+    assert selected is not None
+    assert selected.key.vector_weights == vector
+    if vector:
+        assert selected.plan.smem == plan.smem + 11 * 8 * 32 * (4 - dtype.itemsize)
+        assert not selected.key.precise
+        assert selected.workers <= original.workers
+    else:
+        assert selected == original
+
+
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_source_and_offline_nvrtc(dtype: torch.dtype) -> None:
     keys = (

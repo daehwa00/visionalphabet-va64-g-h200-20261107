@@ -4,6 +4,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
 suite=h200/wave14_vscan_probe
 baseline=fb4a33c76335c369c5f0dfbc0d8fc57dcafacea5
+refined=79042ae47c67f68f8b7d6e1fb18cf350927fefc2
 export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 WANDB_MODE=disabled
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=4
 unset LNET_GENERAL_SCANS LNET_FUSED_FACTORIZED_READER LNET_GENERAL_SCAN_REF_FWD
@@ -52,26 +53,22 @@ baseline_dir=$RUN_ROOT/wave13
 mkdir -p "$baseline_dir"
 git archive "$baseline" src scripts | tar -x -C "$baseline_dir"
 base_path="$baseline_dir/src:$baseline_dir/scripts"
-if [[ ${1:-} == --refine ]]; then
-    forward=(fast-packed traffic async async-line)
-    backward=(async-line async-full async-shared shared-packed)
-    arms=(packed traffic)
-else
-    forward=(fast line line-source vector-line vector-line-source prefetch)
-    backward=(weights line shared half-dwi chunk14 chunk28 full full-shared cached-ds full-cached-ds)
-    arms=(compute cached)
-fi
-"$run_python" "$suite/bench.py" --out "$out/isolated.jsonl" --repeats 5 --forward "${forward[@]}" --backward "${backward[@]}" |
+experimental=$RUN_ROOT/refined
+mkdir -p "$experimental"
+git archive "$refined" src scripts | tar -x -C "$experimental"
+"$run_python" "$suite/bench.py" --out "$out/isolated.jsonl" --repeats 5 --forward --backward |
     tee "$out/isolated.log"
 PYTHONPATH="$base_path" "$run_python" "$suite/bench.py" --out "$out/isolated_wave13.jsonl"     --repeats 5 --forward --backward | tee "$out/isolated_wave13.log"
+PYTHONPATH="$experimental/src:$experimental/scripts" "$run_python" "$suite/bench.py"     --out "$out/isolated_refined.jsonl" --repeats 5     --forward fast-packed traffic async async-line     --backward async-line async-full async-shared shared-packed |
+    tee "$out/isolated_refined.log"
+"$run_python" "$suite/hscan.py" --batch 1024 --out "$out/hscan.json"
 "$run_python" - "$out" <<'PYTHON'
 import json
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-for stem in ("isolated", "isolated_wave13"):
-    source = root / f"{stem}.jsonl"
+for source in sorted(root.glob("isolated*.jsonl")):
     rows = []
     for line in source.read_text().splitlines():
         row = json.loads(line)
@@ -83,8 +80,16 @@ for stem in ("isolated", "isolated_wave13"):
                         "finite": all(v["finite"] for v in arm["parity"]),
                     }
         rows.append(row)
-    (root / f"{stem}.json").write_text(json.dumps(rows) + "\n")
+    source.with_suffix(".json").write_text(json.dumps(rows) + "\n")
 PYTHON
 
-PYTHONPATH="$base_path" "$run_python" "$suite/model.py" --out "$out" --arm baseline     | tee "$out/model_wave13.log"
-"$run_python" "$suite/model.py" --out "$out" --arm "${arms[@]}" | tee "$out/model_wave14.log"
+PYTHONPATH="$base_path" "$run_python" "$suite/model.py" --out "$out" --arm baseline --fold-batch 1024 |
+    tee "$out/model_wave13.log"
+"$run_python" "$suite/model.py" --out "$out" --arm selected --fold-batch 1024 |
+    tee "$out/model_wave14.log"
+
+status=0
+started=$SECONDS
+timeout --foreground --kill-after=5s 13m "$run_python" -m pytest -q     tests/test_general_cuda_scans.py tests/test_product_scan_pipeline.py tests/test_p1_nr4.py     > "$out/pytest_targeted.log" 2>&1 || status=$?
+"$run_python" h200/liverms_v2_opt/bench_h200.py wrap-pytest     --out "$out/pytest_targeted.json" --log "$out/pytest_targeted.log"     --exit-code "$status" --elapsed "$((SECONDS - started))"
+exit "$status"

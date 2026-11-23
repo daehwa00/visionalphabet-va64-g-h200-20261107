@@ -6,6 +6,7 @@ import re
 import subprocess
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -68,6 +69,47 @@ def candidates(
                             yield arch, str(dtype), coarse, backward, name, plan, key
 
 
+def selected_candidates(
+    arches: Iterable[int], dtypes: Iterable[torch.dtype], warps: Iterable[int],
+) -> Iterator[Case]:
+    for arch in arches:
+        for dtype in dtypes:
+            for coarse in (False, True):
+                for backward, heights in ((False, (28, 56)), (True, (14, 28, 56, 128))):
+                    for h in heights:
+                        plans = scans._scan_plans(
+                            h, 227 * 1024, vertical=True, backward=backward, coarse=coarse,
+                            hidden=8, itemsize=dtype.itemsize,
+                        )
+                        for packed in plans:
+                            if (
+                                packed.warps not in warps or not packed.cache_weights
+                                or packed.shared_acc or packed.global_checkpoints
+                                or (coarse and not backward and not packed.cache_line)
+                                or (backward and packed.chunk not in (4, 8, h))
+                            ):
+                                continue
+                            chunk = 0 if packed.full_trajectory else packed.chunk
+                            shape = f"{h}-{chunk}-{int(packed.cache_line)}"
+                            shape += f"-{int(packed.cache_source)}"
+                            plan = packed._replace(smem=packed.smem + 11 * 8 * 32 * 2)
+                            if plan.smem > 227 * 1024:
+                                continue
+                            key = scans.Kernel(
+                                dtype, plan.warps, backward, vertical=True, coarse=coarse,
+                                hidden8=True, cache_weights=True, cache_line=plan.cache_line,
+                                cache_source=plan.cache_source, compact=backward and coarse,
+                                chunk=chunk, vector_weights=True,
+                            )
+                            yield (
+                                arch, str(dtype), coarse, backward, f"vector-{shape}", plan, key,
+                            )
+                            yield (
+                                arch, str(dtype), coarse, backward, f"packed-{shape}", packed,
+                                replace(key, vector_weights=False, precise=not backward),
+                            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ptxas", default="/usr/local/cuda/bin/ptxas")
@@ -76,6 +118,7 @@ def main() -> None:
     parser.add_argument("--warps", type=int, nargs="+", default=(1, 2))
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--selected", action="store_true")
     args = parser.parse_args()
     dtypes = [torch.bfloat16, torch.float16] if args.fp16 else [torch.bfloat16]
     with (
@@ -83,9 +126,10 @@ def main() -> None:
         args.out.open("w") as out,
         ThreadPoolExecutor(max_workers=args.jobs) as pool,
     ):
+        matrix = selected_candidates if args.selected else candidates
         for row in pool.map(
             partial(build, ptxas=args.ptxas, folder=Path(tmp)),
-            candidates(args.arch, dtypes, args.warps),
+            matrix(args.arch, dtypes, args.warps),
         ):
             print(json.dumps(row), file=out, flush=True)
 

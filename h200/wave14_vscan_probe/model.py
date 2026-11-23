@@ -24,6 +24,7 @@ ARMS = {
     "line": ("line", "line"),
     "traffic": ("traffic", "baseline"),
     "packed": ("fast-packed", "baseline"),
+    "selected": ("baseline", "baseline"),
 }
 
 
@@ -82,6 +83,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--batch", type=int, nargs="+", default=(128, 256, 512, 1024))
+    parser.add_argument("--fold-batch", type=int)
     parser.add_argument("--arm", choices=ARMS, nargs="+", default=("baseline", "compute", "cached"))
     parser.add_argument("--forward")
     parser.add_argument("--backward")
@@ -107,7 +109,8 @@ def main() -> None:
         for name, arm in arms.items():
             for command in ("dynamo", "infer-fold"):
                 output = args.out / "infer" / f"{command}_{name}.json"
-                outcome.append(run(bench, arm, command, output, min(args.batch), profile=False))
+                batch = args.fold_batch or min(args.batch)
+                outcome.append(run(bench, arm, command, output, batch, profile=False))
     raise SystemExit(0 if all(outcome) else 1)
 
 
