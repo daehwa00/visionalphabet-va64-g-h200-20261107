@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 
 from lnet import general_cuda_scans as scans
+from lnet.product_scan_reference import bidirectional_product_scan_reference
 
 TRIAL_ENABLED = "state_layout" in inspect.signature(scans._hscan).parameters
 
@@ -82,6 +83,49 @@ def horizontal_warps(name):
         scans._launch_for_shape.cache_clear()
 
 
+def torch_reference(source, px, py, aux, path, dy, coarse, dtype, arms):
+    # Check a complete spatial field with one batch item and four independent
+    # modes. This keeps reference autograd bounded on the large rectangles.
+    source = [value[:1, ..., :4].contiguous().requires_grad_() for value in source]
+    px, py, path = (
+        [value[:4].contiguous().requires_grad_() for value in group] for group in (px, py, path)
+    )
+    aux = [value[..., :4].contiguous() for value in aux]
+    dy = [value[:1, ..., :4].contiguous() for value in dy]
+    reference_states = torch.stack(bidirectional_product_scan_reference(tuple(px), tuple(source)))
+    reference = scans._reference_vertical(py, reference_states, aux, path, coarse, 1e-6)
+    grad = torch.autograd.grad(reference, (*source, *px, *py, *path), dy)
+    forward_tol, backward_tol = {
+        torch.float32: ((4e-5, 3e-6), (4e-4, 2e-4)),
+        torch.float16: ((8e-3, 1e-3), (5e-2, 2e-2)),
+        torch.bfloat16: ((4e-2, 5e-3), (1.2e-1, 8e-2)),
+    }[dtype]
+    results = {}
+    for name in arms:
+        layout, scratch, single, drop_source = ARMS[name]
+        hopts = {"state_layout": layout} if TRIAL_ENABLED else {}
+        vopts = {
+            **hopts, "local_scratch": scratch, "single_store": single,
+            "drop_source": drop_source,
+            "shared_hidden": int(name[-1]) if name.startswith("column-shared") else 0,
+        } if TRIAL_ENABLED else {}
+        with torch.no_grad(), horizontal_warps(name):
+            states, _ = scans._hscan(px, *source, **hopts)
+            output = scans._vscan(py, states, aux, path, coarse, 1e-6, True, **vopts)
+            dv = scans._vscan(py, states, aux, path, coarse, 1e-6, False, tuple(dy), compact=coarse, **vopts)
+            dx, pole = scans._hscan(px, *source, states, dv[4], compact=coarse, **hopts)
+            actual = (*dx.chunk(2, dim=-1), *pole, *dv[:4], *dv[5:])
+        for values, target, (rtol, atol) in (
+            (output, reference, forward_tol), (actual, grad, backward_tol),
+        ):
+            torch.testing.assert_close(values, target, rtol=rtol, atol=atol)
+        results[name] = {
+            "forward": compare(signature(output), signature(reference)),
+            "backward": compare(signature(actual), signature(grad)),
+        }
+    return results
+
+
 def probe(case, args):
     h, w, modes, coarse = case
     b = args.batch if h <= 56 else 4
@@ -102,7 +146,10 @@ def probe(case, args):
                 name, h, modes, coarse, dtype, source, px, py, aux, path, dy,
                 expected, args.repeats,
             )
-    return {"shape": [b, h, w, modes, coarse], "dtype": args.dtype, "results": results}
+    row = {"shape": [b, h, w, modes, coarse], "dtype": args.dtype, "results": results}
+    if args.reference:
+        row["torch_reference"] = torch_reference(source, px, py, aux, path, dy, coarse, dtype, args.arms)
+    return row
 
 
 def measure_arm(name, h, modes, coarse, dtype, source, px, py, aux, path, dy, expected, repeats):
@@ -134,7 +181,7 @@ def measure_arm(name, h, modes, coarse, dtype, source, px, py, aux, path, dy, ex
     values = signature(warm)
     expected = values if expected is None else expected
     parity = compare(values, expected)
-    del warm
+    del warm, values
     plans = {}
     events = {}
 
@@ -189,6 +236,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--reference", action="store_true")
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
     parser.add_argument("--cases", type=int, nargs="+", default=list(range(len(CASES))))
     args = parser.parse_args()
