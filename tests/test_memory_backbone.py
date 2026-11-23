@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch.nn import functional
 
-from lnet.memory_backbone import ChannelRMSNorm
+from lnet.memory_backbone import ChannelRMSNorm, SwiGLU
 
 _FAST_FLAGS = ("LNET_FUSED_FACTORIZED_READER", "LNET_GENERAL_SCANS")
 
@@ -80,4 +80,23 @@ def test_channel_rms_norm_dense_compiled_gradients(dtype, monkeypatch) -> None:
     actual_grad = torch.autograd.grad(actual, inputs, grad)
     tol = 3e-2 if dtype == torch.bfloat16 else 4e-3
     for got, want in zip((actual, *actual_grad), (expected, *expected_grad), strict=True):
+        torch.testing.assert_close(got, want, rtol=tol, atol=tol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hidden", [31, 160])
+def test_swiglu_compiled_packed_gate(dtype, hidden) -> None:
+    rng = torch.Generator(device="cuda").manual_seed(53)
+    model = SwiGLU(67, hidden).cuda().to(dtype)
+    sample = torch.randn(2, 7, 11, 67, device="cuda", dtype=dtype, generator=rng)
+    x = sample.requires_grad_()
+    dy = torch.randn(x.shape, device="cuda", dtype=dtype, generator=rng)
+    inputs = (x, *model.parameters())
+    expected = model(x)
+    actual = torch.compile(model, fullgraph=True)(x)
+    expected_grads = torch.autograd.grad(expected, inputs, dy)
+    actual_grads = torch.autograd.grad(actual, inputs, dy)
+    tol = {torch.float32: 3e-5, torch.float16: 4e-3, torch.bfloat16: 3e-2}[dtype]
+    for got, want in zip((actual, *actual_grads), (expected, *expected_grads), strict=True):
         torch.testing.assert_close(got, want, rtol=tol, atol=tol)

@@ -15,6 +15,7 @@ from torch.nn import functional
 from .complex_layers import ComplexLinear
 from .factorized_complex_scan_reader import FactorizedComplexConv2dReader
 from .factorized_reader_kernels import real_gram_kernel_energy, real_packed_spatial
+from .fused_backbone_ops import channel_rms_backward, packed_swiglu
 from .gated_post_fusion import GatedComplexPostFusion
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
@@ -49,6 +50,16 @@ class _CompiledChannelRMSNorm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None]:  # noqa: ANN001
         x, weight, inverse = ctx.saved_tensors
+        if (
+            all(ctx.needs_input_grad[:2])
+            and x.is_contiguous()
+            and grad.is_contiguous()
+            and weight.is_contiguous()
+            and inverse.is_contiguous()
+            and x.shape[-1] <= 1024
+        ):
+            dx, dw = channel_rms_backward(x, grad, weight, inverse)
+            return dx, dw, None
         # Promotion keeps the reductions in FP32 without requesting contiguous copies
         # of the activation and output gradient in the ATen backward decomposition.
         normalized = x * inverse
@@ -124,7 +135,18 @@ class SwiGLU(nn.Module):
         return result
 
     def forward(self, x: Tensor) -> Tensor:
-        value, gate = self.value_gate(self.norm(x)).chunk(2, dim=-1)
+        packed = self.value_gate(self.norm(x))
+        if (
+            packed.is_cuda
+            and torch.compiler.is_compiling()
+            and torch.is_grad_enabled()
+            and self.training
+            and packed.dtype in (torch.bfloat16, torch.float16)
+            and packed.is_contiguous()
+            and packed.numel() > 0
+        ):
+            return x + self.output(packed_swiglu(packed))
+        value, gate = packed.chunk(2, dim=-1)
         return x + self.output(value * functional.silu(gate))
 
     def forward_residual_packed(self, left: Tensor, right: Tensor) -> Tensor:
