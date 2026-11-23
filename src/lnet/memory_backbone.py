@@ -15,6 +15,13 @@ from torch.nn import functional
 from .complex_layers import ComplexLinear
 from .factorized_complex_scan_reader import FactorizedComplexConv2dReader
 from .factorized_reader_kernels import real_gram_kernel_energy, real_packed_spatial
+from .fused_rmsnorm_ops import (
+    fused_residual_rmsnorm,
+    fused_rmsnorm,
+    rmsnorm_mode,
+    supports_fused_residual_rmsnorm,
+    supports_fused_rmsnorm,
+)
 from .gated_post_fusion import GatedComplexPostFusion
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
@@ -27,6 +34,12 @@ _MAX_FUSED_GRAM_RANK = 8
 
 def _fused_factorized_reader_enabled() -> bool:
     return os.environ.get(_FUSED_FACTORIZED_READER_ENV) != "0"
+
+
+def _cuda_rmsnorm_enabled(x: Tensor) -> bool:
+    return x.is_cuda and (
+        _fused_factorized_reader_enabled() or os.environ.get(_GENERAL_SCANS_ENV) != "0"
+    )
 
 
 class _PackedTopology(Protocol):
@@ -73,11 +86,11 @@ class ChannelRMSNorm(nn.Module):
         self.epsilon = epsilon
 
     def forward(self, x: Tensor) -> Tensor:
-        if x.is_cuda and (
-            _fused_factorized_reader_enabled()
-            or os.environ.get(_GENERAL_SCANS_ENV) != "0"
-        ):
+        if _cuda_rmsnorm_enabled(x):
             weight = self.weight.to(x.dtype)
+            mode = rmsnorm_mode()
+            if mode == "on" and supports_fused_rmsnorm(x, weight):
+                return fused_rmsnorm(x, weight, self.epsilon)
             if (
                 torch.compiler.is_compiling()
                 and torch.is_grad_enabled()
@@ -124,10 +137,18 @@ class SwiGLU(nn.Module):
         return result
 
     def forward(self, x: Tensor) -> Tensor:
-        value, gate = self.value_gate(self.norm(x)).chunk(2, dim=-1)
+        return self._forward_normalized(x, self.norm(x))
+
+    def _forward_normalized(self, x: Tensor, normalized: Tensor) -> Tensor:
+        value, gate = self.value_gate(normalized).chunk(2, dim=-1)
         return x + self.output(value * functional.silu(gate))
 
     def forward_residual_packed(self, left: Tensor, right: Tensor) -> Tensor:
+        if _cuda_rmsnorm_enabled(left) and rmsnorm_mode() == "on":
+            weight = self.norm.weight.to(left.dtype)
+            if supports_fused_residual_rmsnorm(left, right, weight):
+                x, normalized = fused_residual_rmsnorm(left, right, weight, self.norm.epsilon)
+                return self._forward_normalized(x, normalized)
         return self(left + right)
 
 
