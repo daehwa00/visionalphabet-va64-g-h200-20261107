@@ -180,7 +180,7 @@ def kernel_bucket(name: str) -> str:
     return "other"
 
 
-def profile_step(step: Callable) -> dict:
+def profile_step(step: Callable, *, full_kernels: bool = False) -> dict:  # noqa: PLR0915
     import torch
 
     from lnet import general_cuda_scans as scans
@@ -234,7 +234,10 @@ def profile_step(step: Callable) -> dict:
         bucket = kernel_bucket(event.key)
         buckets[bucket] += elapsed
         dispatches[bucket] += event.count
-        kernels.append({"name": event.key, "count": event.count, "self_cuda_ms": elapsed})
+        kernels.append({
+            "name": event.key, "count": event.count, "self_cuda_ms": elapsed,
+            **({"bucket": bucket} if full_kernels else {}),
+        })
 
     event_ms = {"general_hscan": 0.0, "general_vscan": 0.0}
     shapes: dict[tuple, dict] = {}
@@ -259,17 +262,22 @@ def profile_step(step: Callable) -> dict:
         row = shapes[shape]
         row["cuda_event_ms"] += elapsed
         row["count"] += 1
-        row["plans"][launch.plan, launch.workers, launch.partials] += 1
+        batch_path = getattr(launch.key, "batch_path", False)
+        row["plans"][launch.plan, launch.workers, launch.partials, batch_path] += 1
     for row in shapes.values():
         row["plans"] = [
-            {**plan._asdict(), "workers": workers, "partials": partials, "count": count}
-            for (plan, workers, partials), count in row["plans"].items()
+            {
+                **plan._asdict(), "workers": workers, "partials": partials, "count": count,
+                **({"batch_path": batch_path} if full_kernels else {}),
+            }
+            for (plan, workers, partials, batch_path), count in row["plans"].items()
         ]
     event_total = sum(event_ms.values())
     if event_total:
         shared = buckets.pop("general_scan_shared")
         for axis, elapsed in event_ms.items():
             buckets[axis] += shared * elapsed / event_total
+    kernels.sort(key=lambda row: -row["self_cuda_ms"])
     return {
         "self_cuda_ms_by_bucket": buckets,
         "dispatches_by_profiler_bucket": dispatches,
@@ -278,7 +286,8 @@ def profile_step(step: Callable) -> dict:
         "scan_axis_cuda_event_ms": event_ms,
         "scan_shape_cuda_events": sorted(shapes.values(), key=lambda row: -row["cuda_event_ms"]),
         "scan_axis_attribution": "Profiler shared scan time apportioned by CUDA event durations",
-        "top_kernels": sorted(kernels, key=lambda row: -row["self_cuda_ms"])[:25],
+        "top_kernels": kernels[:25],
+        **({"kernels": kernels} if full_kernels else {}),
     }
 
 
@@ -341,7 +350,7 @@ def train_arm(args: argparse.Namespace) -> dict:
     optimizer.zero_grad(set_to_none=True)
     if args.profile:
         write_json(args.out, {**result, "status": "profiling"})
-        result["profiler"] = profile_step(step)
+        result["profiler"] = profile_step(step, full_kernels=args.full_kernels)
     return result
 
 
@@ -726,6 +735,7 @@ def main() -> None:
             sub.add_argument("--batch", required=True, type=int)
         if name == "train-arm":
             sub.add_argument("--profile", action="store_true")
+            sub.add_argument("--full-kernels", action="store_true")
         if name == "dynamo":
             sub.add_argument("--variant", choices=VARIANTS)
         if name == "wrap-pytest":
