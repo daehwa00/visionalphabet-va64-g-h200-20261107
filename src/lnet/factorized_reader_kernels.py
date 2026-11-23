@@ -40,6 +40,7 @@ _LARGE_WEIGHT_PLANE_PIXELS = 262144
 _SPECIALIZE_MIN_PIXELS = 16384
 _SPECIALIZE_MODE_ALIGNMENT = 16
 _RANK_FOUR_WEIGHT_WAVES = 20
+_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3
 
 
 # PyTorch references
@@ -355,7 +356,9 @@ __device__ __forceinline__ void sliding_spatial(
             #pragma unroll
             for (int i = 0; i < Inputs; ++i)
                 right[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, true>(
-                    input + (next + py * width * input_step + i * modes));
+                    input + (READER_UPDATED_SPATIAL && Vec == 1 && !Backward
+                        ? ((base + py * width + x + 1) * Inputs + i) * modes + mode
+                        : next + py * width * input_step + i * modes));
         }
         V ar[Rows] = {}, ai[Rows] = {};
         #pragma unroll
@@ -430,7 +433,9 @@ __device__ __forceinline__ void sliding_spatial(
             #pragma unroll
             for (int y = 0; y < Rows; ++y) {
                 if (y0 + y >= height) continue;
-                O* out = output + (destination + (y0 + y) * width * output_step);
+                O* out = output + (READER_UPDATED_SPATIAL && Vec == 1
+                    ? (base + (y0 + y) * width + x) * Outputs * modes + mode
+                    : destination + (y0 + y) * width * output_step);
                 mode_store<Vec>(out, ar[y]);
                 mode_store<Vec>(out + modes, ai[y]);
             }
@@ -988,11 +993,13 @@ def _reader_cuda_module(
     spatial_vec: int = 1,
     spatial_read_only: bool = False,
     weight_read_only: bool = True,
+    updated_spatial: bool = False,
 ) -> _CudaModule:
     weight_tile, weight_rows, weight_warps = weight_geometry or _DEFAULT_WEIGHT_GEOMETRY
     macros = {
         **dict(zip(("BATCH", "HEIGHT", "WIDTH", "MODES"), shape, strict=True)),
         "COLUMNS": columns, "RANK": rank, "KERNEL": kernel, "STRICT": int(strict),
+        "UPDATED_SPATIAL": int(updated_spatial),
         "SPATIAL_ROWS": spatial_geometry[0], "SPATIAL_WARPS": spatial_geometry[1],
         "REGISTER_FILTERS": register_filters, "KEEP_REAL": keep_real,
         "BFLOAT16": int("__nv_bfloat16" in types),
@@ -1242,10 +1249,184 @@ def _reader_spatial_geometry(
     return _spatial_geometry(projected.shape[2], rank, kernel, projected.dtype, strict=strict)
 
 
+class _VectorLaunch(NamedTuple):
+    vec: int
+    columns: int
+    rows: int
+    warps: int
+
+
+@cache
+def _reader_resident(module: _CudaModule, op: str, warps: int) -> int:
+    blocks = ctypes.c_int()
+    local_size = ctypes.c_int()
+    function = module.functions[f"reader_{op}"]
+    _check_cu(
+        module.driver.cuFuncGetAttribute(
+            ctypes.byref(local_size), _CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function,
+        ),
+        "cuFuncGetAttribute(LOCAL_SIZE_BYTES)",
+    )
+    if local_size.value:
+        return 0
+    _check_cu(
+        module.driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            ctypes.byref(blocks), function, warps * _WARP_SIZE, ctypes.c_size_t(0),
+        ),
+        "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+    )
+    return blocks.value
+
+
+def _traffic_score(
+    launch: _VectorLaunch, op: str, rank: int, width: int, blocks: int,
+    resident: int, sms: int,
+) -> float:
+    """Estimate useful work per byte at the achieved SM wave fullness."""
+    wave_blocks = sms * resident
+    fullness = blocks / (_ceildiv(blocks, wave_blocks) * wave_blocks)
+    halo = (launch.rows + 2) / launch.rows
+    traffic = (2 if op == "dinput" else rank) * halo
+    traffic *= (launch.columns + 2) / launch.columns
+    traffic += rank if op == "dinput" else 2
+    useful_warps = min(launch.warps, _ceildiv(width, launch.columns))
+    # Once four schedulers each have a ready warp, additional residency
+    # improves latency hiding with diminishing returns.
+    ready_warps = resident * useful_warps * fullness
+    return min(ready_warps / 4, 1.0) / traffic
+
+
+def _wave24b_enabled() -> bool:
+    return os.environ.get("LNET_READER_W24B", "auto") in ("auto", "on")
+
+
+def _wave24b_spatial_candidates(
+    height: int, width: int, rank: int, op: str, *,
+    hopper: bool, may_pack: bool, few_mode_tiles: bool,
+) -> list[_VectorLaunch]:
+    compact = _reader_columns(width)
+    columns = _reader_vector_columns(width, 2)
+    candidates = []
+    if (
+        not hopper and rank == _STATIC_RANK_LIMIT and width <= compact
+        and _VEC2_SPATIAL_GEOMETRY[0] < height <= _COMPACT_COLUMNS
+    ):
+        candidates.append(_VectorLaunch(2, _DEFAULT_COLUMNS, height, 1))
+    # Prefer taller forward tiles when they cover complete strips and column warps.
+    wide = 2 * _COMPACT_COLUMNS
+    if (
+        not hopper and op == "forward" and rank == _STATIC_RANK_LIMIT and few_mode_tiles
+        and width >= 2 * wide and width % wide == 0
+    ):
+        candidates.extend(
+            _VectorLaunch(2, wide, rows, 2)
+            for rows in (2 * _VEC2_SPATIAL_GEOMETRY[0], _COMPACT_COLUMNS)
+            if height >= 4 * rows and height % rows == 0
+        )
+    if may_pack:
+        geometries = ((4, 2), (2, 2), (2, 4)) if hopper else ((4, 2), (2, 4), (2, 2))
+        for rows, warps in geometries:
+            tile_columns = columns if hopper else min(columns, width)
+            if hopper and width <= compact:
+                tile_columns = _DEFAULT_COLUMNS
+            if not hopper and width < warps * columns and width % compact == 0:
+                tile_columns = compact
+            candidates.append(_VectorLaunch(2, tile_columns, rows, warps))
+    return candidates
+
+
+@cache
+def _wave24b_spatial_plan(
+    device: int, shape: tuple[int, int, int, int], compile_shape: tuple[int, int, int, int],
+    rank: int, types: tuple[str, str, str], op: str, scalar: tuple[int, int], *,
+    streaming: bool,
+) -> tuple[_VectorLaunch, _CudaModule] | None:
+    batch, height, width, modes = shape
+    props = torch.cuda.get_device_properties(device)
+    hopper = props.major == 9
+    compact = _reader_columns(width)
+    columns = _reader_vector_columns(width, 2)
+    may_pack = width <= compact or width > 2 * compact
+    few_mode_tiles = _ceildiv(modes, 2 * _WARP_SIZE) < _DEFAULT_SPATIAL_GEOMETRY[1]
+    few_backward_partitions = (
+        hopper and op == "dinput" and types == ("__nv_bfloat16",) * 3
+        and width >= columns * _DEFAULT_SPATIAL_GEOMETRY[1]
+        and few_mode_tiles
+    )
+    candidates = _wave24b_spatial_candidates(
+        height, width, rank, op, hopper=hopper, may_pack=may_pack and not few_backward_partitions,
+        few_mode_tiles=few_mode_tiles,
+    )
+    candidates.append(_VectorLaunch(1, compact, *scalar))
+    best = None
+    best_score = (-1.0, 0)
+    for launch in candidates:
+        vec, columns, rows, warps = launch
+        if vec == 1 and best:
+            return best
+        grid = _reader_spatial_grid(batch, height, width, modes, rows, warps, vec, columns)
+        blocks = grid[0] * grid[1] * grid[2]
+        if grid[1] > _MAX_CUDA_GRID_DIM or (vec > 1 and blocks < props.multi_processor_count):
+            continue
+        resident_filters = 0 if vec > 1 or streaming else -1
+        module = _reader_cuda_module(
+            device, compile_shape, columns, rank, _STATIC_SPATIAL_KERNEL, types, strict=False,
+            spatial_geometry=(rows, warps), spatial_vec=vec, updated_spatial=True,
+            register_filters=resident_filters, keep_real=resident_filters,
+        )
+        resident = _reader_resident(module, op, warps)
+        if not resident:
+            continue
+        if vec == 1:
+            return launch, module
+        long_tile = width > 2 * compact and resident >= 2 and warps == 2 and rows >= 4
+        full_plane = rows == height and warps == 1 and blocks >= 2 * props.multi_processor_count
+        if not hopper and (long_tile or full_plane):
+            return launch, module
+        if hopper:
+            score = _traffic_score(
+                launch, op, rank, width, blocks, resident, props.multi_processor_count,
+            ), rows
+        else:
+            active = min(blocks / props.multi_processor_count, resident)
+            score = active * min(warps, _ceildiv(width, columns)), rows * columns
+        if score > best_score:
+            best, best_score = (launch, module), score
+    return best
+
+
+def _wave24b_spatial(
+    projected: Tensor, real: Tensor, grad: Tensor | None, op: str, *,
+    strict: bool, plan: _RankFourPlan | None,
+) -> tuple[_VectorLaunch, _CudaModule] | None:
+    modes, rank, kernel, _ = real.shape
+    dtype = projected.dtype
+    if (
+        not _wave24b_enabled() or os.environ.get("LNET_READER_VEC", "auto") != "auto"
+        or strict or kernel != _STATIC_SPATIAL_KERNEL or rank > _STATIC_RANK_LIMIT
+        or modes % 2 or dtype not in (torch.bfloat16, torch.float16)
+        or projected.data_ptr() % 4
+        or (grad is not None and (grad.dtype != dtype or grad.data_ptr() % 4))
+    ):
+        return None
+    props = torch.cuda.get_device_properties(projected.device)
+    if (props.major, props.minor) not in {(8, 6), (9, 0)}:
+        return None
+    batch, height, width, _ = projected.shape
+    scalar = plan.spatial if plan else _spatial_geometry(width, rank, kernel, dtype, strict=False)
+    return _wave24b_spatial_plan(
+        projected.device.index or 0, (batch, height, width, modes),
+        _reader_compile_shape(projected, modes), rank,
+        (_CUDA_TYPES[dtype], _CUDA_TYPES[real.dtype], _CUDA_TYPES[dtype]), op, scalar,
+        streaming=plan is not None,
+    )
+
+
 def _reader_module_for(
     projected: Tensor, real: Tensor, grad: Tensor | None = None, *,
     strict: bool, rank_four_plan: _RankFourPlan | None = None,
     weight_vec: int = 1, spatial_vec: int = 1,
+    weight_override: tuple[int, int, int] | None = None,
 ) -> _CudaModule:
     _, _, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
@@ -1259,7 +1440,9 @@ def _reader_module_for(
     elif not strict and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL:
         weight_geometry = _weight_geometry(projected, modes, rank, dtypes[2])
     if weight_vec > 1:
-        weight_geometry = _VEC2_WEIGHT_GEOMETRY if weight_vec == 2 else _VEC4_WEIGHT_GEOMETRY
+        weight_geometry = weight_override or (
+            _VEC2_WEIGHT_GEOMETRY if weight_vec == 2 else _VEC4_WEIGHT_GEOMETRY
+        )
     return _reader_cuda_module(
         projected.device.index or 0, _reader_compile_shape(projected, modes),
         _reader_vector_columns(width, spatial_vec),
@@ -1269,6 +1452,37 @@ def _reader_module_for(
         register_filters=0 if rank_four_plan else -1, keep_real=0 if rank_four_plan else -1,
         weight_vec=weight_vec, spatial_vec=spatial_vec, weight_read_only=weight_vec != 2,
     )
+
+
+def _wave24b_weight(
+    projected: Tensor, real: Tensor, grad: Tensor, vec: int, sms: int,
+) -> tuple[tuple[int, int, int], _CudaModule] | None:
+    if (
+        not _wave24b_enabled() or os.environ.get("LNET_READER_VEC", "auto") != "auto"
+        or vec != 2 or torch.cuda.get_device_capability(projected.device) != (8, 6)
+    ):
+        return None
+    batch, height, width, _ = projected.shape
+    modes, rank, _, _ = real.shape
+    rows, warps = 2 * _COMPACT_COLUMNS, _WIDE_WEIGHT_WARPS
+    tile = _CENTERED_WEIGHT_TILE
+    mode_tiles = _ceildiv(modes, _WARP_SIZE * 2)
+    workers = _ceildiv(batch * _ceildiv(height, rows), warps)
+    if (
+        rank != 2 * tile or height < 4 * rows or height % rows
+        or width < 2 * _reader_vector_columns(width, vec)
+        or min(workers, _ceildiv(5 * sms, mode_tiles)) * mode_tiles * 2 < 2 * sms
+    ):
+        return None
+    geometry = tile, rows, warps
+    with torch.cuda.device(projected.device):
+        module = _reader_module_for(
+            projected, real, grad, strict=False, weight_vec=vec, spatial_vec=vec,
+            weight_override=geometry,
+        )
+        if _reader_resident(module, "dweight", warps):
+            return geometry, module
+    return None
 
 
 # CUDA launch state
@@ -1427,8 +1641,11 @@ def real_gram_normalize_spatial(
 
 def _reader_spatial_grid(
     batch: int, height: int, width: int, modes: int, rows: int, warps: int, vec: int = 1,
+    columns: int | None = None,
 ) -> tuple[int, int, int]:
-    tiles = _ceildiv(height, rows) * _ceildiv(width, warps * _reader_vector_columns(width, vec))
+    tiles = _ceildiv(height, rows) * _ceildiv(width, warps * (
+        columns or _reader_vector_columns(width, vec)
+    ))
     return _ceildiv(modes, _WARP_SIZE * vec), tiles, batch
 
 
@@ -1443,17 +1660,24 @@ def _packed_spatial(
         plan = _rank_four_plan(projected, real, strict=strict_complex)
         vec = _reader_vector_width(projected, real, None, strict=strict_complex)
         with torch.cuda.device(projected.device):
-            module = _reader_module_for(
-                projected, real, strict=strict_complex, rank_four_plan=plan,
-                spatial_vec=vec, weight_vec=vec,
+            candidate = _wave24b_spatial(
+                projected, real, None, "forward", strict=strict_complex, plan=plan,
             )
-            rows, warps = _reader_spatial_geometry(
-                projected, rank, kernel, strict=strict_complex, plan=plan, vec=vec,
-            )
+            columns = None
+            if candidate:
+                (vec, columns, rows, warps), module = candidate
+            else:
+                module = _reader_module_for(
+                    projected, real, strict=strict_complex, rank_four_plan=plan,
+                    spatial_vec=vec, weight_vec=vec,
+                )
+                rows, warps = _reader_spatial_geometry(
+                    projected, rank, kernel, strict=strict_complex, plan=plan, vec=vec,
+                )
             stream = _reader_stream(module, projected.device)
             _launch_reader_cuda(
                 module, "forward",
-                _reader_spatial_grid(batch, height, width, modes, rows, warps, vec),
+                _reader_spatial_grid(batch, height, width, modes, rows, warps, vec, columns),
                 (projected, real, imag, output), (height, width, modes, rank),
                 stream=stream, threads=warps * _WARP_SIZE,
             )
@@ -1469,7 +1693,7 @@ def _packed_spatial_fake(
 
 
 @torch.library.custom_op("va_reader::packed_spatial_backward", mutates_args=(), device_types="cuda")
-def _packed_spatial_backward(
+def _packed_spatial_backward(  # noqa: PLR0915
     grad: Tensor,
     projected: Tensor,
     real: Tensor,
@@ -1486,8 +1710,11 @@ def _packed_spatial_backward(
         vec = _reader_vector_width(projected, real, grad, strict=strict_complex)
         mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
         plan = _rank_four_plan(projected, real, grad, strict=strict_complex)
+        weight_candidate = _wave24b_weight(projected, real, grad, vec, sms)
         if vec > 1:
-            geometry = _VEC2_WEIGHT_GEOMETRY if vec == 2 else _VEC4_WEIGHT_GEOMETRY
+            geometry = weight_candidate[0] if weight_candidate else (
+                _VEC2_WEIGHT_GEOMETRY if vec == 2 else _VEC4_WEIGHT_GEOMETRY
+            )
             tile, weight_rows, weight_warps = geometry
             rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
             rows = _ceildiv(height, weight_rows)
@@ -1531,7 +1758,7 @@ def _packed_spatial_backward(
         reduce_columns = _WARP_SIZE if parallel_reduce else _DEFAULT_THREADS
         reduce_op = "dweight_reduce_parallel" if parallel_reduce else "dweight_reduce"
         with torch.cuda.device(projected.device):
-            module = _reader_module_for(
+            module = weight_candidate[1] if weight_candidate else _reader_module_for(
                 projected, real, grad, strict=strict_complex, rank_four_plan=plan,
                 weight_vec=vec, spatial_vec=vec,
             )
@@ -1545,10 +1772,20 @@ def _packed_spatial_backward(
                 module, reduce_op, (_ceildiv(weight_grad.numel(), reduce_columns), 1, 1),
                 (partial, weight_grad), (modes, rank, workers), stream=stream,
             )
-            spatial_rows, warps = _reader_spatial_geometry(
-                projected, rank, kernel, strict=strict_complex, plan=plan, vec=vec,
+            candidate = _wave24b_spatial(
+                projected, real, grad, "dinput", strict=strict_complex, plan=plan,
             )
-            grid = _reader_spatial_grid(batch, height, width, modes, spatial_rows, warps, vec)
+            columns = None
+            if candidate:
+                (vec, columns, spatial_rows, warps), module = candidate
+                stream = _reader_stream(module, projected.device)
+            else:
+                spatial_rows, warps = _reader_spatial_geometry(
+                    projected, rank, kernel, strict=strict_complex, plan=plan, vec=vec,
+                )
+            grid = _reader_spatial_grid(
+                batch, height, width, modes, spatial_rows, warps, vec, columns,
+            )
             _launch_reader_cuda(
                 module, "dinput", grid, (grad, real, imag, grad_projected),
                 (height, width, modes, rank), stream=stream, threads=warps * _WARP_SIZE,
