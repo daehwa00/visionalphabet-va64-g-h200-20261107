@@ -63,7 +63,32 @@ class CifarConvStem(nn.Module):
         )
 
     def forward(self, inputs: Tensor) -> Tensor:
+        if inputs.is_cuda and os.environ.get("LNET_DIRECT_CONV_STEM") == "on":
+            hidden = self._try_fused_conv_stem(inputs)
+            if hidden is not None:
+                return hidden.permute(0, 2, 3, 1)
         return self.layers(inputs).permute(0, 2, 3, 1)
+
+    def _try_fused_conv_stem(self, inputs: Tensor) -> Tensor | None:
+        first = self.layers[0]
+        if not (
+            type(first) is nn.Conv2d
+            and first.kernel_size == (3, 3)
+            and first.stride == (2, 2)
+            and first.padding == (1, 1)
+            and first.dilation == (1, 1)
+            and first.groups == 1
+            and first.padding_mode == "zeros"
+        ):
+            return None
+        from .fused_conv_stem_ops import try_direct_conv3x3s2  # noqa: PLC0415
+
+        hidden = try_direct_conv3x3s2(inputs, first.weight, first.bias)
+        if hidden is None:
+            return None
+        for layer in list(self.layers)[1:]:
+            hidden = layer(hidden)
+        return hidden
 
 
 def _fused_stem_enabled(inputs: Tensor) -> bool:
