@@ -20,19 +20,18 @@ from lnet.cuda_nvrtc import _check_nvrtc, _CudaModule, _include_dirs, _nvrtc
 
 SHAPE = tuple[int, int, int, int, int]
 DTYPE = torch.bfloat16
-TYPES = ("__nv_bfloat16",) * 3
 DIV = reader._ceildiv
 OPS = ("forward", "dinput", "dweight", "dweight_reduce")
 
 
-def compile_probe(shape: SHAPE, tiles: set[str]) -> _CudaModule:
+def compile_probe(shape: SHAPE, tiles: set[str], *, streaming: str = "") -> _CudaModule:
     nvrtc = _nvrtc()
     program = ct.c_void_p()
     _check_nvrtc(
         nvrtc,
         nvrtc.nvrtcCreateProgram(
             ct.byref(program),
-            generate(shape, tiles).encode(),
+            generate(shape, tiles, streaming=streaming).encode(),
             b"wave14b_reader.cu",
             0,
             None,
@@ -274,7 +273,7 @@ def all_calls(
     outputs: tuple[Tensor, Tensor, Tensor],
     names: set[str],
 ) -> dict[str, dict[str, Launch]]:
-    b, h, w, m, rank = inputs.shape
+    rank = inputs.shape[-1]
     module, gs, gw = baseline(inputs)
     spatial = {
         op: {"wave13": spatial_call(inputs, output, op, module, geometry=gs)}
@@ -305,18 +304,8 @@ def all_calls(
                     candidates[op][t.name] = spatial_call(inputs, out, op, tiled, tile=t)
     for name, (tile, rows, warps, vec, waves) in WEIGHT_STREAM.items():
         if name in names:
-            streaming = reader._reader_cuda_module(
-                torch.cuda.current_device(),
-                (b, h, w, m),
-                reader._reader_columns(w),
-                rank,
-                3,
-                TYPES,
-                strict=False,
-                spatial_geometry=gs,
-                weight_geometry=(tile, rows, warps),
-                weight_vec=vec,
-            )
+            streaming = compile_probe(inputs.shape, set(), streaming=name)
+            streaming.load_function("reader_dweight", 0)
             p, q = weight_calls(
                 inputs, outputs[-1], streaming, module, geometry=(tile, rows, warps, vec, waves)
             )

@@ -34,8 +34,10 @@ if ! "$py" -c 'import timm' 2>/dev/null; then
 fi
 
 names=ring4x7,ring4x14,ring8x14,smem8x14_scalar,smem8x14_pair,smem8x16_pair
-names+=,smem8x28_pair,smem8x14_ldg128,weight8x14_pair,weight8x14_reuse,weight8x28_reuse
+names+=,smem8x28_pair,smem8x14_ldg128,smem8x14_block_pair,smem8x14_block_scalar
+names+=,smem8x28_block_pair,weight8x14_pair,weight8x14_reuse,weight8x28_reuse
 names+=,weight8x28_pair,weight_t1r8_vec2,weight_t1r14_vec2,weight_t2r8_scalar
+names+=,weight_t1r2_packed,weight_t1r4_packed
 "$py" "$src/probe.py" --batch 1024 --samples 7 --reference --names "$names" \
     --out "$root/isolated.json" 2>&1 | tee "$root/isolated.log"
 "$py" "$src/full.py" select --policy "$root/isolated.json" --out "$root/policy.json"

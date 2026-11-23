@@ -10,7 +10,7 @@ from collections import Counter
 from functools import cache
 from pathlib import Path
 
-from probe import DIV, DTYPE, TYPES, Launch, compile_probe, write_json
+from probe import DIV, DTYPE, Launch, compile_probe, write_json
 from sourcegen import RING, SPATIAL, WEIGHT, WEIGHT_STREAM
 
 from h200.liverms_v2_opt import bench_h200 as bench
@@ -52,20 +52,10 @@ def select_policy(path: Path) -> dict:
 
 @cache
 def prepare(shape: tuple[int, int, int, int, int], op: str, name: str) -> tuple:
-    b, h, w, m, rank = shape
+    rank = shape[-1]
     if name in WEIGHT_STREAM:
-        ranks, rows, warps, vec, _ = WEIGHT_STREAM[name]
-        module = reader._reader_cuda_module(
-            0,
-            (b, h, w, m),
-            reader._reader_columns(w),
-            rank,
-            3,
-            TYPES,
-            strict=False,
-            weight_geometry=(ranks, rows, warps),
-            weight_vec=vec,
-        )
+        module = compile_probe(shape, set(), streaming=name)
+        module.load_function("reader_dweight", 0)
         return module, "reader_dweight", 0
     tile = TILES[name]
     module = compile_probe(shape, {name})

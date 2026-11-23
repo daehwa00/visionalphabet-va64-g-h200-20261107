@@ -38,7 +38,64 @@ __device__ __forceinline__ void store_bf16(__nv_bfloat16* dst, ModeValues<Vec> v
     else *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v.value[0], v.value[1]);
 }
 
-template <bool Backward, int Rows, int Columns, int Vec, bool Async, int YBlock>
+// A rank-local patch feeds four output pixels. Keep the FMA order within each
+// pixel while reusing both the input patch and the filter taps across pixels.
+template <int Rows, int Columns, int Vec>
+__device__ __forceinline__ void blocked_forward(
+    const __nv_bfloat16* tile, float (*filters)[Rank][9][32], __nv_bfloat16* output,
+    long long base, int y0, int x0, int h, int w, int modes, int mode, int local_mode
+) {
+    constexpr int Modes = 32, Lanes = Modes / Vec, ColBlocks = Columns / 2;
+    constexpr int Pitch = (Columns + 2) * Rank * Modes;
+    using V = ModeValues<Vec>;
+    for (int index = threadIdx.x / Lanes; index < Rows / 2 * ColBlocks;
+         index += blockDim.x / Lanes) {
+        int y = index / ColBlocks * 2, x = index % ColBlocks * 2;
+        if (y0 + y >= h || x0 + x >= w) continue;
+        V a[2][2]{}, b[2][2]{};
+        #pragma unroll
+        for (int r = 0; r < Rank; ++r) {
+            const auto* p = tile + y * Pitch + (x * Rank + r) * Modes + local_mode;
+            V patch[4][4];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    patch[j][i] = mode_load<Vec>(p + j * Pitch + i * Rank * Modes);
+            #pragma unroll
+            for (int ky = 0; ky < 3; ++ky)
+                #pragma unroll
+                for (int kx = 0; kx < 3; ++kx) {
+                    V f, g;
+                    const int tap = ky * 3 + kx;
+                    #pragma unroll
+                    for (int v = 0; v < Vec; ++v) {
+                        f.value[v] = filters[0][r][tap][local_mode + v];
+                        g.value[v] = filters[1][r][tap][local_mode + v];
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < 2; ++j)
+                        #pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            a[j][i] = fmaf(patch[j + ky][i + kx], f, a[j][i]);
+                            b[j][i] = fmaf(patch[j + ky][i + kx], g, b[j][i]);
+                        }
+                }
+        }
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                if (y0 + y + j >= h || x0 + x + i >= w) continue;
+                const long long pixel = base + (y0 + y + j) * w + x0 + x + i;
+                auto* out = output + pixel * 2 * modes + mode;
+                store_bf16<Vec>(out, a[j][i]);
+                store_bf16<Vec>(out + modes, b[j][i]);
+            }
+    }
+}
+
+template <bool Backward, int Rows, int Columns, int Vec, bool Async, int YBlock, bool Blocked>
 __device__ __forceinline__ void tiled_spatial(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ real, const __nv_bfloat16* __restrict__ imag,
@@ -70,6 +127,11 @@ __device__ __forceinline__ void tiled_spatial(
     finish_stage<Async>();
     const int mode = mode0 + local_mode;
     if (mode >= modes) return;
+    if constexpr (!Backward && Blocked) {
+        blocked_forward<Rows, Columns, Vec>(
+            tile, filters, output, base, y0, x0, h, w, modes, mode, local_mode);
+        return;
+    }
     const int row_stride = blockDim.x / Lanes * YBlock;
     for (int row = threadIdx.x / Lanes * YBlock; row < Rows && y0 + row < h;
          row += row_stride) {

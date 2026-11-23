@@ -29,6 +29,7 @@ class Tile:
     async_copy: bool = True
     row_block: int = 1
     reuse: bool = False
+    blocked: bool = False
 
     def spatial_smem(self, rank: int, *, backward: bool) -> int:
         return (self.rows + 2) * (self.columns + 2) * (
@@ -56,6 +57,9 @@ SPATIAL = (
     Tile("smem8x16_pair", 8, 16, 4, 2),
     Tile("smem8x28_pair", 8, 28, 4, 2),
     Tile("smem4x28_pair", 4, 28, 4, 2),
+    Tile("smem8x14_block_pair", 8, 14, 4, 2, blocked=True),
+    Tile("smem8x14_block_scalar", 8, 14, 4, row_block=2, blocked=True),
+    Tile("smem8x28_block_pair", 8, 28, 4, 2, blocked=True),
 )
 WEIGHT = (
     Tile("weight8x14_pair", 8, 14, 4, 2),
@@ -71,6 +75,10 @@ WEIGHT_STREAM = {
     "weight_t1r4_vec2": (1, 4, 4, 2, 10),
     "weight_t1r8_vec2": (1, 8, 4, 2, 10),
     "weight_t1r14_vec2": (1, 14, 4, 2, 10),
+    "weight_t1r2_packed": (1, 2, 4, 2, 10),
+    "weight_t1r4_packed": (1, 4, 4, 2, 10),
+    "weight_t1r8_packed": (1, 8, 4, 2, 10),
+    "weight_t1r14_packed": (1, 14, 4, 2, 10),
     "weight_t2r8_scalar": (2, 8, 4, 1, 10),
     "weight_t2r14_scalar": (2, 14, 4, 1, 10),
 }
@@ -87,7 +95,13 @@ def baseline_sources() -> tuple[str, str]:
     return values["_READER_CUDA_TYPES"], values["_READER_CUDA"]
 
 
-def generate(shape: tuple[int, ...], names: set[str], *, native: bool = False) -> str:
+def generate(
+    shape: tuple[int, ...],
+    names: set[str],
+    *,
+    native: bool = False,
+    streaming: str = "",
+) -> str:
     batch, height, width, modes, rank = shape
     # Leave edge width/height static even when there is a partially populated mode warp.
     macros = {
@@ -113,8 +127,26 @@ def generate(shape: tuple[int, ...], names: set[str], *, native: bool = False) -
         "GRAD": "__nv_bfloat16",
     }
     definitions, baseline = baseline_sources()
-    if not native:
+    if streaming:
+        tile, rows, warps, vec, _ = WEIGHT_STREAM[streaming]
+        macros.update(WEIGHT_TILE=tile, WEIGHT_ROWS=rows, WEIGHT_WARPS=warps, WEIGHT_VEC=vec)
+    if streaming.endswith("_packed"):
+        baseline = packed_window(baseline)
+    if not native or streaming:
         baseline = baseline[: baseline.index('extern "C" __global__ void reader_forward(')]
+    wrappers = []
+    if streaming:
+        wrappers.append("""
+extern "C" __global__ void reader_dweight(
+    const Input* p, const Grad* g, float* dw, int h, int w, int m, int b, int rank
+) { real_weight_gradient_3x3<Input, Grad, Rank>(p, g, dw, h, w, m, b); }
+""")
+    header = "".join(f"#define READER_{key} {value}\n" for key, value in macros.items())
+    src = "\n".join((HERE / name).read_text(encoding="utf-8") for name in ("ring.cuh", "tiled.cuh"))
+    return header + definitions + baseline + src + "".join(wrappers) + tile_wrappers(names)
+
+
+def tile_wrappers(names: set[str]) -> str:
     wrappers = []
     for tile in (*RING, *SPATIAL):
         if tile.name not in names:
@@ -126,7 +158,7 @@ def generate(shape: tuple[int, ...], names: set[str], *, native: bool = False) -
                 async_copy = str(tile.async_copy).lower()
                 launch = (
                     f"tiled_spatial<{backward},{tile.rows},{tile.columns},"
-                    f"{tile.vec},{async_copy},{tile.row_block}>"
+                    f"{tile.vec},{async_copy},{tile.row_block},{str(tile.blocked).lower()}>"
                 )
             wrappers.append(f"""
 extern "C" __global__ void reader_{tile.name}_{suffix}(
@@ -146,6 +178,43 @@ extern "C" __global__ void reader_{tile.name}_dweight(
     const Input* p, const Grad* g, float* dw, int h, int w, int m, int b, int rank
 ) {{ tiled_dweight<{template}>(p, g, dw, h, w, m, b); }}
 """)
-    header = "".join(f"#define READER_{key} {value}\n" for key, value in macros.items())
-    src = "\n".join((HERE / name).read_text(encoding="utf-8") for name in ("ring.cuh", "tiled.cuh"))
-    return header + definitions + baseline + src + "".join(wrappers)
+    return "".join(wrappers)
+
+
+def packed_window(source: str) -> str:
+    # Keep both BF16 values in one register during window rotation.
+    specialization = "template <class T> struct WeightWindow<1, T> { using Type = T; };"
+    load = "else return mode_load<N, T, ReadOnly>(ptr);"
+    convert = (
+        "template <int N>\n__device__ __forceinline__ ModeValues<N> window_values(ModeValues<N>"
+    )
+    for marker in (specialization, load, convert):
+        if source.count(marker) != 1:
+            msg = f"Wave 13B weight-window source changed near {marker!r}"
+            raise ValueError(msg)
+    return (
+        source.replace(
+            specialization,
+            specialization + "\ntemplate <class T> struct WeightWindow<2, T> "
+            "{ using Type = __nv_bfloat162; };",
+        )
+        .replace(
+            load,
+            """else {
+        const auto* pair = reinterpret_cast<const __nv_bfloat162*>(ptr);
+        return ReadOnly ? __ldg(pair) : *pair;
+    }""",
+        )
+        .replace(
+            convert,
+            """__device__ __forceinline__ ModeValues<2> window_values(
+    __nv_bfloat162 value
+) {
+    const float2 pair = __bfloat1622float2(value);
+    return {{pair.x, pair.y}};
+}
+
+"""
+            + convert,
+        )
+    )

@@ -16,11 +16,7 @@ from sourcegen import RING, SHAPES, SPATIAL, WEIGHT, WEIGHT_STREAM, generate
 def run(out: Path, arch: str, names: set[str]) -> None:
     out.mkdir(parents=True, exist_ok=True)
     variants = {"tiled": generate(SHAPES[0], names, native=True)}
-    for name, (tile, rows, warps, vec, _) in WEIGHT_STREAM.items():
-        source = generate(SHAPES[0], set(), native=True)
-        for macro, value in (("TILE", tile), ("ROWS", rows), ("WARPS", warps), ("VEC", vec)):
-            source = re.sub(rf"(#define READER_WEIGHT_{macro} )\d+", rf"\g<1>{value}", source)
-        variants[name] = source
+    variants.update((name, generate(SHAPES[0], set(), streaming=name)) for name in WEIGHT_STREAM)
     for name, source in variants.items():
         cu = out / f"{name}.cu"
         ptx, cubin = cu.with_suffix(".ptx"), cu.with_suffix(".cubin")
