@@ -191,6 +191,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: C901, PLR0915
     }
     del gradients
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    if args.coordinates:
+        coordinates = {
+            name: parameter.detach().cpu()
+            for name, parameter in model.named_parameters()
+            if name.endswith("analysis.parametrizations.weight.original")
+        }
+        torch.save(coordinates, args.coordinates)
     if args.trace:
         mark_step()
         with torch.profiler.profile(
@@ -217,6 +224,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--trace", type=Path)
+    parser.add_argument("--coordinates", type=Path)
     parser.add_argument(
         "--exp-fp32",
         action="store_true",

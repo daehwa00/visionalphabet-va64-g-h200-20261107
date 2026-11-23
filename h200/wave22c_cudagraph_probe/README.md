@@ -48,3 +48,9 @@ autocast while preserving it for the surrounding projection and model.
 Use `gates.py --gate dynamo --output results/dynamo.json` for the existing
 six-configuration Dynamo audit. For folding, use `gates.py --gate fold
 --variant VARIANT --output results/fold.json` for each of the three models.
+
+To inspect the nonzero skew reached by native training, add
+`--coordinates results/p1-coordinates.pt` to the native step invocation,
+then pass the same argument to the matrix probe. The file contains only
+the learned analysis coordinates and the matrix probe applies them to
+the seeded P1/NR4 builder.

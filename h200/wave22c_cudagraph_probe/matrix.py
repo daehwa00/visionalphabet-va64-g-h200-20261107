@@ -85,12 +85,16 @@ def benchmark(fn: Callable, matrix: torch.Tensor, probe: torch.Tensor, count: in
     }
 
 
-def check_models(device: str) -> tuple[dict, dict]:
+def check_models(device: str, coordinates: dict) -> tuple[dict, dict]:
     info = {}
     matrices = {}
     for variant in VARIANTS:
         torch.manual_seed(501)
         native = build_variant(variant).to(device)
+        if variant == VARIANTS[0] and coordinates:
+            with torch.no_grad():
+                for name, value in coordinates.items():
+                    native.get_parameter(name).copy_(value)
         candidate = build_variant(variant).to(device)
         candidate.load_state_dict(native.state_dict(), strict=True)
         keys = tuple(native.state_dict())
@@ -138,7 +142,12 @@ def check_models(device: str) -> tuple[dict, dict]:
 
 def run(args: argparse.Namespace) -> dict:
     torch.set_float32_matmul_precision("highest")
-    models, matrices = check_models(args.device)
+    coordinates = (
+        torch.load(args.coordinates, map_location=args.device, weights_only=True)
+        if args.coordinates
+        else {}
+    )
+    models, matrices = check_models(args.device, coordinates)
     torch.manual_seed(501)
     random = torch.randn(64, 64, device=args.device)
     skew = random - random.mT
@@ -184,5 +193,6 @@ if __name__ == "__main__":
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--count", type=int, default=30)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--coordinates", type=Path)
     args = parser.parse_args()
     args.output.write_text(json.dumps(run(args), indent=2), encoding="utf-8")
