@@ -1965,11 +1965,13 @@ def _launch_for_shape(  # noqa: C901, PLR0915
         )
         if single_store and not plan.cache_line:
             scratch += m * (length * 8 - length // (1 + coarse) * 4) * dtype.itemsize
-        if vertical and local_scratch and not plan.cache_line and scratch:
+        if vertical and local_scratch and scratch:
             resident_wave = _ceil(sms * resident, mode_tiles) * plan.warps
-            full_coverage = _ceil(sms, mode_tiles) * plan.warps
-            l2_workers = (_l2_size(device) * 3 // 5 // scratch // plan.warps) * plan.warps
-            workers = min(workers, resident_wave, max(full_coverage, l2_workers))
+            minimum_coverage = min(lines, (_ceil(sms, mode_tiles) - 1) * plan.warps + 1)
+            l2_workers = _l2_size(device) * 3 // 5 // scratch
+            if l2_workers < minimum_coverage:
+                continue
+            workers = min(workers, resident_wave, l2_workers)
         if scratch:
             workers = min(workers, (_MAX_SCRATCH_BYTES + extra_budget) // scratch)
         if not resident or not workers:
@@ -1998,6 +2000,16 @@ def _launch_for_shape(  # noqa: C901, PLR0915
         )
         if best_score is None or score > best_score:
             best_score, best = score, Launch(plan, key, workers, groups if reduce else workers)
+    if best is None and local_scratch:
+        # Large rectangles can outgrow both the per-CTA line and the L2 budget
+        # even at one resident wave. Keep the original traffic path for them.
+        return _launch_for_shape(
+            device, dtype, shape, index_bound, backward=backward, vertical=vertical,
+            coarse=coarse, hidden=hidden, precise=precise, compact=compact,
+            interleaved=interleaved, transposed=transposed, pure_vertical=pure_vertical,
+            state_layout=state_layout, drop_source=drop_source, shared_hidden=shared_hidden,
+            async_source=async_source,
+        )
     return _with_vector_path_weights(device, best, modes=m, hidden=hidden, wave_limit=wave_limit)
 
 
@@ -2416,7 +2428,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         gr = gi = gs = partial = None
     scratch = (
         None if launch.plan.cache_line else
-        states.new_empty((h, launch.workers, m, 8) if single_store
+        states.new_empty((h, launch.workers, m, 8) if launch.key.single_store
                          else (oh, launch.workers, m, 4))
     )
     inputs = (

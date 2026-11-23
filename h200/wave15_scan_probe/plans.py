@@ -55,6 +55,7 @@ def main() -> None:
                 "grid_resident_waves": grids / (sms * resident), "workers": workers,
                 "smem_limit_bytes": smem_limit, "smem_bytes": plan.smem, "l2_bytes": l2_bytes,
                 "scratch_bytes": scratch, "checkpoint_bytes": checkpoint,
+                "contiguous_scratch": key.local_scratch, "single_store": key.single_store,
                 "scratch_l2_fraction": (scratch + checkpoint) / l2_bytes,
             }), flush=True)
 
