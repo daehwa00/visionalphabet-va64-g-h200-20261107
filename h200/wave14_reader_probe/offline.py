@@ -13,10 +13,11 @@ from pathlib import Path
 from sourcegen import RING, SHAPES, SPATIAL, WEIGHT, WEIGHT_STREAM, generate
 
 
-def run(out: Path, arch: str, names: set[str]) -> None:
+def run(out: Path, arch: str, names: set[str], shape_index: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    variants = {"tiled": generate(SHAPES[0], names, native=True)}
-    variants.update((name, generate(SHAPES[0], set(), streaming=name)) for name in WEIGHT_STREAM)
+    shape = SHAPES[shape_index]
+    variants = {"tiled": generate(shape, names, native=True)}
+    variants.update((name, generate(shape, set(), streaming=name)) for name in WEIGHT_STREAM)
     for name, source in variants.items():
         cu = out / f"{name}.cu"
         ptx, cubin = cu.with_suffix(".ptx"), cu.with_suffix(".cubin")
@@ -42,5 +43,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--arch", choices=("86", "89", "90"), required=True)
+    parser.add_argument("--shape-index", type=int, choices=range(len(SHAPES)), default=0)
     args = parser.parse_args()
-    run(args.out, args.arch, {tile.name for tile in (*RING, *SPATIAL, *WEIGHT)})
+    run(args.out, args.arch, {tile.name for tile in (*RING, *SPATIAL, *WEIGHT)}, args.shape_index)
