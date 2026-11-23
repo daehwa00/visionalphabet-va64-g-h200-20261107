@@ -5,7 +5,6 @@ import gc
 import json
 import os
 import runpy
-import statistics
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,45 +22,9 @@ ARMS = {
     "compute": ("fast", "weights"),
     "cached": ("vector-line-source", "full-shared"),
     "line": ("line", "line"),
+    "traffic": ("traffic", "baseline"),
+    "packed": ("fast-packed", "baseline"),
 }
-
-
-def graph_measure(
-    step: Callable, batch: int, *, warmup: int, count: int,
-) -> tuple[dict, list]:
-    for _ in range(warmup):
-        step()
-    torch.cuda.synchronize()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        step()
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    torch.cuda.reset_peak_memory_stats()
-    with torch.cuda.graph(graph, stream=stream):
-        output = step()
-    graph.replay()
-    torch.cuda.synchronize()
-    measurements, outputs = [], []
-    for _ in range(count):
-        start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        start.record()
-        for _ in range(4):
-            graph.replay()
-        stop.record()
-        stop.synchronize()
-        measurements.append(start.elapsed_time(stop) / 4)
-        outputs.append(output.clone())
-    p25, median, p75 = statistics.quantiles(measurements, n=4, method="inclusive")
-    return {
-        "median_ms": median, "min_ms": min(measurements), "max_ms": max(measurements),
-        "p25_ms": p25, "p75_ms": p75, "images_per_second": batch * 1000 / median,
-        "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
-        "peak_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
-        "samples_ms": measurements,
-    }, outputs
 
 
 def annotate_payload(profile: dict, batch: int) -> None:
@@ -70,10 +33,10 @@ def annotate_payload(profile: dict, batch: int) -> None:
         if not row["vertical"]:
             continue
         b, h, w, m = batch, row["height"], row["width"], row["modes"]
-        states = 4 * b * h * w * m * 2
         ratio = 1 + row["coarse"]
+        states = 4 * b * h * w * m * 2 // ratio
         outputs = 2 * b * (h // ratio) * (w // ratio) * m * 2
-        minimum = states + outputs + (states // ratio if row["backward"] else 0)
+        minimum = states + outputs + (states if row["backward"] else 0)
         row["payload_bytes"] = minimum
         row["effective_GBps"] = minimum / (row["mean_event_ms"] * 1e6)
 
@@ -115,14 +78,13 @@ def run(
     return checked(result, command)
 
 
-def main() -> None:  # noqa: C901
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--batch", type=int, nargs="+", default=(128, 256, 512, 1024))
     parser.add_argument("--arm", choices=ARMS, nargs="+", default=("baseline", "compute", "cached"))
     parser.add_argument("--forward")
     parser.add_argument("--backward")
-    parser.add_argument("--graph", action="store_true")
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--train-only", action="store_true")
     args = parser.parse_args()
@@ -131,20 +93,6 @@ def main() -> None:  # noqa: C901
     if args.forward and args.backward:
         arms["selected"] = (args.forward, args.backward)
     bench = runpy.run_path(SUITE)["main"]
-    if args.graph:
-        import va_model_builder as builder  # noqa: PLC0415
-
-        build_optimizer = builder.build_optimizer
-
-        def capture_optimizer(*args: object, **kwargs: object) -> torch.optim.Optimizer:
-            optimizer = build_optimizer(*args, **kwargs)
-            for group in optimizer.param_groups:
-                group["capturable"] = True
-            return optimizer
-
-        builder.build_optimizer = capture_optimizer
-        bench.__globals__["measure"] = graph_measure
-
     args.out.mkdir(exist_ok=True, parents=True)
     probe = bench.__globals__["probe"](SimpleNamespace())
     (args.out / "probe.json").write_text(json.dumps(probe, indent=2) + "\n")

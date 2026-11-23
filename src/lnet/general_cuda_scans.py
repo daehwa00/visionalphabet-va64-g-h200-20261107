@@ -128,6 +128,7 @@ class Kernel:
     shared_hidden: int = 0
     prefetch_rows: bool = False
     cache_positive: bool = False
+    async_source: bool = False
 
 
 class Launch(NamedTuple):
@@ -493,6 +494,46 @@ struct Column {
     __device__ I cell(int y) const { return output + I(y) * OW * M; }
 };
 
+// Each half warp copies four planes of one row in 16-byte segments.
+template<int THREADS, class T, class I>
+__device__ void stage_column_source(Column<T, I> c, Quad<T>* cache, int lane) {
+    static_assert(sizeof(T) == 2);
+    constexpr int lanes_per_row = 16, modes_per_copy = 8, rows_per_group = 16;
+    const int plane = (lane % lanes_per_row) / 4;
+    const int mode = (lane % 4) * modes_per_copy;
+    const I column = (plane < 2 ? c.offset_a : c.offset_b) - lane + mode;
+    const T* source = c.states + plane * c.source_plane + column;
+    T* destination = reinterpret_cast<T*>(cache) + (threadIdx.x - lane) + mode;
+    __syncwarp();
+    for (int base = 0; base < c.H; base += rows_per_group) {
+        #pragma unroll
+        for (int offset = 0; offset < rows_per_group; offset += 2) {
+            const int y = base + offset + lane / lanes_per_row;
+            if (y < c.H) {
+                const auto dst = static_cast<unsigned>(
+                    __cvta_generic_to_shared(destination + (4 * I(y) + plane) * THREADS));
+                const auto src = source + I(y) * c.W * c.M;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                             :: "r"(dst), "l"(src) : "memory");
+            }
+        }
+        asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+    }
+    __syncwarp();
+}
+
+template<bool PLANAR, int THREADS, class T, class I>
+__device__ __forceinline__ float4 cached_column_source(const Quad<T>* cache, I row) {
+    if constexpr (PLANAR) {
+        const auto* planes = reinterpret_cast<const T*>(cache - threadIdx.x)
+            + threadIdx.x + 4 * row * THREADS;
+        return make_float4(read(planes[0]), read(planes[THREADS]),
+                           read(planes[2 * THREADS]), read(planes[3 * THREADS]));
+    } else {
+        return cache[row * THREADS].unpack();
+    }
+}
+
 template<class T>
 __device__ Quad<T> normalize_packed(float4 v, float2 gain) {
     const auto stored = Quad<T>::pack(v).unpack();
@@ -616,17 +657,6 @@ __device__ __forceinline__ void clear_unused_columns(Column<T, I> c, int y, T* g
     }
 }
 
-template<bool REVERSE, bool COMPACT, class T, class I>
-__device__ __forceinline__ void column_adjoint(
-    Column<T, I> c, int y, float4 prev, float4 source, float4 inject,
-    Complex a, Complex g, Complex& adj_a, Complex& adj_b, Complex& da, Complex& dg,
-    T* gs
-) {
-    const auto ds = column_adjoint_step<REVERSE>(
-        prev, source, inject, a, g, adj_a, adj_b, da, dg);
-    write_column_gradient<REVERSE, COMPACT, REVERSE>(c, y, ds, gs);
-}
-
 struct ProjectWeights {
     static constexpr bool vector_weights = true;
     const float* __restrict__ cache;
@@ -667,7 +697,7 @@ __device__ void load_project_weights(
 
 template<class T, class I, bool COARSE, int CHUNK, int THREADS, int HIDDEN,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE,
-         bool PURE, int SHARED_HIDDEN, bool CACHE_POSITIVE, class Weights>
+         bool PURE, int SHARED_HIDDEN, bool CACHE_POSITIVE, bool ASYNC_SOURCE, class Weights>
 __device__ __forceinline__ void column_backward(
     Column<T, I> c, Complex a, Complex g,
     Weights path,
@@ -687,7 +717,9 @@ __device__ __forceinline__ void column_backward(
         const bool last = full || block == chunks - 1;
         for (int j = 0; j < length; ++j) {
             float4 source;
-            if constexpr (CACHE_SOURCE) {
+            if constexpr (ASYNC_SOURCE) {
+                source = cached_column_source<true, THREADS>(seg_src, y0 + j);
+            } else if constexpr (CACHE_SOURCE) {
                 const auto packed = c.packed_source(y0 + j);
                 seg_src[(y0 + j) * THREADS] = packed;
                 source = packed.unpack();
@@ -716,7 +748,8 @@ __device__ __forceinline__ void column_backward(
             pos = before;
             for (int j = 0; j < length; ++j) {
                 const auto source = CACHE_SOURCE
-                    ? source_cache[j * THREADS].unpack() : c.source(y0 + j);
+                    ? cached_column_source<ASYNC_SOURCE, THREADS>(source_cache, j)
+                    : c.source(y0 + j);
                 pos = advance(pos, source, a, g);
                 seg[j * THREADS] = pos;
                 if constexpr (COARSE && !CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(source);
@@ -726,13 +759,13 @@ __device__ __forceinline__ void column_backward(
         for (int j = length - 1; j >= 0; j -= COARSE ? 2 : 1) {
             const int y = y0 + j;
             const auto s = (COARSE || CACHE_SOURCE)
-                ? source_cache[j * THREADS].unpack() : c.source(y);
+                ? cached_column_source<ASYNC_SOURCE, THREADS>(source_cache, j) : c.source(y);
             const auto next = neg;
             neg = advance(neg, s, ar, gg);
             auto se = s;
             const auto next_even = neg;
             if constexpr (COARSE) {
-                se = source_cache[(j - 1) * THREADS].unpack();
+                se = cached_column_source<ASYNC_SOURCE, THREADS>(source_cache, j - 1);
                 neg = advance(neg, se, ar, gg);
             }
             const int yo = COARSE ? y / 2 : y;
@@ -780,7 +813,8 @@ __device__ __forceinline__ void column_backward(
             // Store the previous negative state for each adjoint update.
             for (int j = length - 1; j >= 0; --j) {
                 const auto s = CACHE_SOURCE
-                    ? source_cache[j * THREADS].unpack() : c.source(y0 + j);
+                    ? cached_column_source<ASYNC_SOURCE, THREADS>(source_cache, j)
+                    : c.source(y0 + j);
                 seg[j * THREADS] = neg;
                 if constexpr (!CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(s);
                 neg = advance(neg, s, ar, gg);
@@ -791,7 +825,8 @@ __device__ __forceinline__ void column_backward(
             const auto in = !COARSE || !(y & 1)
                 ? g2[I(COARSE ? y / 2 : y) * g2_stride].unpack() : float4{};
             const auto ds = column_adjoint_step<true>(
-                seg[j * THREADS], source_cache[j * THREADS].unpack(), in, ar, gg,
+                seg[j * THREADS], cached_column_source<ASYNC_SOURCE, THREADS>(source_cache, j),
+                in, ar, gg,
                 adj_a, adj_b, da, dg);
             if constexpr (CACHE_POSITIVE)
                 write_column_gradient<true, COMPACT>(c, y, ds, gs, positive_ds[I(y) * THREADS]);
@@ -850,7 +885,8 @@ __device__ __forceinline__ void write_vscan_partial(
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS, int SHARED_HIDDEN, bool PREFETCH_ROWS, bool CACHE_POSITIVE>
+         bool VECTOR_WEIGHTS, int SHARED_HIDDEN, bool PREFETCH_ROWS, bool CACHE_POSITIVE,
+         bool ASYNC_SOURCE>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -949,12 +985,13 @@ __device__ __forceinline__ void vertical(
                            vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps};
             auto* buf = CACHE_LINE ? line_buf + threadIdx.x : scratch + I(worker) * M + m;
             const I stride = CACHE_LINE ? threads : I(workers) * M;
+            if constexpr (ASYNC_SOURCE) stage_column_source<threads>(c, seg_src, lane);
             if constexpr (BACKWARD) {
                 auto* boundaries = GLOBAL_CKPT
                     ? global_checkpoints + I(worker) * M + m : ckpt + threadIdx.x;
                 column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
                                 REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE,
-                                SHARED_HIDDEN, CACHE_POSITIVE>(
+                                SHARED_HIDDEN, CACHE_POSITIVE, ASYNC_SOURCE>(
                     c, a, g, path, gr, gi, gs, acc, acc_stride, shared_dwi,
                     seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
                     GLOBAL_CKPT ? I(workers) * M : threads, buf, stride,
@@ -964,37 +1001,53 @@ __device__ __forceinline__ void vertical(
             } else {
                 float4 state{};
                 auto* source_cache = seg_src + threadIdx.x;
-                auto read_source = [&](int y) -> float4 {
-                    if constexpr (CACHE_SOURCE) {
-                        const auto source = c.packed_source(y);
-                        source_cache[I(y) * threads] = source;
-                        return source.unpack();
-                    } else {
-                        return c.source(y);
+                if constexpr (!CACHE_SOURCE && !PREFETCH_ROWS) {
+                    for (int y = 0; y < H; ++y) {
+                        state = advance(state, c.source(y), a, g);
+                        if (!COARSE || (y & 1)) {
+                            buf[I(COARSE ? y / 2 : y) * stride] =
+                                normalize_packed<T>(state, c.gain(y, false));
+                        }
                     }
-                };
-                auto positive = [&](int y, float4 source) {
-                    state = advance(state, source, a, g);
-                    if (!COARSE || (y & 1)) {
-                        buf[I(COARSE ? y / 2 : y) * stride] =
-                            normalize_packed<T>(state, c.gain(y, false));
+                } else {
+                    auto read_source = [&](int y) -> float4 {
+                        if constexpr (ASYNC_SOURCE) {
+                            return cached_column_source<true, threads>(source_cache, y);
+                        } else if constexpr (CACHE_SOURCE) {
+                            const auto source = c.packed_source(y);
+                            source_cache[I(y) * threads] = source;
+                            return source.unpack();
+                        } else {
+                            return c.source(y);
+                        }
+                    };
+                    auto positive = [&](int y, float4 source) {
+                        state = advance(state, source, a, g);
+                        if (!COARSE || (y & 1)) {
+                            buf[I(COARSE ? y / 2 : y) * stride] =
+                                normalize_packed<T>(state, c.gain(y, false));
+                        }
+                    };
+                    int y = 0;
+                    if constexpr (PREFETCH_ROWS) {
+                        for (; y + 1 < H; y += 2) {
+                            const auto first = read_source(y);
+                            const auto second = read_source(y + 1);
+                            positive(y, first);
+                            positive(y + 1, second);
+                        }
                     }
-                };
-                int y = 0;
-                if constexpr (PREFETCH_ROWS) {
-                    for (; y + 1 < H; y += 2) {
-                        const auto first = read_source(y);
-                        const auto second = read_source(y + 1);
-                        positive(y, first);
-                        positive(y + 1, second);
-                    }
+                    for (; y < H; ++y) positive(y, read_source(y));
                 }
-                for (; y < H; ++y) positive(y, read_source(y));
                 state = {};
                 for (int y = H - 1; y >= 0; --y) {
-                    const auto source = CACHE_SOURCE
-                        ? source_cache[I(y) * threads].unpack() : c.source(y);
-                    state = advance(state, source, a.conj(), g.conj());
+                    if constexpr (CACHE_SOURCE) {
+                        const auto source = cached_column_source<ASYNC_SOURCE, threads>(
+                            source_cache, y);
+                        state = advance(state, source, a.conj(), g.conj());
+                    } else {
+                        state = advance(state, c.source(y), a.conj(), g.conj());
+                    }
                     if (COARSE && (y & 1)) continue;
                     const int yo = COARSE ? y / 2 : y;
                     const I cell = c.cell(yo);
@@ -1271,7 +1324,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
             f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
             f"{key.shared_hidden}, {str(key.prefetch_rows).lower()}, "
-            f"{str(key.cache_positive).lower()}"
+            f"{str(key.cache_positive).lower()}, {str(key.async_source).lower()}"
         )
         wrapper = f"""
 {bounds}(

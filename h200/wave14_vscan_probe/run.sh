@@ -52,7 +52,17 @@ baseline_dir=$RUN_ROOT/wave13
 mkdir -p "$baseline_dir"
 git archive "$baseline" src scripts | tar -x -C "$baseline_dir"
 base_path="$baseline_dir/src:$baseline_dir/scripts"
-"$run_python" "$suite/bench.py" --out "$out/isolated.jsonl" --repeats 5     --forward fast line line-source vector-line vector-line-source prefetch     --backward weights line shared half-dwi chunk14 chunk28 full full-shared cached-ds full-cached-ds     | tee "$out/isolated.log"
+if [[ ${1:-} == --refine ]]; then
+    forward=(fast-packed traffic async async-line)
+    backward=(async-line async-full async-shared shared-packed)
+    arms=(packed traffic)
+else
+    forward=(fast line line-source vector-line vector-line-source prefetch)
+    backward=(weights line shared half-dwi chunk14 chunk28 full full-shared cached-ds full-cached-ds)
+    arms=(compute cached)
+fi
+"$run_python" "$suite/bench.py" --out "$out/isolated.jsonl" --repeats 5 --forward "${forward[@]}" --backward "${backward[@]}" |
+    tee "$out/isolated.log"
 PYTHONPATH="$base_path" "$run_python" "$suite/bench.py" --out "$out/isolated_wave13.jsonl"     --repeats 5 --forward --backward | tee "$out/isolated_wave13.log"
 "$run_python" - "$out" <<'PYTHON'
 import json
@@ -77,4 +87,4 @@ for stem in ("isolated", "isolated_wave13"):
 PYTHON
 
 PYTHONPATH="$base_path" "$run_python" "$suite/model.py" --out "$out" --arm baseline     | tee "$out/model_wave13.log"
-"$run_python" "$suite/model.py" --out "$out" --arm compute cached     | tee "$out/model_wave14.log"
+"$run_python" "$suite/model.py" --out "$out" --arm "${arms[@]}" | tee "$out/model_wave14.log"

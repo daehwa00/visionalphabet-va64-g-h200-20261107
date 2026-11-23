@@ -49,18 +49,18 @@ def compare(outputs: list[torch.Tensor], expected: list[torch.Tensor]) -> list[d
 
 
 def measure(
-    operation: Callable, repeats: int, verify_keys: tuple[str, ...],
+    operation: Callable, repeats: int, verify_keys: tuple[str, ...], *, vertical: bool = True,
 ) -> tuple[dict, list[torch.Tensor]]:
     original = scans._dispatch
     begin, end = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
     plans = []
 
     def track(source: torch.Tensor, launch: scans.Launch, args: tuple) -> None:
-        if launch.key.vertical:
+        if launch.key.vertical == vertical:
             begin.record()
             plans.append(launch)
         original(source, launch, args)
-        if launch.key.vertical:
+        if launch.key.vertical == vertical:
             end.record()
 
     warm = operation()
@@ -71,7 +71,7 @@ def measure(
     with patch.object(scans, "_dispatch", track), torch.cuda.graph(graph):
         outputs = operation()
     if len(plans) != 1:
-        raise RuntimeError(f"Expected one fused vertical dispatch, received {len(plans)}")
+        raise RuntimeError(f"Expected one fused scan dispatch, received {len(plans)}")
     plan, key, workers, partials = plans[0]
     if any(not getattr(key, field) for field in verify_keys):
         return {"status": "infeasible"}, values
@@ -93,7 +93,7 @@ def measure(
         "plan": {**plan._asdict(), "workers": workers, "partials": partials},
         "key": {field: asdict(key).get(field) for field in (
             "vector_weights", "fast_forward", "shared_hidden", "prefetch_rows", "precise",
-            "cache_positive",
+            "cache_positive", "async_source",
         )},
     }, values
 
@@ -120,12 +120,11 @@ def probe(
         return scans.vertical_backward(pole, states, aux, path, *dy, coarse, compact=coarse)
 
     row = {"shape": [b, h, w, m, coarse], "dtype": str(dtype)}
-    states_bytes = states.numel() * states.element_size()
+    states_bytes = states.numel() * states.element_size() // (1 + coarse)
     dy_bytes = sum(t.numel() * t.element_size() for t in dy)
     for direction, operation, options, names, payload in (
         ("forward", forward, FORWARD, args.forward, states_bytes + dy_bytes),
-        ("backward", backward, BACKWARD, args.backward,
-         states_bytes + dy_bytes + states_bytes // (1 + coarse)),
+        ("backward", backward, BACKWARD, args.backward, 2 * states_bytes + dy_bytes),
     ):
         results = {}
         expected = None
@@ -136,6 +135,7 @@ def probe(
             verify = tuple(
                 field for field in (
                     "vector_weights", "cache_line", "cache_source", "cache_positive",
+                    "async_source",
                 )
                 if trial is not None and getattr(trial, field)
             )
@@ -158,7 +158,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--batch-divisor", type=int, default=1)
     parser.add_argument("--case-index", type=int, choices=range(len(CASES)), nargs="+")
-    parser.add_argument("--forward", nargs="*", choices=FORWARD)
+    parser.add_argument("--forward", nargs="*", choices=(*FORWARD, "traffic"))
     parser.add_argument("--backward", nargs="*", choices=BACKWARD)
     parser.add_argument("--warps", type=int, choices=range(1, 5))
     parser.add_argument("--repeats", type=int, default=7)
