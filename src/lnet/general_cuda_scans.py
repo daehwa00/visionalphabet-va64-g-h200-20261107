@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 _WARP_SIZE = 32
 _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
+_STAGED_PATH_ROWS = 5
 _MAX_CACHED_HIDDEN = 16
 _MAX_SAVED_DP_CACHE_CHUNKS = 8
 
@@ -96,6 +97,7 @@ class ScanPlan(NamedTuple):
     shared_acc: bool = False
     full_trajectory: bool = False
     cache_source: bool = False
+    shared_path_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ class Kernel:
     real_transposed: bool = False
     imag_transposed: bool = False
     vector_weights: bool = False
+    shared_path_rows: int = 0
 
 
 class Launch(NamedTuple):
@@ -663,12 +666,12 @@ __device__ void load_project_weights(
 
 template<class T, class I, bool COARSE, int CHUNK, int THREADS, int HIDDEN,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE,
-         bool PURE, class Weights>
+         bool PURE, int SHARED_HIDDEN, class Weights>
 __device__ __forceinline__ void column_backward(
     Column<T, I> c, Complex a, Complex g, Weights path,
     const T* gr, const T* gi, T* gs, float* acc, I acc_stride,
     float4* seg, Quad<T>* seg_src, float4* ckpt, I ckpt_stride, Quad<T>* g2, I g2_stride,
-    int chunks, Complex& da, Complex& dg
+    int chunks, Complex& da, Complex& dg, float* shared_dwi
 ) {
     const auto ar = a.conj(), gg = g.conj();
     // CHUNK == 0 keeps the whole trajectory and needs no boundaries.
@@ -737,12 +740,12 @@ __device__ __forceinline__ void column_backward(
             if constexpr (PURE) {
                 #pragma unroll
                 for (int k = 0; k < 8; ++k) dp[k] = read(gr[I(k) * c.feature_plane + cell]);
-            } else path_mlp<T, I, HIDDEN, false, true>(
+            } else path_mlp<T, I, HIDDEN, false, true, SHARED_HIDDEN>(
                 normalize<T>(seg[j * THREADS], gp), normalize<T>(neg, gn),
                 path, {},
                 make_float2(read(gr[(cell - c.m) * (1 + REAL_INTERLEAVED) + c.m]),
                             read(gi[(cell - c.m) * (1 + IMAG_INTERLEAVED) + c.m])),
-                acc, acc_stride, dp);
+                acc, acc_stride, dp, shared_dwi, THREADS);
             const auto ip = normalize<T>(make_float4(dp[0], dp[4], dp[1], dp[5]), gp);
             g2[I(yo) * g2_stride] =
                 normalize_packed<T>(make_float4(dp[2], dp[6], dp[3], dp[7]), gn);
@@ -795,9 +798,10 @@ __device__ __forceinline__ void column_backward(
 // Tile the CTA reduction so all scan warps can share one small staging buffer.
 constexpr int vscan_reduce_tile = 32;
 
-template<int WARPS, int FIELDS, class I>
+template<int WARPS, int FIELDS, int SHARED_WI, class I>
 __device__ __forceinline__ void write_vscan_partial(
-    float* shared, float* row, const float* gradients, Complex da, Complex dg, int m, int M
+    float* shared, float* row, const float* gradients, Complex da, Complex dg, int m, int M,
+    const float* shared_dwi = nullptr
 ) {
     constexpr int threads = WARPS * 32;
     const float pole[4] = {da.r, da.i, dg.r, dg.i};
@@ -807,13 +811,19 @@ __device__ __forceinline__ void write_vscan_partial(
         #pragma unroll
         for (int j = 0; j < vscan_reduce_tile && begin + j < FIELDS; ++j) {
             const int field = begin + j;
-            shared[j * threads + threadIdx.x] = field < 4 ? pole[field] : gradients[field - 4];
+            if (field < 4) {
+                shared[j * threads + threadIdx.x] = pole[field];
+            } else if (field >= 4 + SHARED_WI) {
+                shared[j * threads + threadIdx.x] = gradients[field - 4 - SHARED_WI];
+            }
         }
         __syncthreads();
         if (threadIdx.x < 32 && m < M) {
             #pragma unroll
             for (int j = 0; j < vscan_reduce_tile && begin + j < FIELDS; ++j) {
-                const float* staged = shared + j * threads + threadIdx.x;
+                const int field = begin + j;
+                const float* staged = field >= 4 && field < 4 + SHARED_WI
+                    ? shared_dwi + (field - 4) * threads : shared + j * threads + threadIdx.x;
                 float sum = staged[0];
                 #pragma unroll
                 for (int k = 1; k < WARPS; ++k) sum += staged[k * 32];
@@ -826,7 +836,7 @@ __device__ __forceinline__ void write_vscan_partial(
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS>
+         bool VECTOR_WEIGHTS, int SHARED_HIDDEN>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -884,7 +894,20 @@ __device__ __forceinline__ void vertical(
         seg_src + (BACKWARD ? I(CACHE_SOURCE ? H : span) * threads : 0));
     auto* line_buf = reinterpret_cast<Quad<T>*>(acc_base + (SHARED_ACC ? fields * threads : 0));
     float* row = partials;
-    float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};
+    constexpr int shared_wi = 8 * SHARED_HIDDEN;
+    static_assert(!shared_wi || (register_acc && SHARED_HIDDEN <= HIDDEN));
+    float local_acc[register_acc ? 11 * HIDDEN + 2 - shared_wi : 1]{};
+    float* shared_dwi = nullptr;
+    if constexpr (shared_wi) {
+        const auto* storage_end = line_buf + (CACHE_LINE ? I(oh) * threads : 0);
+        const I storage_floats = reinterpret_cast<const float*>(storage_end)
+            - reinterpret_cast<float*>(shared);
+        constexpr int reduce_floats = reduce ? vscan_reduce_tile * threads : 0;
+        shared_dwi = reinterpret_cast<float*>(shared) + max(storage_floats, I(reduce_floats))
+            + threadIdx.x;
+        #pragma unroll
+        for (int j = 0; j < shared_wi; ++j) shared_dwi[j * threads] = 0;
+    }
     float* acc = acc_base + threadIdx.x;
     const I acc_stride = register_acc ? 1 : SHARED_ACC ? threads : M;
     if constexpr (BACKWARD) {
@@ -924,10 +947,12 @@ __device__ __forceinline__ void vertical(
                 auto* boundaries = GLOBAL_CKPT
                     ? global_checkpoints + I(worker) * M + m : ckpt + threadIdx.x;
                 column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
-                                REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE>(
+                                REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE,
+                                SHARED_HIDDEN>(
                     c, a, g, path, gr, gi, gs,
                     acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
-                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg);
+                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg,
+                    shared_dwi);
             } else {
                 float4 state{};
                 for (int y = 0; y < H; ++y) {
@@ -965,11 +990,11 @@ __device__ __forceinline__ void vertical(
     }
     if constexpr (BACKWARD) {
         if constexpr (PURE && reduce) {
-            write_vscan_partial<WARPS, 4, I>(
+            write_vscan_partial<WARPS, 4, 0, I>(
                 reinterpret_cast<float*>(shared), row, nullptr, da, dg, m, M);
         } else if constexpr (register_acc && reduce) {
-            write_vscan_partial<WARPS, 11 * HIDDEN + 6, I>(
-                reinterpret_cast<float*>(shared), row, local_acc, da, dg, m, M);
+            write_vscan_partial<WARPS, 11 * HIDDEN + 6, shared_wi, I>(
+                reinterpret_cast<float*>(shared), row, local_acc, da, dg, m, M, shared_dwi);
         } else if constexpr (SHARED_ACC) {
             acc -= 4 * threads;
             acc[0] = da.r;
@@ -994,7 +1019,11 @@ __device__ __forceinline__ void vertical(
             row[3 * I(M)] = dg.i;
             if constexpr (register_acc) {
                 #pragma unroll
-                for (int j = 0; j < 11 * HIDDEN + 2; ++j) row[(4 + I(j)) * M] = local_acc[j];
+                for (int j = 0; j < shared_wi; ++j) row[(4 + I(j)) * M] = shared_dwi[j * threads];
+                #pragma unroll
+                for (int j = shared_wi; j < 11 * HIDDEN + 2; ++j) {
+                    row[(4 + I(j)) * M] = local_acc[j - shared_wi];
+                }
             }
         }
     }
@@ -1210,7 +1239,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{io}, {index}, {coarse}, {key.warps}, {key.chunk}, {hidden}, "
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
-            f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}"
+            f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
+            f"{key.shared_path_rows}"
         )
         wrapper = f"""
 {bounds}(
@@ -1604,6 +1634,46 @@ def _with_vector_path_weights(
     return Launch(plan._replace(smem=smem), vector, workers, partials)
 
 
+def _kernel_local_bytes(device: int, key: Kernel) -> int:
+    driver, function = _function(device, key)
+    local_bytes = ct.c_int()
+    with torch.cuda.device(device):
+        _ensure_context(driver, device)
+        _check_cu(
+            driver.cuFuncGetAttribute(ct.byref(local_bytes), 3, function),
+            "cuFuncGetAttribute(LOCAL_SIZE_BYTES)",
+        )
+    return local_bytes.value
+
+
+@lru_cache(maxsize=256)
+def _with_shared_path_gradients(device: int, launch: Launch, policy: str) -> Launch:
+    plan, key, _, _ = launch
+    if (
+        policy not in ("on", "auto") or not key.vertical or not key.backward
+        or key.pure_vertical or not key.hidden8 or plan.shared_acc or not plan.cache_weights
+    ):
+        return launch
+
+    # Keep the CTA grid and all CUDA allocations fixed. Trade some of the
+    # FP32 dW1 registers for a lane-interleaved shared tile.
+    threads = plan.warps * _WARP_SIZE
+    accumulator_bytes = 8 * _STAGED_PATH_ROWS * threads * 4
+    smem = plan.smem + accumulator_bytes
+    _, limit, _ = device_limits(device)
+    if smem > limit:
+        return launch
+    staged = replace(key, shared_path_rows=_STAGED_PATH_ROWS)
+    resident = _resident(device, staged, smem)
+    if not resident or (policy == "auto" and resident <= _resident(device, key, plan.smem)):
+        return launch
+    if _kernel_local_bytes(device, staged):
+        return launch
+    return launch._replace(
+        plan=plan._replace(smem=smem, shared_path_rows=_STAGED_PATH_ROWS), key=staged,
+    )
+
+
 @lru_cache(maxsize=256)
 def _launch_for_shape(
     device: int,
@@ -1790,16 +1860,22 @@ def _plan_launch(
         index_bound = max(index_bound, source.stride(0) * 4)
     if not vertical:
         index_bound *= 4
-    return _launch_for_shape(
-        source.device.index or 0, source.dtype, shape, index_bound,
+    device = source.device.index or 0
+    launch = _launch_for_shape(
+        device, source.dtype, shape, index_bound,
         backward=backward, vertical=vertical, coarse=coarse, hidden=hidden, precise=precise,
         compact=compact, interleaved=interleaved, transposed=transposed,
         pure_vertical=pure_vertical,
     )
 
+    if launch is not None and vertical and backward and not pure_vertical:
+        launch = _with_shared_path_gradients(
+            device, launch, os.environ.get("LNET_VSCAN_FUSED_OPT", "auto")
+        )
+    return launch
+
 
 # Custom ops and public API
-
 
 def _eligible(
     source: Tensor,

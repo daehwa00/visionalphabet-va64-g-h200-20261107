@@ -1067,3 +1067,78 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     ):
         for value, target in zip(values, reference, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    ("policy", "new_residency", "selected"),
+    [("off", 4, False), ("auto", 2, False), ("auto", 3, True), ("on", 1, True), ("on", 0, False)],
+)
+def test_fused_gradient_staging_policy(
+    monkeypatch: pytest.MonkeyPatch, policy: str, new_residency: int, selected: bool,
+) -> None:
+    monkeypatch.setattr(scans, "device_limits", lambda _: (80, 101376, 48))
+    monkeypatch.setattr(
+        scans, "_resident",
+        lambda _device, key, _smem: new_residency if key.shared_path_rows else 2,
+    )
+    monkeypatch.setattr(scans, "_kernel_local_bytes", lambda _device, _key: 0)
+    plan = scans.ScanPlan(2, 24 * 1024, cache_weights=True, cache_line=True)
+    key = scans.Kernel(
+        torch.bfloat16, 2, backward=True, vertical=True, hidden8=True,
+        cache_weights=True, cache_line=True,
+    )
+    baseline = scans.Launch(plan, key, 62, 31)
+    scans._with_shared_path_gradients.cache_clear()
+    try:
+        result = scans._with_shared_path_gradients(0, baseline, policy)
+        assert bool(result.key.shared_path_rows) == selected
+        assert result.plan.shared_path_rows == result.key.shared_path_rows
+        assert result.workers == baseline.workers
+        assert result.partials == baseline.partials
+        assert result.plan.smem == plan.smem + 8 * result.plan.shared_path_rows * 64 * 4
+    finally:
+        scans._with_shared_path_gradients.cache_clear()
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize(
+    ("h", "w", "m", "coarse"),
+    [(3, 7, 16, False), (7, 13, 64, False), (13, 31, 160, False),
+     (31, 56, 320, False), (56, 56, 160, True), (28, 28, 320, True),
+     (14, 14, 640, True), (56, 28, 640, False)],
+)
+def test_cuda_fused_gradient_staging(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, w: int, m: int, coarse: bool,
+) -> None:
+    torch.manual_seed(731)
+    _, pole, real, imag, aux, path = _inputs(h, w, m, 8, dtype, "cuda")
+    states = torch.stack((real, imag, imag, real)).detach().requires_grad_()
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    monkeypatch.setenv("LNET_VSCAN_FUSED_OPT", "off")
+    baseline = scans.vertical_forward(pole, states, aux, path, coarse)
+    adjoints = tuple(torch.randn_like(x) * 0.1 for x in baseline)
+    baseline_grads = scans.vertical_backward(pole, states, aux, path, *adjoints, coarse)
+
+    monkeypatch.setenv("LNET_VSCAN_FUSED_OPT", "on")
+    actual = scans.vertical_forward(pole, states, aux, path, coarse)
+    actual_grads = scans.vertical_backward(pole, states, aux, path, *adjoints, coarse)
+    reference = _reference_vscan(pole, states.float(), aux, path, coarse)
+    reference_grads = torch.autograd.grad(
+        reference, [*pole, states, *path], tuple(x.float() for x in adjoints),
+    )
+    forward_tol, backward_tol = {
+        torch.float32: ((4e-5, 3e-6), (4e-4, 2e-4)),
+        torch.float16: ((8e-3, 1e-3), (5e-2, 2e-2)),
+        torch.bfloat16: ((4e-2, 5e-3), (1.2e-1, 8e-2)),
+    }[dtype]
+    for value, expected, ref in zip(actual, baseline, reference, strict=True):
+        torch.testing.assert_close(value, expected, rtol=0, atol=0)
+        torch.testing.assert_close(value.float(), ref, rtol=forward_tol[0], atol=forward_tol[1])
+    for value, expected, ref in zip(actual_grads, baseline_grads, reference_grads, strict=True):
+        # CUDA may contract FP32 operations differently across specializations.
+        torch.testing.assert_close(value, expected, rtol=2e-6, atol=3e-5)
+        torch.testing.assert_close(
+            value.float(), ref.float(), rtol=backward_tol[0], atol=backward_tol[1],
+        )
