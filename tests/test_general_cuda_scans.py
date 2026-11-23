@@ -1,6 +1,7 @@
 """CPU launch/dispatcher checks and opt-in CUDA numerical equivalence tests."""
 
 import warnings
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -1067,3 +1068,39 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     ):
         for value, target in zip(values, reference, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    ("local_bytes", "candidate_residency", "policy", "selected"),
+    [(0, 8, "auto", True), (0, 7, "auto", False), (0, 7, "on", True),
+     (0, 0, "on", False), (8, 8, "on", False)],
+)
+def test_paired_horizontal_launch_preserves_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    local_bytes: int,
+    candidate_residency: int,
+    policy: str,
+    selected: bool,
+) -> None:
+    def get_attribute(out: SimpleNamespace, attribute: int, _function: object) -> int:
+        assert attribute == scans._CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
+        out._obj.value = local_bytes
+        return 0
+
+    driver = SimpleNamespace(cuFuncGetAttribute=get_attribute)
+    key = scans.Kernel(torch.bfloat16, 2, backward=True, cache_line=True, compact=True)
+    plan = scans.ScanPlan(2, 8192, cache_line=True)
+    baseline = scans.Launch(plan, key, 256, 128)
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(scans, "_ensure_context", lambda *_: None)
+    monkeypatch.setattr(scans, "_function", lambda *_: (driver, None))
+    monkeypatch.setattr(
+        scans, "_resident", lambda _, key, __: candidate_residency if key.paired_hscan else 8,
+    )
+    scans._paired_horizontal_launch.cache_clear()
+    try:
+        actual = scans._paired_horizontal_launch(0, baseline, policy)
+        assert actual.key.paired_hscan == selected
+        assert (actual.plan, actual.workers, actual.partials) == (plan, 256, 128)
+    finally:
+        scans._paired_horizontal_launch.cache_clear()

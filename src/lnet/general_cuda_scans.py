@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 # Constants and types
 
 _WARP_SIZE = 32
+_CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3
 _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
 _MAX_CACHED_HIDDEN = 16
@@ -124,6 +125,7 @@ class Kernel:
     real_transposed: bool = False
     imag_transposed: bool = False
     vector_weights: bool = False
+    paired_hscan: bool = False
 
 
 class Launch(NamedTuple):
@@ -298,7 +300,8 @@ __device__ void pole_grad(Complex adj, Complex prev, Complex source, Complex& da
 }
 
 template<class T, class I, int WARPS, bool BACKWARD, bool CACHE, bool COMPACT,
-         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool REAL_TRANSPOSED, bool IMAG_TRANSPOSED>
+         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool REAL_TRANSPOSED, bool IMAG_TRANSPOSED,
+         bool PAIRED>
 __device__ __forceinline__ void horizontal(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -356,52 +359,100 @@ __device__ __forceinline__ void horizontal(
                 Complex right{}, left{}, neg{};
                 const I grad_plane = COMPACT ? plane / 2 : plane;
                 const I grad_base = COMPACT ? line * (W / 2) * M + m : base;
-                #pragma unroll 4
-                for (int x = 0; x < W; ++x) {
-                    const I i = base + I(x) * M;
-                    const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
-                    right = a * right + (COMPACT && (x & 1)
-                        ? Complex{} : load_complex(grad, 2 * grad_plane + gi, grad_plane));
-                    // Odd compact positions have no incoming right adjoint.
-                    // Reconstruct them from the preceding even position.
-                    if (!COMPACT || !(x & 1)) {
-                        buf[I(x / (1 + COMPACT)) * stride] = Pair<float>::pack(right);
+                if constexpr (PAIRED) {
+                    static_assert(COMPACT && CACHE);
+                    #pragma unroll 1
+                    for (int x = 0; x < W; x += 2) {
+                        const I gi = grad_base + I(x / 2) * M;
+                        right = a * right + load_complex(grad, 2 * grad_plane + gi, grad_plane);
+                        buf[I(x / 2) * stride] = Pair<float>::pack(right);
+                        right = a * right + Complex{};
                     }
-                }
-                #pragma unroll 4
-                for (int x = W - 1; x >= 0; --x) {
-                    const I i = base + I(x) * M;
-                    const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
-                    left = a.conj() * left + (COMPACT && !(x & 1)
-                        ? Complex{} : load_complex(grad, gi, grad_plane));
-                    auto right_adj = buf[I(x / (1 + COMPACT)) * stride].unpack();
-                    if constexpr (COMPACT) {
-                        if (x & 1) right_adj = a * right_adj;
+                    auto accumulate = [&](int x, Complex right_adj) {
+                        const I i = base + I(x) * M;
+                        const auto prev = x ? load_complex(states, i - M, plane) : Complex{};
+                        const auto s = source(x);
+                        const Complex next = [&]() -> Complex {
+                            if constexpr (sizeof(T) == sizeof(float)) {
+                                return x + 1 < W ? load_complex(states, 2 * plane + i + M, plane)
+                                                 : Complex{};
+                            } else {
+                                // This sweep already has the negative recurrence's input.
+                                // Recreate its stored values without loading two more planes.
+                                const auto stored = Pair<T>::pack(neg).unpack();
+                                neg = a.conj() * neg + g.conj() * s;
+                                return stored;
+                            }
+                        }();
+                        da.r += left.r * prev.r + left.i * prev.i
+                                + right_adj.r * next.r + right_adj.i * next.i;
+                        da.i += left.i * prev.r - left.r * prev.i
+                                + right_adj.r * next.i - right_adj.i * next.r;
+                        const Complex sum = left + right_adj;
+                        const Complex diff{left.r - right_adj.r, left.i - right_adj.i};
+                        dg.r += sum.r * s.r + sum.i * s.i;
+                        dg.i += diff.i * s.r - diff.r * s.i;
+                        store_complex(out, 2 * (i - m) + m, I(M),
+                                      {sum.r * g.r + diff.i * g.i, sum.i * g.r - diff.r * g.i});
+                    };
+                    #pragma unroll 1
+                    for (int x = W - 1; x >= 0; x -= 2) {
+                        const I gi = grad_base + I(x / 2) * M;
+                        // Keep both adjoints in registers after one shared load.
+                        const auto even = buf[I(x / 2) * stride].unpack();
+                        left = a.conj() * left + load_complex(grad, gi, grad_plane);
+                        accumulate(x, a * even);
+                        left = a.conj() * left + Complex{};
+                        accumulate(x - 1, even);
                     }
-                    const auto prev = x ? load_complex(states, i - M, plane) : Complex{};
-                    const auto s = source(x);
-                    const Complex next = [&]() -> Complex {
-                        if constexpr (sizeof(T) == sizeof(float)) {
-                            return x + 1 < W ? load_complex(states, 2 * plane + i + M, plane)
-                                             : Complex{};
-                        } else {
-                            // This sweep already has the negative recurrence's input.
-                            // Recreate its stored values without loading two more planes.
-                            const auto stored = Pair<T>::pack(neg).unpack();
-                            neg = a.conj() * neg + g.conj() * s;
-                            return stored;
+                } else {
+                    #pragma unroll 4
+                    for (int x = 0; x < W; ++x) {
+                        const I i = base + I(x) * M;
+                        const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
+                        right = a * right + (COMPACT && (x & 1)
+                            ? Complex{} : load_complex(grad, 2 * grad_plane + gi, grad_plane));
+                        // Odd compact positions have no incoming right adjoint.
+                        // Reconstruct them from the preceding even position.
+                        if (!COMPACT || !(x & 1)) {
+                            buf[I(x / (1 + COMPACT)) * stride] = Pair<float>::pack(right);
                         }
-                    }();
-                    da.r += left.r * prev.r + left.i * prev.i
-                            + right_adj.r * next.r + right_adj.i * next.i;
-                    da.i += left.i * prev.r - left.r * prev.i
-                            + right_adj.r * next.i - right_adj.i * next.r;
-                    const Complex sum = left + right_adj;
-                    const Complex diff{left.r - right_adj.r, left.i - right_adj.i};
-                    dg.r += sum.r * s.r + sum.i * s.i;
-                    dg.i += diff.i * s.r - diff.r * s.i;
-                    store_complex(out, 2 * (i - m) + m, I(M),
-                                  {sum.r * g.r + diff.i * g.i, sum.i * g.r - diff.r * g.i});
+                    }
+                    #pragma unroll 4
+                    for (int x = W - 1; x >= 0; --x) {
+                        const I i = base + I(x) * M;
+                        const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
+                        left = a.conj() * left + (COMPACT && !(x & 1)
+                            ? Complex{} : load_complex(grad, gi, grad_plane));
+                        auto right_adj = buf[I(x / (1 + COMPACT)) * stride].unpack();
+                        if constexpr (COMPACT) {
+                            if (x & 1) right_adj = a * right_adj;
+                        }
+                        const auto prev = x ? load_complex(states, i - M, plane) : Complex{};
+                        const auto s = source(x);
+                        const Complex next = [&]() -> Complex {
+                            if constexpr (sizeof(T) == sizeof(float)) {
+                                return x + 1 < W ? load_complex(states, 2 * plane + i + M, plane)
+                                                 : Complex{};
+                            } else {
+                                // This sweep already has the negative recurrence's input.
+                                // Recreate its stored values without loading two more planes.
+                                const auto stored = Pair<T>::pack(neg).unpack();
+                                neg = a.conj() * neg + g.conj() * s;
+                                return stored;
+                            }
+                        }();
+                        da.r += left.r * prev.r + left.i * prev.i
+                                + right_adj.r * next.r + right_adj.i * next.i;
+                        da.i += left.i * prev.r - left.r * prev.i
+                                + right_adj.r * next.i - right_adj.i * next.r;
+                        const Complex sum = left + right_adj;
+                        const Complex diff{left.r - right_adj.r, left.i - right_adj.i};
+                        dg.r += sum.r * s.r + sum.i * s.i;
+                        dg.i += diff.i * s.r - diff.r * s.i;
+                        store_complex(out, 2 * (i - m) + m, I(M),
+                                      {sum.r * g.r + diff.i * g.i, sum.i * g.r - diff.r * g.i});
+                    }
                 }
             }
         }
@@ -1246,7 +1297,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     int B, int H, int W, int M, int workers
 ) {{
     horizontal<{io}, {index}, {key.warps}, {backward}, {cache_line},
-               {compact}, {layout}, {transposed}>(
+               {compact}, {layout}, {transposed}, {str(key.paired_hscan).lower()}>(
         dr, di, decay_gr, decay_gi, sr, si, states, grad, out, partials, scratch,
         B, H, W, M, workers);
 }}
@@ -1767,6 +1818,28 @@ def _launch_for_shape(
     return _with_vector_path_weights(device, best, modes=m, hidden=hidden, wave_limit=wave_limit)
 
 
+@lru_cache(maxsize=256)
+def _paired_horizontal_launch(device: int, launch: Launch, policy: str) -> Launch:
+    paired = replace(launch.key, paired_hscan=True)
+    smem = launch.plan.smem
+    driver, function = _function(device, paired)
+    local_bytes = ct.c_int()
+    with torch.cuda.device(device):
+        _ensure_context(driver, device)
+        _check_cu(
+            driver.cuFuncGetAttribute(
+                ct.byref(local_bytes), _CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, function,
+            ),
+            "cuFuncGetAttribute(LOCAL_SIZE_BYTES)",
+        )
+    resident = _resident(device, paired, smem)
+    if resident and not local_bytes.value and (
+        policy == "on" or resident >= _resident(device, launch.key, smem)
+    ):
+        return launch._replace(key=paired)
+    return launch
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -1790,12 +1863,23 @@ def _plan_launch(
         index_bound = max(index_bound, source.stride(0) * 4)
     if not vertical:
         index_bound *= 4
-    return _launch_for_shape(
-        source.device.index or 0, source.dtype, shape, index_bound,
+    device = source.device.index or 0
+    launch = _launch_for_shape(
+        device, source.dtype, shape, index_bound,
         backward=backward, vertical=vertical, coarse=coarse, hidden=hidden, precise=precise,
         compact=compact, interleaved=interleaved, transposed=transposed,
         pure_vertical=pure_vertical,
     )
+
+    if not vertical and backward and compact and launch is not None and launch.plan.cache_line:
+        policy = os.environ.get("LNET_HSCAN_OPT", "auto")
+        if policy in ("auto", "on"):
+            try:
+                return _paired_horizontal_launch(device, launch, policy)
+            except RuntimeError:
+                if policy == "on":
+                    raise
+    return launch
 
 
 # Custom ops and public API
