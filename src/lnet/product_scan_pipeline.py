@@ -1198,6 +1198,10 @@ def _wave15_operands(
     layout: int,
 ) -> tuple[list[Tensor], list[Tensor], list[Tensor], bool] | None:
     real, imag = source
+    if os.getenv("VA_WAVE15_DENSE56_ONLY") == "1" and (
+        epilogue != "full16" or real.shape[1:3] != (56, 56)
+    ):
+        return None
     if (
         epilogue not in ("full16", "coarse_path") or not general_scans_enabled(forward=True)
         or os.getenv("LNET_VSCAN_DECOUPLED") is not None
