@@ -61,15 +61,14 @@ def shapes(batch: int) -> list[dict]:
     return result
 
 
-def graph_time(fn: Callable, repeats: int = 15) -> float:
-    stream = torch.cuda.Stream()
+def graph_time(fn: Callable, stream: torch.cuda.Stream, repeats: int = 15) -> float:
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
             fn()
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=stream):
         for _ in range(12):
             fn()
     samples = []
@@ -113,16 +112,20 @@ def isolated(batch: int, out: Path, shard: int) -> None:
                 for name, fn in (("off", old), ("native", native), ("on", custom)):
                     compiled = torch.compile(fn, fullgraph=True) if name != "on" else fn
                     # Retain the forward graph so backward timing excludes the forward launch.
-                    y = compiled(x, w)
+                    stream = torch.cuda.Stream()
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        y = compiled(x, w)
+                    torch.cuda.current_stream().wait_stream(stream)
+                    forward_ms = graph_time(lambda fn=compiled, x=x, w=w: fn(x, w), stream)
 
-                    forward_ms = graph_time(lambda fn=compiled, x=x, w=w: fn(x, w))
                     def backward(
                         y: torch.Tensor = y, x: torch.Tensor = x,
                         w: torch.Tensor = w, dy: torch.Tensor = dy,
                     ) -> tuple[torch.Tensor, ...]:
                         return torch.autograd.grad(y, (x, w), dy, retain_graph=True)
 
-                    backward_ms = graph_time(backward)
+                    backward_ms = graph_time(backward, stream)
                     kernel_names = {}
                     if n == 401408 and c == 64 and dtype == torch.bfloat16:
                         kernel_names = {
