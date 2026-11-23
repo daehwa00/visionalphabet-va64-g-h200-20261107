@@ -87,7 +87,7 @@ def time_case(batch, shape, dtype, samples, modules):
     p, g, real, imag = inputs(batch, shape, dtype)
     result = {"shape": (batch, h, w, m, r), "dtype": str(dtype), "arms": {}}
     for name, module in modules:
-        os.environ["LNET_READER_VEC"] = name if name != "baseline" else "1"
+        os.environ["LNET_READER_VEC"] = {"baseline": "1", "wave17b": "auto"}.get(name, name)
         calls = record_launches(module, p, g, real, imag)
         groups = {
             "forward": calls[:1], "dinput": calls[-1:], "dweight": calls[1:-1], "total": calls,
@@ -95,18 +95,34 @@ def time_case(batch, shape, dtype, samples, modules):
         result["arms"][name] = {
             key: graph_time(value, module, samples) for key, value in groups.items()
         }
+        if module is reader:
+            result.setdefault("plans", {})[name] = {}
+            for operation in ("forward", "dinput", "dweight"):
+                gradient = None if operation == "forward" else g
+                selected = reader._operation_vector_plan(
+                    p, real, gradient, operation, strict=False,
+                )
+                if selected:
+                    geometry, compiled = selected
+                    result["plans"][name][operation] = {
+                        **geometry._asdict(),
+                        "resident_blocks": reader._reader_resident(
+                            compiled, operation, geometry.warps,
+                        ),
+                    }
+        del calls, groups
     return result
 
 
-def load_baseline(path):
+def load_baseline(path, arm="wave14a"):
     if path is None:
         return None
-    name = "lnet._wave14a_reader"
+    name = f"lnet._{arm}_reader"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     # Custom-op names are process-global, so give Wave 14A independent registrations.
-    code = path.read_text().replace('"va_reader::', '"va_reader_wave14a::')
+    code = path.read_text().replace('"va_reader::', f'"va_reader_{arm}::')
     exec(compile(code, str(path), "exec"), module.__dict__)  # noqa: S102
     return module
 
@@ -155,21 +171,29 @@ def main():
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--samples", type=int, default=16)
     parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--wave17b", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--shape", type=int, nargs=4)
+    parser.add_argument("--case", type=int)
+    parser.add_argument("--arms", nargs="+", choices=("1", "2", "4", "auto"),
+                        default=("1", "2", "4", "auto"))
     args = parser.parse_args()
     torch.manual_seed(644)
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False
     baseline = load_baseline(args.baseline)
     shapes = [args.shape] if args.shape else STANDARD
+    if args.case is not None:
+        shapes = [shapes[args.case]]
     dtypes = (torch.bfloat16, torch.float16)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     failed = False
     with args.out.open("w") as out:
         if args.mode == "bench":
             modules = [("baseline", baseline)] if baseline else []
-            modules.extend((vec, reader) for vec in ("1", "2", "4", "auto"))
+            if args.wave17b:
+                modules.append(("wave17b", load_baseline(args.wave17b, "wave17b")))
+            modules.extend((vec, reader) for vec in args.arms)
             cases = (
                 time_case(args.batch, shape, dtype, args.samples, modules)
                 for shape, dtype in itertools.product(shapes, dtypes)

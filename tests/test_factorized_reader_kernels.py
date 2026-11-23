@@ -686,3 +686,33 @@ def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None
     reference = kernels._spatial_reference(p, *w.unbind(1), strict_complex=False)
     torch.testing.assert_close(output, reference, atol=0.008, rtol=0.005)
     _check_gradients(output, reference, (p, w), (p, w), rtol=0.005, atol=0.001)
+
+
+def test_reader_operation_occupancy(monkeypatch: pytest.MonkeyPatch) -> None:
+    props = SimpleNamespace(major=9, multi_processor_count=32, shared_memory_per_block=49152)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    def compile_module(*_args, **kwargs):  # noqa: ANN002, ANN003
+        return kwargs["spatial_geometry"], kwargs["weight_geometry"]
+
+    def resident(module, operation, _warps):
+        spatial, weight = module
+        if operation == "dweight":
+            return 4 if weight == (1, 2, 4) else 1
+        return 0 if spatial[0] == 4 else 3
+
+    monkeypatch.setattr(kernels, "_reader_cuda_module", compile_module)
+    monkeypatch.setattr(kernels, "_reader_resident", resident)
+    kernels._vector_plan.cache_clear()
+    try:
+        shape = (64, 13, 13, 96)
+        spatial, _ = kernels._vector_plan(
+            0, shape, shape, 4, ("__half",) * 3, 2, "dinput", automatic=False,
+        )
+        weight, _ = kernels._vector_plan(
+            0, shape, shape, 4, ("__half",) * 3, 2, "dweight", automatic=False,
+        )
+        assert (spatial.rows, spatial.warps) == (2, 4)
+        assert (weight.rows, weight.warps, weight.rank_tile) == (2, 4, 1)
+    finally:
+        kernels._vector_plan.cache_clear()

@@ -24,9 +24,9 @@ class OfflineModule:
 
 def compile_case(job):
     target, geometry, dtype, rank, strict, vec, out, cuda = job
-    shape, columns, spatial, weight, readonly = geometry
+    shape, columns, spatial, weight, readonly, keep_real = geometry
     tag = "-".join(map(str, (target, dtype, rank, int(strict), vec, *shape, columns,
-                            *spatial, *weight, int(readonly))))
+                            *spatial, *weight, int(readonly), keep_real)))
     directory = out / tag
     directory.mkdir(exist_ok=True)
     torch.cuda.get_device_capability = lambda _: tuple(map(int, target))
@@ -36,7 +36,7 @@ def compile_case(job):
         module = reader._reader_cuda_module(
             0, shape, columns, rank, 3, (dtype,) * 3, strict=strict,
             spatial_geometry=spatial, weight_geometry=weight, weight_vec=vec, spatial_vec=vec,
-            register_filters=0, keep_real=0, spatial_read_only=readonly,
+            register_filters=0, keep_real=keep_real, spatial_read_only=readonly,
             weight_read_only=readonly,
         )
         ptx = directory / "reader.ptx"
@@ -63,6 +63,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--ablate", action="store_true")
     parser.add_argument("--tuned", action="store_true")
+    parser.add_argument("--matrix", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     geometries = [
@@ -89,13 +90,21 @@ def main():
                 ),
             )
         ]
+    geometries = [(*geometry, 0) for geometry in geometries]
+    if args.matrix:
+        geometries = [
+            ((128, 56, 56, 160), columns, (rows, warps), (tile, rows, warps), False, keep)
+            for columns, rows, warps, tile, keep in itertools.product(
+                (7, 8, 14), (2, 4), (2, 4), (1, 2), (0, 1),
+            )
+        ]
     jobs = [
         (target, geometry, dtype, rank, strict, vec, args.output, args.cuda)
         for target, geometry, dtype, rank, strict, vec in itertools.product(
             ("86", "89", "90"), geometries, ("__half", "__nv_bfloat16", "float"),
             (1, 2, 4), (False, True), (1, 2, 4),
         )
-        if vec == 1 or (dtype != "float" and not strict)
+        if args.matrix or vec == 1 or (dtype != "float" and not strict)
     ]
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         results = list(pool.map(compile_case, jobs))
