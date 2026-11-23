@@ -1296,12 +1296,27 @@ def _prefer_scalar_weight(
     packed_tiles = _ceildiv(modes, _WARP_SIZE * vec)
     if packed_tiles < warps and packed_tiles * _WARP_SIZE * vec != modes:
         return True
-    # A short packed grid increases the number of partial rows per mode.
-    # Keep scalar splits on single-column planes with few packed partitions.
     column_warps = _ceildiv(width, _reader_columns(width))
-    return (column_warps == 1 and packed_tiles < warps) or (
-        architecture_major >= 9 and column_warps == _COMPACT_SPATIAL_GEOMETRY[1]
+    return architecture_major >= 9 and column_warps == _COMPACT_SPATIAL_GEOMETRY[1]
+
+
+def _compact_weight_geometry(
+    batch: int, height: int, modes: int, sms: int,
+) -> tuple[int, int, int] | None:
+    """Use a packed row tile only within the scalar partial-buffer budget."""
+    _, scalar_rows, warps = _DEFAULT_WEIGHT_GEOMETRY
+    rows = 2 * scalar_rows
+    scalar_modes = _ceildiv(modes, _WARP_SIZE)
+    packed_modes = _ceildiv(modes, 2 * _WARP_SIZE)
+    scalar_workers = min(
+        _ceildiv(batch * _ceildiv(height, scalar_rows), warps),
+        _ceildiv(_WEIGHT_TARGET_WAVES * sms, scalar_modes),
     )
+    packed_workers = min(
+        _ceildiv(batch * _ceildiv(height, rows), warps),
+        _ceildiv(_WEIGHT_TARGET_WAVES * sms, packed_modes),
+    )
+    return (rows, warps, _CENTERED_WEIGHT_TILE) if packed_workers <= scalar_workers else None
 
 
 @cache
@@ -1337,11 +1352,17 @@ def _vector_plan(  # noqa: C901, PLR0912, PLR0915
         # Two column warps fit the compact scalar path without an idle warp.
         return None
     mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
-    if (
-        automatic and weight and vec == 2 and types[2] == "__nv_bfloat16"
-        and _prefer_scalar_weight(height, width, modes, rank, vec, props.major)
-    ):
+    bf16_weight = automatic and weight and vec == 2 and types[2] == "__nv_bfloat16"
+    if bf16_weight and _prefer_scalar_weight(height, width, modes, rank, vec, props.major):
         return None
+    if (
+        bf16_weight and rank == _STATIC_RANK_LIMIT and height * width <= _SMALL_WEIGHT_PLANE_PIXELS
+        and width <= compact and mode_tiles < _DEFAULT_WEIGHT_GEOMETRY[2]
+    ):
+        geometry = _compact_weight_geometry(batch, height, modes, sms)
+        if geometry is None:
+            return None
+        geometries = (geometry,)
     if (
         automatic and hopper and op != "forward"
         and types == ("__nv_bfloat16",) * 3

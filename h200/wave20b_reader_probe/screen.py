@@ -19,37 +19,41 @@ GENERAL = ((28, 28, 320, 4), (14, 14, 640, 4), (7, 7, 640, 4), (128, 192, 160, 4
 SAMPLES = 24
 
 
-def capture(module: object, launches: list) -> tuple[torch.cuda.CUDAGraph, list]:
+def capture(
+    module: object, launches: list,
+) -> tuple[torch.cuda.CUDAGraph, torch.cuda.Event, torch.cuda.Event, list]:
     graph = torch.cuda.CUDAGraph()
+    start = torch.cuda.Event(enable_timing=True, external=True)
+    end = torch.cuda.Event(enable_timing=True, external=True)
     with torch.cuda.graph(graph):
+        start.record()
         for args, options in launches:
             stream = module._reader_stream(args[0], args[3][0].device)
             module._launch_reader_cuda(*args, **{**options, "stream": stream})
-    return graph, [(args[1], args[2], options.get("threads", module._DEFAULT_THREADS))
-                   for args, options in launches]
+        end.record()
+    return graph, start, end, [(args[1], args[2], options.get("threads", module._DEFAULT_THREADS))
+                               for args, options in launches]
 
 
 def measure(graphs: dict) -> dict:
-    pairs = {name: [] for name in graphs}
+    samples = {name: [] for name in graphs}
     names = tuple(graphs)
     for _ in range(4):
-        for graph, _ in graphs.values():
+        for graph, *_ in graphs.values():
             graph.replay()
+    stream = torch.cuda.current_stream()
     for _ in range(SAMPLES):
         names = names[1:] + names[:1]
         for name in names:
-            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-            start.record()
-            graphs[name][0].replay()
-            end.record()
-            pairs[name].append((start, end))
-    torch.cuda.synchronize()
+            graph, start, end, _ = graphs[name]
+            graph.replay()
+            stream.synchronize()
+            samples[name].append(start.elapsed_time(end))
     result = {}
-    for name, events in pairs.items():
-        raw = [start.elapsed_time(end) for start, end in events]
+    for name, raw in samples.items():
         q1, _, q3 = statistics.quantiles(raw, n=4, method="inclusive")
         result[name] = {"samples_ms": raw, "median_ms": statistics.median(raw),
-                        "iqr_ms": q3 - q1, "launches": graphs[name][1]}
+                        "iqr_ms": q3 - q1, "launches": graphs[name][3]}
     return result
 
 
@@ -80,6 +84,7 @@ def main() -> None:
         wave19 = load_baseline(args.refs / "wave19.py")
         def bench_case(shape: tuple, dtype: torch.dtype) -> dict:
             h, w, modes, rank = shape
+            torch.cuda.empty_cache()
             free, _ = torch.cuda.mem_get_info()
             # Retain the outputs from all arms for interleaved graph replay.
             buffers = h * w * modes * (rank + 2) * (1 + 5) * dtype.itemsize
