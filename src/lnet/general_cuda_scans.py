@@ -2624,7 +2624,10 @@ def _plan_tc_projection(
         groups = max(1, min(_ceil(cells, cell_tile), _ceil(4 * sms * resident, mode_tiles)))
         if base.backward:
             groups = min(groups, max(1, _MAX_PARTIAL_BYTES // (fields * modes * 4)))
-        score = min(sms * resident, groups * mode_tiles) * min(warps, modes)
+        active = min(sms * resident, groups * mode_tiles) * min(warps, modes)
+        # At equal useful warp occupancy, more independent CTAs hide the
+        # shared-memory barrier and global-memory latency more effectively.
+        score = (active, min(resident, groups * mode_tiles))
         if best is None or score > best[0]:
             best = score, key, groups, smem
     if best is None:
