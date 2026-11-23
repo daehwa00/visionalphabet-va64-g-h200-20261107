@@ -40,6 +40,11 @@ names+=,weight8x28_pair,weight_t1r8_vec2,weight_t1r14_vec2,weight_t2r8_scalar
 names+=,weight_t1r2_packed,weight_t1r4_packed
 "$py" "$src/probe.py" --batch 1024 --samples 7 --reference --names "$names" \
     --out "$root/isolated.json" 2>&1 | tee "$root/isolated.log"
+if [[ ${1:-} == --isolated-only ]]; then
+    # Restore a full set of raw samples if the earlier pod's output is unavailable.
+    "$py" "$src/export.py" "$root" --samples
+    exit
+fi
 "$py" "$src/full.py" select --policy "$root/isolated.json" --out "$root/policy.json"
 for batch in 128 256 512 1024; do
     for arm in wave13 wave14; do
