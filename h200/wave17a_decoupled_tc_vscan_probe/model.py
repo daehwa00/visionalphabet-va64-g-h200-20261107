@@ -120,12 +120,17 @@ def main() -> None:  # noqa: C901
         overrides = {"measure": measure, "profile_step": profile}
         stack.enter_context(patch.dict(probe.__globals__, overrides))
         if args.graph:
-            adamw = torch.optim.AdamW
+            import va_model_builder as builder  # noqa: PLC0415
+
+            build_optimizer = builder.build_optimizer
 
             def capturable(*values: object, **kwargs: object) -> torch.optim.Optimizer:
-                return adamw(*values, **kwargs, capturable=True)
+                optimizer = build_optimizer(*values, **kwargs)
+                for group in optimizer.param_groups:
+                    group["capturable"] = True
+                return optimizer
 
-            stack.enter_context(patch.object(torch.optim, "AdamW", capturable))
+            stack.enter_context(patch.object(builder, "build_optimizer", capturable))
         try:
             probe()
         except SystemExit as exc:

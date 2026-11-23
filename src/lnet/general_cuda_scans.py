@@ -2396,29 +2396,32 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or saved_features.shape != (8, b * oh * ow, m)
         or saved_features.device != states.device
         or saved_features.dtype != states.dtype
-        or not (saved_features.is_contiguous() or saved_features.transpose(0, 1).is_contiguous())
+        or not (
+            saved_features.is_contiguous()
+            or saved_features.transpose(0, 1).is_contiguous()
+            or saved_features.permute(1, 2, 0).is_contiguous()
+        )
     ):
         raise ValueError("Invalid saved vertical features")
     if not pure:
         if saved_features is None:
-            tc = _use_tc_projection(states, hidden)
+            chunk = _decoupled_chunk(states, coarse)
+            tc = False
+            if chunk and os.environ.get("LNET_VSCAN_DECOUPLED") == "chunk_tc":
+                tc = _supports_tc_projection(states, hidden)
+                if not tc:
+                    chunk = 0
         else:
-            tc = saved_features.stride(1) == 8 * m
-            if tc and not _supports_tc_projection(states, hidden):
-                raise ValueError("Invalid Tensor Core saved vertical features")
-        chunk = (
-            _saved_backward_chunk(states, coarse)
-            if saved_features is not None else _decoupled_chunk(states, coarse)
-        )
-        if os.environ.get("LNET_VSCAN_DECOUPLED") == "chunk_tc" and not tc:
-            chunk = 0
-        if tc and saved_features is not None and _total_vram(states.device) >= _TC_SAVED_VRAM:
-            _, _, height, width, modes = states.shape
-            per_sample = (
-                8 * (height // (1 + coarse)) * (width // (1 + coarse))
-                * modes * states.element_size()
-            )
-            chunk = min(b, max(chunk, (_total_vram(states.device) // 16) // per_sample))
+            tc = saved_features.stride(1) == 8 * m or _features_packed(saved_features)
+            chunk = _saved_backward_chunk(states, coarse)
+            if tc:
+                if not _supports_tc_projection(states, hidden):
+                    raise ValueError("Invalid Tensor Core saved vertical features")
+                vram = _total_vram(states.device)
+                if vram >= _TC_SAVED_VRAM:
+                    # Bound the live dP plane and amortize the scan reductions.
+                    per_sample = 8 * oh * ow * m * states.element_size()
+                    chunk = min(b, max(chunk, (vram // 16) // per_sample))
         if chunk:
             with torch.autocast(device_type="cuda", enabled=False):
                 return _decoupled_vscan(
@@ -2564,9 +2567,11 @@ def _use_tc_projection(states: Tensor, hidden: int) -> bool:
     policy = os.environ.get("LNET_VSCAN_DECOUPLED", "auto")
     if policy not in {"auto", "saved_tc", "test_saved_tc", "chunk_tc"}:
         return False
-    if not _supports_tc_projection(states, hidden):
+    if not states.is_cuda:
         return False
-    return policy in {"test_saved_tc", "chunk_tc"} or _total_vram(states.device) >= _TC_SAVED_VRAM
+    if policy in {"auto", "saved_tc"} and _total_vram(states.device) < _TC_SAVED_VRAM:
+        return False
+    return _supports_tc_projection(states, hidden)
 
 
 def _should_save_vscan(states: Tensor, coarse: bool, hidden: int) -> bool:
@@ -2664,6 +2669,10 @@ def _empty_features(
     return source.new_empty((8, cells, modes))
 
 
+def _features_packed(features: Tensor) -> bool:
+    return features.stride(0) == 1 and features.stride(2) == 8
+
+
 def _project_path(
     features: Tensor, path: list[Tensor], real: Tensor, imag: Tensor, *,
     backward: bool, precise: bool, projection_tc: bool = False,
@@ -2671,7 +2680,7 @@ def _project_path(
     _, cells, modes = features.shape
     hidden = path[0].shape[1]
     feature_plane = features.stride(0)
-    packed = projection_tc and feature_plane == 1 and features.stride(2) == 8
+    packed = projection_tc and _features_packed(features)
     cell_major = projection_tc and feature_plane == modes and not packed
     base = Kernel(
         features.dtype, 0, backward, projection=True, projection_tc=projection_tc,
@@ -2754,7 +2763,7 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
         if saved_features is None:
             features = _vscan(
                 pole, source, auxiliary, path, coarse, epsilon, precise,
-                pure=True, cell_major=projection_tc,
+                pure=True, packed_features=projection_tc,
             )
         else:
             area = oh * ow
@@ -2777,10 +2786,12 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
         if projected is None:
             raise TypeError("Expected path projection gradients")
         dp, path_grads = projected
+        packed_dp = projection_tc and _features_packed(dp)
         gradients = _vscan(
             float_pole, source, auxiliary, path, coarse, epsilon, precise,
             compact=compact, features=dp, state_grad=gs[:, part], pure=True,
-            cell_major=projection_tc and dp.stride(0) == modes,
+            packed_features=packed_dp,
+            cell_major=projection_tc and not packed_dp and dp.stride(0) == modes,
         )
         if not isinstance(gradients, list):
             raise TypeError("Expected pure scan gradients")
@@ -3019,7 +3030,7 @@ def _vertical_forward_saved(
     with torch.autocast(device_type="cuda", enabled=False):
         features = _vscan(
             pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise,
-            pure=True, cell_major=tc,
+            pure=True, packed_features=tc,
         )
         if not isinstance(features, Tensor):
             raise TypeError("Expected normalized scan features")
@@ -3058,7 +3069,7 @@ def _fake_vertical_forward_saved(
         states.new_empty(shape if separate else (0,)),
         _empty_features(
             states, b * (h // step) * (w // step), m,
-            cell_major=_use_tc_projection(states, path[0].shape[1]),
+            cell_major=False, packed=_use_tc_projection(states, path[0].shape[1]),
         ),
     )
 
@@ -3153,7 +3164,10 @@ def vertical_forward(
     precise: bool = True,
     mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
-    if mode == "cuda" and _should_save_vscan(states, coarse, path[0].shape[1]):
+    if (
+        mode == "cuda" and len(path) == 4 and path[0].ndim == 3
+        and _should_save_vscan(states, coarse, path[0].shape[1])
+    ):
         real, imag, _ = _vertical_forward_saved(
             pole, states, auxiliary, path, coarse, epsilon,
             planar=False, precise=precise, separate=True,

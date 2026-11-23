@@ -1052,10 +1052,11 @@ def test_cuda_decoupled_vscan(  # noqa: C901
         packed = scans.vertical_forward_packed(pole, states, auxiliary, path, coarse, 1e-6, planar)
         target = torch.stack(actual) if planar else torch.cat(actual, dim=-1)
         if policy == "test_saved_tc" and scans._use_tc_projection(states, hidden):
-            packed, _, _ = scans._vertical_forward_saved(
+            packed, _, saved = scans._vertical_forward_saved(
                 pole, states, auxiliary, path, coarse, 1e-6,
                 planar=planar, precise=True, separate=False,
             )
+            assert scans._features_packed(saved)
         torch.testing.assert_close(packed, target)
     if dtype == torch.float32:
         forward_tol, backward_tol = (4e-5, 3e-6), (4e-4, 2e-4)

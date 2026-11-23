@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterator
 from functools import partial
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import torch
 from torch import Tensor
@@ -226,7 +227,12 @@ def micro(shape: tuple[int, int, int, int, bool], dtype: torch.dtype, repeats: i
         backward = partial(
             scans.vertical_backward, *args[:4], *dy, coarse, compact=coarse, saved_features=saved,
         )
-        row["end_to_end"][policy] = pair_graph(forward, backward, repeats)
+        result = pair_graph(forward, backward, repeats)
+        result["saved_features_active"] = saved is not None
+        row["end_to_end"][policy] = result
+        if policy == "test_saved_tc" and saved is not None:
+            with patch.object(scans, "_saved_backward_chunk", return_value=b):
+                row["saved_tc_backward_full_chunk"] = graph(backward, repeats)
         del saved, backward
         torch.cuda.empty_cache()
     return row
