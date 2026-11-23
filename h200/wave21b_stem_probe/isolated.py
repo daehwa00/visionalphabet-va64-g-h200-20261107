@@ -2,6 +2,7 @@
 
 # ruff: noqa: T201
 import json
+import math
 import os
 import statistics
 from collections.abc import Callable
@@ -12,8 +13,8 @@ from torch.nn import functional
 from lnet.fused_stem_ops import _backward, _forward
 
 
-def capture(call: Callable) -> torch.cuda.CUDAGraph:
-    stream = torch.cuda.Stream()
+def capture(call: Callable, stream: torch.cuda.Stream | None = None) -> torch.cuda.CUDAGraph:
+    stream = stream or torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         call()
@@ -40,8 +41,9 @@ def measure(graph: torch.cuda.CUDAGraph) -> float:
     return statistics.median(samples)
 
 
-def run(shape: tuple[int, ...], dtype: torch.dtype) -> bool:
-    x = torch.randn(shape, device="cuda", dtype=dtype)
+def run(shape: tuple[int, ...], dtype: torch.dtype, *, offset: int = 0) -> bool:
+    size = math.prod(shape)
+    x = torch.randn(size + offset, device="cuda", dtype=dtype)[offset:].view(shape)
     affine = tuple(torch.empty(shape[-1], device="cuda") for _ in range(3))
     w, b, cb = affine
     w.uniform_(0.7, 1.3)
@@ -88,7 +90,8 @@ def run(shape: tuple[int, ...], dtype: torch.dtype) -> bool:
                     "effective_forward_gbps": 2 * payload / fwd / 1e6,
                     "effective_backward_gbps": 3 * payload / bwd / 1e6,
                 })
-    print(json.dumps({"shape": shape, "dtype": str(dtype), **results}), flush=True)
+    record = {"shape": shape, "dtype": str(dtype), "storage_offset": offset, **results}
+    print(json.dumps(record), flush=True)
     return results["exact"]
 
 
@@ -98,6 +101,7 @@ def main() -> None:
     for dtype in (torch.bfloat16, torch.float16, torch.float32):
         for shape in ((2, 37, 53, 53), (2, 37, 53, 64), (2, 37, 53, 96)):
             passed &= run(shape, dtype)
+        passed &= run((2, 37, 53, 64), dtype, offset=1)
     for dtype in (torch.bfloat16, torch.float16):
         for shape in ((128, 112, 112, 32), (128, 56, 56, 64), (128, 48, 64, 64), (128, 37, 53, 53)):
             passed &= run(shape, dtype)

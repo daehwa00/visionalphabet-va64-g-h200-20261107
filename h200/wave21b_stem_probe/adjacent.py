@@ -56,15 +56,20 @@ def postfusion() -> None:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             return compiled(x)
 
-    y = forward()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        y = forward()
     inputs = (x, *module.parameters())
-    _ = torch.autograd.grad(y, inputs, dy, retain_graph=True)
+    with torch.cuda.stream(stream):
+        _ = torch.autograd.grad(y, inputs, dy, retain_graph=True)
+    torch.cuda.current_stream().wait_stream(stream)
 
     def backward() -> tuple[torch.Tensor, ...]:
         return torch.autograd.grad(y, inputs, dy, retain_graph=True)
 
     fwd = measure(capture(forward))
-    bwd = measure(capture(backward))
+    bwd = measure(capture(backward, stream))
     fwd_bytes = x.nbytes + y.nbytes + sum(p.nbytes for p in module.parameters())
     bwd_bytes = dy.nbytes + sum(t.nbytes for t in inputs)
     print(json.dumps({
