@@ -31,24 +31,32 @@ def variants(arch: int) -> dict[scans.Kernel, int]:
     for dtype, coarse, backward in itertools.product(
         (*types, torch.float32), (False, True), (False, True),
     ):
-        for height in (4, 8, 16, 24, 32, 56, 128, 512, 8192):
+        # Cover the transition from shared to global checkpoints for every
+        # warp count, including narrow windows close to the SMEM limit.
+        plans: dict[tuple, int] = {}
+        step = 1 + coarse
+        for height in range(step, 8193, step):
             for plan in scans._scan_plans(
                 height, limit, vertical=True, backward=backward, coarse=coarse,
                 hidden=0, itemsize=dtype.itemsize, pure_vertical=True,
             ):
-                layouts = (False, True) if dtype in types else (False,)
-                options = itertools.product((False, True), (False, True), layouts)
-                for index32, option, packed in options:
-                    key = scans.Kernel(
-                        dtype, plan.warps, backward, vertical=True, coarse=coarse,
-                        index32=index32, pure_vertical=True, cell_major=not packed,
-                        packed_features=packed,
-                        chunk=0 if plan.full_trajectory else plan.chunk,
-                        compact=option and coarse and backward, precise=option and not backward,
-                        cache_line=plan.cache_line, cache_source=plan.cache_source,
-                        global_checkpoints=plan.global_checkpoints,
-                    )
-                    cases[key] = max(cases.get(key, 0), plan.smem)
+                config = (
+                    plan.warps, 0 if plan.full_trajectory else plan.chunk,
+                    plan.cache_line, plan.cache_source, plan.global_checkpoints,
+                )
+                plans[config] = max(plans.get(config, 0), plan.smem)
+        layouts = (False, True) if dtype in types else (False,)
+        for (warps, chunk, cache_line, cache_source, global_ckpt), smem in plans.items():
+            for index32, option, packed in itertools.product((False, True), (False, True), layouts):
+                key = scans.Kernel(
+                    dtype, warps, backward, vertical=True, coarse=coarse,
+                    index32=index32, pure_vertical=True, cell_major=not packed,
+                    packed_features=packed, chunk=chunk,
+                    compact=option and coarse and backward, precise=option and not backward,
+                    cache_line=cache_line, cache_source=cache_source,
+                    global_checkpoints=global_ckpt,
+                )
+                cases[key] = smem
     return cases
 
 
