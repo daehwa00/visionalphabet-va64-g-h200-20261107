@@ -59,7 +59,7 @@ def main() -> None:
         with args.resources.open("w") as output:
             for sm, key in product((86, 89, 90), keys()):
                 candidate = None
-                if key.batch_path and not key.coarse:
+                if key.batch_path and not (key.coarse or key.vector_weights):
                     candidate = replace(key, register_path=True, cache_weights=False)
                 if not key.vertical and key.backward and key.warps == 1 and key.dtype.itemsize == 2:
                     candidate = replace(key, horizontal_unroll8=True)

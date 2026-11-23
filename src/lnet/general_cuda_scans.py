@@ -1916,13 +1916,12 @@ def _with_wave24a(launch: Launch, device: int, shape: tuple[int, int, int, int])
         if _resident(device, candidate, plan.smem) >= _resident(device, key, plan.smem):
             return launch._replace(key=candidate)
         return launch
-    if key.coarse or not key.batch_path:
+    # The FP32 vector-weight baseline enables FMA contraction. Keep it on
+    # the shared path because the packed register variant can change BF16 results.
+    if key.coarse or key.vector_weights or not key.batch_path:
         return launch
-    # Retain vector_weights in the key so NVRTC keeps the baseline FMA policy.
     candidate = replace(key, register_path=True, cache_weights=False)
-    weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (
-        4 if key.vector_weights else key.dtype.itemsize
-    )
+    weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * key.dtype.itemsize
     smem = plan.smem - weight_bytes
     if _resident(device, candidate, smem) == 0:
         return launch
