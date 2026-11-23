@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
+
+out=$(mktemp -d /app/output/va-t60-h200.XXXXXX)
+export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 WANDB_MODE=disabled
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=4
+unset LNET_GENERAL_SCANS LNET_FUSED_FACTORIZED_READER LNET_GENERAL_SCAN_REF_FWD
+unset VA_REAL_MEMORY_SCAN_BATCH_PARTIALS VA_REAL_MEMORY_TRAINING_OPTIMIZATIONS
+unset LNET_DISABLE_LAUNCH_AUTOTUNE LNET_NR4_FUSED LNET_VSCAN_DECOUPLED
+export TORCHINDUCTOR_CACHE_DIR="$out/inductor"
+export SCAN_BATCH=1024 MODEL_BATCHES="128 256 512 1024" COMBINED_SCAN=1 GRAPH_VARIANTS=auto
+
+finish() {
+    local rc=$?
+    trap - EXIT
+    printf 'Wave 16A results %s, runner exit %d\n' "$out" "$rc"
+    printf '%d\n' "$rc" > "$out/exit-code.txt"
+    (cd -- "$out" && find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 tar -cf -) |
+        xz -T2 | base64 -w 120 |
+        sed 's/^/VA_T60_XZ /'
+    exit "$rc"
+}
+trap finish EXIT
+
+for candidate in \
+    /app/output/va-h200-effective1024-r3-combined-20261119/environment/bin/python \
+    /app/output/va-h200-r4-marker-fix-20261119/environment/bin/python \
+    "$(command -v python3)"; do
+    if test -x "$candidate" && "$candidate" -c '
+import sys
+import numpy, pytest, timm, torch, torchvision
+raise SystemExit(sys.version_info < (3, 13) or not torch.cuda.is_available())
+'; then
+        export PYTHON_BIN=$candidate
+        break
+    fi
+done
+test -n "${PYTHON_BIN:-}"
+bash h200/wave16_tc_vscan_probe/run.sh "$out"

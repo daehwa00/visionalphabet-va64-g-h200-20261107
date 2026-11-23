@@ -1082,8 +1082,10 @@ def test_cuda_decoupled_vscan(  # noqa: C901
         (1, 56, 56, 160, True, False),
     ],
 )
+@pytest.mark.parametrize("variant", ["4", "4x8"])
 def test_cuda_spatial_vscan(
     monkeypatch: pytest.MonkeyPatch,
+    variant: str,
     dtype: torch.dtype,
     batch: int,
     h: int,
@@ -1094,6 +1096,8 @@ def test_cuda_spatial_vscan(
 ) -> None:
     if torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("SM 8.0 required")
+    if variant == "4x8" and h <= 8:
+        variant = "8"
     torch.manual_seed(416)
     _, pole, real, imag, auxiliary, path = _inputs(h, w, m, 8, dtype, "cuda", batch)
     states = torch.stack((real, imag, imag, real))
@@ -1110,7 +1114,7 @@ def test_cuda_spatial_vscan(
     if compact:
         gs = reference_grad[4]
         reference_grad[4] = torch.cat((gs[:2, :, :, 1::2], gs[2:, :, :, ::2]))
-    monkeypatch.setenv("LNET_VSCAN_SPATIAL", "4")
+    monkeypatch.setenv("LNET_VSCAN_SPATIAL", variant)
     dispatch = scans._dispatch
     keys = []
 
@@ -1123,7 +1127,9 @@ def test_cuda_spatial_vscan(
     actual_grad = scans.vertical_backward(
         pole, states, auxiliary, path, *dy, coarse, compact=compact,
     )
-    assert [key.spatial for key in keys] == [True, True]
+    expected_spatial = "x" not in variant
+    assert [key.spatial for key in keys] == [expected_spatial, True]
+    assert keys[1].chunk == (8 if "x" in variant else 0)
 
     forward_tol, backward_tol = (
         ((8e-3, 1e-3), (5e-2, 2e-2)) if dtype == torch.float16
@@ -1138,3 +1144,27 @@ def test_cuda_spatial_vscan(
     ):
         for value, target in zip(values, targets, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+def test_spatial_planner_respects_hardware_and_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 9))
+    monkeypatch.setattr(scans, "device_limits", lambda _device: (128, 99 * 1024, 48))
+    monkeypatch.setattr(scans, "_resident", lambda _device, _key, _smem: 1)
+    scans._spatial_launch.cache_clear()
+    key = scans.Kernel(torch.bfloat16, 1, backward=True, vertical=True, hidden8=True)
+    baseline = scans.Launch(scans.ScanPlan(1, 0), key, 384, 384)
+    shape = (4, 512, 768, 49)
+    result = scans._spatial_launch(0, shape, baseline, "4x8-global")
+    assert result is not None
+    assert result.key.spatial
+    assert result.key.chunk == 8
+    assert result.plan.smem <= 99 * 1024
+    assert result.partials <= baseline.partials
+    padded_modes = scans._ceil(shape[-1], result.plan.warps) * result.plan.warps
+    assert 512 * result.workers * padded_modes * 32 * 4 <= 512 * 384 * 49 * 8
+    no_workspace = scans.Launch(scans.ScanPlan(1, 0, cache_line=True), key, 384, 384)
+    assert scans._spatial_launch(0, shape, no_workspace, "4x8-global") is None
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (7, 5))
+    scans._spatial_launch.cache_clear()
+    assert scans._spatial_launch(0, shape, baseline, "auto") is None
+    scans._spatial_launch.cache_clear()
