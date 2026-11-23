@@ -28,6 +28,7 @@ ARMS = {
     "scratch": (0, True, False, False),
     "row": (1, False, False, False),
     "column": (2, False, False, False),
+    "column-async": (2, False, False, False),
     "column-shared2": (2, False, False, False),
     "column-shared4": (2, False, False, False),
     "column-2warps": (2, False, False, False),
@@ -108,6 +109,7 @@ def torch_reference(source, px, py, aux, path, dy, coarse, dtype, arms):
             **hopts, "local_scratch": scratch, "single_store": single,
             "drop_source": drop_source,
             "shared_hidden": int(name[-1]) if name.startswith("column-shared") else 0,
+        "async_source": name == "column-async",
         } if TRIAL_ENABLED else {}
         with torch.no_grad(), horizontal_warps(name):
             states, _ = scans._hscan(px, *source, **hopts)
@@ -159,6 +161,7 @@ def measure_arm(name, h, modes, coarse, dtype, source, px, py, aux, path, dy, ex
         "state_layout": layout, "local_scratch": scratch,
         "single_store": single, "drop_source": drop_source,
         "shared_hidden": int(name[-1]) if name.startswith("column-shared") else 0,
+        "async_source": name == "column-async",
     }
 
     horizontal_options = {"state_layout": layout} if TRIAL_ENABLED else {}

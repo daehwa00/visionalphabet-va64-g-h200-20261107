@@ -128,6 +128,7 @@ class Kernel:
     local_scratch: bool = False
     single_store: bool = False
     shared_hidden: int = 0
+    async_source: bool = False
 
 
 class Launch(NamedTuple):
@@ -532,6 +533,13 @@ template<bool PRECISE> struct Sum {
     }
 };
 
+template<int BYTES>
+__device__ void copy_to_shared_async(void* target, const void* source) {
+    const auto address = static_cast<unsigned int>(__cvta_generic_to_shared(target));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;"
+                 :: "r"(address), "l"(source), "n"(BYTES) : "memory");
+}
+
 template<class T, class I, int LAYOUT, bool COARSE>
 struct Column {
     const T* states;
@@ -552,6 +560,18 @@ struct Column {
         const I ia = row + offset_a, ib = row + offset_b + 2 * source_plane;
         return {Pair<T>::from(states[ia], states[ia + source_plane]),
                 Pair<T>::from(states[ib], states[ib + source_plane])};
+    }
+
+    __device__ void stage_source(int y, Quad<T>* target) const {
+        static_assert(LAYOUT);
+        const I row = I(y) * (LAYOUT == 2 ? 1 : W) * M;
+        const auto* input = reinterpret_cast<const PackedQuad<T>*>(states);
+        if constexpr (COARSE) {
+            copy_to_shared_async<sizeof(Pair<T>)>(&target->a, &input[row + packed_a].a);
+            copy_to_shared_async<sizeof(Pair<T>)>(&target->b, &input[row + packed_b].b);
+        } else {
+            copy_to_shared_async<sizeof(Quad<T>)>(target, input + row + packed_a);
+        }
     }
 
     __device__ float4 source(int y) const {
@@ -774,7 +794,7 @@ __device__ void load_project_weights(
 template<class T, class I, bool COARSE, int CHUNK, int THREADS, int HIDDEN,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE,
          bool PURE, bool SINGLE_STORE, bool CACHE_LINE, int LAYOUT, int SHARED_HIDDEN,
-         class Weights>
+         bool ASYNC_SOURCE, class Weights>
 __device__ __forceinline__ void column_backward(
     Column<T, I, LAYOUT, COARSE> c, Complex a, Complex g, Weights path,
     const T* gr, const T* gi, T* gs, float* acc, I acc_stride,
@@ -787,13 +807,28 @@ __device__ __forceinline__ void column_backward(
     static_assert(!full || CACHE_SOURCE);
     const int span = full ? c.H : CHUNK;
     float4 pos{}, neg{};
+    if constexpr (ASYNC_SOURCE) {
+        static_assert(CACHE_SOURCE && LAYOUT);
+        // The column is read by the same lane that copies it. No CTA-wide
+        // synchronization is needed after waiting for that lane's copies.
+        for (int y = 0; y < c.H; y += 4) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (y + j < c.H) c.stage_source(y + j, seg_src + (y + j) * THREADS);
+            }
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+    }
     for (int block = 0; block < chunks; ++block) {
         const int y0 = block * span;
         const int length = min(span, c.H - y0);
         const bool last = full || block == chunks - 1;
         for (int j = 0; j < length; ++j) {
             float4 source;
-            if constexpr (CACHE_SOURCE) {
+            if constexpr (ASYNC_SOURCE) {
+                source = seg_src[(y0 + j) * THREADS].unpack();
+            } else if constexpr (CACHE_SOURCE) {
                 const auto packed = c.packed_source(y0 + j);
                 seg_src[(y0 + j) * THREADS] = packed;
                 source = packed.unpack();
@@ -960,7 +995,8 @@ __device__ __forceinline__ void write_vscan_partial(
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS, int LAYOUT, bool LOCAL_SCRATCH, bool SINGLE_STORE, int SHARED_HIDDEN>
+         bool VECTOR_WEIGHTS, int LAYOUT, bool LOCAL_SCRATCH, bool SINGLE_STORE, int SHARED_HIDDEN,
+         bool ASYNC_SOURCE>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -1083,7 +1119,8 @@ __device__ __forceinline__ void vertical(
                     ? global_checkpoints + I(worker) * M + m : ckpt + threadIdx.x;
                 column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
                                 REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE,
-                                PURE, SINGLE_STORE, CACHE_LINE, LAYOUT, SHARED_HIDDEN>(
+                                PURE, SINGLE_STORE, CACHE_LINE, LAYOUT, SHARED_HIDDEN,
+                                ASYNC_SOURCE>(
                     c, a, g, path, gr, gi, gs,
                     acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
                     GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg,
@@ -1375,7 +1412,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
             f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
             f"{key.state_layout}, {str(key.local_scratch).lower()}, "
-            f"{str(key.single_store).lower()}, {key.shared_hidden}"
+            f"{str(key.single_store).lower()}, {key.shared_hidden}, {str(key.async_source).lower()}"
         )
         wrapper = f"""
 {bounds}(
@@ -1801,6 +1838,7 @@ def _launch_for_shape(  # noqa: C901, PLR0915
     single_store: bool = False,
     drop_source: bool = False,
     shared_hidden: int = 0,
+    async_source: bool = False,
 ) -> Launch | None:
     b, h, w, m = shape
     sms, limit, max_warps_per_sm = device_limits(device)
@@ -1809,11 +1847,13 @@ def _launch_for_shape(  # noqa: C901, PLR0915
         length, limit,
         vertical=vertical, backward=backward, coarse=coarse, hidden=hidden,
         itemsize=dtype.itemsize, compact=compact,
-        cache_trajectories=limit >= _TRAJECTORY_MIN_SMEM,
+        cache_trajectories=limit >= _TRAJECTORY_MIN_SMEM or async_source,
         pure_vertical=pure_vertical,
         state_layout=state_layout, single_store=single_store, drop_source=drop_source,
         shared_hidden=shared_hidden,
     )
+    if async_source:
+        plans = [plan for plan in plans if plan.cache_source]
     fields = ((11 * hidden + 6) if vertical and not pure_vertical else 4) if backward else 0
     lines = b * ((w // 2 if coarse else w) if vertical else h)
     mode_tiles = _ceil(m, _WARP_SIZE)
@@ -1904,7 +1944,7 @@ def _launch_for_shape(  # noqa: C901, PLR0915
             real_transposed=transposed[0],
             imag_transposed=transposed[1],
             state_layout=state_layout, local_scratch=local_scratch, single_store=single_store,
-            shared_hidden=shared_hidden,
+            shared_hidden=shared_hidden, async_source=async_source,
         )
         resident = _resident(device, key, plan.smem)
         active_warps = resident * plan.warps
@@ -1979,6 +2019,7 @@ def _plan_launch(
     single_store: bool = False,
     drop_source: bool = False,
     shared_hidden: int = 0,
+    async_source: bool = False,
 ) -> Launch | None:
     if not source.is_cuda or source.dtype not in _DTYPES:
         return None
@@ -1995,6 +2036,7 @@ def _plan_launch(
         compact=compact, interleaved=interleaved, transposed=transposed,
         pure_vertical=pure_vertical, state_layout=state_layout, local_scratch=local_scratch,
         single_store=single_store, drop_source=drop_source, shared_hidden=shared_hidden,
+        async_source=async_source,
     )
 
 
@@ -2275,6 +2317,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     single_store: bool = False,
     drop_source: bool = False,
     shared_hidden: int = 0,
+    async_source: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     if state_layout:
         b, first, second, m, _ = states.shape
@@ -2337,6 +2380,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         state_layout=state_layout, local_scratch=local_scratch, single_store=single_store,
         drop_source=backward and drop_source,
         shared_hidden=shared_hidden if backward and hidden == _REGISTER_HIDDEN else 0,
+        async_source=async_source and backward and h <= 28 and bool(state_layout),
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
