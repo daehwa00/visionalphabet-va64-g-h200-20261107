@@ -55,11 +55,26 @@ def model_row(model: dict, source: str) -> dict:
     }
 
 
+def profile_rows(model: dict, source: str) -> list[dict]:
+    return [
+        {
+            "source": source, "batch": model.get("batch"),
+            **{field: row[field] for field in (
+                "name", "vertical", "backward", "coarse", "height", "width", "modes", "count",
+                "cuda_event_ms",
+            )},
+            "mean_event_ms": row["cuda_event_ms"] / row["count"],
+            "plans": json.dumps(row["plans"], separators=(",", ":")),
+        }
+        for row in model.get("profiler", {}).get("scan_shape_cuda_events", [])
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("folder", type=Path)
     root = parser.parse_args().folder
-    graph, model, resources = [], [], []
+    graph, model, resources, profiles = [], [], [], []
     for path in sorted(root.rglob("*.jsonl")):
         relative = str(path.relative_to(root))
         rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -78,17 +93,23 @@ def main() -> None:
             graph.extend(graph_rows(rows, relative))
     for path in sorted(root.rglob("*.json")):
         if path.name.startswith("model"):
-            model.append(model_row(json.loads(path.read_text()), str(path.relative_to(root))))
+            row = json.loads(path.read_text())
+            source = str(path.relative_to(root))
+            model.append(model_row(row, source))
+            profiles.extend(profile_rows(row, source))
         if path.name.startswith("h200-") and path.name.endswith("-result.json"):
             result = json.loads(path.read_text())
             for name, rows in result.items():
                 if isinstance(rows, list):
                     graph.extend(graph_rows(rows, f"{path.name}/{name}"))
             for name, row in result.get("arms", {}).items():
-                model.append(model_row(row, f"{path.name}/{name}"))
+                source = f"{path.name}/{name}"
+                model.append(model_row(row, source))
+                profiles.extend(profile_rows(row, source))
     write(root / "cuda-graph.csv", graph)
     write(root / "p1-nr4.csv", model)
     write(root / "ptxas.csv", resources)
+    write(root / "scan-profiler.csv", profiles)
 
 
 if __name__ == "__main__":
