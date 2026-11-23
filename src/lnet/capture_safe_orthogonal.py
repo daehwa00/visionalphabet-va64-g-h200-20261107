@@ -9,13 +9,33 @@ and replaces only the exponential evaluation with a fixed computation graph.
 
 from __future__ import annotations
 
-from typing import Final
+import math
+import os
+from typing import TYPE_CHECKING, Final
 
 import torch
 from torch import Tensor, nn
 
-DEFAULT_TAYLOR_DEGREE: Final = 12
-DEFAULT_SCALING_STEPS: Final = 3
+if TYPE_CHECKING:
+    from torch.autograd.function import FunctionCtx
+
+DEFAULT_TAYLOR_DEGREE: Final = 14
+DEFAULT_SCALING_STEPS: Final = 2
+
+
+class _AutocastIsolatedMatmul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: FunctionCtx, left: Tensor, right: Tensor) -> Tensor:
+        ctx.save_for_backward(left, right)
+        return left @ right
+
+    @staticmethod
+    def backward(ctx: FunctionCtx, gradient: Tensor) -> tuple[Tensor, Tensor]:
+        left, right = ctx.saved_tensors
+        # AOTAutograd may trace this backward under the ambient forward
+        # autocast policy. Keep the polynomial VJP at its forward dtype.
+        with torch.amp.autocast(device_type=left.device.type, enabled=False):
+            return gradient @ right.mT, left.mT @ gradient
 
 
 def fixed_taylor_matrix_exp(
@@ -27,11 +47,8 @@ def fixed_taylor_matrix_exp(
 ) -> Tensor:
     """Approximate ``exp(matrix)`` with a fixed capture-safe FP32 graph.
 
-    The Taylor polynomial is evaluated in Horner form after scaling by
-    ``2**scaling_steps`` and the result is squared ``scaling_steps`` times.
-    Both loop counts are Python constants for a prepared parametrization, so
-    CUDA Graph capture and ``torch.compile(fullgraph=True)`` see no data-
-    dependent control flow.
+    The default degree-14 polynomial uses Paterson-Stockmeyer blocks.
+    Other degrees retain the configurable Horner evaluation.
     """
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
         message = f"expected one square matrix, got shape={tuple(matrix.shape)}"
@@ -49,15 +66,42 @@ def fixed_taylor_matrix_exp(
         message = f"compute_dtype must be float32 or float64, got {compute_dtype}"
         raise ValueError(message)
 
-    active = matrix if compute_dtype is None else matrix.to(dtype=compute_dtype)
-    identity = torch.eye(active.shape[0], dtype=active.dtype, device=active.device)
-    scaled = active * (2.0**-scaling_steps)
-    result = identity
-    for denominator in range(taylor_degree, 0, -1):
-        result = identity + torch.matmul(scaled, result) / denominator
+    if compute_dtype is None and matrix.dtype in (torch.float16, torch.bfloat16):
+        compute_dtype = torch.float32
+    with torch.amp.autocast(device_type=matrix.device.type, enabled=False):
+        active = matrix if compute_dtype is None else matrix.to(dtype=compute_dtype)
+        identity = torch.eye(active.shape[0], dtype=active.dtype, device=active.device)
+        scaled = active * (2.0**-scaling_steps)
+        if taylor_degree == DEFAULT_TAYLOR_DEGREE:
+            return _paterson_stockmeyer_14(scaled, identity, scaling_steps).to(matrix.dtype)
+        result = identity
+        for denominator in range(taylor_degree, 0, -1):
+            result = identity + _AutocastIsolatedMatmul.apply(scaled, result) / denominator
+        for _ in range(scaling_steps):
+            result = _AutocastIsolatedMatmul.apply(result, result)
+        return result.to(dtype=matrix.dtype)
+
+
+def _paterson_stockmeyer_14(scaled: Tensor, identity: Tensor, scaling_steps: int) -> Tensor:
+    squared = _AutocastIsolatedMatmul.apply(scaled, scaled)
+    cubed = _AutocastIsolatedMatmul.apply(squared, scaled)
+    fourth = _AutocastIsolatedMatmul.apply(squared, squared)
+    powers = (identity, scaled, squared, cubed)
+
+    def block(start: int, count: int) -> Tensor:
+        value = powers[0] / math.factorial(start)
+        for i in range(1, count):
+            value = value + powers[i] / math.factorial(start + i)
+        return value
+
+    result = block(12, 3)
+    for start in (8, 4):
+        result = _AutocastIsolatedMatmul.apply(result, fourth) + block(start, 4)
+    residual = _AutocastIsolatedMatmul.apply(result, fourth) + (scaled + squared / 2 + cubed / 6)
+    # Square I + R while keeping unit diagonal entries out of the matmuls.
     for _ in range(scaling_steps):
-        result = torch.matmul(result, result)
-    return result.to(dtype=matrix.dtype)
+        residual = 2 * residual + _AutocastIsolatedMatmul.apply(residual, residual)
+    return identity + residual
 
 
 class CaptureSafeMatrixExpOrthogonal(nn.Module):
@@ -173,12 +217,22 @@ def prepare_capture_safe_orthogonal_(
     taylor_degree: int = DEFAULT_TAYLOR_DEGREE,
     scaling_steps: int = DEFAULT_SCALING_STEPS,
     compute_dtype: torch.dtype | None = None,
+    auto: bool = True,
 ) -> tuple[str, ...]:
     """Replace every existing matrix-exp orthogonal parametrization in ``model``.
 
     Returns the qualified tensor paths that were changed.  Calling the
     function again is idempotent and returns an empty tuple.
+
+    The environment can force preparation on or off. In auto mode, callers
+    opt in via ``auto``, which defaults to True for explicit preparation.
     """
+    policy = os.environ.get("LNET_CAPTURE_SAFE_ORTHOGONAL", "auto")
+    if policy not in {"auto", "on", "off"}:
+        raise ValueError(f"invalid LNET_CAPTURE_SAFE_ORTHOGONAL: {policy!r}")
+    if policy == "off" or (policy == "auto" and not auto):
+        return ()
+
     replaced: list[str] = []
     for module_path, module in tuple(model.named_modules()):
         parametrizations = getattr(module, "parametrizations", None)
