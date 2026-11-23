@@ -6,6 +6,7 @@ from __future__ import annotations
 # The composition boundary intentionally uses package-private primitive ops so
 # their intermediate autograd contexts do not retain horizontal scan states.
 # pyright: reportPrivateUsage=false
+import os
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import torch
@@ -13,9 +14,14 @@ from torch import Tensor
 from torch.library import triton_op
 
 from .general_cuda_scans import (
+    _eligible,
     _general_vertical_inputs,
+    _horizontal_layout,
+    _hscan,
     _should_save_vscan,
+    _state_shape,
     _vertical_forward_saved,
+    _vscan,
     can_use_general_hscan,
     general_scans_enabled,
     horizontal_backward,
@@ -1170,6 +1176,115 @@ def _packed_horizontal_forward(
     return _horizontal_forward_planes_op(*pole, *source)
 
 
+def _wave15_options() -> tuple[int, bool, bool, bool]:
+    return (
+        int(os.getenv("VA_WAVE15_LAYOUT", "0")),
+        os.getenv("VA_WAVE15_SCRATCH") == "1",
+        os.getenv("VA_WAVE15_SINGLE_STORE") == "1",
+        os.getenv("VA_WAVE15_DROP_SOURCE") == "1",
+    )
+
+
+def _wave15_operands(
+    pole_x: tuple[Tensor, Tensor, Tensor, Tensor],
+    pole_y: tuple[Tensor, Tensor, Tensor, Tensor],
+    source: tuple[Tensor, Tensor],
+    auxiliary: tuple[Tensor, Tensor, Tensor],
+    path: list[Tensor],
+    epilogue: str,
+    kind: int,
+    path_swiglu: bool,
+    layout: int,
+) -> tuple[list[Tensor], list[Tensor], list[Tensor], bool] | None:
+    real, imag = source
+    if (
+        epilogue not in ("full16", "coarse_path") or not general_scans_enabled(forward=True)
+        or os.getenv("LNET_VSCAN_DECOUPLED") is not None
+        or not can_use_general_hscan(real, imag, list(pole_x))
+        or not _eligible(
+            real, tuple(real.shape), vertical=False, coarse=False, hidden=0, precise=False,
+            state_layout=layout, **_horizontal_layout(real, imag),
+        )
+    ):
+        return None
+    shape_probe = real.unsqueeze(0).expand(4, *real.shape)
+    operands = _general_vertical_inputs(
+        pole_y, shape_probe, auxiliary, path, epilogue, kind, path_swiglu,
+    )
+    if operands is None:
+        return None
+    py, _, tables, weights, coarse = operands
+    return py, tables, weights, coarse
+
+
+@torch.library.custom_op("lnet::wave15_scan_forward", mutates_args=())
+def _wave15_forward(
+    px: list[Tensor], source: list[Tensor], py: list[Tensor], aux: list[Tensor],
+    path: list[Tensor], coarse: bool, epsilon: float, packed: bool, planar: bool,
+    layout: int, scratch: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    states, _ = _hscan(px, *source, state_layout=layout)
+    out = _vscan(
+        py, states, aux, path, coarse, epsilon, True, packed=packed, planar=planar,
+        state_layout=layout, local_scratch=scratch,
+    )
+    if isinstance(out, Tensor):
+        return out, out.new_empty((0,)), states
+    if not isinstance(out, tuple):
+        raise TypeError("Expected vertical scan output")
+    return *out, states
+
+
+@_wave15_forward.register_fake
+def _fake_wave15_forward(
+    px: list[Tensor], source: list[Tensor], py: list[Tensor], aux: list[Tensor],  # noqa: ARG001
+    path: list[Tensor], coarse: bool, epsilon: float, packed: bool, planar: bool,  # noqa: ARG001
+    layout: int, scratch: bool,  # noqa: ARG001
+) -> tuple[Tensor, Tensor, Tensor]:
+    real = source[0]
+    b, h, w, m = real.shape
+    shape = (b, h // (1 + coarse), w // (1 + coarse), m)
+    states = real.new_empty(_state_shape(b, h, w, m, layout))
+    if packed:
+        out = real.new_empty((2, *shape) if planar else (*shape[:-1], 2 * m))
+        return out, real.new_empty((0,)), states
+    return real.new_empty(shape), real.new_empty(shape), states
+
+
+@torch.library.custom_op("lnet::wave15_scan_backward", mutates_args=())
+def _wave15_backward(
+    px: list[Tensor], source: list[Tensor], py: list[Tensor], aux: list[Tensor],
+    path: list[Tensor], saved: list[Tensor], dy: list[Tensor], coarse: bool, epsilon: float,
+    layout: int, scratch: bool, single: bool, drop_source: bool,
+) -> list[Tensor]:
+    states = saved[0] if saved else _hscan(px, *source, state_layout=layout)[0]
+    vertical = _vscan(
+        py, states, aux, path, coarse, epsilon, False, (dy[0], dy[1]),
+        compact=coarse, state_layout=layout, local_scratch=scratch,
+        single_store=single, drop_source=drop_source,
+    )
+    if not isinstance(vertical, list):
+        raise TypeError("Expected vertical scan gradients")
+    dx, pole = _hscan(px, *source, states, vertical[4], compact=coarse, state_layout=layout)
+    if pole is None:
+        raise TypeError("Expected horizontal scan gradients")
+    return [*pole, *vertical[:4], dx, *vertical[5:]]
+
+
+@_wave15_backward.register_fake
+def _fake_wave15_backward(
+    px: list[Tensor], source: list[Tensor], py: list[Tensor], aux: list[Tensor],  # noqa: ARG001
+    path: list[Tensor], saved: list[Tensor], dy: list[Tensor], coarse: bool, epsilon: float,  # noqa: ARG001
+    layout: int, scratch: bool, single: bool, drop_source: bool,  # noqa: ARG001
+) -> list[Tensor]:
+    real = source[0]
+    return [
+        *(t.new_empty(t.shape) for t in (*px, *py)),
+        real.new_empty((*real.shape[:-1], 2 * real.shape[-1])),
+        *(t.new_empty(t.shape) for t in path),
+    ]
+
+
 def _run_packed_cuda_forward(
     inputs: list[Tensor],
     path: list[Tensor],
@@ -1186,7 +1301,6 @@ def _run_packed_cuda_forward(
     pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
-    horizontal_storage = _packed_horizontal_forward(pole_x, source)
     auxiliary = static_product_scan_auxiliary(
         pole_x,
         pole_y,
@@ -1194,6 +1308,24 @@ def _run_packed_cuda_forward(
         epsilon=epsilon,
         gain_kind=kind,
     )
+
+    layout, scratch, single, drop_source = _wave15_options()
+    if layout or scratch or single or drop_source:
+        trial = _wave15_operands(
+            pole_x, pole_y, source, auxiliary, path, epilogue, kind, path_swiglu, layout,
+        )
+        if trial is not None:
+            py, tables, weights, coarse = trial
+            real, imag, states = _wave15_forward(
+                list(pole_x), list(source), py, tables, weights, coarse, epsilon,
+                packed_output, planar_output, layout, scratch or single,
+            )
+            if not packed_output and not squeeze_collapsed:
+                real, imag = real.unsqueeze(-2), imag.unsqueeze(-2)
+            return real, imag, real.new_empty((0,), dtype=torch.float32), (
+                [] if recompute else [states]
+            )
+    horizontal_storage = _packed_horizontal_forward(pole_x, source)
 
     if general_scans_enabled(forward=True):
         operands = _general_vertical_inputs(
@@ -1298,16 +1430,29 @@ def _run_packed_cuda_backward(
     saved_features = None
     if horizontal_states and horizontal_states[-1].ndim == 3:
         *horizontal_states, saved_features = horizontal_states
-    horizontal_storage = (
-        horizontal_states[0] if horizontal_states
-        else _packed_horizontal_forward(pole_x, source)
-    )
     auxiliary = static_product_scan_auxiliary(
         pole_x,
         pole_y,
         source[0],
         epsilon=epsilon,
         gain_kind=kind,
+    )
+    layout, scratch, single, drop_source = _wave15_options()
+    if layout or scratch or single or drop_source:
+        trial = _wave15_operands(
+            pole_x, pole_y, source, auxiliary, path, epilogue, kind, path_swiglu, layout,
+        )
+        if trial is not None:
+            py, tables, weights, coarse = trial
+            if grad_real.ndim == 5:
+                grad_real, grad_imag = grad_real.squeeze(-2), grad_imag.squeeze(-2)
+            return _wave15_backward(
+                list(pole_x), list(source), py, tables, weights, horizontal_states,
+                [grad_real, grad_imag], coarse, epsilon, layout, scratch, single, drop_source,
+            )
+    horizontal_storage = (
+        horizontal_states[0] if horizontal_states
+        else _packed_horizontal_forward(pole_x, source)
     )
     factor = (
         grad_descriptor * torch.exp(-descriptor) / (

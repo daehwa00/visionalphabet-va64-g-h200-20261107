@@ -1,0 +1,164 @@
+# ruff: noqa: SLF001, FBT003, ANN001, ANN201, ANN202, B023, PLR0915, T201, E501
+"""Measure candidate layouts in a single graph with Wave 14A as the control."""
+
+import argparse
+import inspect
+import json
+import statistics
+from pathlib import Path
+from unittest.mock import patch
+
+import torch
+
+from lnet import general_cuda_scans as scans
+
+TRIAL_ENABLED = "state_layout" in inspect.signature(scans._hscan).parameters
+
+CASES = (
+    (56, 56, 160, False), (56, 56, 160, True),
+    (28, 28, 160, False), (28, 28, 160, True),
+    (14, 14, 160, False), (7, 7, 160, False),
+    (128, 192, 160, False), (512, 768, 48, False),
+)
+ARMS = {
+    "baseline": (0, False, False, False),
+    "scratch": (0, True, False, False),
+    "row": (1, False, False, False),
+    "column": (2, False, False, False),
+    "single": (2, True, True, False),
+    "drop-source": (2, True, True, True),
+}
+
+
+def sample(shape, dtype, scale):
+    return torch.randn(shape, device="cuda", dtype=dtype).mul_(scale)
+
+
+def signature(outputs):
+    return [
+        value.flatten()[::max(1, value.numel() // 16384)].float()
+        for value in outputs
+    ]
+
+
+def compare(outputs, expected):
+    return [
+        {
+            "exact": torch.equal(value, reference),
+            "max_abs": (value - reference).abs().max().item(),
+            "reference_max_abs": reference.abs().max().item(),
+            "finite": bool(value.isfinite().all()),
+        }
+        for value, reference in zip(outputs, expected, strict=True)
+    ]
+
+
+def probe(case, args):
+    h, w, modes, coarse = case
+    b = args.batch if h <= 56 else 4
+    oh, ow = h // (1 + coarse), w // (1 + coarse)
+    dtype = getattr(torch, args.dtype)
+    source = [sample((b, h, w, modes), dtype, 0.4) for _ in range(2)]
+    px, py = [[sample((modes,), torch.float32, 0.12) for _ in range(4)] for _ in range(2)]
+    aux = [torch.ones((2, length, modes), device="cuda") for length in (w, h)]
+    path = [sample(size, torch.float32, 0.17) for size in (
+        (modes, 8, 8), (modes, 8), (modes, 2, 8), (modes, 2),
+    )]
+    dy = [sample((b, oh, ow, modes), dtype, 0.1) for _ in range(2)]
+    expected = None
+    results = {}
+    for name in args.arms:
+        layout, scratch, single, drop_source = ARMS[name]
+        options = {
+            "state_layout": layout, "local_scratch": scratch,
+            "single_store": single, "drop_source": drop_source,
+        }
+
+        horizontal_options = {"state_layout": layout} if TRIAL_ENABLED else {}
+        options = options if TRIAL_ENABLED else {}
+
+        def operation():
+            states, _ = scans._hscan(px, *source, **horizontal_options)
+            output = scans._vscan(py, states, aux, path, coarse, 1e-6, True, **options)
+            vertical = scans._vscan(
+                py, states, aux, path, coarse, 1e-6, False, tuple(dy),
+                compact=coarse, **options,
+            )
+            dx, pole = scans._hscan(
+                px, *source, states, vertical[4], compact=coarse, **horizontal_options,
+            )
+            return [*output, dx, *pole, *vertical[:4], *vertical[5:]]
+
+        warm = operation()
+        torch.cuda.synchronize()
+        values = signature(warm)
+        expected = values if expected is None else expected
+        parity = compare(values, expected)
+        del warm
+        plans = {}
+        events = {}
+
+        def track(source, launch, arguments):
+            key = launch.key
+            phase = ("vscan" if key.vertical else "hscan") + ("_bwd" if key.backward else "_fwd")
+            start, stop = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
+            plans[phase] = {
+                **launch.plan._asdict(), "workers": launch.workers,
+                "estimated_scratch_bytes": (
+                    0 if not key.vertical or launch.plan.cache_line else
+                    launch.workers * modes * dtype.itemsize * (8 * h if getattr(key, "single_store", False) else 4 * oh)
+                ),
+            }
+            events[phase] = start, stop
+            start.record()
+            dispatch(source, launch, arguments)
+            stop.record()
+
+        graph = torch.cuda.CUDAGraph()
+        dispatch = scans._dispatch
+        torch.cuda.reset_peak_memory_stats()
+        with patch.object(scans, "_dispatch", track), torch.cuda.graph(graph):
+            outputs = operation()
+        peak = torch.cuda.max_memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        samples = {phase: [] for phase in (*events, "combined")}
+        for _ in range(args.repeats):
+            start.record()
+            for _ in range(5):
+                graph.replay()
+            stop.record()
+            stop.synchronize()
+            samples["combined"].append(start.elapsed_time(stop) / 5)
+            for phase, (before, after) in events.items():
+                samples[phase].append(before.elapsed_time(after))
+        results[name] = {
+            "samples_ms": samples,
+            "median_ms": {phase: statistics.median(times) for phase, times in samples.items()},
+            "plan": plans, "sampled_parity": parity, "peak_allocated_bytes": peak,
+        }
+        del outputs, graph
+    return {"shape": [b, h, w, modes, coarse], "dtype": args.dtype, "results": results}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--repeats", type=int, default=7)
+    parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
+    parser.add_argument("--cases", type=int, nargs="+", default=list(range(len(CASES))))
+    args = parser.parse_args()
+    torch.manual_seed(731)
+    print(torch.cuda.get_device_name(), torch.__version__, flush=True)
+    with args.out.open("w") as out:
+        for index in args.cases:
+            row = probe(CASES[index], args)
+            print(json.dumps(row), file=out, flush=True)
+            print(row["shape"], {k: v["median_ms"]["combined"] for k, v in row["results"].items()}, flush=True)
+
+
+if __name__ == "__main__":
+    main()

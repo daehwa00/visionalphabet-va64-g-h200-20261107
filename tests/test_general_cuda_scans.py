@@ -1067,3 +1067,42 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     ):
         for value, target in zip(values, reference, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize(("h", "w", "coarse"), [(15, 19, False), (14, 28, True)])
+@pytest.mark.parametrize(("layout", "single"), [(1, False), (2, False), (2, True)])
+def test_wave15_packed_scan_equivalence(
+    dtype: torch.dtype, h: int, w: int, coarse: bool, layout: int, single: bool,
+) -> None:
+    torch.manual_seed(902)
+    px, py, real, imag, auxiliary, path = _inputs(h, w, 35, 8, dtype, "cuda", batch=3)
+    aux = [value.detach() for value in auxiliary]
+    states = scans.horizontal_forward(px, real, imag)
+    out = scans.vertical_forward(py, states, aux, path, coarse)
+    weights = [torch.randn_like(item) for item in out]
+    (packed, _) = scans._hscan(px, real, imag, state_layout=layout)
+    assert packed.shape == ((3, h, w, 35, 4) if layout == 1 else (3, w, h, 35, 4))
+    unpacked = packed.permute(4, 0, 1, 2, 3) if layout == 1 else packed.permute(4, 0, 2, 1, 3)
+    torch.testing.assert_close(unpacked, states, rtol=0, atol=0)
+    forward = scans._vscan(py, packed, aux, path, coarse, 1e-6, precise=True, state_layout=layout)
+    torch.testing.assert_close(forward, out, rtol=0, atol=0)
+    dv = scans._vscan(
+        py, packed, aux, path, coarse, 1e-6, precise=False, grad=tuple(weights),
+        compact=coarse, state_layout=layout, single_store=single,
+    )
+    dh, dx = scans._hscan(px, real, imag, packed, dv[4], compact=coarse, state_layout=layout)
+    expected = _reference_vscan(
+        py, torch.stack(bidirectional_product_scan_reference(tuple(px), (real, imag))),
+        aux, path, coarse,
+    )
+    expected_grads = torch.autograd.grad(expected, (real, imag, *px, *py, *path), weights)
+    values = (*dh.split(35, dim=-1), *dx, *dv[:4], *dv[5:])
+    rtol, atol = {
+        torch.float32: (4e-4, 2e-4),
+        torch.float16: (5e-2, 2e-2),
+        torch.bfloat16: (1.2e-1, 8e-2),
+    }[dtype]
+    torch.testing.assert_close(values, expected_grads, rtol=rtol, atol=atol)
