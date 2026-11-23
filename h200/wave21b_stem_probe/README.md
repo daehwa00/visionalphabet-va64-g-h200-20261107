@@ -26,3 +26,6 @@ bash h200/wave21b_stem_probe/verify.sh "$HOME/miniconda3/envs/alphabet/bin/pytho
   PYTHONPATH=src:scripts "$HOME/miniconda3/envs/alphabet/bin/python" h200/wave21b_stem_probe/adjacent.py
 ) 9>/tmp/va-gpu.lock
 ```
+
+The same lock applies to `nr4_geometry.py`, which compares six launch
+geometries for the unchanged NR4 Triton kernel.
