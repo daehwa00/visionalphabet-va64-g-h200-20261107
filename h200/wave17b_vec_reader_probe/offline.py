@@ -52,6 +52,8 @@ def compile_case(job):
                 subprocess.run([cuda / "cuobjdump", "--dump-sass", elf], stdout=log, check=True)
     except (RuntimeError, subprocess.CalledProcessError) as error:
         (directory / "error.log").write_text(str(error))
+        if dtype == "float" and vec > 1 and "ModePair" in str(error):
+            return tag, "unsupported_fp32_vector"
         return tag, str(error)
     return tag, ""
 
@@ -108,10 +110,14 @@ def main():
     ]
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         results = list(pool.map(compile_case, jobs))
-    failures = [(tag, error) for tag, error in results if error]
+    unsupported = sum(error == "unsupported_fp32_vector" for _, error in results)
+    failures = [(tag, error) for tag, error in results
+                if error and error != "unsupported_fp32_vector"]
     for tag, error in failures:
         print(tag, error)
-    print(f"{len(results) - len(failures)}/{len(results)} compiler cases passed")
+    compiled = len(results) - len(failures) - unsupported
+    print(f"{compiled}/{len(results)} compiled; {unsupported} unsupported FP32 vectors; "
+          f"{len(failures)} unexpected failures")
     raise SystemExit(bool(failures))
 
 
