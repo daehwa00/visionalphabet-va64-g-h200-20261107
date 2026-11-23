@@ -10,7 +10,11 @@ unset VA_REAL_MEMORY_SCAN_BATCH_PARTIALS VA_REAL_MEMORY_TRAINING_OPTIMIZATIONS
 unset LNET_DISABLE_LAUNCH_AUTOTUNE LNET_NR4_FUSED LNET_VSCAN_DECOUPLED
 export TORCHINDUCTOR_CACHE_DIR="$out/inductor"
 export SCAN_BATCH=1024 MODEL_BATCHES="128 256 512 1024" COMBINED_SCAN=1 REFERENCE_CHECK=0
-export SPATIAL_VARIANT=auto-batched GRAPH_VARIANTS=auto-batched
+export SPATIAL_VARIANT=16x8-batched GRAPH_VARIANTS="auto-batched 16x8-batched"
+baseline=42ff1ee5170892b94d44a4a17106af28b71400ab
+mkdir "$out/wave14a"
+git archive "$baseline" src scripts | tar -x -C "$out/wave14a"
+export BASELINE_PYTHONPATH="$out/wave14a/src:$out/wave14a/scripts"
 
 finish() {
     local rc=$?

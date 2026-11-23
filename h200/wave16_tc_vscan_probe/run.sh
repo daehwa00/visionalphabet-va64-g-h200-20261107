@@ -33,9 +33,14 @@ fi
 
 for model_batch in ${MODEL_BATCHES:-128}; do
     for arm in baseline spatial; do
-        setting=
-        if [[ $arm == spatial ]]; then setting=$variant; fi
-        LNET_VSCAN_SPATIAL=$setting "$python_bin" "$suite" train-arm --variant "$model" \
+        setting= search_path=$PYTHONPATH
+        if [[ $arm == spatial ]]; then
+            setting=$variant
+        else
+            search_path=${BASELINE_PYTHONPATH:-$PYTHONPATH}
+        fi
+        PYTHONPATH=$search_path LNET_VSCAN_SPATIAL=$setting \
+            "$python_bin" "$suite" train-arm --variant "$model" \
             --batch "$model_batch" --profile --out "$out/b${model_batch}_${arm}.json"
     done
 done
