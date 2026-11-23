@@ -17,7 +17,7 @@ from lnet import factorized_reader_kernels as reader
 
 STANDARD = (
     (56, 56, 160, 4), (28, 28, 320, 4), (14, 14, 640, 4), (7, 7, 640, 4),
-    (128, 192, 48, 2), (96, 128, 80, 8), (512, 768, 48, 2),
+    (128, 192, 160, 4), (96, 128, 320, 4), (512, 768, 160, 4),
 )
 PROBE_EDGES = (1, 2, 3, 4, 6, 17, 30, 33, 34, 48)
 
@@ -87,7 +87,8 @@ def time_case(batch, shape, dtype, samples, modules):
     p, g, real, imag = inputs(batch, shape, dtype)
     result = {"shape": (batch, h, w, m, r), "dtype": str(dtype), "arms": {}}
     for name, module in modules:
-        os.environ["LNET_READER_VEC"] = {"baseline": "1", "wave17b": "auto"}.get(name, name)
+        historical_arms = {"baseline": "1", "wave17b": "auto", "wave18b": "auto"}
+        os.environ["LNET_READER_VEC"] = historical_arms.get(name, name)
         calls = record_launches(module, p, g, real, imag)
         groups = {
             "forward": calls[:1], "dinput": calls[-1:], "dweight": calls[1:-1], "total": calls,
@@ -172,6 +173,7 @@ def main():
     parser.add_argument("--samples", type=int, default=16)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--wave17b", type=Path)
+    parser.add_argument("--wave18b", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--shape", type=int, nargs=4)
     parser.add_argument("--case", type=int)
@@ -193,6 +195,8 @@ def main():
             modules = [("baseline", baseline)] if baseline else []
             if args.wave17b:
                 modules.append(("wave17b", load_baseline(args.wave17b, "wave17b")))
+            if args.wave18b:
+                modules.append(("wave18b", load_baseline(args.wave18b, "wave18b")))
             modules.extend((vec, reader) for vec in args.arms)
             cases = (
                 time_case(args.batch, shape, dtype, args.samples, modules)

@@ -613,7 +613,7 @@ def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
     [
         ("auto", 90, 160, torch.bfloat16, False, 0, 2),
         ("auto", 86, 160, torch.bfloat16, False, 0, 2),
-        ("auto", 89, 160, torch.bfloat16, False, 0, 1),
+        ("auto", 89, 160, torch.bfloat16, False, 0, 2),
         ("1", 90, 160, torch.bfloat16, False, 0, 1),
         ("2", 86, 34, torch.float16, False, 0, 2),
         ("2", 90, 17, torch.bfloat16, False, 0, 1),
@@ -712,7 +712,18 @@ def test_reader_operation_occupancy(monkeypatch: pytest.MonkeyPatch) -> None:
         weight, _ = kernels._vector_plan(
             0, shape, shape, 4, ("__half",) * 3, 2, "dweight", automatic=False,
         )
-        assert (spatial.rows, spatial.warps) == (2, 4)
+        assert (spatial.rows, spatial.warps) == (2, 2)
         assert (weight.rows, weight.warps, weight.rank_tile) == (2, 4, 1)
     finally:
         kernels._vector_plan.cache_clear()
+
+
+def test_reader_traffic_accounts_for_halo_rank_reuse_and_partial_waves() -> None:
+    sms = 132
+    long_tile = kernels._VectorLaunch(2, 8, 4, 4, 2)
+    short_tile = kernels._VectorLaunch(2, 8, 2, 4, 1)
+    long_score = kernels._traffic_score(long_tile, "dweight", 4, 32, sms * 4, 4, sms)
+    short_score = kernels._traffic_score(short_tile, "dweight", 4, 32, sms * 6, 6, sms)
+    assert long_score > short_score
+    underfilled = kernels._traffic_score(long_tile, "dweight", 4, 32, sms // 2, 4, sms)
+    assert underfilled < long_score

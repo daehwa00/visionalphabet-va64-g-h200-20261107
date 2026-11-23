@@ -1124,7 +1124,7 @@ def _weight_geometry(
                 return tile, 1, _WIDE_WEIGHT_WARPS
     if rank == _STATIC_RANK_LIMIT and grad_dtype == torch.bfloat16:
         if area <= _SMALL_WEIGHT_PLANE_PIXELS:
-            return _STATIC_RANK_LIMIT, 2, 4
+            return _CENTERED_WEIGHT_TILE, 4, 4
         if area >= _LARGE_WEIGHT_PLANE_PIXELS:
             return _STATIC_RANK_LIMIT, 2, 8
     return _DEFAULT_WEIGHT_GEOMETRY
@@ -1207,7 +1207,7 @@ def _reader_vector_width(
     if projected.data_ptr() % alignment or (grad is not None and grad.data_ptr() % alignment):
         return 1
     props = torch.cuda.get_device_properties(projected.device)
-    if choice == "auto" and (props.major, props.minor) not in {(8, 6), (9, 0)}:
+    if choice == "auto" and (props.major, props.minor) not in {(8, 6), (8, 9), (9, 0)}:
         return 1
     return vec
 
@@ -1243,6 +1243,32 @@ def _reader_resident(module: _CudaModule, op: str, warps: int) -> int:
     return blocks.value
 
 
+def _traffic_score(
+    launch: _VectorLaunch, op: str, rank: int, width: int, blocks: int,
+    resident: int, sms: int,
+) -> float:
+    """Estimate useful work per byte at the achieved SM wave fullness."""
+    wave_blocks = sms * resident
+    fullness = blocks / (_ceildiv(blocks, wave_blocks) * wave_blocks)
+    halo = (launch.rows + 2) / launch.rows
+    rank_reuse = min(rank, launch.rank_tile)
+    if op == "dweight":
+        # Gradient has two components and gets loaded once per rank tile.
+        traffic = rank + 2 * halo * _ceildiv(rank, rank_reuse)
+        useful_warps = launch.warps
+    else:
+        # Spatial kernels unroll the rank in a single CTA. Their horizontal
+        # windows restart at every active column warp.
+        traffic = (2 if op == "dinput" else rank) * halo
+        traffic *= (launch.columns + 2) / launch.columns
+        traffic += rank if op == "dinput" else 2
+        useful_warps = min(launch.warps, _ceildiv(width, launch.columns))
+    # Once four schedulers each have a ready warp, additional residency
+    # improves latency hiding with diminishing returns.
+    ready_warps = resident * useful_warps * fullness
+    return min(ready_warps / 4, 1.0) / traffic
+
+
 @cache
 def _vector_plan(  # noqa: C901, PLR0912, PLR0915
     device: int, shape: tuple[int, int, int, int],
@@ -1253,18 +1279,38 @@ def _vector_plan(  # noqa: C901, PLR0912, PLR0915
     props = torch.cuda.get_device_properties(device)
     weight = op == "dweight"
     columns = _reader_vector_columns(width, vec)
+    hopper = props.major >= 9
+    compact = _reader_columns(width)
+    compact_plane = compact < width <= 2 * compact
+    sms = props.multi_processor_count
     if vec == 4:
         geometries = ((1, 4, 1),)
+    elif hopper and not (weight and compact_plane):
+        geometries = ((4, 4, 2), (2, 4, 2), (2, 4, 1)) if weight else (
+            (4, 2, rank), (2, 2, rank), (2, 4, rank),
+        )
+        if width <= compact:
+            # Leave the second column warp outside the plane, as in the
+            # original long-row specialization.
+            columns = _DEFAULT_COLUMNS
     elif weight:
         geometries = ((2, 4, 1), (2, 4, 2), (4, 4, 2))
     else:
         geometries = ((2, 4, 1), (4, 2, 1), (2, 2, 1))
 
-    compact = _reader_columns(width)
-    if automatic and not weight and vec == 2 and compact < width <= 2 * compact:
+    if automatic and not weight and vec == 2 and compact_plane:
         # Two column warps fit the compact scalar path without an idle warp.
         return None
     mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
+    if (
+        automatic and hopper and op != "forward"
+        and types == ("__nv_bfloat16",) * 3
+        and width >= columns * _DEFAULT_SPATIAL_GEOMETRY[1]
+        and mode_tiles < _DEFAULT_SPATIAL_GEOMETRY[1]
+    ):
+        # The BF16 scalar backward path exposes more independent mode warps
+        # for long rows with few packed mode partitions.
+        return None
     best = None
     best_score = None
     if vec == 2 and width > 2 * _reader_columns(width):
@@ -1276,8 +1322,10 @@ def _vector_plan(  # noqa: C901, PLR0912, PLR0915
     else:
         reuse = None
     for rows, warps, tile in geometries:
-        op_columns = min(columns, width)
-        if not weight and width < warps * columns and width % compact == 0:
+        op_columns = columns
+        if not hopper or compact_plane:
+            op_columns = min(columns, width)
+        if not hopper and not weight and width < warps * columns and width % compact == 0:
             op_columns = compact
         row_tiles = _ceildiv(height, rows)
         column_tiles = _ceildiv(width, warps * op_columns)
@@ -1311,10 +1359,11 @@ def _vector_plan(  # noqa: C901, PLR0912, PLR0915
         launch = _VectorLaunch(vec, op_columns, rows, warps, tile)
         if props.major == 8 and (rows, warps, tile) == reuse and resident >= 2:
             return launch, module
-        active = min(blocks / props.multi_processor_count, resident)
-        # Estimate resident useful warps. Prefer fewer rank passes or larger
-        # spatial tiles where residency is equal.
-        score = active * useful_warps, tile if weight else rows * op_columns
+        active = min(blocks / sms, resident)
+        if hopper and vec == 2 and not (weight and compact_plane):
+            score = _traffic_score(launch, op, rank, width, blocks, resident, sms), rows
+        else:
+            score = active * useful_warps, tile if weight else rows * op_columns
         if best_score is None or score > best_score:
             best_score = score
             best = launch, module
