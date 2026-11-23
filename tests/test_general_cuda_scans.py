@@ -598,8 +598,10 @@ def test_packed_vertical_index_bound(
 ) -> None:
     monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
     monkeypatch.setattr(scans, "_resident", lambda *_: 3)
+    monkeypatch.setattr(scans, "_kernel_local_bytes", lambda *_: 0)
     monkeypatch.setattr(scans, "_extra_workspace_budget", lambda _: 0)
     scans._launch_for_shape.cache_clear()
+    scans._with_shared_path_gradients.cache_clear()
     try:
         shape = (batch, 56, 56, 160)
         states = SimpleNamespace(
@@ -615,6 +617,7 @@ def test_packed_vertical_index_bound(
         assert launch.key.index32 == index32
     finally:
         scans._launch_for_shape.cache_clear()
+        scans._with_shared_path_gradients.cache_clear()
 
 
 # Cover every requested value with both eager and Inductor; include checkpoint
@@ -1113,8 +1116,8 @@ def test_cuda_fused_gradient_staging(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, w: int, m: int, coarse: bool,
 ) -> None:
     torch.manual_seed(731)
-    _, pole, real, imag, aux, path = _inputs(h, w, m, 8, dtype, "cuda")
-    states = torch.stack((real, imag, imag, real)).detach().requires_grad_()
+    px, pole, real, imag, aux, path = _inputs(h, w, m, 8, dtype, "cuda")
+    states = scans.horizontal_forward(px, real, imag).detach().requires_grad_()
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     monkeypatch.setenv("LNET_VSCAN_FUSED_OPT", "off")
     baseline = scans.vertical_forward(pole, states, aux, path, coarse)
@@ -1124,10 +1127,9 @@ def test_cuda_fused_gradient_staging(
     monkeypatch.setenv("LNET_VSCAN_FUSED_OPT", "on")
     actual = scans.vertical_forward(pole, states, aux, path, coarse)
     actual_grads = scans.vertical_backward(pole, states, aux, path, *adjoints, coarse)
-    reference = _reference_vscan(pole, states.float(), aux, path, coarse)
-    reference_grads = torch.autograd.grad(
-        reference, [*pole, states, *path], tuple(x.float() for x in adjoints),
-    )
+    # The reference accumulates in FP32 with the selected dtype's cast points.
+    reference = _reference_vscan(pole, states, aux, path, coarse)
+    reference_grads = torch.autograd.grad(reference, [*pole, states, *path], adjoints)
     forward_tol, backward_tol = {
         torch.float32: ((4e-5, 3e-6), (4e-4, 2e-4)),
         torch.float16: ((8e-3, 1e-3), (5e-2, 2e-2)),
@@ -1135,10 +1137,10 @@ def test_cuda_fused_gradient_staging(
     }[dtype]
     for value, expected, ref in zip(actual, baseline, reference, strict=True):
         torch.testing.assert_close(value, expected, rtol=0, atol=0)
-        torch.testing.assert_close(value.float(), ref, rtol=forward_tol[0], atol=forward_tol[1])
+        torch.testing.assert_close(value, ref, rtol=forward_tol[0], atol=forward_tol[1])
     for value, expected, ref in zip(actual_grads, baseline_grads, reference_grads, strict=True):
         # CUDA may contract FP32 operations differently across specializations.
         torch.testing.assert_close(value, expected, rtol=2e-6, atol=3e-5)
         torch.testing.assert_close(
-            value.float(), ref.float(), rtol=backward_tol[0], atol=backward_tol[1],
+            value, ref, rtol=backward_tol[0], atol=backward_tol[1],
         )
