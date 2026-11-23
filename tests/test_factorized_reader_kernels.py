@@ -622,13 +622,18 @@ def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
         ("4", 90, 48, torch.float16, False, 1, 1),
         ("4", 90, 48, torch.float32, False, 0, 1),
         ("4", 90, 48, torch.float16, True, 0, 1),
+        ("8", 89, 160, torch.bfloat16, False, 0, 8),
+        ("8", 86, 164, torch.float16, False, 0, 1),
+        ("8", 90, 160, torch.bfloat16, False, 4, 1),
+        ("8", 90, 160, torch.bfloat16, False, 8, 8),
     ],
 )
 def test_reader_vector_plan(
     choice: str, sm: int, modes: int, dtype: torch.dtype, strict: bool,
     offset: int, expected: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("LNET_READER_VEC", choice)
+    monkeypatch.setenv("LNET_READER_VEC", "1")
+    monkeypatch.setenv("LNET_READER_VEC_MODE", choice)
     props = SimpleNamespace(
         major=sm // 10, minor=sm % 10, multi_processor_count=132, shared_memory_per_block=49152,
         shared_memory_per_multiprocessor=229376, max_threads_per_multi_processor=2048,
@@ -668,16 +673,16 @@ def test_compact_weight_partial_budget(
 @requires_cuda
 @pytest.mark.usefixtures("cudnn_full_precision")
 @pytest.mark.parametrize(("rank", "vec", "dtype"), product(
-    (1, 2, 3, 4), (2, 4), (torch.bfloat16, torch.float16),
+    (1, 2, 3, 4), ("2", "4", "8", "4-rank"), (torch.bfloat16, torch.float16),
 ))
 def test_reader_vector_parity(
-    rank: int, vec: int, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch,
+    rank: int, vec: str, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("native BF16 requires SM80 or newer")
-    monkeypatch.setenv("LNET_READER_VEC", str(vec))
+    monkeypatch.setenv("LNET_READER_VEC_MODE", vec)
     torch.manual_seed(52)
-    modes, shape = 64 + vec, (2, 7, 11)
+    modes, shape = 64 + int(vec.split("-", maxsplit=1)[0]), (2, 7, 11)
     kwargs = {"device": "cuda", "dtype": dtype}
     p = torch.randn((*shape, rank * modes), **kwargs) * 0.2
     real, imag = (torch.randn((2, modes, rank, 3, 3), **kwargs) * 0.2).unbind()
