@@ -609,59 +609,52 @@ def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("major", "batch", "shape", "modes", "rank", "kernel", "dtype", "strict", "offset", "expected"),
+    ("choice", "sm", "modes", "dtype", "strict", "offset", "expected"),
     [
-        (9, 128, (7, 11), 66, 1, 3, torch.bfloat16, False, 0, 2),
-        (9, 128, (7, 11), 68, 2, 3, torch.bfloat16, False, 0, 2),
-        (9, 128, (7, 11), 66, 3, 3, torch.bfloat16, False, 0, 2),
-        (9, 128, (7, 11), 160, 4, 3, torch.bfloat16, False, 0, 2),
-        (8, 128, (7, 11), 160, 4, 3, torch.bfloat16, False, 0, 1),
-        (9, 4, (96, 128), 80, 2, 3, torch.bfloat16, False, 0, 1),
-        (9, 2, (7, 11), 160, 4, 3, torch.bfloat16, False, 0, 1),
-        (9, 128, (7, 11), 67, 4, 3, torch.bfloat16, False, 0, 1),
-        (9, 128, (7, 11), 66, 4, 3, torch.bfloat16, False, 1, 1),
-        (9, 128, (7, 11), 66, 6, 3, torch.bfloat16, False, 0, 1),
-        (9, 128, (7, 11), 66, 4, 5, torch.bfloat16, False, 0, 1),
-        (9, 128, (7, 11), 66, 4, 3, torch.bfloat16, True, 0, 1),
-        (9, 128, (7, 11), 66, 4, 3, torch.float32, False, 0, 1),
-        (9, 128, (7, 11), 66, 4, 3, torch.float16, False, 0, 1),
+        ("auto", 90, 160, torch.bfloat16, False, 0, 2),
+        ("auto", 86, 160, torch.bfloat16, False, 0, 2),
+        ("auto", 89, 160, torch.bfloat16, False, 0, 1),
+        ("1", 90, 160, torch.bfloat16, False, 0, 1),
+        ("2", 86, 34, torch.float16, False, 0, 2),
+        ("2", 90, 17, torch.bfloat16, False, 0, 1),
+        ("4", 86, 48, torch.bfloat16, False, 0, 4),
+        ("4", 90, 30, torch.float16, False, 0, 1),
+        ("4", 90, 48, torch.float16, False, 1, 1),
+        ("4", 90, 48, torch.float32, False, 0, 1),
+        ("4", 90, 48, torch.float16, True, 0, 1),
     ],
 )
-def test_reader_weight_vector_plan(
-    major: int, batch: int, shape: tuple[int, int], modes: int, rank: int,
-    kernel: int, dtype: torch.dtype, strict: bool, offset: int, expected: int,
+def test_reader_vector_plan(
+    choice: str, sm: int, modes: int, dtype: torch.dtype, strict: bool,
+    offset: int, expected: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dims = (batch, *shape, modes * rank)
-    p = torch.empty((1 + offset,), dtype=dtype)[offset:].as_strided(dims, (0,) * 4)
-    g = torch.empty(1, dtype=dtype).as_strided((batch, *shape, modes * 2), (0,) * 4)
-    real = torch.empty((modes, rank, kernel, kernel), dtype=dtype)
-    assert kernels._reader_weight_vector_width(
-        p, real, g, strict=strict, major=major, sms=132,
-    ) == expected
+    monkeypatch.setenv("LNET_READER_VEC", choice)
+    props = SimpleNamespace(
+        major=sm // 10, minor=sm % 10, multi_processor_count=132, shared_memory_per_block=49152,
+        shared_memory_per_multiprocessor=229376, max_threads_per_multi_processor=2048,
+        regs_per_multiprocessor=65536,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+    p = torch.empty((1 + offset,), dtype=dtype)[offset:].as_strided((128, 56, 56, modes), (0,) * 4)
+    g = torch.empty(1, dtype=dtype).as_strided((128, 56, 56, modes * 2), (0,) * 4)
+    real = torch.empty((modes, 1, 3, 3), dtype=dtype)
+    assert kernels._reader_vector_width(p, real, g, strict=strict) == expected
 
 
 @requires_cuda
 @pytest.mark.usefixtures("cudnn_full_precision")
-@pytest.mark.parametrize("rank", [1, 2, 3, 4])
-def test_reader_weight_vector_parity(
-    rank: int, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(("rank", "vec", "dtype"), product(
+    (1, 2, 3, 4), (2, 4), (torch.bfloat16, torch.float16),
+))
+def test_reader_vector_parity(
+    rank: int, vec: int, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("native BF16 requires SM80 or newer")
-    choose_width = kernels._reader_weight_vector_width
-
-    def force_vector(
-        p: torch.Tensor, real: torch.Tensor, grad: torch.Tensor, *,
-        strict: bool, major: int, sms: int,  # noqa: ARG001
-    ) -> int:
-        width = choose_width(p, real, grad, strict=strict, major=9, sms=1)
-        assert width == 2
-        return width
-
-    monkeypatch.setattr(kernels, "_reader_weight_vector_width", force_vector)
+    monkeypatch.setenv("LNET_READER_VEC", str(vec))
     torch.manual_seed(52)
-    modes, shape = 66, (2, 7, 11)
-    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    modes, shape = 64 + vec, (2, 7, 11)
+    kwargs = {"device": "cuda", "dtype": dtype}
     p = torch.randn((*shape, rank * modes), **kwargs) * 0.2
     real, imag = (torch.randn((2, modes, rank, 3, 3), **kwargs) * 0.2).unbind()
     grad = torch.randn((*shape, modes * 2), **kwargs) * 0.2
@@ -669,7 +662,9 @@ def test_reader_weight_vector_parity(
     ref_dp, ref_dw = kernels._spatial_reference_backward(
         grad, p, real, imag, strict_complex=False,
     )
-    for result, reference in ((dp, ref_dp), (dw, ref_dw)):
+    output = kernels._packed_spatial(p, real, imag, strict_complex=False)
+    ref_output = kernels._spatial_reference(p, real, imag, strict_complex=False)
+    for result, reference in ((output, ref_output), (dp, ref_dp), (dw, ref_dw)):
         ref = reference.float()
         diff = result.float() - ref
         assert diff.abs().max().item() <= 0.02
@@ -681,7 +676,7 @@ def test_reader_weight_vector_parity(
 def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("native BF16 requires SM80 or newer")
-    monkeypatch.setattr(kernels, "_reader_weight_vector_width", lambda *_args, **_kwargs: 2)
+    monkeypatch.setenv("LNET_READER_VEC", "4")
     torch.manual_seed(231)
     kwargs = {"device": "cuda", "dtype": torch.bfloat16}
     p = torch.randn((2, 7, 11, 4 * 48), **kwargs).requires_grad_()
@@ -691,3 +686,33 @@ def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None
     reference = kernels._spatial_reference(p, *w.unbind(1), strict_complex=False)
     torch.testing.assert_close(output, reference, atol=0.008, rtol=0.005)
     _check_gradients(output, reference, (p, w), (p, w), rtol=0.005, atol=0.001)
+
+
+def test_reader_operation_occupancy(monkeypatch: pytest.MonkeyPatch) -> None:
+    props = SimpleNamespace(major=9, multi_processor_count=32, shared_memory_per_block=49152)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    def compile_module(*_args, **kwargs):  # noqa: ANN002, ANN003
+        return kwargs["spatial_geometry"], kwargs["weight_geometry"]
+
+    def resident(module, operation, _warps):
+        spatial, weight = module
+        if operation == "dweight":
+            return 4 if weight == (1, 2, 4) else 1
+        return 0 if spatial[0] == 4 else 3
+
+    monkeypatch.setattr(kernels, "_reader_cuda_module", compile_module)
+    monkeypatch.setattr(kernels, "_reader_resident", resident)
+    kernels._vector_plan.cache_clear()
+    try:
+        shape = (64, 13, 13, 96)
+        spatial, _ = kernels._vector_plan(
+            0, shape, shape, 4, ("__half",) * 3, 2, "dinput", automatic=False,
+        )
+        weight, _ = kernels._vector_plan(
+            0, shape, shape, 4, ("__half",) * 3, 2, "dweight", automatic=False,
+        )
+        assert (spatial.rows, spatial.warps) == (2, 4)
+        assert (weight.rows, weight.warps, weight.rank_tile) == (2, 4, 1)
+    finally:
+        kernels._vector_plan.cache_clear()
