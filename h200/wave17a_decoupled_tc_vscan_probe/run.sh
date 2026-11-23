@@ -15,6 +15,7 @@ export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 WANDB_MODE=disabled
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4} MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
 export TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS:-4}
 batch=${WAVE17A_BATCH:-1024}
+"$python_bin" h200/liverms_v2_opt/bench_h200.py probe --out "$out/device.json"
 for policy in off auto; do
     "$python_bin" "$suite/model.py" train-arm --batch "$batch" --policy "$policy" \
         --profile --out "$out/train_$policy.json"
