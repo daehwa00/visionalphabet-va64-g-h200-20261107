@@ -32,5 +32,22 @@ def main(root: Path, status: int) -> None:
     sys.stdout.write(f"WAVE14_READER_XZ {payload}\n")
 
 
+def samples(root: Path) -> None:
+    isolated = json.loads((root / "isolated.json").read_text(encoding="utf-8"))
+    raw = {
+        shape: {
+            op: {name: values["samples_ms"] for name, values in measurements.items()}
+            for op, measurements in row.items()
+        }
+        for shape, row in isolated["shapes"].items()
+    }
+    logs = {path.name: path.read_text(encoding="utf-8") for path in sorted(root.glob("*.log"))}
+    payload = encode({"samples_ms": raw, "logs": logs})
+    sys.stdout.write(f"WAVE14_READER_SAMPLES_XZ {payload}\n")
+
+
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), int(sys.argv[2]))
+    if sys.argv[2] == "--samples":
+        samples(Path(sys.argv[1]))
+    else:
+        main(Path(sys.argv[1]), int(sys.argv[2]))
