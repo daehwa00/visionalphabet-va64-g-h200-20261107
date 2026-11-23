@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--cuda", type=Path, default=Path("/usr/local/cuda/bin"))
     parser.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--ablate", action="store_true")
+    parser.add_argument("--tuned", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     geometries = [
@@ -77,6 +78,14 @@ def main():
                 (8, 2, 8, 2, 2, 8, False), (14, 1, 4, 2, 4, 8, True),
             )
         )
+    if args.tuned:
+        geometries = [
+            (shape, columns, spatial, weight, False)
+            for shape, (columns, spatial, weight) in itertools.product(
+                ((0, 0, 0, 0), (128, 56, 56, 160), (128, 28, 28, 320)),
+                ((14, (4, 2), (2, 4, 4)), (7, (4, 4), (1, 4, 4)), (7, (2, 4), (1, 2, 4))),
+            )
+        ]
     jobs = [
         (target, geometry, dtype, rank, strict, vec, args.output, args.cuda)
         for target, geometry, dtype, rank, strict, vec in itertools.product(
