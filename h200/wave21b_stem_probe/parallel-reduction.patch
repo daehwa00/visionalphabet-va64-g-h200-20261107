@@ -1,0 +1,117 @@
+diff --git a/src/lnet/fused_stem_ops.py b/src/lnet/fused_stem_ops.py
+index 05c60f7..fb5cdc9 100644
+--- a/src/lnet/fused_stem_ops.py
++++ b/src/lnet/fused_stem_ops.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ # Custom op schemas use positional flags.
+ # ruff: noqa: FBT001
+ import ctypes as ct
++import os
+ from functools import cache
+
+ import torch
+@@ -188,6 +189,36 @@ __device__ void pixel_rows(
+         }
+     }
+     if constexpr (backward) {
++        if constexpr (PARALLEL_REDUCTION) {
++            __shared__ float buffered[2 + HAS_CONV_BIAS][elements][threads];
++            for (int t = 0; t < tiles; t++) {
++                #pragma unroll
++                for (int e = 0; e < elements; e++) {
++                    buffered[0][e][threadIdx.x] = accum_w[t][e];
++                    buffered[1][e][threadIdx.x] = accum_b[t][e];
++                    if constexpr (HAS_CONV_BIAS)
++                        buffered[2][e][threadIdx.x] = accum_cb[t][e];
++                }
++                __syncthreads();
++                int channel = threadIdx.x;
++                if (channel < group * elements && t * group + channel / elements < vectors) {
++                    int c = t * group * elements + channel;
++                    int e = channel % elements;
++                    int col = channel / elements;
++                    int worker = blockIdx.x * (2 + HAS_CONV_BIAS) * C;
++                    #pragma unroll
++                    for (int f = 0; f < 2 + HAS_CONV_BIAS; f++) {
++                        float acc = 0.f;
++                        #pragma unroll
++                        for (int i = 0; i < rows; i++)
++                            acc += buffered[f][e][i * group + col];
++                        partial[worker + f * C + c] = acc;
++                    }
++                }
++                if (tiles > 1) __syncthreads();
++            }
++            return;
++        }
+         __shared__ float partial_w[threads], partial_b[threads], partial_cb[threads];
+         for (int t = 0; t < tiles; t++) {
+             int v = t * group + lane;
+@@ -274,6 +305,7 @@ def _compile_ptx(
+     vector: bool,
+     conv_bias_type: str | None = None,
+     round_affine: bool = True,
++    parallel_reduction: bool = False,
+ ) -> ct.Array:
+     header = {
+         "C": channels,
+@@ -290,6 +322,7 @@ def _compile_ptx(
+         "ROUND_AFFINE": int(round_affine),
+         "BF16": int("__nv_bfloat16" in (*types, conv_bias_type)),
+         "VEC": int(vector),
++        "PARALLEL_REDUCTION": int(parallel_reduction),
+     }
+     source = "".join(f"#define {name} {value}\n" for name, value in header.items()) + _CUDA
+     nvrtc = _nvrtc()
+@@ -332,6 +365,7 @@ def _module(
+     vector: bool,
+     conv_bias_type: str | None,
+     round_affine: bool,
++    parallel_reduction: bool = False,
+ ) -> _CudaModule:
+     image = _compile_ptx(
+         torch.cuda.get_device_capability(device),
+@@ -340,6 +374,7 @@ def _module(
+         vector=vector,
+         conv_bias_type=conv_bias_type,
+         round_affine=round_affine,
++        parallel_reduction=parallel_reduction,
+     )
+     module = _CudaModule(image, device)
+     for name in ("stem_forward", "stem_backward", "stem_reduce"):
+@@ -390,6 +425,7 @@ def _kernel_module(
+     *,
+     vector: bool,
+     round_affine: bool,
++    parallel_reduction: bool = False,
+ ) -> _CudaModule:
+     types = (_TYPES[x.dtype], _TYPES[w.dtype], _TYPES[b.dtype], _TYPES[output_dtype])
+     return _module(
+@@ -399,6 +435,7 @@ def _kernel_module(
+         vector=vector,
+         conv_bias_type=_TYPES[cb.dtype] if cb is not None else None,
+         round_affine=round_affine,
++        parallel_reduction=parallel_reduction,
+     )
+
+
+@@ -485,6 +522,19 @@ def _backward(
+         module = _kernel_module(x, w, b, cb, dy.dtype, vector=vector, round_affine=round_affine)
+         _ensure_context(module.driver, x.device.index or 0)
+         workers = min(_worker_limit(module, x.device), (n + rows - 1) // rows)
++        # Keep the baseline worker count and row assignment for bitwise gradients.
++        if (
++            os.environ.get("LNET_STEM_OPT", "auto") in {"auto", "on"}
++            and vector
++            and channels <= _THREADS
++            and rows > 1
++        ):
++            optimized = _kernel_module(
++                x, w, b, cb, dy.dtype, vector=True, round_affine=round_affine,
++                parallel_reduction=True,
++            )
++            if _worker_limit(optimized, x.device) >= workers:
++                module = optimized
+         partial = x.new_empty((workers, 2 + int(cb is not None), channels), dtype=torch.float32)
+         stream = torch.cuda.current_stream().cuda_stream
+         _launch(
