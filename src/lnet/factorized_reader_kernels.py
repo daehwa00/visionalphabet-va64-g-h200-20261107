@@ -1124,7 +1124,11 @@ def _weight_geometry(
                 return tile, 1, _WIDE_WEIGHT_WARPS
     if rank == _STATIC_RANK_LIMIT and grad_dtype == torch.bfloat16:
         if area <= _SMALL_WEIGHT_PLANE_PIXELS:
-            return _CENTERED_WEIGHT_TILE, 4, 4
+            if width > _reader_columns(width):
+                props = torch.cuda.get_device_properties(projected.device)
+                if props.major >= 9:
+                    return _CENTERED_WEIGHT_TILE, 2, 4
+            return _STATIC_RANK_LIMIT, 2, 4
         if area >= _LARGE_WEIGHT_PLANE_PIXELS:
             return _STATIC_RANK_LIMIT, 2, 8
     return _DEFAULT_WEIGHT_GEOMETRY

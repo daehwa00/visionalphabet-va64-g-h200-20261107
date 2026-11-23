@@ -727,3 +727,13 @@ def test_reader_traffic_accounts_for_halo_rank_reuse_and_partial_waves() -> None
     assert long_score > short_score
     underfilled = kernels._traffic_score(long_tile, "dweight", 4, 32, sms // 2, 4, sms)
     assert underfilled < long_score
+
+
+@pytest.mark.parametrize(("major", "expected_tile"), [(8, 4), (9, 2)])
+def test_reader_compact_scalar_weight_tile(
+    major: int, expected_tile: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: SimpleNamespace(major=major))
+    width = 2 * kernels._COMPACT_COLUMNS
+    projected = SimpleNamespace(shape=(128, width, width, 4 * 64), device=torch.device("cuda:0"))
+    assert kernels._weight_geometry(projected, 64, 4, torch.bfloat16) == (expected_tile, 2, 4)
