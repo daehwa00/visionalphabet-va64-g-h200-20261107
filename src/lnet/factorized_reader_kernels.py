@@ -1298,7 +1298,7 @@ def _traffic_score(
 
 
 def _wave25b_enabled() -> bool:
-    return os.environ.get("LNET_READER_W25B", "auto") in ("auto", "on")
+    return os.environ.get("LNET_READER_W25B", "off") in ("auto", "on")
 
 
 def _wave25b_spatial_candidates(

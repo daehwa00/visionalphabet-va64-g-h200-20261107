@@ -1,6 +1,6 @@
 # Wave 25B reader verification
 
-기준은 Wave 21C 커밋 `039440f2c0a9a9d006948fcbbf45dd5c96e36efb`이다. `LNET_READER_W25B=off`는 기존 디스패치를 실행한다. `on`은 실험 경로를 선택한다. `LNET_READER_VEC` 강제 설정은 기존 경로를 유지한다.
+기준은 Wave 21C 커밋 `039440f2c0a9a9d006948fcbbf45dd5c96e36efb`이다. 기본값과 `LNET_READER_W25B=off`는 기존 디스패치를 실행한다. 명시적으로 `auto` 또는 `on`을 지정하면 SM 8.6과 SM 9.0에서 후보를 선택한다. `LNET_READER_VEC` 강제 설정은 기존 경로를 유지한다.
 
 ## 오프라인 리소스 확인
 
