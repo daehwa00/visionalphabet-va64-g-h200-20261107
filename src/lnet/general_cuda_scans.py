@@ -125,6 +125,7 @@ class Kernel:
     imag_transposed: bool = False
     vector_weights: bool = False
     batch_path: bool = False
+    mma_path: bool = False
 
 
 class Launch(NamedTuple):
@@ -710,6 +711,154 @@ __device__ void load_project_weights(
     }
 }
 
+// Each mode owner keeps the four accumulator fragments across scan tiles.
+enum { vscan_mma_mode_stride = 162 };
+template<class T> constexpr bool vscan_is_fp16 = false;
+template<> constexpr bool vscan_is_fp16<__half> = true;
+
+struct VscanMmaGrad {
+    float w1[2], b1[2], w2[2], b2;
+};
+
+template<class T> __device__ unsigned vscan_pack(T a, T b) {
+    if constexpr (sizeof(T) != 2) return 0;
+    else if constexpr (vscan_is_fp16<T>)
+        return __half_as_ushort(a) | (unsigned(__half_as_ushort(b)) << 16);
+    else return __bfloat16_as_ushort(a) | (unsigned(__bfloat16_as_ushort(b)) << 16);
+}
+
+template<class T, int K>
+__device__ __forceinline__ void vscan_mma(float (&d)[4], unsigned a0, unsigned a1,
+                                        unsigned b0, unsigned a2 = 0, unsigned a3 = 0,
+                                        unsigned b1 = 0) {
+#define VSCAN_MMA8(S) asm("mma.sync.aligned.m16n8k8.row.col.f32." S "." S ".f32 " \
+    "{%0,%1,%2,%3},{%4,%5},{%6},{%0,%1,%2,%3};" \
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) : "r"(a0), "r"(a1), "r"(b0))
+#define VSCAN_MMA16(S) asm("mma.sync.aligned.m16n8k16.row.col.f32." S "." S ".f32 " \
+    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};" \
+    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]) \
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
+    if constexpr (K == 8) {
+        if constexpr (vscan_is_fp16<T>) VSCAN_MMA8("f16");
+        else VSCAN_MMA8("bf16");
+    } else {
+        if constexpr (vscan_is_fp16<T>) VSCAN_MMA16("f16");
+        else VSCAN_MMA16("bf16");
+    }
+#undef VSCAN_MMA8
+#undef VSCAN_MMA16
+}
+
+// A lane holds consecutive columns of rows group and group + 8. To
+// transpose, the pair of adjacent rows lives in two lanes with the same
+// column pair.
+template<class T>
+__device__ __forceinline__ unsigned vscan_transpose(const T (&v)[4], int r, int c) {
+    const int from = 4 * (r & 7) + c / 2;
+    const auto low = vscan_pack(v[0], v[1]), high = vscan_pack(v[2], v[3]);
+    const auto x = __shfl_sync(0xffffffff, low, from);
+    const auto y = __shfl_sync(0xffffffff, high, from);
+    const auto xx = __shfl_sync(0xffffffff, low, from + 4);
+    const auto yy = __shfl_sync(0xffffffff, high, from + 4);
+    const auto bits = (r < 8 ? x : y) >> (16 * (c & 1));
+    const auto next = (r < 8 ? xx : yy) >> (16 * (c & 1));
+    return (bits & 0xffff) | (next << 16);
+}
+
+// P uses feature-major layout within each mode. dY follows the same layout.
+// A mode owner needs the entire 8x8 matrix in contiguous rows.
+template<class T, class I, int THREADS>
+__device__ void load_vscan_mma_weights(
+    T* weights, const void* wi, const void* bi, const void* wo, int types, int mode0, int M
+) {
+    const int modes = min(32, M - mode0);
+    auto* pairs = reinterpret_cast<Pair<T>*>(weights);
+    for (int idx = threadIdx.x; idx < modes * 32; idx += THREADS) {
+        const I offset = 64 * I(mode0) + 2 * I(idx);
+        pairs[(idx / 32) * 44 + idx % 32] = Pair<T>::pack(
+            {load_scalar(wi, offset, types & 3), load_scalar(wi, offset + 1, types & 3)});
+    }
+    for (int idx = threadIdx.x; idx < modes * 8; idx += THREADS) {
+        weights[(idx / 8) * 88 + 64 + idx % 8] =
+            write<T>(load_scalar(bi, I(mode0) * 8 + idx, (types >> 2) & 3));
+    }
+    for (int idx = threadIdx.x; idx < modes * 16; idx += THREADS) {
+        weights[(idx / 16) * 88 + 72 + idx % 16] =
+            write<T>(load_scalar(wo, I(mode0) * 16 + idx, (types >> 4) & 3));
+    }
+}
+
+template<class T, int WARPS>
+__device__ __forceinline__ void vscan_mma_tile(
+    T* tile, const T* weights, VscanMmaGrad* accum, int modes
+) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int g = lane / 4, p = lane % 4 * 2;
+    #pragma unroll
+    for (int slot = 0; slot < 32 / WARPS; ++slot) {
+        const int mode = warp * (32 / WARPS) + slot;
+        if (mode >= modes) continue;
+        T* data = tile + vscan_mma_mode_stride * mode;
+        const auto* w = weights + 88 * mode;
+        const auto pp = [&](int row, int k) {
+            return vscan_pack(data[k * 16 + row], data[(k + 1) * 16 + row]);
+        };
+        float pre[4]{};
+        vscan_mma<T, 8>(pre, pp(g, p), pp(g + 8, p),
+                        vscan_pack(w[8 * g + p], w[8 * g + p + 1]));
+        T z[4], act[4];
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = g + (e / 2) * 8, col = p + (e & 1);
+            const float x = rounded<T>(rounded<T>(pre[e]) + read(w[64 + col]));
+            const float sig = __fdividef(1.0f, 1.0f + __expf(-x));
+            const float dr = read(data[128 + row]), di = read(data[144 + row]);
+            const float dact = rounded<T>(dr * read(w[72 + col]) + di * read(w[80 + col]));
+            z[e] = write<T>(dact * (sig * (1.0f + x * (1.0f - sig))));
+            act[e] = write<T>(x * sig);
+        }
+
+        const unsigned za = vscan_transpose(z, p, g);
+        const unsigned zb = vscan_transpose(z, p + 8, g);
+        const auto pk = [&](int row) { return vscan_pack(data[16*g+row], data[16*g+row+1]); };
+        auto& acc = accum[slot];
+        float d1[4]{acc.w1[0], acc.w1[1], 0, 0};
+        // dW1 uses z^T @ P. Bias gradients are accumulated independently below.
+        vscan_mma<T, 16>(d1, za, 0, pk(p), zb, 0, pk(p + 8));
+        acc.w1[0] = d1[0];
+        acc.w1[1] = d1[1];
+        float z0 = read(z[0]) + read(z[2]), z1 = read(z[1]) + read(z[3]);
+        #pragma unroll
+        for (int offset = 16; offset >= 4; offset /= 2) {
+            z0 += __shfl_xor_sync(0xffffffff, z0, offset);
+            z1 += __shfl_xor_sync(0xffffffff, z1, offset);
+        }
+        acc.b1[0] += z0;
+        acc.b1[1] += z1;
+        const auto dy = [&](int row) {
+            return g < 2 ? vscan_pack(data[128+16*g+row], data[128+16*g+row+1]) : 0;
+        };
+        float d2[4]{acc.w2[0], acc.w2[1], 0, 0};
+        vscan_mma<T, 16>(d2, dy(p), 0, vscan_transpose(act, p, g),
+                        dy(p + 8), 0, vscan_transpose(act, p + 8, g));
+        acc.w2[0] = d2[0];
+        acc.w2[1] = d2[1];
+        const T* y = data + 128 + 16 * (g & 1);
+        float bias = (read(y[p]) + read(y[p+1])) + (read(y[p+8]) + read(y[p+9]));
+        bias += __shfl_xor_sync(0xffffffff, bias, 1);
+        bias += __shfl_xor_sync(0xffffffff, bias, 2);
+        acc.b2 += bias;
+
+        float dp[4]{};
+        vscan_mma<T, 8>(dp, vscan_pack(z[0], z[1]), vscan_pack(z[2], z[3]),
+                        vscan_pack(w[8 * p + g], w[8 * (p + 1) + g]));
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+            data[16 * (p + (e & 1)) + g + (e / 2) * 8] = write<T>(dp[e]);
+    }
+}
+
 template<class T, class I, bool COARSE, int CHUNK, int THREADS, int HIDDEN,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE,
          bool PURE, class Weights>
@@ -841,6 +990,174 @@ __device__ __forceinline__ void column_backward(
     }
 }
 
+template<class T, class I, bool COARSE, int CHUNK, int THREADS,
+         bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE>
+__device__ __forceinline__ void column_backward_mma(
+    Column<T, I> c, Complex a, Complex g,
+    const T* gr, const T* gi, T* gs,
+    float4* seg, Quad<T>* seg_src, float4* ckpt, Quad<T>* g2, I g2_stride,
+    int chunks, Complex& da, Complex& dg,
+    bool active, T* tile, const T* weights, VscanMmaGrad* mma_acc
+) {
+    const auto ar = a.conj(), gg = g.conj();
+    // CHUNK == 0 keeps the whole trajectory and needs no boundaries.
+    constexpr bool full = CHUNK == 0;
+    constexpr int step = 1 + int(COARSE);
+    constexpr int batch = 16 / (THREADS / 32);
+    const int mode = threadIdx.x % 32, scan_warp = threadIdx.x / 32;
+    auto* data = tile + mode * vscan_mma_mode_stride + scan_warp * batch;
+    static_assert(!full || CACHE_SOURCE);
+    const int span = full ? c.H : CHUNK;
+    float4 pos{}, neg{};
+    for (int block = 0; block < chunks; ++block) {
+        const int y0 = block * span;
+        const int length = min(span, c.H - y0);
+        const bool last = full || block == chunks - 1;
+        for (int j = 0; j < length; ++j) {
+            float4 source;
+            if constexpr (CACHE_SOURCE) {
+                const auto packed = active ? c.packed_source(y0 + j) : Quad<T>{};
+                seg_src[(y0 + j) * THREADS] = packed;
+                source = packed.unpack();
+            } else {
+                source = active ? c.source(y0 + j) : float4{};
+            }
+            pos = advance(pos, source, a, g);
+            if (last) {
+                seg[j * THREADS] = pos;
+                if constexpr (COARSE && !CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(source);
+            }
+        }
+        if (!last) ckpt[I(block) * THREADS] = pos;
+    }
+
+    Complex adj_a{}, adj_b{};
+    for (int block = chunks - 1; block >= 0; --block) {
+        const int y0 = block * span;
+        const int length = min(span, c.H - y0);
+        Quad<T>* source_cache = seg_src + (CACHE_SOURCE ? I(y0) * THREADS : 0);
+        const float4 before = !full && block ? ckpt[I(block - 1) * THREADS] : float4{};
+        if (!full && block + 1 < chunks) {
+            // The positive boundary at this slot was consumed in the next
+            // chunk. Replace it with this chunk's negative entry state.
+            ckpt[I(block) * THREADS] = neg;
+            pos = before;
+            for (int j = 0; j < length; ++j) {
+                const auto source = CACHE_SOURCE
+                    ? source_cache[j * THREADS].unpack()
+                    : (active ? c.source(y0 + j) : float4{});
+                pos = advance(pos, source, a, g);
+                seg[j * THREADS] = pos;
+                if constexpr (COARSE && !CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(source);
+            }
+        }
+
+        for (int end = length - 1; end >= 0; end -= batch * step) {
+            // The reverse recurrence is independent of dP. Stage the inputs
+            // first, then replay this short batch for the positive adjoint.
+            auto reverse = neg;
+            for (int t = 0; t < batch; ++t) {
+                const int j = end - t * step;
+                float p[8]{};
+                T dy_r{}, dy_i{};
+                if (active && j >= 0) {
+                    const int y = y0 + j;
+                    const auto src = [&](int offset) {
+                        if constexpr (CACHE_SOURCE || COARSE)
+                            return source_cache[(j + offset) * THREADS].unpack();
+                        else return c.source(y + offset);
+                    };
+                    reverse = advance(reverse, src(0), ar, gg);
+                    if constexpr (COARSE) reverse = advance(reverse, src(-1), ar, gg);
+                    const auto p0 = normalize<T>(seg[j * THREADS], c.gain(y, false));
+                    const auto p1 = normalize<T>(reverse, c.gain(y - int(COARSE), true));
+                    p[0] = p0.x; p[1] = p0.z; p[2] = p1.x; p[3] = p1.z;
+                    p[4] = p0.y; p[5] = p0.w; p[6] = p1.y; p[7] = p1.w;
+                    const I cell = c.cell(y / step);
+                    dy_r = gr[(cell - c.m) * (1 + REAL_INTERLEAVED) + c.m];
+                    dy_i = gi[(cell - c.m) * (1 + IMAG_INTERLEAVED) + c.m];
+                }
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) data[16 * k + t] = write<T>(p[k]);
+                data[128 + t] = dy_r;
+                data[144 + t] = dy_i;
+            }
+            __syncthreads();
+            vscan_mma_tile<T, THREADS / 32>(tile, weights, mma_acc, c.M - (c.m - mode));
+            __syncthreads();
+
+            for (int t = 0; t < batch; ++t) {
+                const int j = end - t * step;
+                if (!active || j < 0) break;
+
+                const int y = y0 + j;
+                const auto s = (COARSE || CACHE_SOURCE)
+                    ? source_cache[j * THREADS].unpack() : c.source(y);
+                const auto next = neg;
+                neg = advance(neg, s, ar, gg);
+                auto se = s;
+                const auto next_even = neg;
+                if constexpr (COARSE) {
+                    se = source_cache[(j - 1) * THREADS].unpack();
+                    neg = advance(neg, se, ar, gg);
+                }
+                const int yo = COARSE ? y / 2 : y;
+                const auto gp = c.gain(y, false), gn = c.gain(y - int(COARSE), true);
+                float dp[8]{};
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) dp[k] = read(data[16 * k + t]);
+                const auto ip = normalize<T>(make_float4(dp[0], dp[4], dp[1], dp[5]), gp);
+                g2[I(yo) * g2_stride] =
+                    normalize_packed<T>(make_float4(dp[2], dp[6], dp[3], dp[7]), gn);
+
+                column_adjoint<false, COMPACT>(
+                    c, y, j ? seg[(j - 1) * THREADS] : before, s, ip, a, g,
+                    adj_a, adj_b, da, dg, gs);
+                if constexpr (COARSE) {
+                    column_adjoint<false, COMPACT>(
+                        c, y - 1, j > 1 ? seg[(j - 2) * THREADS] : before, se, {}, a, g,
+                        adj_a, adj_b, da, dg, gs);
+                }
+                if constexpr (full) {
+                    // The positive adjoint consumed these states. Reuse the slots
+                    // for the inputs of the negative recurrence.
+                    seg[j * THREADS] = next;
+                    if constexpr (COARSE) seg[(j - 1) * THREADS] = next_even;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (!active) return;
+    adj_a = adj_b = {};
+    for (int block = 0; block < chunks; ++block) {
+        const int y0 = block * span;
+        const int length = min(span, c.H - y0);
+        Quad<T>* source_cache = seg_src + (CACHE_SOURCE ? I(y0) * THREADS : 0);
+        if constexpr (!full) {
+            neg = block + 1 < chunks ? ckpt[I(block) * THREADS] : float4{};
+            // Store the previous negative state for each adjoint update.
+            for (int j = length - 1; j >= 0; --j) {
+                const auto s = CACHE_SOURCE
+                    ? source_cache[j * THREADS].unpack() : c.source(y0 + j);
+                seg[j * THREADS] = neg;
+                if constexpr (!CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(s);
+                neg = advance(neg, s, ar, gg);
+            }
+        }
+        for (int j = 0; j < length; ++j) {
+            const int y = y0 + j;
+            const auto in = !COARSE || !(y & 1)
+                ? g2[I(COARSE ? y / 2 : y) * g2_stride].unpack() : float4{};
+            column_adjoint<true, COMPACT>(
+                c, y, seg[j * THREADS], source_cache[j * THREADS].unpack(), in, ar, gg,
+                adj_a, adj_b, da, dg, gs);
+            if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);
+        }
+    }
+}
+
 // Tile the CTA reduction so all scan warps can share one small staging buffer.
 constexpr int vscan_reduce_tile = 32;
 
@@ -875,7 +1192,7 @@ __device__ __forceinline__ void write_vscan_partial(
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS, bool BATCH_PATH>
+         bool VECTOR_WEIGHTS, bool BATCH_PATH, bool MMA = false>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -893,8 +1210,8 @@ __device__ __forceinline__ void vertical(
     const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     const int mode0 = (blockIdx.x % tiles) * 32, m = mode0 + lane;
     const int group = blockIdx.x / tiles, worker = group * WARPS + warp;
-    constexpr bool register_acc = BACKWARD && HIDDEN && !SHARED_ACC;
-    constexpr bool reduce = (PURE || SHARED_ACC || register_acc) && WARPS > 1;
+    constexpr bool register_acc = BACKWARD && HIDDEN && !SHARED_ACC && !MMA;
+    constexpr bool reduce = (PURE || SHARED_ACC || register_acc || MMA) && WARPS > 1;
     const bool active = m < M && worker < workers;
     const int size = HIDDEN ? HIDDEN : hidden;
     const I fields = PURE ? 4 : 11 * I(size) + 6;
@@ -913,7 +1230,10 @@ __device__ __forceinline__ void vertical(
             reinterpret_cast<float*>(shared), wi, bi, wo, nullptr, types, mode0, M, size);
         __syncthreads();
     } else if constexpr (CACHE_WEIGHT) {
-        load_path_weights<T, I>(weights_shared, wi, bi, wo, types, mode0, M, size, threads);
+        if constexpr (MMA)
+            load_vscan_mma_weights<T, I, threads>(weights_shared, wi, bi, wo, types, mode0, M);
+        else
+            load_path_weights<T, I>(weights_shared, wi, bi, wo, types, mode0, M, size, threads);
         __syncthreads();
     }
     const auto path = [&] {
@@ -932,6 +1252,8 @@ __device__ __forceinline__ void vertical(
     auto* acc_base = reinterpret_cast<float*>(
         seg_src + (BACKWARD ? I(CACHE_SOURCE ? H : span) * threads : 0));
     auto* line_buf = reinterpret_cast<Quad<T>*>(acc_base + (SHARED_ACC ? fields * threads : 0));
+    VscanMmaGrad mma_acc[MMA ? 32 / WARPS : 1]{};
+    auto* tile = reinterpret_cast<T*>(line_buf + (CACHE_LINE ? I(oh) * threads : 0));
     float* row = partials;
     float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};
     float* acc = acc_base + threadIdx.x;
@@ -940,7 +1262,7 @@ __device__ __forceinline__ void vertical(
         row += I(reduce ? group : worker) * fields * M + m;
         if constexpr (register_acc) {
             acc = local_acc;
-        } else if constexpr (!SHARED_ACC && !PURE) {
+        } else if constexpr (!SHARED_ACC && !PURE && !MMA) {
             acc = row + 4 * I(M);
             if (active) {
                 for (I j = 0; j < fields - 4; ++j) acc[j * M] = 0;
@@ -951,14 +1273,16 @@ __device__ __forceinline__ void vertical(
         }
     }
     Complex da{}, dg{};
-    if (active) {
-        const Complex a{dr[m], di[m]}, g{decay_gr[m], decay_gi[m]};
+    if (MMA || active) {
+        const Complex a = (!MMA || active) ? Complex{dr[m], di[m]} : Complex{};
+        const Complex g = (!MMA || active) ? Complex{decay_gr[m], decay_gi[m]} : Complex{};
         float2 bias{};
         if constexpr (!BACKWARD && !PURE) {
             bias = make_float2(rounded<T>(load_scalar(bo, 2 * I(m), types >> 6)),
                                rounded<T>(load_scalar(bo, 2 * I(m) + 1, types >> 6)));
         }
-        for (I line = worker; line < I(B) * ow; line += workers) {
+        for (I line = worker; line - (MMA ? warp : 0) < I(B) * ow; line += workers) {
+            const bool valid = !MMA || (active && line < I(B) * ow);
             const I b = line / ow;
             const int x = line % ow, xa = COARSE ? 2 * x + 1 : x, xb = COARSE ? 2 * x : x;
             const I base = b * H * W * M + m;
@@ -966,17 +1290,26 @@ __device__ __forceinline__ void vertical(
                            target_plane, source_plane, (b * oh * ow + x) * M + m,
                            I(B) * oh * ow * M,
                            H, W, M, ow, m,
-                           vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps};
-            auto* buf = CACHE_LINE ? line_buf + threadIdx.x : scratch + I(worker) * M + m;
+                           valid ? vx[I(xa) * M + m] : 0,
+                           valid ? vx[(I(W) + xb) * M + m] : 0, eps};
+            auto* buf = CACHE_LINE ? line_buf + threadIdx.x
+                : (valid ? scratch + I(worker) * M + m : scratch);
             const I stride = CACHE_LINE ? threads : I(workers) * M;
             if constexpr (BACKWARD) {
                 auto* boundaries = GLOBAL_CKPT
                     ? global_checkpoints + I(worker) * M + m : ckpt + threadIdx.x;
-                column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
-                                REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE>(
-                    c, a, g, path, gr, gi, gs,
-                    acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
-                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg);
+                if constexpr (MMA) {
+                    column_backward_mma<T, I, COARSE, CHUNK, threads, COMPACT,
+                                        REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE>(
+                        c, a, g, gr, gi, gs, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
+                        buf, stride, chunks, da, dg, valid, tile, weights_shared, mma_acc);
+                } else {
+                    column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
+                                    REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE>(
+                        c, a, g, path, gr, gi, gs,
+                        acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
+                        GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg);
+                }
             } else {
                 float4 state{};
                 for (int y = 0; y < H; ++y) {
@@ -1048,7 +1381,30 @@ __device__ __forceinline__ void vertical(
         }
     }
     if constexpr (BACKWARD) {
-        if constexpr (PURE && reduce) {
+        if constexpr (MMA) {
+            const int g = lane / 4, k = 2 * (lane % 4);
+            float* block = row - m + mode0;
+            #pragma unroll
+            for (int slot = 0; slot < 32 / WARPS; ++slot) {
+                const int mode = warp * (32 / WARPS) + slot;
+                if (mode0 + mode >= M) continue;
+                const auto& d = mma_acc[slot];
+                block[(4 + 8*g + k) * I(M) + mode] = d.w1[0];
+                block[(5 + 8*g + k) * I(M) + mode] = d.w1[1];
+                if (g == 0) {
+                    block[(68 + k) * I(M) + mode] = d.b1[0];
+                    block[(69 + k) * I(M) + mode] = d.b1[1];
+                }
+                if (g < 2) {
+                    block[(76 + 8*g + k) * I(M) + mode] = d.w2[0];
+                    block[(77 + 8*g + k) * I(M) + mode] = d.w2[1];
+                    if (k == 0) block[(92 + g) * I(M) + mode] = d.b2;
+                }
+            }
+            __syncthreads();
+            write_vscan_partial<WARPS, 4, I>(
+                reinterpret_cast<float*>(shared), row, nullptr, da, dg, m, M);
+        } else if constexpr (PURE && reduce) {
             write_vscan_partial<WARPS, 4, I>(
                 reinterpret_cast<float*>(shared), row, nullptr, da, dg, m, M);
         } else if constexpr (register_acc && reduce) {
@@ -1295,7 +1651,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
             f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
-            f"{str(key.batch_path).lower()}"
+            f"{str(key.batch_path).lower()}" + (", true" if key.mma_path else "")
         )
         wrapper = f"""
 {bounds}(
@@ -1455,7 +1811,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     blocks = ct.c_int()
     with torch.cuda.device(device):
         _ensure_context(driver, device)
-        if key.batch_path:
+        if key.batch_path or key.mma_path:
             local = ct.c_int()
             _check_cu(
                 driver.cuFuncGetAttribute(ct.byref(local), 3, func),
@@ -1860,6 +2216,40 @@ def _launch_for_shape(
     return _with_vector_path_weights(device, best, modes=m, hidden=hidden, wave_limit=wave_limit)
 
 
+def _with_vscan_mma(device: int, launch: Launch, shape: tuple[int, int, int, int]) -> Launch:
+    plan, key, workers, _ = launch
+    _, h, _, _ = shape
+    _, limit, _ = device_limits(device)
+    tile_bytes = 32 * 162 * key.dtype.itemsize
+    # Keep the line buffer and worker count. Wider CTAs may reduce the number
+    # of partial rows without allocating any additional global workspace.
+    options = _scan_plans(
+        h, limit - tile_bytes, vertical=True, backward=True, coarse=key.coarse,
+        hidden=_REGISTER_HIDDEN, itemsize=key.dtype.itemsize, compact=key.compact,
+    )
+    candidates = (
+        option for option in options
+        if option.warps in (2, 4) and option.warps >= plan.warps
+        and (option.warps == 4 or option.full_trajectory)
+        and option.cache_weights and not option.shared_acc and not option.global_checkpoints
+        and option.cache_line == plan.cache_line
+    )
+    for option in sorted(candidates, key=lambda p: (p.warps, p == plan, p.full_trajectory),
+                         reverse=True):
+        smem = option.smem + tile_bytes
+        candidate = replace(
+            key, mma_path=True, warps=option.warps, cache_weights=True,
+            vector_weights=False, shared_acc=False, global_checkpoints=False,
+            chunk=0 if option.full_trajectory else option.chunk,
+            cache_source=option.cache_source,
+        )
+        if _resident(device, candidate, smem):
+            return Launch(
+                option._replace(smem=smem), candidate, workers, _ceil(workers, option.warps),
+            )
+    return launch
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -1891,13 +2281,21 @@ def _plan_launch(
         pure_vertical=pure_vertical,
     )
 
-    if launch is None or os.environ.get("LNET_GENERAL_SCAN_OPT", "auto") == "off":
+    if launch is None:
         return launch
     plan, key, workers, _ = launch
+    # Auto retains the validated baseline until the MMA path clears performance gates.
+    if (
+        os.environ.get("LNET_VSCAN_MMA", "auto") == "on"
+        and key.vertical and key.backward and key.hidden8 and not key.pure_vertical
+        and key.dtype.itemsize == 2 and torch.cuda.get_device_capability(device) >= (8, 0)
+    ):
+        return _with_vscan_mma(device, launch, shape)
     # Use the batched path for bandwidth-heavy forward plans that already
     # keep weights in shared memory and stage the trajectory outside the CTA.
     if (
-        not key.vertical or key.backward or key.pure_vertical or not key.hidden8
+        os.environ.get("LNET_GENERAL_SCAN_OPT", "auto") == "off"
+        or not key.vertical or key.backward or key.pure_vertical or not key.hidden8
         or key.dtype.itemsize != 2 or not key.index32
         or not plan.cache_weights or plan.cache_line or plan.warps != 1
         or shape[1] < 8 * (1 + key.coarse)

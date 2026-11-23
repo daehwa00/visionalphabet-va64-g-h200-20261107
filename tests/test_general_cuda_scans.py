@@ -773,6 +773,76 @@ def test_cuda_full_trajectory_reference(
 
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize(
+    ("shape", "coarse", "full"), [((1, 37, 53, 53), False, False), ((3, 14, 10, 53), True, True)]
+)
+def test_cuda_vscan_mma_backward(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    shape: tuple[int, int, int, int],
+    coarse: bool,
+    full: bool,
+) -> None:
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("SM 8.0 required")
+    monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", "auto")
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    torch.manual_seed(1439)
+    batch, h, w, m = shape
+    _, py, _, _, auxiliary, path = _inputs(h, w, m, 8, dtype, "cuda", batch=batch)
+    states = torch.randn((4, *shape), device="cuda", dtype=dtype).mul_(0.1).requires_grad_()
+    step = 1 + int(coarse)
+    gr, gi = torch.randn(
+        (batch, h // step, w // step, 2 * m), device="cuda", dtype=dtype
+    ).mul_(0.1).chunk(2, dim=-1)
+    original_plans = scans._scan_plans
+
+    def select_plan(*args: object, **kwargs: bool | int) -> list[scans.ScanPlan]:
+        kwargs["cache_trajectories"] = True
+        return [
+            plan for plan in original_plans(*args, **kwargs)
+            if plan.warps == 4 and plan.cache_weights and plan.cache_line and not plan.shared_acc
+            and not plan.global_checkpoints and plan.full_trajectory == full
+            and plan.cache_source == full
+        ]
+
+    if dtype != torch.float32:
+        monkeypatch.setattr(scans, "_scan_plans", select_plan)
+    seen = []
+    dispatch = scans._dispatch
+
+    def record(source: Tensor, launch: scans.Launch, args: tuple) -> None:
+        seen.append(launch.key.mma_path)
+        dispatch(source, launch, args)
+
+    monkeypatch.setattr(scans, "_dispatch", record)
+    results = []
+    scans._launch_for_shape.cache_clear()
+    try:
+        for policy in ("off", "on"):
+            monkeypatch.setenv("LNET_VSCAN_MMA", policy)
+            results.append(scans.vertical_backward(
+                py, states, auxiliary, path, gr.contiguous(), gi, coarse, compact=coarse,
+            ))
+    finally:
+        scans._launch_for_shape.cache_clear()
+    assert seen == [False, dtype != torch.float32]
+    expected = torch.autograd.grad(
+        _reference_vscan(py, states, auxiliary, path, coarse),
+        [*py, states, *path], (gr, gi),
+    )
+    if coarse:
+        ds = expected[4]
+        expected = (*expected[:4], torch.cat((ds[:2, :, :, 1::2], ds[2:, :, :, ::2])),
+                    *expected[5:])
+    for actual, baseline, reference in zip(results[1], results[0], expected, strict=True):
+        torch.testing.assert_close(actual, baseline, rtol=2e-2, atol=2e-3)
+        torch.testing.assert_close(actual, reference, rtol=3e-2, atol=3e-3)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(("h", "coarse"), [(57, False), (56, True)])
 def test_cuda_trajectory_replay_preserves_gradients(
