@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,24 @@ def measure(op: Callable, samples: int) -> dict:
             for event in profile.events()
             if event.device_type == torch.autograd.DeviceType.CUDA
         ],
+    }
+
+
+def clock_sample() -> dict:
+    """Compare host clocks and elapsed CUDA events across the same idle interval."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    wall = time.perf_counter_ns()
+    raw = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    start.record()
+    start.synchronize()
+    time.sleep(0.075)
+    end.record()
+    end.synchronize()
+    return {
+        "wall_ms": (time.perf_counter_ns() - wall) / 1e6,
+        "raw_wall_ms": (time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) - raw) / 1e6,
+        "cuda_event_ms": start.elapsed_time(end),
     }
 
 
@@ -90,6 +109,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
     result = {
         "batch": args.batch,
+        "clock_samples": [clock_sample() for _ in range(3)],
         "cudnn_benchmark": args.cudnn_benchmark,
         "stems": [
             stem(args.batch, cin, cout, side, args.count)

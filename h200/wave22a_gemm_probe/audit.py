@@ -138,14 +138,10 @@ def analyze(path: Path, fx: tuple[Path, Path] | None = None) -> dict:  # noqa: C
             call = matched.get(external)
             if call:
                 left, right = call["dims"]
-                row.update(
-                    m=left[-2],
-                    n=right[-1],
-                    k=left[-1],
-                    batch=left[0] if len(left) == 3 else 1,
-                    types=call["types"],
-                    fx=call,
-                )
+                shape = {"m": left[-2], "n": right[-1], "k": left[-1]}
+                if all(row.get(axis, length) == length for axis, length in shape.items()):
+                    row.setdefault("types", call["types"])
+                    row.update(**shape, batch=left[0] if len(left) == 3 else 1, fx=call)
         rows.append(row)
     grouped = collections.defaultdict(list)
     for row in rows:
@@ -180,16 +176,17 @@ def analyze(path: Path, fx: tuple[Path, Path] | None = None) -> dict:  # noqa: C
                     size * batch * (m * k + k * n + m * n),
                     operator["elapsed_us"],
                 )
-                shape = [m, n, k]
-                spatial_axes = {128 * side**2 for side in (7, 14, 28, 56)}
-                if any(dimension in spatial_axes for dimension in shape):
-                    m, n, k = [d * 8 if d in spatial_axes else d for d in shape]
-                    operator["b1024_spatial_model"] = {
-                        "m": m,
-                        "n": n,
-                        "k": k,
-                        **roofline(2 * batch * m * n * k, size * batch * (m * k + k * n + m * n)),
-                    }
+                batch_axes = {128 * side**2 for side in (7, 14, 28, 56)}
+                source = (row.get("fx") or {}).get("source") or ""
+                if "self.standardizer(descriptor)" in source:
+                    batch_axes.add(128)
+                m, n, k = [d * 8 if d in batch_axes else d for d in (m, n, k)]
+                operator["b1024_model"] = {
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    **roofline(2 * batch * m * n * k, size * batch * (m * k + k * n + m * n)),
+                }
         operators.append(operator)
     summary = {}
     for row in rows:
