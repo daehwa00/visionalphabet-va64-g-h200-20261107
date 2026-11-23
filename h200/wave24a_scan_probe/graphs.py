@@ -209,7 +209,8 @@ def pair(operation: Operation, trials: tuple[str, ...], repeats: int) -> Iterato
 
 
 def probe(
-    case: Case, batch: int, dtype: torch.dtype, repeats: int, *, production: bool,
+    case: Case, batch: int, dtype: torch.dtype, repeats: int, *,
+    production: bool, only: set[str] | None = None,
 ) -> Iterator[dict]:
     h, w, m, coarse = case
     b = min(batch, 4) if max(h, w) > 96 else batch
@@ -234,6 +235,10 @@ def probe(
         return scans.vertical_backward(pole, states, auxiliary, path, *dy, coarse, compact=coarse)
 
     def rows(kind: str, operation: Operation, trials: tuple[str, ...]) -> Iterator[dict]:
+        if only:
+            trials = tuple(name for name in trials if name in only)
+        if not trials:
+            return
         for row in pair(operation, trials, repeats):
             yield {"shape": shape, "coarse": coarse, "dtype": str(dtype), "direction": kind, **row}
 
@@ -267,12 +272,13 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), required=True)
     parser.add_argument("--production", action="store_true")
+    parser.add_argument("--only", nargs="+", type=str)
     args = parser.parse_args()
     with patch.object(scans, "_kernel_source", source), args.out.open("w") as stream:
         for index in args.cases:
             for row in probe(
                 CASES[index], args.batch, getattr(torch, args.dtype), args.repeats,
-                production=args.production,
+                production=args.production, only=set(args.only) if args.only else None,
             ):
                 print(json.dumps(row), file=stream, flush=True)
 
