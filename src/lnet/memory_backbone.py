@@ -16,6 +16,7 @@ from .complex_layers import ComplexLinear
 from .factorized_complex_scan_reader import FactorizedComplexConv2dReader
 from .factorized_reader_kernels import real_gram_kernel_energy, real_packed_spatial
 from .gated_post_fusion import GatedComplexPostFusion
+from .model_w28c import model_w28c_enabled, packed_swiglu
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
 
@@ -124,7 +125,17 @@ class SwiGLU(nn.Module):
         return result
 
     def forward(self, x: Tensor) -> Tensor:
-        value, gate = self.value_gate(self.norm(x)).chunk(2, dim=-1)
+        joint = self.value_gate(self.norm(x))
+        if (
+            joint.is_cuda
+            and joint.dtype in (torch.bfloat16, torch.float16)
+            and joint.is_contiguous()
+            and 0 < joint.numel() < 2**31
+            and self.hidden % 16 == 0
+            and model_w28c_enabled(joint.device, "swiglu")
+        ):
+            return x + self.output(packed_swiglu(joint))
+        value, gate = joint.chunk(2, dim=-1)
         return x + self.output(value * functional.silu(gate))
 
     def forward_residual_packed(self, left: Tensor, right: Tensor) -> Tensor:
