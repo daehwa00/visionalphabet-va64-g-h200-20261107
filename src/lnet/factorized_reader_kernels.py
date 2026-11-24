@@ -30,6 +30,7 @@ _RESIDENT_FILTER_RANK_LIMIT = 2
 _CENTERED_WEIGHT_TILE = 2
 _VEC2_SPATIAL_GEOMETRY = (4, 2)
 _DEFAULT_WEIGHT_GEOMETRY = (_CENTERED_WEIGHT_TILE, 2, 4)
+_W35B_PARTIAL_BUDGET = 64 * 2**20
 _WIDE_WEIGHT_WARPS = 8
 _MAX_STREAMING_WEIGHT_WAVES = 40
 _WEIGHT_PARALLEL_REDUCTION_WORKERS = 512
@@ -248,6 +249,10 @@ __device__ __forceinline__ void mode_store(T* ptr, ModeValues<N> value) {
 template <int N, bool ReadOnly, bool Convert, class T>
 __device__ __forceinline__ auto window_load(const T* ptr) {
     const auto packed = packed_load<N, ReadOnly>(ptr);
+#if READER_W35B_WEIGHT || READER_W35B_SPATIAL
+    if constexpr (Convert && (N == 2 || N == 4)) return unpack_modes<N, T>(packed);
+    else
+#endif
     if constexpr (N == 1 && Convert) return as_float(packed);
     else return packed;
 }
@@ -257,6 +262,13 @@ __device__ __forceinline__ ModeValues<N> window_values(Packed packed) {
     if constexpr (N == 1) return {{as_float(packed)}};
     else return unpack_modes<N, T>(packed);
 }
+
+#if READER_W35B_WEIGHT || READER_W35B_SPATIAL
+template <int N, class T>
+__device__ __forceinline__ ModeValues<N> window_values(ModeValues<N> value) {
+    return value;
+}
+#endif
 
 template <class T, class W, class O, int R, bool Strict, bool Backward, int Vec>
 __device__ __forceinline__ void sliding_spatial(
@@ -273,7 +285,21 @@ __device__ __forceinline__ void sliding_spatial(
     constexpr int Warps = READER_SPATIAL_WARPS;
     constexpr int Inputs = Backward ? 2 : R * (Strict ? 2 : 1);
     using V = ModeValues<Vec>;
-    using Window = decltype(window_load<Vec, READER_SPATIAL_READ_ONLY, true>(input));
+#if READER_W35B_SPATIAL
+    // Forward has a separate input plane per rank. Keep those planes packed
+    // across columns and share one unpack across both output components.
+    constexpr bool ConvertSpatial = Backward;
+    using Window = decltype(window_load<Vec, READER_SPATIAL_READ_ONLY, ConvertSpatial>(input));
+    const int mode = (blockIdx.x * 32 + threadIdx.x % 32) * Vec;
+    const int xtiles = (width + Columns - 1) / Columns;
+    const int tile = blockIdx.y * Warps + threadIdx.x / 32;
+    const int y0 = tile / xtiles * Rows;
+    const int x0 = tile % xtiles * Columns;
+    const long long base = static_cast<long long>(blockIdx.z) * height * width;
+    if (mode >= modes || y0 >= height) return;
+#else
+    constexpr bool ConvertSpatial = true;
+    using Window = decltype(window_load<Vec, READER_SPATIAL_READ_ONLY, ConvertSpatial>(input));
     // Small real filters fit alongside the low-precision window in registers.
     // Reuse them across columns without reloading taps from shared memory.
     constexpr bool RegisterFilters = Vec == 1 && !Strict && (READER_REGISTER_FILTERS < 0
@@ -324,6 +350,7 @@ __device__ __forceinline__ void sliding_spatial(
                     }
                 }
     }
+#endif
     Window left[Rows + 2][Inputs] = {}, middle[Rows + 2][Inputs] = {};
     #pragma unroll
     for (int y = 0; y < Rows + 2; ++y) {
@@ -332,9 +359,10 @@ __device__ __forceinline__ void sliding_spatial(
         #pragma unroll
         for (int i = 0; i < Inputs; ++i) {
             const long long index = ((base + py * width + x0) * Inputs + i) * modes + mode;
-            middle[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, true>(input + index);
+            middle[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, ConvertSpatial>(
+                input + index);
             if (x0 > 0)
-                left[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, true>(
+                left[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, ConvertSpatial>(
                     input + index - Inputs * modes);
         }
     }
@@ -352,7 +380,7 @@ __device__ __forceinline__ void sliding_spatial(
             if (py < 0 || py >= height || x + 1 == width) continue;
             #pragma unroll
             for (int i = 0; i < Inputs; ++i)
-                right[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, true>(
+                right[y][i] = window_load<Vec, READER_SPATIAL_READ_ONLY, ConvertSpatial>(
                     input + (READER_UPDATED_SPATIAL && Vec == 1 && !Backward
                         ? ((base + py * width + x + 1) * Inputs + i) * modes + mode
                         : next + py * width * input_step + i * modes));
@@ -364,6 +392,19 @@ __device__ __forceinline__ void sliding_spatial(
             #pragma unroll
             for (int ky = 0; ky < 3; ++ky) {
                 constexpr int Left = 0, Middle = 1, Right = 2;
+#if READER_W35B_SPATIAL
+                V f[2][3];
+                #pragma unroll
+                for (int kx = 0; kx < 3; ++kx) {
+                    const int tap = ky * 3 + kx;
+                    #pragma unroll
+                    for (int v = 0; v < Vec; ++v) {
+                        const int index = ((mode + v) * R + r) * 9 + (Backward ? 8 - tap : tap);
+                        f[0][kx].value[v] = as_float(real[index]);
+                        f[1][kx].value[v] = as_float(imag[index]);
+                    }
+                }
+#else
                 const V f[2][3] = {
                     {KeepReal ? resident[0][r][ky][0] : filters[0][r][ky][0][lane],
                      KeepReal ? resident[0][r][ky][1] : filters[0][r][ky][1][lane],
@@ -372,6 +413,7 @@ __device__ __forceinline__ void sliding_spatial(
                      RegisterFilters ? resident[1][r][ky][1] : filters[1][r][ky][1][lane],
                      RegisterFilters ? resident[1][r][ky][2] : filters[1][r][ky][2][lane]},
                 };
+#endif
                 #pragma unroll
                 for (int y = 0; y < Rows; ++y) {
                     ar[y] = fmaf(window_values<Vec, T>(left[y + ky][i]), f[0][Left], ar[y]);
@@ -631,7 +673,13 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
     constexpr int Warps = READER_WEIGHT_WARPS, Rows = READER_WEIGHT_ROWS;
     constexpr bool ReadOnly = Vec > 1 ? READER_WEIGHT_READ_ONLY
         : (READER_WIDTH >= 28 || Warps == 8);
+#if READER_W35B_WEIGHT
+    // Grad components are in separate mode planes. Convert each plane when
+    // the column enters the window and carry its values across all taps.
+    constexpr bool ConvertWindow = true;
+#else
     constexpr bool ConvertWindow = R <= 2 && sizeof(G) == 2 && READER_WIDTH > 2 * READER_COLUMNS;
+#endif
     using V = ModeValues<Vec>;
     using Window = decltype(window_load<Vec, ReadOnly, ConvertWindow>(grad));
     constexpr int RankTile = R < READER_WEIGHT_TILE ? R : READER_WEIGHT_TILE;
@@ -782,7 +830,11 @@ extern "C" __global__ void reader_dinput(
             input, real, imag, output, h, w, m, rank);
 }
 
-extern "C" __global__ void reader_dweight(
+extern "C" __global__
+#if READER_W35B_WEIGHT && READER_WEIGHT_VEC == 2
+__maxnreg__(160)
+#endif
+void reader_dweight(
     const Input* projected, const Grad* grad, float* partial,
     int h, int w, int m, int batch, int rank
 ) {
@@ -994,6 +1046,8 @@ def _reader_cuda_module(
     spatial_read_only: bool = False,
     weight_read_only: bool = True,
     updated_spatial: bool = False,
+    w35b_weight: bool = False,
+    w35b_spatial: bool = False,
 ) -> _CudaModule:
     weight_tile, weight_rows, weight_warps = weight_geometry or _DEFAULT_WEIGHT_GEOMETRY
     macros = {
@@ -1008,6 +1062,10 @@ def _reader_cuda_module(
         "WEIGHT_TILE": weight_tile, "WEIGHT_ROWS": weight_rows, "WEIGHT_WARPS": weight_warps,
         **dict(zip(("INPUT", "WEIGHT", "GRAD"), types, strict=True)),
     }
+    if w35b_weight:
+        macros["W35B_WEIGHT"] = 1
+    if w35b_spatial:
+        macros["W35B_SPATIAL"] = 1
     header = "".join(f"#define READER_{key} {value}\n" for key, value in macros.items())
     source, operations = (
         (_GRAM_NORMALIZE_CUDA, ("gram_normalize", "gram_normalize_backward"))
@@ -1158,6 +1216,10 @@ class _VectorLaunch(NamedTuple):
     warps: int
 
 
+class _WarpRowLaunch(_VectorLaunch):
+    __slots__ = ()
+
+
 @cache
 def _reader_resident(module: _CudaModule, op: str, warps: int) -> int:
     blocks = ctypes.c_int()
@@ -1212,6 +1274,7 @@ def _reader_module_for(
     projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
     launch: _VectorLaunch, weight_geometry: tuple[int, int, int] | None = None,
     weight_vec: int = 1, updated: bool = False,
+    w35b_weight: bool = False, w35b_spatial: bool = False,
 ) -> _CudaModule:
     modes, rank, kernel, _ = real.shape
     dtypes = (projected.dtype, real.dtype, grad.dtype if grad is not None else projected.dtype)
@@ -1223,11 +1286,32 @@ def _reader_module_for(
         spatial_geometry=(launch.rows, launch.warps), weight_geometry=weight_geometry,
         register_filters=filters, keep_real=filters, weight_vec=weight_vec, spatial_vec=launch.vec,
         updated_spatial=updated, weight_read_only=updated or weight_vec != 2,
+        **({"w35b_weight": True} if w35b_weight else {}),
+        **({"w35b_spatial": True} if w35b_spatial else {}),
     )
 
 
 def _reader_vec_explicit() -> bool:
     return os.environ.get("LNET_READER_VEC", "auto") in ("2", "4")
+
+
+def _reader_w35b() -> str:
+    return os.environ.get("LNET_READER_W35B", "off")
+
+
+def _reader_w35b_eligible(
+    projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool, vec: int,
+) -> bool:
+    modes, rank, kernel, _ = real.shape
+    dtype = projected.dtype
+    alignment = vec * projected.element_size()
+    return (
+        not strict and 1 <= rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL
+        and dtype in (torch.float16, torch.bfloat16) and real.dtype == dtype
+        and modes % vec == 0 and projected.data_ptr() % alignment == 0
+        and (grad is None or (grad.dtype == dtype and grad.data_ptr() % alignment == 0))
+        and torch.cuda.get_device_properties(projected.device).major >= 8
+    )
 
 
 def _reader_auto(projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool) -> bool:
@@ -1274,6 +1358,19 @@ def _reader_spatial_plan(
     props = torch.cuda.get_device_properties(projected.device)
     backward = grad is not None
     op = "dinput" if backward else "forward"
+    if (
+        _reader_w35b() in ("auto", "fwd_dinput_vec4", "full_w35b")
+        and _reader_w35b_eligible(projected, real, grad, strict=strict, vec=4)
+    ):
+        # Distribute full-width row strips across warps to avoid horizontal halos.
+        launch = _WarpRowLaunch(4, min(width, 128), 1, 4)
+        grid = _reader_spatial_grid(batch, height, width, modes, launch.rows, launch.warps,
+                                    launch.vec, launch.columns, warp_row_tiles=True)
+        if grid[1] <= _MAX_CUDA_GRID_DIM:
+            module = _reader_module_for(projected, real, grad, strict=False, launch=launch,
+                                        w35b_spatial=True)
+            if _reader_resident(module, op, launch.warps) * launch.warps >= 16:
+                return launch, module
     if _reader_auto(projected, real, grad, strict=strict):
         vec = _reader_vector_width(projected, real, grad, strict=strict)
         best = None
@@ -1348,6 +1445,34 @@ def _reader_weight_candidate(
     return (geometry, vec, module, resident) if resident else None
 
 
+def _reader_w35b_weight_candidate(
+    projected: Tensor, real: Tensor, grad: Tensor, spatial: _VectorLaunch, *, strict: bool,
+) -> tuple[tuple[int, int, int], int, _CudaModule, int] | None:
+    variant = _reader_w35b()
+    if variant not in ("auto", "dweight_rt4", "dweight_rows4", "full_w35b"):
+        return None
+    vec = 2 if variant == "dweight_rows4" else 1
+    if (
+        8 * real.numel() > _W35B_PARTIAL_BUDGET
+        or not _reader_w35b_eligible(projected, real, grad, strict=strict, vec=vec)
+    ):
+        return None
+    height = projected.shape[1]
+    rank = real.shape[1]
+    tile = min(rank, 2 if vec == 2 else 4)
+    candidates = (4, 3, 2) if vec == 2 else (3, 2)
+    for rows in dict.fromkeys(min(height, row) for row in candidates):
+        geometry = (tile, rows, 4)
+        module = _reader_module_for(
+            projected, real, grad, strict=False, launch=spatial,
+            weight_geometry=geometry, weight_vec=vec, w35b_weight=True,
+        )
+        resident = _reader_resident(module, "dweight", geometry[2])
+        if resident >= (3 if vec == 2 else 4):
+            return geometry, vec, module, resident
+    return None
+
+
 def _reader_weight_plan(
     projected: Tensor, real: Tensor, grad: Tensor, *, strict: bool,
 ) -> _WeightLaunch:
@@ -1366,7 +1491,12 @@ def _reader_weight_plan(
     cta_waves = 5 if static else 3
     resident = 1
     compact = width <= columns and height <= 2 * columns
-    if _reader_auto(projected, real, grad, strict=strict):
+    candidate = _reader_w35b_weight_candidate(projected, real, grad, spatial, strict=strict)
+    w35b = candidate is not None
+    if candidate is not None:
+        geometry, weight_vec, module, resident = candidate
+        cta_waves = 2 * resident
+    elif _reader_auto(projected, real, grad, strict=strict):
         candidate = _reader_weight_candidate(projected, real, grad, spatial, compact=compact)
         if candidate is not None:
             geometry, weight_vec, module, resident = candidate
@@ -1384,7 +1514,9 @@ def _reader_weight_plan(
         rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
     ctas = mode_tiles * tap_tiles
     available = _ceildiv(batch * _ceildiv(height, weight_rows), weight_warps)
-    if module is not None and not compact:
+    if w35b:
+        workers = _ceildiv(cta_waves * sms, ctas)
+    elif module is not None and not compact:
         workers = max(1, cta_waves * sms // ctas)
     else:
         workers = _ceildiv(cta_waves * sms, mode_tiles)
@@ -1395,6 +1527,8 @@ def _reader_weight_plan(
     limit = _weight_partial_limit(
         props.total_memory, sms, stride, max(resident, 1) * weight_warps * _WARP_SIZE, device,
     )
+    if w35b:
+        limit = min(limit, _W35B_PARTIAL_BUDGET // (4 * stride))
     workers = min(available, workers, limit)
     if workers >= _WEIGHT_PARALLEL_REDUCTION_WORKERS:
         return _WeightLaunch((ctas, workers, rank_tiles), weight_warps, "dweight_reduce_parallel",
@@ -1559,8 +1693,11 @@ def real_gram_normalize_spatial(
 
 def _reader_spatial_grid(
     batch: int, height: int, width: int, modes: int, rows: int, warps: int, vec: int = 1,
-    columns: int | None = None,
+    columns: int | None = None, *, warp_row_tiles: bool = False,
 ) -> tuple[int, int, int]:
+    if warp_row_tiles:
+        strips = _ceildiv(height, rows) * _ceildiv(width, columns or width)
+        return _ceildiv(modes, _WARP_SIZE * vec), _ceildiv(strips, warps), batch
     tiles = _ceildiv(height, rows) * _ceildiv(width, warps * (
         columns or _reader_vector_columns(width, vec)
     ))
@@ -1576,13 +1713,15 @@ def _packed_spatial(
     if _use_reader_cuda(projected, real, imag):
         output = projected.new_empty((batch, height, width, 2 * modes))
         with torch.cuda.device(projected.device):
-            (vec, columns, rows, warps), module = _reader_spatial_plan(
+            launch, module = _reader_spatial_plan(
                 projected, real, None, strict=strict_complex,
             )
+            vec, columns, rows, warps = launch
             stream = _reader_stream(module, projected.device)
             _launch_reader_cuda(
                 module, "forward",
-                _reader_spatial_grid(batch, height, width, modes, rows, warps, vec, columns),
+                _reader_spatial_grid(batch, height, width, modes, rows, warps, vec, columns,
+                                     warp_row_tiles=isinstance(launch, _WarpRowLaunch)),
                 (projected, real, imag, output), (height, width, modes, rank),
                 stream=stream, threads=warps * _WARP_SIZE,
             )
@@ -1627,12 +1766,14 @@ def _packed_spatial_backward(
                 (partial, weight_grad), (modes, rank, plan.grid[1]), stream=stream,
             )
             del partial
-            (vec, columns, spatial_rows, warps), module = _reader_spatial_plan(
+            launch, module = _reader_spatial_plan(
                 projected, real, grad, strict=strict_complex,
             )
+            vec, columns, spatial_rows, warps = launch
             stream = _reader_stream(module, projected.device)
             grid = _reader_spatial_grid(
                 batch, height, width, modes, spatial_rows, warps, vec, columns,
+                warp_row_tiles=isinstance(launch, _WarpRowLaunch),
             )
             _launch_reader_cuda(
                 module, "dinput", grid, (grad, real, imag, grad_projected),
