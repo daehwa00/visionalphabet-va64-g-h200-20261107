@@ -16,6 +16,14 @@ from .complex_layers import ComplexLinear
 from .factorized_complex_scan_reader import FactorizedComplexConv2dReader
 from .factorized_reader_kernels import real_gram_kernel_energy, real_packed_spatial
 from .gated_post_fusion import GatedComplexPostFusion
+from .model_w28c import model_w28c_enabled, packed_swiglu
+from .model_w29c import (
+    channel_rmsnorm,
+    channel_rmsnorm_vjp,
+    model_w29c_enabled,
+    packed_swiglu_vec2d,
+    rmsnorm_eligible,
+)
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
 
@@ -41,14 +49,21 @@ class _CompiledChannelRMSNorm(torch.autograd.Function):
     """Keep strided activations and output gradients in their original layouts."""
 
     @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, epsilon: float) -> Tensor:  # noqa: ANN001
+    def forward(ctx, x: Tensor, weight: Tensor, epsilon: float, fused: bool) -> Tensor:  # noqa: ANN001, FBT001
         result, inverse = torch.ops.aten._fused_rms_norm(x, [x.shape[-1]], weight, epsilon)
+        ctx.fused = fused
         ctx.save_for_backward(x, weight, inverse.reshape(*x.shape[:-1], 1))
         return result
 
     @staticmethod
-    def backward(ctx, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None]:  # noqa: ANN001
+    def backward(ctx, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None, None]:  # noqa: ANN001
         x, weight, inverse = ctx.saved_tensors
+        if ctx.fused:
+            dx, dw = channel_rmsnorm_vjp(
+                x, weight, inverse, grad,
+                need_dx=ctx.needs_input_grad[0], need_dw=ctx.needs_input_grad[1],
+            )
+            return dx, dw, None, None
         # Promotion keeps the reductions in FP32 without requesting contiguous copies
         # of the activation and output gradient in the ATen backward decomposition.
         normalized = x * inverse
@@ -59,7 +74,7 @@ class _CompiledChannelRMSNorm(torch.autograd.Function):
             dx = ((scaled_grad - (normalized / x.shape[-1]) * projection) * inverse).to(x.dtype)
         if ctx.needs_input_grad[1]:
             dw = (grad * normalized).reshape(-1, x.shape[-1]).sum(0).to(weight.dtype)
-        return dx, dw, None
+        return dx, dw, None, None
 
 
 class ChannelRMSNorm(nn.Module):
@@ -78,6 +93,19 @@ class ChannelRMSNorm(nn.Module):
             or os.environ.get(_GENERAL_SCANS_ENV) != "0"
         ):
             weight = self.weight.to(x.dtype)
+            wave29 = (
+                x.dtype in (torch.bfloat16, torch.float16)
+                and x.shape[-1] == weight.numel()
+                and model_w29c_enabled(x.device, "rmsnorm_bwd")
+            )
+            if (
+                wave29 and model_w29c_enabled(x.device, "rmsnorm_full")
+                and rmsnorm_eligible(x, weight)
+            ):
+                save_inverse = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
+                return channel_rmsnorm(x, weight, self.epsilon, save_inverse)[0]
+            if wave29 and torch.is_grad_enabled():
+                return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon, True)  # noqa: FBT003
             if (
                 torch.compiler.is_compiling()
                 and torch.is_grad_enabled()
@@ -85,7 +113,7 @@ class ChannelRMSNorm(nn.Module):
                 and x.shape[-1] == weight.numel()
                 and x.numel() > 0
             ):
-                return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon)
+                return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon, False)  # noqa: FBT003
             return functional.rms_norm(x, (x.shape[-1],), weight, self.epsilon)
         inverse = torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.epsilon).to(x.dtype)
         return x * inverse * self.weight.to(x.dtype)
@@ -124,7 +152,18 @@ class SwiGLU(nn.Module):
         return result
 
     def forward(self, x: Tensor) -> Tensor:
-        value, gate = self.value_gate(self.norm(x)).chunk(2, dim=-1)
+        joint = self.value_gate(self.norm(x))
+        if (
+            joint.is_cuda
+            and joint.dtype in (torch.bfloat16, torch.float16)
+            and joint.is_contiguous()
+            and 0 < joint.numel() < 2**31
+        ):
+            if model_w29c_enabled(joint.device, "swiglu_vec2d"):
+                return x + self.output(packed_swiglu_vec2d(joint))
+            if self.hidden % 16 == 0 and model_w28c_enabled(joint.device, "swiglu"):
+                return x + self.output(packed_swiglu(joint))
+        value, gate = joint.chunk(2, dim=-1)
         return x + self.output(value * functional.silu(gate))
 
     def forward_residual_packed(self, left: Tensor, right: Tensor) -> Tensor:
