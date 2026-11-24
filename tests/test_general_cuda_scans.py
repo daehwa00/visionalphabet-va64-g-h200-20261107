@@ -1236,3 +1236,121 @@ def test_scan_wave_alignment_respects_work_and_workspace() -> None:
     assert scans._align_workers(launch, 200, 3, 64, max_workers=127).workers == 105
     assert scans._align_workers(launch, 200, 3, 64, max_workers=128).workers == 128
     assert scans._align_workers(launch, 240, 3, 64).workers == 84
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("track", "h", "w", "m", "coarse"),
+    [
+        ("vscan_coop_bwd", 13, 19, 63, False),
+        ("vscan_coop_bwd", 14, 20, 63, True),
+        ("vscan_decoupled_simt", 37, 13, 63, False),
+        ("vscan_decoupled_simt", 14, 20, 63, True),
+        ("hscan_vec2", 13, 19, 128, False),
+        ("hscan_vec2", 14, 20, 64, True),
+        ("hscan_vec2", 14, 20, 63, True),
+    ],
+)
+def test_cuda_wave35a_pipeline(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, track: str,
+    h: int, w: int, m: int, coarse: bool,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W35A", track)
+    monkeypatch.delenv("LNET_VSCAN_DECOUPLED", raising=False)
+    if track == "vscan_decoupled_simt" and scans._total_vram(torch.device("cuda")) < 48 * 1024**3:
+        pytest.skip("AoSoA path requires 48 GiB")
+    launches = []
+    launch_kernel = scans._launch_kernel
+
+    def capture(source, key, grid, smem, args):
+        launches.append(key)
+        return launch_kernel(source, key, grid, smem, args)
+
+    monkeypatch.setattr(scans, "_launch_kernel", capture)
+    _compare_pipeline(h, w, m, coarse, dtype, 8, compiled=False, mode="cuda")
+    if track == "vscan_coop_bwd":
+        assert any(key.cooperative for key in launches)
+    elif track == "vscan_decoupled_simt":
+        assert all(any(key.aosoa and key.backward == backward for key in launches)
+                   for backward in (False, True))
+    else:
+        assert any(key.horizontal_vec2 for key in launches) == (m % 2 == 0)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cuda_wave35a_compact_horizontal(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype,
+) -> None:
+    px, _, real, imag, _, _ = _inputs(14, 20, 160, 8, dtype, "cuda")
+    monkeypatch.setenv("LNET_SCAN_W35A", "off")
+    states, _ = scans._hscan(px, real, imag)
+    dy = torch.randn_like(states[..., ::2, :])
+    baseline, poles = scans._hscan(px, real, imag, states, dy, compact=True)
+    monkeypatch.setenv("LNET_SCAN_W35A", "hscan_vec2")
+    actual, vec_poles = scans._hscan(px, real, imag, states, dy, compact=True)
+    torch.testing.assert_close(actual, baseline, atol=0.02, rtol=0.02)
+    assert poles is not None
+    assert vec_poles is not None
+    for reference, value in zip(poles, vec_poles, strict=True):
+        torch.testing.assert_close(value, reference, atol=0.04, rtol=0.02)
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+def test_cpu_wave35a_compiled_reference(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    monkeypatch.setenv("LNET_SCAN_W35A", "full_w35a")
+    args = _inputs(4, 6, 3, 8, torch.float32, "cpu", batch=1)
+    px, py, r, i, _, path = args
+    px = tuple(p.reshape(1, 1, 1, -1) for p in px)
+    py = tuple(p.reshape(1, 1, 1, -1) for p in py)
+    packed = torch.cat((r, i), dim=-1)
+    run = run_product_scan_coarse_path_collapse_packed
+    eager = run(tuple(px), tuple(py), packed, tuple(path), gain_normalization="pointwise")
+    compiled = torch.compile(run, fullgraph=True, backend=backend)(
+        tuple(px), tuple(py), packed, tuple(path), gain_normalization="pointwise",
+    )
+    params = [r, i, *px, *py, *path]
+    a = torch.autograd.grad(eager.square().sum(), params)
+    b = torch.autograd.grad(compiled.square().sum(), params)
+    torch.testing.assert_close(compiled, eager)
+    torch.testing.assert_close(b, a)
+
+
+def test_cpu_wave35a_fake_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_SCAN_W35A", "full_w35a")
+    with FakeTensorMode():
+        args = _inputs(13, 19, 63, 8, torch.bfloat16, "cpu", batch=2)
+        run = torch.compile(_pipeline, fullgraph=True, backend="eager")
+        states, real, imag = run(*args, coarse=False, mode="cuda")
+        assert states.shape == (4, 2, 13, 19, 63)
+        assert real.shape == imag.shape == (2, 13, 19, 63)
+
+
+@pytest.mark.parametrize(
+    ("m", "dtype", "transposed", "selected"),
+    [(160, torch.bfloat16, False, True), (63, torch.bfloat16, False, False),
+     (128, torch.float32, False, False), (64, torch.float16, True, False)],
+)
+def test_cpu_wave35a_horizontal_plan(
+    monkeypatch: pytest.MonkeyPatch, m: int, dtype: torch.dtype, transposed: bool, selected: bool,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W35A", "hscan_vec2")
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 8)
+    monkeypatch.setattr(scans, "_scan_workspace_budget", lambda _: 64 * 1024**2)
+    real = SimpleNamespace(
+        is_cuda=True, dtype=dtype, device=SimpleNamespace(index=0),
+        element_size=lambda: dtype.itemsize, numel=lambda: 1024 * 56 * 56 * m, data_ptr=lambda: 4,
+    )
+    launch = scans._plan_horizontal_vec2(
+        real, real, (1024, 56, 56, m),
+        {"interleaved": (False, False), "transposed": (transposed, False)},
+        backward=True, compact=False,
+    )
+    assert (launch is not None) == selected
+    if launch:
+        assert launch.key.horizontal_vec2
+        assert launch.plan.smem == 16384

@@ -33,6 +33,7 @@ from .product_scan_reference import (
     bidirectional_product_scan_reference,
     d4_grouped_path_collapse_packed_reference,
 )
+from .scan_wave35a import COOPERATIVE_VERTICAL, HIDDEN_SPLIT, HORIZONTAL_VEC2
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
 # Constants and types
 
 _WARP_SIZE = 32
+_AOSOA_PROJECTION_SMEM = 11 * 8 * _WARP_SIZE * 2
+_AOSOA_PARTIAL_BYTES = 2 * 1024**2
 _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
 _MAX_CACHED_HIDDEN = 16
@@ -132,6 +135,10 @@ class Kernel:
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
+    horizontal_vec2: bool = False
+    cooperative: bool = False
+    aosoa: bool = False
+    single_store: bool = False
 
 
 class Launch(NamedTuple):
@@ -1447,6 +1454,8 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 def _kernel_name(key: Kernel) -> str:
     if key.projection:
+        if key.aosoa:
+            return "project_path_bwd_aosoa" if key.backward else "project_path_fwd_aosoa"
         return "path_mlp_backward" if key.backward else "path_mlp_forward"
     if key.projection_reduction:
         return "reduce_path_mlp_partials"
@@ -1455,7 +1464,7 @@ def _kernel_name(key: Kernel) -> str:
     return "scan"
 
 
-def _kernel_source(key: Kernel) -> str:
+def _kernel_source(key: Kernel) -> str:  # noqa: C901, PLR0912
     """Instantiate a single entry point without modifying the device source."""
     if key.reduction:
         return _CUDA_SOURCE + f"""
@@ -1475,7 +1484,7 @@ extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
         ))
         hidden = _REGISTER_HIDDEN if key.hidden8 else 0
         index = "unsigned int" if key.index32 else "long long"
-        return _CUDA_SOURCE + f"""
+        wrapper = f"""
 extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key)}(
     const {io}* __restrict__ features, const void* __restrict__ wi, const void* __restrict__ bi,
     const void* __restrict__ wo, const void* __restrict__ bo,
@@ -1489,6 +1498,16 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         cells, feature_plane, M, hidden, types);
 }}
 """
+        if key.aosoa:
+            call = wrapper.index("    project_path<")
+            wrapper = wrapper[:call] + f"""
+    project_path_aosoa<{io}, {index}, {str(key.backward).lower()},
+                       {str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}>(
+        features, wi, bi, wo, bo, gr, gi, real, imag, dp, partials,
+        static_cast<{index}>(cells), M, types);
+}}
+"""
+        return _CUDA_SOURCE + (HIDDEN_SPLIT if key.aosoa else "") + wrapper
     index = "int" if key.index32 else "long long"
     backward, coarse, cache_weights, global_ckpt, cache_line, shared_acc, precise = (
         str(flag).lower()
@@ -1551,6 +1570,36 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         B, H, W, M, workers);
 }}
 """
+    if key.horizontal_vec2:
+        call = wrapper.index("    horizontal<")
+        wrapper = wrapper[:call] + f"""
+    horizontal_vec2<{io}, {index}, {key.warps}, {backward}, {compact}, {layout}, 16>(
+        dr, di, decay_gr, decay_gi, sr, si, states, grad, out, partials, B, H, W, M, workers);
+}}
+"""
+        return _CUDA_SOURCE + HORIZONTAL_VEC2 + wrapper
+    if key.cooperative:
+        call = wrapper.index("    vertical<")
+        wrapper = wrapper[:call] + f"""
+    vertical_cooperative<{io}, {index}, {coarse}, {compact}, {layout}, {key.chunk}>(
+        dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo,
+        gr, gi, gs, partials, B, H, W, M, workers, types, eps);
+}}
+"""
+        return _CUDA_SOURCE + HIDDEN_SPLIT + COOPERATIVE_VERTICAL + wrapper
+    if key.aosoa:
+        use = "aosoa_offset(cell / c.M, c.m, c.M, k)"
+        if key.backward:
+            source = _CUDA_SOURCE.replace("I(k) * c.feature_plane + cell", use)
+        else:
+            source = _CUDA_SOURCE.replace("I(k) * c.feature_plane + cell", use.replace("c.M", "M"))
+        if key.single_store:
+            source = _single_store_source(source)
+        declaration = (
+            "template<class I> __device__ __forceinline__ I "
+            "aosoa_offset(I cell, int m, int M, int k);\n"
+        )
+        return declaration + source + HIDDEN_SPLIT + wrapper
     source = _CUDA_SOURCE
     if key.backward_batch2:
         source = "#define BACKWARD_BATCH2\n" + source
@@ -1564,6 +1613,31 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             .replace("states[ib + source_plane]", "__ldg(states + ib + source_plane)")
         )
     return source + wrapper
+
+
+def _single_store_source(source: str) -> str:
+    # The line buffer holds negative injections, followed by a packed positive
+    # gradient for every row. This avoids a read-modify-write through gs.
+    start = source.index("            column_adjoint<false, COMPACT>(\n                c, y, j ?")
+    end = source.index("            if constexpr (full)", start)
+    source = source[:start] + """
+            auto* positive = g2 + I(c.H / (1 + COARSE)) * g2_stride;
+            positive[I(y) * THREADS] = Quad<T>::pack(column_adjoint_step<false>(
+                j ? seg[(j - 1) * THREADS] : before, s, ip, a, g, adj_a, adj_b, da, dg));
+            if constexpr (COARSE) {
+                positive[I(y - 1) * THREADS] = Quad<T>::pack(column_adjoint_step<false>(
+                    j > 1 ? seg[(j - 2) * THREADS] : before, se, {}, a, g, adj_a, adj_b, da, dg));
+            }
+""" + source[end:]
+    return source.replace(
+        """            column_adjoint<true, COMPACT>(
+                c, y, seg[j * THREADS], CACHED_SOURCE_AT(j), in, ar, gg,
+                adj_a, adj_b, da, dg, gs);""",
+        """            const auto ds = column_adjoint_step<true>(
+                seg[j * THREADS], CACHED_SOURCE_AT(j), in, ar, gg, adj_a, adj_b, da, dg);
+            const auto previous = g2[(I(c.H / (1 + COARSE)) * g2_stride) + I(y) * THREADS];
+            write_column_gradient<true, COMPACT>(c, y, ds, gs, previous);""",
+    )
 
 
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
@@ -1685,8 +1759,8 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     with torch.cuda.device(device):
         _ensure_context(driver, device)
         if (
-            key.batch_path or key.register_path or key.horizontal_unroll8
-            or key.backward_batch2 or key.backward_readonly
+            key.batch_path or key.register_path or key.horizontal_unroll8 or key.horizontal_vec2
+            or key.backward_batch2 or key.backward_readonly or key.cooperative or key.aosoa
             or (key.vertical and key.backward and key.chunk and key.cache_source)
         ):
             local = ct.c_int()
@@ -1712,7 +1786,8 @@ def _dispatch(source: Tensor, launch: Launch | None, args: tuple) -> None:
     if launch is None:
         raise RuntimeError("CUDA scan is ineligible on this device")
     plan, key, workers, _ = launch
-    grid = _ceil(source.shape[-1], _WARP_SIZE) * _ceil(workers, plan.warps)
+    tile = 2 * _WARP_SIZE if key.horizontal_vec2 else _WARP_SIZE
+    grid = _ceil(source.shape[-1], tile) * _ceil(workers, plan.warps)
     _launch_kernel(source, key, grid, plan.smem, args)
 
 
@@ -1931,8 +2006,22 @@ def _with_vector_path_weights(
     return Launch(plan._replace(smem=smem), vector, workers, partials)
 
 
+def _scan_plan_residency(
+    device: int, plan: ScanPlan, key: Kernel, height: int, limit: int,
+) -> tuple[ScanPlan, Kernel, int]:
+    resident = _resident(device, key, plan.smem)
+    if key.aosoa and key.backward and plan.cache_line and resident * plan.warps >= 16:
+        # Keep positive gradients on chip when the extra slots still allow 16 warps.
+        smem = plan.smem + height * plan.warps * _WARP_SIZE * 8
+        single = replace(key, single_store=True)
+        single_resident = _resident(device, single, smem) if smem <= limit else 0
+        if single_resident * plan.warps >= 16:
+            return plan._replace(smem=smem), single, single_resident
+    return plan, key, resident
+
+
 @lru_cache(maxsize=256)
-def _launch_for_shape(
+def _launch_for_shape(  # noqa: PLR0915
     device: int,
     dtype: torch.dtype,
     shape: tuple[int, int, int, int],
@@ -1947,6 +2036,7 @@ def _launch_for_shape(
     interleaved: tuple[bool, bool] = (False, False),
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
+    aosoa: bool = False,
 ) -> Launch | None:
     b, h, w, m = shape
     sms, limit, max_warps_per_sm = device_limits(device)
@@ -2012,7 +2102,8 @@ def _launch_for_shape(
     ranked = sorted(
         ((locality(plan), plan) for plan in plans), key=lambda item: item[0], reverse=True
     )
-    for local, plan in ranked:
+    for local, candidate in ranked:
+        plan = candidate
         if best_score is not None and local < best_score[0]:
             break
         reduce = backward and (
@@ -2031,6 +2122,7 @@ def _launch_for_shape(
             coarse=coarse,
             hidden8=hidden == _REGISTER_HIDDEN,
             pure_vertical=pure_vertical,
+            aosoa=aosoa,
             index32=bound < 2**31,
             # This variant takes its full-column span from runtime H.
             chunk=0 if plan.full_trajectory else plan.chunk,
@@ -2046,7 +2138,7 @@ def _launch_for_shape(
             real_transposed=transposed[0],
             imag_transposed=transposed[1],
         )
-        resident = _resident(device, key, plan.smem)
+        plan, key, resident = _scan_plan_residency(device, plan, key, h, limit)
         active_warps = resident * plan.warps
         workers = _workers(
             lines, m, fields, plan.warps, sms * resident * wave_limit,
@@ -2433,6 +2525,40 @@ def _horizontal_layout(real: Tensor, imag: Tensor) -> dict[str, tuple[bool, bool
     }
 
 
+def _wave35a_enabled(track: str) -> bool:
+    mode = os.environ.get("LNET_SCAN_W35A", "off")
+    return mode in (track, "full_w35a", "auto")
+
+
+def _plan_horizontal_vec2(
+    real: Tensor, imag: Tensor, shape: tuple[int, int, int, int],
+    layout: dict[str, tuple[bool, bool]], *, backward: bool, compact: bool,
+) -> Launch | None:
+    b, h, w, m = shape
+    if (
+        not _wave35a_enabled("hscan_vec2") or not real.is_cuda or real.element_size() != 2
+        or m % 2 or (backward and w > 4 * 16) or any(layout["transposed"])
+        or any(value.data_ptr() % 4 for value in (real, imag))
+    ):
+        return None
+    device = real.device.index or 0
+    sms, limit, _ = device_limits(device)
+    warps = 2 if backward else 4
+    smem = 16 * warps * _WARP_SIZE * 16 if backward else 0
+    key = Kernel(
+        real.dtype, warps, backward, index32=4 * real.numel() < 2**31,
+        compact=compact, real_interleaved=layout["interleaved"][0],
+        imag_interleaved=layout["interleaved"][1], horizontal_vec2=True,
+    )
+    if smem > limit or not _resident(device, key, smem):
+        return None
+    workers = _workers(
+        b * h, m, 4 if backward else 0, warps, _HSCAN_WAVES * sms,
+        _scan_workspace_budget(device),
+    )
+    return Launch(ScanPlan(warps, smem, cache_line=True), key, workers, _ceil(workers, warps))
+
+
 def _hscan(
     pole: list[Tensor],
     real: Tensor,
@@ -2472,7 +2598,9 @@ def _hscan(
             (real, imag), layout["interleaved"], layout["transposed"], strict=True,
         )
     )
-    launch = _plan_launch(
+    launch = _plan_horizontal_vec2(
+        real_input, imag_input, shape, layout, backward=backward, compact=compact,
+    ) or _plan_launch(
         real, shape, backward=backward, vertical=False, coarse=False, hidden=0, precise=False,
         compact=compact,
         **layout,
@@ -2489,12 +2617,18 @@ def _hscan(
     else:
         out = real.new_empty((4, b, h, w, m))
         partial = scratch = None
+    def aligned(value: Tensor | None) -> Tensor | None:
+        if value is None:
+            return None
+        value = value.contiguous()
+        return value.clone() if launch.key.horizontal_vec2 and value.data_ptr() % 4 else value
+
     inputs = (
         *(p.float().contiguous() for p in pole),
         real_input,
         imag_input,
-        states.contiguous() if states is not None else None,
-        adjoints.contiguous() if adjoints is not None else None,
+        aligned(states),
+        aligned(adjoints),
     )
     _dispatch(
         real,
@@ -2519,6 +2653,38 @@ def _vertical_adjoints(
     return _contiguous_or_interleaved(grad[0]), _contiguous_or_interleaved(grad[1])
 
 
+def _plan_vertical_cooperative(
+    states: Tensor, shape: tuple[int, int, int, int], *, coarse: bool, compact: bool,
+    interleaved: tuple[bool, bool],
+) -> Launch | None:
+    if not _wave35a_enabled("vscan_coop_bwd") or not states.is_cuda or states.element_size() != 2:
+        return None
+    b, h, w, m = shape
+    device = states.device.index or 0
+    sms, limit, _ = device_limits(device)
+    warps, chunk = 4, 8
+    threads = warps * _WARP_SIZE
+    oh, ow = h // (1 + coarse), w // (1 + coarse)
+    smem = threads * (16 * (chunk + _ceil(h, chunk) - 1) + 8 * oh + 20 + 128)
+    key = Kernel(
+        states.dtype, warps, backward=True, vertical=True, coarse=coarse, hidden8=True,
+        index32=max(states.numel(), 64 * m) < 2**31, chunk=chunk, compact=compact,
+        real_interleaved=interleaved[0], imag_interleaved=interleaved[1], cooperative=True,
+    )
+    if smem > limit:
+        return None
+    resident = _resident(device, key, smem)
+    if not resident or (
+        os.environ.get("LNET_SCAN_W35A") == "auto" and resident * warps < 16
+    ):
+        return None
+    groups = min(
+        _ceil(b * ow, warps), _ceil(4 * sms * resident, _ceil(m, _WARP_SIZE)),
+        max(1, _scan_workspace_budget(device) // (94 * m * 4)),
+    )
+    return Launch(ScanPlan(warps, smem, chunk, cache_line=True), key, groups * warps, groups)
+
+
 def _vscan(  # noqa: C901, PLR0912, PLR0915
     pole: list[Tensor],
     states: Tensor,
@@ -2536,6 +2702,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     saved_features: Tensor | None = None,
     state_grad: Tensor | None = None,
     pure: bool = False,
+    aosoa: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     shape = tuple(states.shape[1:])
     if (
@@ -2565,31 +2732,48 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or not saved_features.is_contiguous()
     ):
         raise ValueError("Invalid saved vertical features")
-    if not pure:
+    cooperative = (
+        _plan_vertical_cooperative(
+            states, shape, coarse=coarse, compact=compact, interleaved=interleaved,
+        )
+        if backward and not pure and hidden == _REGISTER_HIDDEN and saved_features is None
+        else None
+    )
+    if not pure and cooperative is None:
         chunk = (
             _saved_backward_chunk(states, coarse)
             if saved_features is not None else _decoupled_chunk(states, coarse)
         )
-        if chunk:
+        aosoa_chunk = _wave35a_chunk(states, coarse, hidden) if saved_features is None else 0
+        if aosoa_chunk or chunk:
             with torch.autocast(device_type="cuda", enabled=False):
                 return _decoupled_vscan(
                     pole, states, auxiliary, path, coarse, epsilon, precise,
                     (gr, gi) if grad is not None else None,
-                    packed=packed, planar=planar, compact=compact, chunk=chunk,
-                    saved_features=saved_features,
+                    packed=packed, planar=planar, compact=compact, chunk=aosoa_chunk or chunk,
+                    saved_features=saved_features, aosoa=bool(aosoa_chunk),
                 )
-    launch = _plan_launch(
-        states,
-        shape,
-        backward=backward,
-        vertical=True,
-        coarse=coarse,
-        hidden=hidden,
-        precise=precise,
-        compact=compact,
-        interleaved=interleaved,
-        pure_vertical=pure,
-    )
+    if aosoa:
+        feature_bound = b * oh * ow * _ceil(m, _WARP_SIZE) * 8 * _WARP_SIZE
+        bound = max(states.numel() * 2, states.stride(0) * 4, feature_bound)
+        launch = _launch_for_shape(
+            states.device.index or 0, states.dtype, shape, bound,
+            backward=backward, vertical=True, coarse=coarse, hidden=0, precise=precise,
+            compact=compact, interleaved=interleaved, pure_vertical=True, aosoa=True,
+        )
+    else:
+        launch = cooperative or _plan_launch(
+            states,
+            shape,
+            backward=backward,
+            vertical=True,
+            coarse=coarse,
+            hidden=hidden,
+            precise=precise,
+            compact=compact,
+            interleaved=interleaved,
+            pure_vertical=pure,
+        )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
     if backward:
@@ -2610,7 +2794,11 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
             )
     else:
         if pure:
-            output = outr = states.new_empty((8, b * oh * ow, m))
+            feature_shape = (
+                (b * oh * ow, _ceil(m, _WARP_SIZE), 8, _WARP_SIZE)
+                if aosoa else (8, b * oh * ow, m)
+            )
+            output = outr = states.new_empty(feature_shape)
             outi = None
         elif packed and planar:
             output = states.new_empty((2, *out_shape))
@@ -2659,6 +2847,28 @@ def _decoupled_chunk(states: Tensor, coarse: bool) -> int:
     if not states.is_cuda or policy not in {"chunk", "saved", "test_saved"}:
         return 0
     return _workspace_vscan_chunk(states, coarse)
+
+
+def _wave35a_chunk(states: Tensor, coarse: bool, hidden: int) -> int:
+    if (
+        not _wave35a_enabled("vscan_decoupled_simt") or not states.is_cuda
+        or states.element_size() != 2 or hidden != _REGISTER_HIDDEN
+    ):
+        return 0
+    _, b, h, w, m = states.shape
+    vram = _total_vram(states.device)
+    if vram < 48 * 1024**3 or 90 * m * 4 > _AOSOA_PARTIAL_BYTES:
+        return 0
+    device = states.device.index or 0
+    for backward in (False, True):
+        key = Kernel(states.dtype, 4, backward, hidden8=True, projection=True, aosoa=True)
+        if not _resident(device, key, _AOSOA_PROJECTION_SMEM):
+            return 0
+    step = 1 + coarse
+    padded_m = _ceil(m, _WARP_SIZE) * _WARP_SIZE
+    per_sample = 16 * (h // step) * (w // step) * padded_m * states.element_size()
+    budget = min(vram // 8, 130 * 1024**3) - _AOSOA_PARTIAL_BYTES
+    return min(b, budget // per_sample)
 
 
 def _workspace_vscan_chunk(states: Tensor, coarse: bool) -> int:
@@ -2749,17 +2959,33 @@ def _project_path(
     features: Tensor, path: list[Tensor], real: Tensor, imag: Tensor, *,
     backward: bool, precise: bool,
 ) -> tuple[Tensor, list[Tensor]] | None:
-    _, cells, modes = features.shape
+    aosoa = features.ndim == 4
+    modes = real.shape[-1]
+    cells = features.shape[0] if aosoa else features.shape[1]
     hidden = path[0].shape[1]
     feature_plane = features.stride(0)
     base = Kernel(
         features.dtype, 0, backward, projection=True,
         precise=precise and not backward and features.dtype == torch.float32,
-        hidden8=hidden == _REGISTER_HIDDEN, index32=8 * feature_plane < 2**32,
+        hidden8=hidden == _REGISTER_HIDDEN, index32=(
+            max(features.numel(), real.numel() * 2) < 2**32 if aosoa else 8 * feature_plane < 2**32
+        ),
+        aosoa=aosoa,
         real_interleaved=not real.is_contiguous(), imag_interleaved=not imag.is_contiguous(),
     )
-    key, groups, smem = _plan_projection(features.device.index or 0, base, cells, modes, hidden)
     tiles = _ceil(modes, _WARP_SIZE)
+    if aosoa:
+        key = replace(base, warps=4)
+        smem = _AOSOA_PROJECTION_SMEM
+        device = features.device.index or 0
+        sms, _, _ = device_limits(device)
+        resident = _resident(device, key, smem)
+        if not resident:
+            raise RuntimeError("AoSoA scan projection needs a spill-free kernel")
+        rows = _AOSOA_PARTIAL_BYTES // (90 * modes * 4) if backward else cells
+        groups = min(cells, max(1, min(rows, _ceil(sms * resident, tiles))))
+    else:
+        key, groups, smem = _plan_projection(features.device.index or 0, base, cells, modes, hidden)
     # Features can be a cell slice of the saved full-batch planes.
     # The pure scan consumes densely packed output planes.
     adjoints = features.new_empty(features.shape) if backward else None
@@ -2800,6 +3026,7 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
     compact: bool,
     chunk: int,
     saved_features: Tensor | None = None,
+    aosoa: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     _, batch, height, width, modes = states.shape
     oh, ow = (height // 2, width // 2) if coarse else (height, width)
@@ -2825,7 +3052,9 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
         part = slice(begin, begin + chunk)
         source = states[:, part]
         if saved_features is None:
-            features = _vscan(pole, source, auxiliary, path, coarse, epsilon, precise, pure=True)
+            features = _vscan(
+                pole, source, auxiliary, path, coarse, epsilon, precise, pure=True, aosoa=aosoa,
+            )
         else:
             area = oh * ow
             features = saved_features[:, begin * area : min(begin + chunk, batch) * area]
@@ -2847,7 +3076,7 @@ def _decoupled_vscan(  # noqa: C901, PLR0912
         dp, path_grads = projected
         gradients = _vscan(
             float_pole, source, auxiliary, path, coarse, epsilon, precise,
-            compact=compact, features=dp, state_grad=gs[:, part], pure=True,
+            compact=compact, features=dp, state_grad=gs[:, part], pure=True, aosoa=aosoa,
         )
         if not isinstance(gradients, list):
             raise TypeError("Expected pure scan gradients")
