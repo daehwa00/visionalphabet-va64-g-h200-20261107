@@ -115,7 +115,8 @@ def instrument(step, original, **options):  # noqa: C901
         "horizontal_unroll8",
         "mma_path",
     )
-    result.pop("top_kernels", None)
+    if "kernels" in result:
+        result.pop("top_kernels", None)
     result["scan_dispatch"] = [
         {**dict(zip(fields, key, strict=True)), "count": count}
         for key, count in Counter(scan_dispatch).items()

@@ -20,7 +20,18 @@ finish() {
     set +e
     printf '%d\n' "$rc" > "$data/exit-code.txt"
     printf '%d\n' "$SECONDS" > "$data/elapsed-seconds.txt"
-    tar -C "$data" -cf - . | xz -3 > "$out/task93.tar.xz"
+    # The provisioning bot posts only the final 65,000 characters.
+    # Keep measured JSON (including full kernels for comparison arms) and retain
+    # bounded diagnostics. Full process logs remain in the job output directory.
+    transport="$out/transport"
+    mkdir "$transport"
+    cp "$data"/*.json "$data"/*.tsv "$data"/*.txt "$transport/" 2>/dev/null
+    for log in "$data"/*.log; do
+        if [[ -s $log ]]; then
+            tail -c 3500 "$log" > "$transport/${log##*/}"
+        fi
+    done
+    tar -C "$transport" -cf - . | xz -9e > "$out/task93.tar.xz"
     archive_rc=$?
     if (( archive_rc == 0 )); then
         sha256sum "$out/task93.tar.xz" | awk '{print "VA_T93_SHA256 " $1}'
@@ -32,6 +43,7 @@ finish() {
         printf 'VA_T93_END %s\n' "$(find "$out" -maxdepth 1 -name 'chunk-*' | wc -l)"
     fi
     printf 'Task 93 result %s, runner exit %d\n' "$out" "$rc"
+    cat "$data/gates.json" "$data/processes.tsv" 2>/dev/null
     if (( rc == 0 && archive_rc != 0 )); then exit "$archive_rc"; fi
     exit "$rc"
 }
@@ -115,7 +127,9 @@ bench() {
 train() (
     local batch=$1 arm=$2 name=$3
     config "$arm"
-    bench 360 "b${batch}_$name" train-arm --variant "$variant" --batch "$batch" --profile --full-kernels
+    opts=(--profile)
+    if [[ $name != *_sweep || $batch == 128 ]]; then opts+=(--full-kernels); fi
+    bench 360 "b${batch}_$name" train-arm --variant "$variant" --batch "$batch" "${opts[@]}"
 )
 
 bench 120 device probe

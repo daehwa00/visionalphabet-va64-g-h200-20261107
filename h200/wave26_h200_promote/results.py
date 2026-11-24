@@ -122,7 +122,7 @@ def regressions(out):
         )
     )
     gates["sweep"] = all(
-        (finite(row) and bool(row.get("profiler", {}).get("kernels")))
+        (finite(row) and bool(row.get("profiler", {}).get("top_kernels") or row["profiler"].get("kernels")))
         or (batch == 2048 and row.get("status") == "oom")
         for batch in (128, 512, 1024, 2048)
         for arm in ("wave21c_base", best)
