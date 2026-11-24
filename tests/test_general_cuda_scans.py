@@ -660,6 +660,9 @@ def test_index_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_packed_vertical_index_bound(
     monkeypatch: pytest.MonkeyPatch, batch: int, index32: bool
 ) -> None:
+    monkeypatch.setenv("LNET_SCAN_W27A", "off")
+    monkeypatch.setenv("LNET_SCAN_W28A", "off")
+    monkeypatch.setenv("LNET_SCAN_W29A", "off")
     monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
     monkeypatch.setattr(scans, "_resident", lambda *_: 3)
     monkeypatch.setattr(scans, "_extra_workspace_budget", lambda _: 0)
@@ -1354,6 +1357,8 @@ def test_wave28a_backward_presets(
 def test_wave27a_checkpoint_and_pair_parity(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, coarse: bool, interleaved: bool,
 ) -> None:
+    monkeypatch.setenv("LNET_SCAN_W28A", "off")
+    monkeypatch.setenv("LNET_SCAN_W29A", "off")
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     torch.manual_seed(719)
     px, py, real, imag, aux, path = _inputs(56, 56, 160, 8, dtype, "cuda", batch=2)
@@ -1404,3 +1409,61 @@ def test_wave27a_checkpoint_and_pair_parity(
             max_relative = 1e-4 if actual.dtype == torch.float32 else 2 * torch.finfo(dtype).eps
             assert diff.abs().max() <= max_relative * reference.abs().max() + 3e-5, label
             assert diff.norm() <= 1e-4 * reference.norm().clamp_min(1e-6), label
+
+
+@pytest.mark.parametrize(("height", "coarse", "preset", "chunk", "paired"), [
+    (56, False, "compose_w28", 14, True),
+    (56, True, "compose_w28", 14, True),
+    (56, True, "compose_ckpt", 20, True),
+    (56, True, "vscan_bwd_deep", 20, True),
+    (28, False, "compose_ckpt", 28, True),
+    (14, False, "compose_ckpt", 14, True),
+    (14, True, "auto", 14, False),
+    (7, False, "auto", 7, True),
+    (56, True, "off", 8, False),
+])
+def test_wave29a_checkpoint_composition(
+    monkeypatch: pytest.MonkeyPatch, height: int, coarse: bool, preset: str,
+    chunk: int, paired: bool,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W29A", preset)
+    monkeypatch.setenv("LNET_SCAN_W28A", "off")
+    monkeypatch.setenv("LNET_SCAN_W27A", "off")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 2)
+    full = height != 56
+    plan = scans.ScanPlan(
+        4, 60000, chunk=height if full else 8, cache_weights=True, cache_source=True,
+        full_trajectory=full,
+    )
+    key = scans.Kernel(
+        torch.bfloat16, 4, backward=True, vertical=True, hidden8=True, coarse=coarse,
+        chunk=0 if full else 8,
+    )
+    baseline = scans.Launch(plan, key, 636, 159)
+    actual = scans._with_wave29a(baseline, 0, (1024, height, height, 128 if height == 7 else 160))
+    assert actual.plan.chunk == chunk
+    assert actual.key.chunk == (0 if full else chunk)
+    assert actual.plan.full_trajectory is full
+    assert actual.key.backward_batch2 is paired
+    assert actual.key.backward_batch_tail is (paired and chunk % (2 * (1 + coarse)) != 0)
+    assert actual.key.backward_readonly is (preset == "vscan_bwd_deep")
+
+
+@pytest.mark.parametrize(("vertical", "coarse", "warps", "workers", "resident", "max_lines"), [
+    (True, False, 1, 1813, 19, 32),
+    (True, True, 1, 3627, 21, 8),
+    (False, False, 3, 57344, 10, 2),
+])
+def test_wave29a_forward_alignment(
+    vertical: bool, coarse: bool, warps: int, workers: int, resident: int, max_lines: int,
+) -> None:
+    key = scans.Kernel(torch.bfloat16, warps, backward=False, vertical=vertical, coarse=coarse)
+    baseline = scans.Launch(scans.ScanPlan(warps, 0), key, workers, workers)
+    launch = scans._wave29a_forward(baseline, 0, (1024, 56, 56, 160), 132, resident)
+    slots = 132 * resident
+    assert launch.key == baseline.key
+    assert 0 <= (-launch.workers // warps * 5) % slots < 5
+    assert scans._ceil(1024 * 56 // (1 + coarse), launch.workers) <= max_lines
+    assert launch.partials == launch.workers

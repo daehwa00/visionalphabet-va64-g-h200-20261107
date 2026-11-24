@@ -131,6 +131,7 @@ class Kernel:
     horizontal_forward_unroll: int = 0
     backward_batch2: bool = False
     backward_batch_tail: bool = False
+    backward_readonly: bool = False
 
 
 class Launch(NamedTuple):
@@ -1551,6 +1552,18 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = "#define WAVE27A_BACKWARD_BATCH2\n" + source
         if key.backward_batch_tail:
             source = "#define WAVE28A_BACKWARD_BATCH_TAIL\n" + source
+    if key.backward_readonly and key.vertical:
+        source = (
+            source.replace("states[ia]", "__ldg(states + ia)")
+            .replace("states[ia + source_plane]", "__ldg(states + ia + source_plane)")
+            .replace("states[ib]", "__ldg(states + ib)")
+            .replace("states[ib + source_plane]", "__ldg(states + ib + source_plane)")
+        )
+    if key.backward_readonly and not key.vertical:
+        source = source.replace(
+            "return {read(p[offset]), read(p[offset + stride])};",
+            "return {read(__ldg(p + offset)), read(__ldg(p + offset + stride))};",
+        )
     if key.horizontal_forward_unroll:
         source = source.replace(
             "// HSCAN_FORWARD_UNROLL", f"#pragma unroll {key.horizontal_forward_unroll}",
@@ -1680,6 +1693,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
         if (
             key.batch_path or key.register_path or key.horizontal_unroll8
             or key.horizontal_forward_unroll or key.backward_batch2
+            or key.backward_readonly
             or (key.vertical and key.backward and key.chunk == 14 and key.cache_source)
         ):
             local = ct.c_int()
@@ -2287,6 +2301,132 @@ def _with_wave28a(
     return _wave28a_backward(launch, device, height, preset, resident, limit)
 
 
+def _wave29a_checkpoint(
+    launch: Launch, device: int, height: int, chunk: int, resident: int, limit: int,
+) -> Launch:
+    plan, key, _, _ = launch
+    old_rows = plan.chunk + (height - 1) // plan.chunk
+    new_rows = chunk + (height - 1) // chunk
+    smem = plan.smem + (new_rows - old_rows) * 16 * _WARP_SIZE * plan.warps
+    candidate = replace(
+        key, chunk=chunk,
+        backward_batch_tail=key.backward_batch2 and bool(chunk % (2 * (1 + key.coarse))),
+    )
+    if smem <= limit and _resident(device, candidate, smem) == resident:
+        return launch._replace(key=candidate, plan=plan._replace(chunk=chunk, smem=smem))
+    return launch
+
+
+def _wave29a_readonly(launch: Launch, device: int, resident: int) -> Launch:
+    candidate = replace(launch.key, backward_readonly=True)
+    if _resident(device, candidate, launch.plan.smem) == resident:
+        return launch._replace(key=candidate)
+    return launch
+
+
+def _wave29a_vbackward(
+    launch: Launch, device: int, shape: tuple[int, int, int, int], preset: str,
+    sms: int, limit: int, resident: int,
+) -> Launch:
+    height = shape[1]
+    launch = _wave27a_workers(launch, shape, sms, resident)
+    if height == 14 and launch.key.coarse:
+        return launch
+    launch = _wave28a_backward(launch, device, height, "wp_batch2_all", resident, limit)
+    if height == 56 and launch.plan.chunk == 8 and not launch.plan.full_trajectory:
+        # Coarse checkpoints must start on two-row cell boundaries.
+        chunk = 20 if launch.key.coarse and preset in {"compose_ckpt", "vscan_bwd_deep"} else 14
+        for span in (chunk, 14) if chunk != 14 else (14,):
+            candidate = _wave29a_checkpoint(launch, device, height, span, resident, limit)
+            if candidate != launch:
+                launch = candidate
+                break
+    if preset == "vscan_bwd_deep" and height in {14, 28, 56}:
+        return _wave29a_readonly(launch, device, resident)
+    return launch
+
+
+def _wave29a_forward(
+    launch: Launch, device: int, shape: tuple[int, int, int, int], sms: int, resident: int,
+) -> Launch:
+    batch, height, width, modes = shape
+    plan, key, _, _ = launch
+    if key.vertical and key.hidden8 and not key.register_path and plan.cache_weights:
+        weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (4 if key.vector_weights else 2)
+        candidate = replace(key, register_path=True, register_batch2=True, cache_weights=False,
+                            batch_path=True)
+        smem = plan.smem - weight_bytes
+        registers_resident = _resident(device, candidate, smem)
+        if registers_resident >= resident:
+            plan = plan._replace(smem=smem, cache_weights=False)
+            launch = launch._replace(plan=plan, key=candidate)
+            resident = registers_resident
+    aligned = _wave28a_workers(launch, shape, sms, resident)
+    if not key.vertical and aligned == launch and launch.workers == batch * height:
+        # Test two lines per worker with the same CTA shape and one complete
+        # mode tile per group. Each line still runs the original recurrence.
+        tiles = _ceil(modes, _WARP_SIZE)
+        slots = sms * resident
+        groups = _ceil(_ceil(launch.workers, 2 * plan.warps) * tiles, slots) * slots // tiles
+        workers = groups * plan.warps
+        if _ceil(launch.workers, 2) <= workers < launch.workers:
+            return launch._replace(workers=workers, partials=workers)
+    if key.vertical and height == 56 and aligned == launch:
+        # Round up only when trimming would increase the maximum loop count.
+        tiles = _ceil(modes, _WARP_SIZE)
+        slots = sms * resident
+        waves = _ceil(_ceil(launch.workers, plan.warps) * tiles, slots)
+        workers = (waves * slots // tiles) * plan.warps
+        if launch.workers < workers <= batch * (width // (1 + key.coarse)):
+            return launch._replace(workers=workers, partials=workers)
+    return aligned
+
+
+def _with_wave29a(  # noqa: PLR0911
+    launch: Launch, device: int, shape: tuple[int, int, int, int], *,
+    legacy: bool = True, preset: str | None = None,
+) -> Launch:
+    if preset is None:
+        preset = os.environ.get("LNET_SCAN_W29A", "off")
+    if preset not in {"auto", "compose_w28", "compose_ckpt", "vscan_fwd_opt", "vscan_bwd_deep"}:
+        return _with_wave28a(launch, device, shape, legacy=legacy)
+    plan, key, _, _ = launch
+    _, height, width, modes = shape
+    if (
+        key.dtype.itemsize != 2 or not key.index32 or key.pure_vertical
+        or (height, width, modes) not in {
+            (56, 56, 160), (28, 28, 160), (14, 14, 160), (7, 7, 128),
+        }
+        or torch.cuda.get_device_capability(device) != (9, 0)
+    ):
+        return _with_wave28a(launch, device, shape, legacy=legacy)
+    sms, limit, _ = device_limits(device)
+    resident = _resident(device, key, plan.smem)
+    if not resident:
+        return launch
+    if key.vertical and key.backward:
+        if key.hidden8 and plan.cache_weights and plan.cache_source and not (
+            key.shared_acc or key.global_checkpoints
+        ):
+            return _wave29a_vbackward(launch, device, shape, preset, sms, limit, resident)
+        return launch
+    if preset == "vscan_fwd_opt" and not key.backward and (
+        (key.vertical and height in {14, 28, 56}) or (not key.vertical and height == 56)
+    ):
+        return _wave29a_forward(launch, device, shape, sms, resident)
+    vertical_waves = key.vertical and not key.backward and (
+        height == 28 or (height == 14 and not key.coarse)
+    )
+    horizontal_backward = not key.vertical and key.backward and plan.cache_line
+    deep_horizontal = horizontal_backward and preset == "vscan_bwd_deep" and height in {28, 56}
+    if deep_horizontal:
+        launch = _wave29a_readonly(launch, device, resident)
+    horizontal_waves = horizontal_backward and height == 56 and key.warps == 4
+    if vertical_waves or deep_horizontal or horizontal_waves:
+        return _wave28a_workers(launch, shape, sms, resident)
+    return launch
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -2329,15 +2469,15 @@ def _plan_launch(
         or not plan.cache_weights or plan.cache_line or plan.warps != 1
         or shape[1] < 8 * (1 + key.coarse)
     ):
-        return _with_wave28a(_with_wave25a(launch, device, shape), device, shape)
+        return _with_wave29a(_with_wave25a(launch, device, shape), device, shape)
     candidate = replace(key, batch_path=True)
     sms, _, max_warps = device_limits(device)
     resident = _resident(device, candidate, plan.smem)
     original = _resident(device, key, plan.smem)
     queued = _ceil(workers * _ceil(shape[-1], _WARP_SIZE), sms)
     if resident < min(max_warps // 4, original) or queued < 2 * resident:
-        return _with_wave28a(_with_wave25a(launch, device, shape), device, shape)
-    return _with_wave28a(
+        return _with_wave29a(_with_wave25a(launch, device, shape), device, shape)
+    return _with_wave29a(
         _with_wave25a(launch._replace(key=candidate), device, shape), device, shape, legacy=False,
     )
 
