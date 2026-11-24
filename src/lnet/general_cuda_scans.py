@@ -20,6 +20,7 @@ import torch
 from torch import Tensor
 from torch._inductor import config as inductor_config
 
+from ._wave36a_scan_cuda import SOURCE as _W36A_SOURCE
 from .cuda_nvrtc import (
     _check_cu,
     _check_nvrtc,
@@ -44,6 +45,7 @@ _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
 _MAX_CACHED_HIDDEN = 16
 _MAX_SAVED_DP_CACHE_CHUNKS = 8
+_WAVE36A_PARTIAL_BYTES = 4 * 1024**2
 
 # Small devices reserve more VRAM for model state. Additional scan workspace
 # on larger devices is useful up to one L2 working set.
@@ -132,6 +134,10 @@ class Kernel:
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
+    saved_trajectory: bool = False
+    saved_gs1: bool = False
+    projection_batch: int = 0
+    horizontal_hiocc: bool = False
 
 
 class Launch(NamedTuple):
@@ -1445,7 +1451,13 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 # NVRTC compilation and driver launch
 
-def _kernel_name(key: Kernel) -> str:
+def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
+    if key.saved_trajectory:
+        return "pure_vscan_bwd" if key.backward else "pure_vscan_fwd"
+    if key.projection_batch:
+        return "project_path_bwd_k8" if key.backward else "project_path_fwd_reg"
+    if key.horizontal_hiocc:
+        return "hscan_bwd_hiocc"
     if key.projection:
         return "path_mlp_backward" if key.backward else "path_mlp_forward"
     if key.projection_reduction:
@@ -1455,8 +1467,101 @@ def _kernel_name(key: Kernel) -> str:
     return "scan"
 
 
+def _wave36a_horizontal_source(source: str) -> str:
+    # Specialize just the dense right-adjoint workspace. Keep the baseline
+    # reverse sweep, including its arithmetic and gradient stores.
+    start = source.index("                #pragma unroll BACKWARD_UNROLL")
+    reverse = source.index("                #pragma unroll BACKWARD_UNROLL", start + 1)
+    end = source.index("\n            }\n        }\n    }", reverse)
+    sweep = source[reverse:end].replace("buf[I(x / (1 + COMPACT)) * stride]",
+                                       "buf[I(x - begin) * stride]")
+    sweep = sweep.replace("W - 1; x >= 0", "end - 1; x >= begin")
+    sweep = sweep.replace("#pragma unroll BACKWARD_UNROLL", "#pragma unroll 1")
+    replay = """
+                const int mid = W / 2 + (W & 1);
+                const auto advance_right = [&](int x) {
+                    const I j = 2 * grad_plane + base + I(x) * M;
+                    right = a * right + Complex{read(__ldg(grad + j)),
+                                                read(__ldg(grad + j + grad_plane))};
+                };
+                #pragma unroll 1
+                for (int x = 0; x < mid; ++x) advance_right(x);
+                #pragma unroll 1
+                for (int half = 1; half >= 0; --half) {
+                    const int begin = half ? mid : 0, end = half ? W : mid;
+                    if (!half) right = {};
+                    #pragma unroll 1
+                    for (int x = begin; x < end; ++x) {
+                        advance_right(x);
+                        buf[I(x - begin) * stride] = Pair<float>::pack(right);
+                    }
+"""
+    source = source[:start] + replay + sweep + "\n                }" + source[end:]
+    return (
+        source.replace("void scan(", "void hscan_bwd_hiocc(")
+        .replace("sr[base_r + I(x) * step_r]", "__ldg(sr + base_r + I(x) * step_r)")
+        .replace("si[base_i + I(x) * step_i]", "__ldg(si + base_i + I(x) * step_i)")
+        .replace("load_complex(states, i - M, plane)",
+                 "Complex{read(__ldg(states + i - M)), read(__ldg(states + i - M + plane))}")
+        .replace("load_complex(states, 2 * plane + i + M, plane)",
+                 "Complex{read(__ldg(states + 2 * plane + i + M)), "
+                 "read(__ldg(states + 3 * plane + i + M))}")
+        .replace("load_complex(grad, gi, grad_plane)",
+                 "Complex{read(__ldg(grad + gi)), read(__ldg(grad + gi + grad_plane))}")
+    )
+
+
+def _wave36a_kernel_source(key: Kernel) -> str:
+    io = _DTYPES[key.dtype]
+    index = "unsigned int" if key.index32 else "long long"
+    minimum = ""
+    if key.projection_batch:
+        # Long offsets need extra address registers to avoid local memory.
+        min_ctas = 6 if key.backward else 5 if key.index32 else 4
+        minimum = f", {min_ctas}"
+    entry = (
+        f'extern "C" __global__ __launch_bounds__({key.warps * 32}{minimum}) '
+        f'void {_kernel_name(key)}'
+    )
+    if key.saved_trajectory:
+        flags = ", ".join(str(flag).lower() for flag in (
+            key.coarse, key.backward, key.compact, key.saved_gs1,
+        ))
+        return _CUDA_SOURCE + _W36A_SOURCE + f"""
+{entry}(
+    const float* dr, const float* di, const float* gr, const float* gi,
+    const {io}* states, const float* vx, const float* vy, SavedQuad<{io}>* trajectory,
+    {io}* features, {io}* gs, float* partial, int B, int H, int W, int M, float eps
+) {{
+    saved_vscan<{io}, {index}, {key.warps}, {flags}>(
+        dr, di, gr, gi, states, vx, vy, trajectory, features, gs, partial, B, H, W, M, eps);
+}}
+"""
+    flags = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
+    signature = f"""
+    const {io}* features, const void* wi, const void* bi, const void* wo, const void* bo,
+    const {io}* gr, const {io}* gi, {io}* real, {io}* imag, {io}* dp, float* partial,
+    long long cells, long long plane, int M, int hidden, int types
+"""
+    if key.backward:
+        call = f"""
+    project_bwd_k8<{io}, {index}, {flags}, {key.projection_batch}>(
+        features, wi, bi, wo, gr, gi, dp, partial, cells, plane, M, types);
+"""
+    else:
+        call = f"""
+    project_fwd_reg<{io}, {index}, {flags}>(
+        features, wi, bi, wo, bo, real, imag, cells, plane, M, types);
+"""
+    return _CUDA_SOURCE + _W36A_SOURCE + f"{entry}({signature}) {{{call}}}\n"
+
+
 def _kernel_source(key: Kernel) -> str:
     """Instantiate a single entry point without modifying the device source."""
+    if key.saved_trajectory or key.projection_batch:
+        return _wave36a_kernel_source(key)
+    if key.horizontal_hiocc:
+        return _wave36a_horizontal_source(_kernel_source(replace(key, horizontal_hiocc=False)))
     if key.reduction:
         return _CUDA_SOURCE + f"""
 extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
@@ -1662,7 +1767,7 @@ def _function(device: int, key: Kernel) -> tuple[ct.CDLL, ct.c_void_p]:
                 driver.cuModuleGetFunction(ct.byref(func), module, _kernel_name(key).encode()),
                 "cuModuleGetFunction",
             )
-            if not key.reduction:
+            if not key.reduction and not key.projection_batch:
                 _configure_smem(driver, func, device_limits(device)[1])
         except RuntimeError:
             driver.cuModuleUnload(module)
@@ -1686,6 +1791,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
         _ensure_context(driver, device)
         if (
             key.batch_path or key.register_path or key.horizontal_unroll8
+            or key.saved_trajectory or key.horizontal_hiocc or key.projection_batch
             or key.backward_batch2 or key.backward_readonly
             or (key.vertical and key.backward and key.chunk and key.cache_source)
         ):
@@ -1717,6 +1823,10 @@ def _dispatch(source: Tensor, launch: Launch | None, args: tuple) -> None:
 
 
 def _launch_kernel(source: Tensor, key: Kernel, grid: int, smem: int, args: tuple) -> None:
+    groups = 1
+    if key.projection_batch:
+        tiles = _ceil(source.shape[-1], _WARP_SIZE)
+        grid, groups = tiles, grid // tiles
     device = source.device.index or 0
     with torch.cuda.device(device):
         driver, fn = _function(device, key)
@@ -1727,7 +1837,7 @@ def _launch_kernel(source: Tensor, key: Kernel, grid: int, smem: int, args: tupl
             driver.cuLaunchKernel(
                 fn,
                 grid,
-                1,
+                groups,
                 1,
                 key.warps * _WARP_SIZE,
                 1,
@@ -2174,6 +2284,32 @@ def _plan_horizontal_backward(
     return launch
 
 
+@lru_cache(maxsize=512)
+def _wave36a_horizontal_plan(
+    device: int, launch: Launch, lines: int, width: int, modes: int,
+) -> Launch:
+    plan, base, _, _ = launch
+    resident = _resident(device, base, plan.smem) * plan.warps
+    if not plan.cache_line or resident >= 24:
+        return launch
+    sms, limit, _ = device_limits(device)
+    budget = _scan_workspace_budget(device)
+    best = launch
+    for warps in (4, 3, 2, 1, 6, 8):
+        smem = _ceil(width, 2) * 8 * warps * _WARP_SIZE
+        if smem > limit:
+            continue
+        key = replace(base, warps=warps, horizontal_hiocc=True, horizontal_unroll8=False)
+        blocks = _resident(device, key, smem)
+        if blocks * warps > resident:
+            resident = blocks * warps
+            workers = _workers(lines, modes, 4, warps, 4 * sms * blocks, budget)
+            best = Launch(
+                plan._replace(warps=warps, smem=smem), key, workers, _ceil(workers, warps),
+            )
+    return best
+
+
 def _plan_vertical_forward(
     device: int, launch: Launch, length: int, lines: int, modes: int, sms: int,
     resident: int, max_warps: int,
@@ -2479,6 +2615,8 @@ def _hscan(
     )
     if launch is None:
         raise RuntimeError("Horizontal CUDA scan is ineligible")
+    if backward and not compact and w > 28 and _wave36a_mode()[2]:
+        launch = _wave36a_horizontal_plan(real.device.index or 0, launch, b * h, w, m)
     if backward:
         out = real.new_empty((b, h, w, 2 * m))
         partial = real.new_empty((launch.partials, 4, m), dtype=torch.float32)
@@ -2709,6 +2847,150 @@ def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
     return 8 * b * (h // step) * (w // step) * m * states.element_size() <= budget
 
 
+def _wave36a_mode() -> tuple[bool, bool, bool]:
+    modes = {mode.strip() for mode in os.environ.get("LNET_SCAN_W36A", "off").split(",")}
+    if "off" in modes:
+        return False, False, False
+    gs1 = bool(modes & {"saved_fast_proj_gs1", "full_w36a", "auto"})
+    saved = gs1 or "saved_fast_proj" in modes
+    horizontal = bool(modes & {"hscan_bwd_hiocc", "full_w36a", "auto"})
+    return saved, gs1, horizontal
+
+
+def _wave36a_saved_mode(states: Tensor, path: list[Tensor], coarse: bool) -> int:
+    enabled, gs1, _ = _wave36a_mode()
+    if not (
+        enabled and states.is_cuda and states.dtype in (torch.bfloat16, torch.float16)
+        and path and path[0].ndim == 3 and path[0].shape[1] == _REGISTER_HIDDEN
+    ):
+        return 0
+    vram = _total_vram(states.device)
+    if vram < 96 * 1024**3:
+        return 0
+    _, b, h, w, m = states.shape
+    step = 1 + coarse
+    trajectory = 8 * b * h * (w // step) * m * states.element_size()
+    features = 8 * b * (h // step) * (w // step) * m * states.element_size()
+    # Bound the per-layer contribution on shapes beyond the measured model.
+    if (
+        90 * m * 4 > _WAVE36A_PARTIAL_BYTES
+        or trajectory + 2 * features + _WAVE36A_PARTIAL_BYTES > vram // 4
+    ):
+        return 0
+    return 2 if gs1 else 1
+
+
+@lru_cache(maxsize=512)
+def _plan_wave36a_projection(
+    device: int, base: Kernel, cells: int, modes: int,
+) -> tuple[Kernel, int, int]:
+    sms, limit, _ = device_limits(device)
+    tiles = _ceil(modes, _WARP_SIZE)
+    batch = 8 if limit >= 128 * 1024 else 4
+    key = replace(base, warps=4, projection_batch=batch)
+    if base.backward:
+        # Static shared allocation is part of the kernel's occupancy query.
+        groups = min(_ceil(cells, batch), max(1, _WAVE36A_PARTIAL_BYTES // (90 * modes * 4)))
+    else:
+        resident = _resident(device, key, 0)
+        groups = min(_ceil(cells, 8), max(1, _ceil(4 * sms * resident, tiles)))
+    return key, min(groups, 65535), 0
+
+
+@lru_cache(maxsize=512)
+def _plan_wave36a_scan(
+    device: int, base: Kernel, lines: int, height: int, modes: int,
+) -> tuple[Kernel, int, int, int]:
+    sms, limit, _ = device_limits(device)
+    tiles = _ceil(modes, _WARP_SIZE)
+    best: tuple[int, Kernel, int, int] | None = None
+    for gs1 in ((True, False) if base.saved_gs1 else (False,)):
+        for warps in (4, 2, 8, 1):
+            key = replace(base, warps=warps, saved_gs1=gs1)
+            reduction_bytes = 4 * warps * _WARP_SIZE * 4 if base.backward else 0
+            gradient_bytes = height * warps * _WARP_SIZE * 8 if gs1 else 0
+            smem = max(reduction_bytes, gradient_bytes)
+            if smem > limit:
+                continue
+            resident = _resident(device, key, smem)
+            if not resident or (gs1 and resident * warps < 16):
+                continue
+            groups = min(_ceil(lines, warps), max(1, 4 * sms * resident // tiles))
+            score = min(sms * resident, groups * tiles) * warps
+            if best is None or score > best[0]:
+                best = score, key, groups, smem
+        if best is not None:
+            _, key, groups, smem = best
+            return key, groups * tiles, groups, smem
+    raise RuntimeError("No Wave 36A saved vertical scan launch fits this device")
+
+
+def _launch_wave36a_scan(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], trajectory: Tensor,
+    features: Tensor, coarse: bool, epsilon: float, gs: Tensor | None,
+    *, compact: bool = False, gs1: bool = False,
+) -> Tensor | None:
+    _, b, h, w, m = states.shape
+    base = Kernel(
+        states.dtype, 0, gs is not None, vertical=True, coarse=coarse, compact=compact,
+        index32=max(states.numel(), trajectory.numel(), features.numel()) < 2**32,
+        saved_trajectory=True, saved_gs1=gs1,
+    )
+    key, grid, rows, smem = _plan_wave36a_scan(
+        states.device.index or 0, base, b * (w // (1 + coarse)), h, m,
+    )
+    partial = states.new_empty((rows, 4, m), dtype=torch.float32) if gs is not None else None
+    tables = [t.float().contiguous() for t in (*pole, *auxiliary)]
+    _launch_kernel(
+        states, key, grid, smem,
+        (
+            *map(_ptr, (*tables[:4], states, *tables[4:], trajectory, features, gs, partial)),
+            *map(ct.c_int, (b, h, w, m)), ct.c_float(epsilon),
+        ),
+    )
+    return partial
+
+
+def _wave36a_backward(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],
+    grad: tuple[Tensor, Tensor], coarse: bool, epsilon: float, compact: bool,
+    features: Tensor, trajectory: Tensor, gs1: bool,
+) -> list[Tensor]:
+    _, b, h, w, m = states.shape
+    step = 1 + coarse
+    oh, ow = h // step, w // step
+    if not (
+        _shape_supported((b, h, w, m))
+        and _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
+        and _pole_ok(pole, states)
+        and states.dtype in (torch.bfloat16, torch.float16)
+        and path[0].shape[1] == _REGISTER_HIDDEN
+        and 0 < epsilon < float("inf")
+        and (coarse or not compact)
+        and features.shape == (8, b * oh * ow, m)
+        and trajectory.shape == (2, b, h, ow, m, 4)
+        and all(t.is_contiguous() and t.device == states.device and t.dtype == states.dtype
+                for t in (features, trajectory))
+    ):
+        raise ValueError("Invalid Wave 36A vertical backward inputs")
+    gr, gi = _vertical_adjoints(grad, states, (b, oh, ow, m))
+    projected = _project_path(
+        features, [p.contiguous() for p in path], gr, gi, backward=True, precise=False, fast=True,
+    )
+    if projected is None:
+        raise RuntimeError("Missing Wave 36A projection gradients")
+    dp, dpath = projected
+    gs = states.new_empty((4, b, h, w // (1 + compact), m))
+    partial = _launch_wave36a_scan(
+        pole, states.contiguous(), auxiliary, trajectory, dp, coarse, epsilon, gs,
+        compact=compact, gs1=gs1,
+    )
+    if partial is None:
+        raise RuntimeError("Missing Wave 36A scan gradients")
+    path_grads = [d.to(p.dtype) for d, p in zip(dpath, path, strict=True)]
+    return [*_reduce_partials(partial, pole), gs, *path_grads]
+
+
 @lru_cache(maxsize=512)
 def _plan_projection(
     device: int, base: Kernel, cells: int, modes: int, hidden: int,
@@ -2747,7 +3029,7 @@ def _plan_projection(
 
 def _project_path(
     features: Tensor, path: list[Tensor], real: Tensor, imag: Tensor, *,
-    backward: bool, precise: bool,
+    backward: bool, precise: bool, fast: bool = False,
 ) -> tuple[Tensor, list[Tensor]] | None:
     _, cells, modes = features.shape
     hidden = path[0].shape[1]
@@ -2758,7 +3040,11 @@ def _project_path(
         hidden8=hidden == _REGISTER_HIDDEN, index32=8 * feature_plane < 2**32,
         real_interleaved=not real.is_contiguous(), imag_interleaved=not imag.is_contiguous(),
     )
-    key, groups, smem = _plan_projection(features.device.index or 0, base, cells, modes, hidden)
+    device = features.device.index or 0
+    key, groups, smem = (
+        _plan_wave36a_projection(device, base, cells, modes) if fast
+        else _plan_projection(device, base, cells, modes, hidden)
+    )
     tiles = _ceil(modes, _WARP_SIZE)
     # Features can be a cell slice of the saved full-batch planes.
     # The pure scan consumes densely packed output planes.
@@ -3036,7 +3322,16 @@ def vertical_backward(
     epsilon: float = 1e-6,
     compact: bool = False,
     saved_features: Tensor | None = None,
+    saved_trajectory: Tensor | None = None,
+    saved_gs1: bool = False,
 ) -> list[Tensor]:
+    if saved_trajectory is not None:
+        if saved_features is None:
+            raise ValueError("Saved trajectory requires normalized vertical features")
+        return _wave36a_backward(
+            pole, states, auxiliary, path, (grad_real, grad_imag), coarse, epsilon,
+            compact, saved_features, saved_trajectory, saved_gs1,
+        )
     out = _vscan(
         pole, states, auxiliary, path, coarse, epsilon, False, (grad_real, grad_imag),  # noqa: FBT003
         compact=compact, saved_features=saved_features,
@@ -3058,6 +3353,8 @@ def _fake_vbackward(
     epsilon: float = 1e-6,  # noqa: ARG001
     compact: bool = False,
     saved_features: Tensor | None = None,  # noqa: ARG001
+    saved_trajectory: Tensor | None = None,  # noqa: ARG001
+    saved_gs1: bool = False,  # noqa: ARG001
 ) -> list[Tensor]:
     _, b, h, w, m = states.shape
     return [
@@ -3124,12 +3421,88 @@ def _fake_vertical_forward_saved(
     )
 
 
+def _wave36a_outputs(
+    states: Tensor, coarse: bool, planar: bool, separate: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    _, b, h, w, m = states.shape
+    step = 1 + coarse
+    shape = (b, h // step, w // step, m)
+    return (
+        states.new_empty(shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))),
+        states.new_empty(shape if separate else (0,)),
+        states.new_empty((8, b * (h // step) * (w // step), m)),
+        states.new_empty((2, b, h, w // step, m, 4)),
+    )
+
+
+@torch.library.custom_op("lnet::general_vscan_forward_wave36a", mutates_args=())
+def _vertical_forward_wave36a(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],
+    coarse: bool, epsilon: float, planar: bool, separate: bool, gs1: bool,  # noqa: ARG001
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    if not (
+        _shape_supported(tuple(states.shape[1:]))
+        and _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
+        and _pole_ok(pole, states)
+        and states.dtype in (torch.bfloat16, torch.float16)
+        and path[0].shape[1] == _REGISTER_HIDDEN
+        and 0 < epsilon < float("inf")
+    ):
+        raise ValueError("Invalid Wave 36A vertical scan inputs")
+    output, secondary, features, trajectory = _wave36a_outputs(states, coarse, planar, separate)
+    if separate:
+        real, imag = output, secondary
+    else:
+        real, imag = output.unbind(0) if planar else output.split(states.shape[-1], dim=-1)
+    _launch_wave36a_scan(
+        pole, states.contiguous(), auxiliary, trajectory, features, coarse, epsilon, None,
+    )
+    _project_path(
+        features, [p.contiguous() for p in path], real, imag,
+        backward=False, precise=False, fast=True,
+    )
+    return output, secondary, features, trajectory
+
+
+@_vertical_forward_wave36a.register_fake
+def _fake_vertical_forward_wave36a(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],  # noqa: ARG001
+    coarse: bool, epsilon: float, planar: bool, separate: bool, gs1: bool,  # noqa: ARG001
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    return _wave36a_outputs(states, coarse, planar, separate)
+
+
+def _save_wave36a(ctx: _AutogradContext, inputs: tuple, output: tuple[Tensor, ...]) -> None:
+    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _, ctx.separate, ctx.gs1 = inputs
+    ctx.mark_non_differentiable(*(output[2:] if ctx.separate else output[1:]))
+    ctx.save_for_backward(*pole, states, *auxiliary, *path, *output[2:])
+
+
+def _differentiate_wave36a(
+    ctx: _AutogradContext, grad: Tensor, secondary: Tensor, _features: Tensor, _trajectory: Tensor,
+) -> tuple:
+    dr, di, gr, gi, states, vx, vy, *path, features, trajectory = ctx.saved_tensors
+    if ctx.separate:
+        real, imag = grad, secondary
+    else:
+        real, imag = grad.unbind(0) if grad.ndim == 5 else grad.chunk(2, dim=-1)
+    gradients = vertical_backward(
+        [dr, di, gr, gi], states, [vx, vy], path, real, imag, ctx.coarse, ctx.epsilon,
+        saved_features=features, saved_trajectory=trajectory, saved_gs1=ctx.gs1,
+    )
+    return gradients[:4], gradients[4], [None, None], gradients[5:], *(None,) * 5
+
+
+_vertical_forward_wave36a.register_autograd(_differentiate_wave36a, setup_context=_save_wave36a)
+
+
 class _AutogradContext(Protocol):
     saved_tensors: tuple[Tensor, ...]
     needs_input_grad: tuple[object, ...]
     coarse: bool
     epsilon: float
     separate: bool
+    gs1: bool
 
     def save_for_backward(self, *tensors: Tensor) -> None: ...
 
@@ -3213,6 +3586,13 @@ def vertical_forward(
     precise: bool = True,
     mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
+    wave36a = _wave36a_saved_mode(states, path, coarse) if mode == "cuda" else 0
+    if wave36a:
+        real, imag, _, _ = _vertical_forward_wave36a(
+            pole, states, auxiliary, path, coarse, epsilon,
+            planar=False, separate=True, gs1=wave36a == 2,
+        )
+        return real, imag
     if mode == "cuda" and _should_save_vscan(states, coarse):
         real, imag, _ = _vertical_forward_saved(
             pole, states, auxiliary, path, coarse, epsilon,
@@ -3294,7 +3674,10 @@ def try_general_vertical_forward(
     inputs = _general_vertical_inputs(pole, states, auxiliary, path, epilogue, kind, swiglu)
     if inputs is None:
         return None
-    real, imag = vertical_forward(*inputs, float(epsilon))
+    # This split legacy interface has no retained vertical outputs.
+    saved_mode = _wave36a_saved_mode(inputs[1], inputs[3], inputs[4])
+    forward = _vertical_forward if saved_mode else vertical_forward
+    real, imag = forward(*inputs, float(epsilon))
     empty = real.new_empty((0,))
     descriptor = real.new_empty((0,), dtype=torch.float32)
     if packed:

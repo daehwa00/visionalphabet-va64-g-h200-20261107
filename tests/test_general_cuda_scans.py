@@ -1,6 +1,7 @@
 """CPU launch/dispatcher checks and opt-in CUDA numerical equivalence tests."""
 
 import warnings
+from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -1236,3 +1237,248 @@ def test_scan_wave_alignment_respects_work_and_workspace() -> None:
     assert scans._align_workers(launch, 200, 3, 64, max_workers=127).workers == 105
     assert scans._align_workers(launch, 200, 3, 64, max_workers=128).workers == 128
     assert scans._align_workers(launch, 240, 3, 64).workers == 84
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("off", (False, False, False)),
+        ("auto", (True, True, True)),
+        ("saved_fast_proj", (True, False, False)),
+        ("saved_fast_proj_gs1", (True, True, False)),
+        ("hscan_bwd_hiocc", (False, False, True)),
+        ("full_w36a", (True, True, True)),
+        ("saved_fast_proj, hscan_bwd_hiocc", (True, False, True)),
+    ],
+)
+def test_wave36a_mode(monkeypatch: pytest.MonkeyPatch, mode: str, expected: tuple) -> None:
+    monkeypatch.setenv("LNET_SCAN_W36A", mode)
+    assert scans._wave36a_mode() == expected
+
+
+def test_wave36a_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_SCAN_W36A", "saved_fast_proj_gs1")
+    with FakeTensorMode():
+        states = torch.empty((4, 1024, 56, 56, 160), device="cuda", dtype=torch.bfloat16)
+        path = [torch.empty((160, 8, 8))]
+        monkeypatch.setattr(scans, "_total_vram", lambda _: 80 << 30)
+        assert scans._wave36a_saved_mode(states, path, coarse=False) == 0
+        monkeypatch.setattr(scans, "_total_vram", lambda _: 96 << 30)
+        assert scans._wave36a_saved_mode(states, path, coarse=False) == 2
+        assert scans._wave36a_saved_mode(states.float(), path, coarse=False) == 0
+
+
+def test_wave36a_fake_and_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = Counter()
+
+    def scan(*args: object, **kwargs: object) -> Tensor | None:  # noqa: ARG001
+        states, gs = args[1], args[7]
+        calls["pure_vscan_fwd" if gs is None else "pure_vscan_bwd"] += 1
+        if gs is None:
+            return None
+        return states.new_zeros((1, 4, states.shape[-1]), dtype=torch.float32)
+
+    def project(features, path, real, imag, *, backward, **kwargs: object):  # noqa: ARG001
+        calls["project_path_bwd_k8" if backward else "project_path_fwd_reg"] += 1
+        if backward:
+            return torch.zeros_like(features), [torch.zeros_like(p).float() for p in path]
+        real.zero_()
+        imag.zero_()
+        return None
+
+    monkeypatch.setattr(scans, "_launch_wave36a_scan", scan)
+    monkeypatch.setattr(scans, "_project_path", project)
+    monkeypatch.setattr(scans, "_reduce_partials", lambda _, p: [torch.zeros_like(t) for t in p])
+
+    def run(pole, states, aux, path):
+        real, imag, _, _ = scans._vertical_forward_wave36a(
+            pole, states, aux, path, coarse=False, epsilon=1e-6,
+            planar=False, separate=True, gs1=True,
+        )
+        return (real + imag).float().sum()
+
+    for backend in ("eager", "aot_eager"):
+        compiled = torch.compile(run, fullgraph=True, backend=backend)
+        _, py, r, _, aux, path = _inputs(13, 19, 63, 8, torch.bfloat16, "cpu")
+        states = torch.stack([r] * 4)
+        grads = torch.autograd.grad(compiled(py, states, aux, path), [states, *py, *path])
+        assert [g.shape for g in grads] == [t.shape for t in (states, *py, *path)]
+    assert set(calls.values()) == {2}
+    assert len(calls) == 4
+
+    calls.clear()
+    with FakeTensorMode():
+        _, py, r, _, aux, path = _inputs(14, 20, 63, 8, torch.float16, "cpu")
+        states = torch.stack([r] * 4)
+        primary, _, features, trajectory = scans._vertical_forward_wave36a(
+            py, states, aux, path, coarse=True, epsilon=1e-6,
+            planar=False, separate=False, gs1=False,
+        )
+        assert features.shape == (8, 70, 63)
+        assert trajectory.shape == (2, 1, 14, 10, 63, 4)
+        torch.autograd.grad(primary.sum(), [states, *py, *path])
+    assert not calls
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("h", "w", "coarse"), [(13, 19, False), (37, 13, False), (14, 20, True)])
+@pytest.mark.parametrize("mode", ["saved_fast_proj", "saved_fast_proj_gs1"])
+def test_cuda_wave36a_vscan(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, w: int, coarse: bool, mode: str,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W36A", "off")
+    monkeypatch.delenv("LNET_VSCAN_DECOUPLED", raising=False)
+    monkeypatch.setattr(scans, "_total_vram", lambda _: 140 << 30)
+    torch.manual_seed(129)
+    _, py, r, i, aux, path = _inputs(h, w, 63, 8, dtype, "cuda", batch=3)
+    states = torch.stack((r, i, r, i))
+    reference = scans.vertical_forward(py, states, aux, path, coarse)
+    inputs = [*py, states, *path]
+    upstream = torch.randn((*reference[0].shape[:-1], 126), device="cuda", dtype=dtype)
+    dy = upstream.chunk(2, dim=-1)
+    expected_grads = torch.autograd.grad(reference, inputs, dy)
+    monkeypatch.setenv("LNET_SCAN_W36A", mode)
+    actual = scans.vertical_forward(py, states, aux, path, coarse)
+    actual_grads = torch.autograd.grad(actual, inputs, dy)
+    if dtype == torch.bfloat16:
+        forward_tol, backward_tol = (4e-2, 5e-3), (1.2e-1, 8e-2)
+    else:
+        forward_tol, backward_tol = (8e-3, 1e-3), (5e-2, 2e-2)
+    for values, targets, (rtol, atol) in (
+        (actual, reference, forward_tol), (actual_grads, expected_grads, backward_tol),
+    ):
+        for value, target in zip(values, targets, strict=True):
+            torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+    packed, _, features, trajectory = scans._vertical_forward_wave36a(
+        py, states, aux, path, coarse, 1e-6,
+        planar=False, separate=False, gs1=mode.endswith("gs1"),
+    )
+    torch.testing.assert_close(
+        packed, torch.cat(reference, dim=-1), rtol=forward_tol[0], atol=forward_tol[1],
+    )
+    packed_grads = scans.vertical_backward(
+        py, states, aux, path, *dy, coarse, compact=coarse,
+        saved_features=features, saved_trajectory=trajectory, saved_gs1=mode.endswith("gs1"),
+    )
+    fused_grads = scans.vertical_backward(py, states, aux, path, *dy, coarse, compact=coarse)
+    for value, target in zip(packed_grads, fused_grads, strict=True):
+        torch.testing.assert_close(value, target, rtol=backward_tol[0], atol=backward_tol[1])
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_cuda_wave36a_hscan(monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype) -> None:
+    monkeypatch.setenv("LNET_SCAN_W36A", "off")
+    torch.manual_seed(129)
+    px, _, r, i, _, _ = _inputs(13, 56, 160, 8, dtype, "cuda", batch=2)
+    states = scans.horizontal_forward(px, r, i)
+    upstream = torch.randn_like(states)
+    expected = scans.horizontal_backward(px, [r, i], states, upstream)
+    monkeypatch.setenv("LNET_SCAN_W36A", "hscan_bwd_hiocc")
+    actual = scans.horizontal_backward(px, [r, i], states, upstream)
+    for value, target in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, target, atol=3e-5, rtol=2e-5)
+
+
+def _projection_cpu(
+    p: Tensor, dy: Tensor, params: list[Tensor], dtype: torch.dtype,
+) -> tuple[Tensor, Tensor, list[Tensor]]:
+    """One cell batch and one consecutive slice of hidden units."""
+    wi, bi, wo = [t.to(dtype).float() for t in params[:3]]
+    z = torch.zeros_like(p[0, :, :, None] * bi)
+    for k in range(8):
+        z = torch.addcmul(z, p[k, :, :, None], wi[:, :, k])
+    z = (z.to(dtype).float() + bi).to(dtype).float()
+    sig = z.sigmoid()
+    act = (z * sig).to(dtype).float()
+    y = sum(
+        act[..., h, None] * wo[..., h] for h in range(wi.shape[1])
+    )
+    dz = sum(dy[..., c, None] * wo[:, c, :] for c in range(2)).to(dtype).float()
+    dz = (dz * (sig * (1 + z * (1 - sig)))).to(dtype).float()
+    dp = sum(dz[..., h].unsqueeze(0) * wi[:, h, :].T[:, None, :] for h in range(wi.shape[1]))
+    dw = (dz[..., None] * p.permute(1, 2, 0).unsqueeze(-2)).sum(0)
+    db = dz.sum(0)
+    dwo = (dy[..., None] * act[:, :, None, :]).sum(0)
+    return y, dp, [dw, db, dwo]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("batch", "interleaved"), [(4, True), (8, False), (8, True)])
+def test_wave36a_projection_cpu_simulation(
+    dtype: torch.dtype, batch: int, interleaved: bool,
+) -> None:
+    gen = torch.Generator().manual_seed(129)
+    cells, modes, groups = 19, 63, 2
+    p = (0.25 * torch.randn((8, cells, modes), generator=gen)).to(dtype).float()
+    params = [
+        0.25 * torch.randn(shape, generator=gen)
+        for shape in ((modes, 8, 8), (modes, 8), (modes, 2, 8), (modes, 2))
+    ]
+    shape = (cells, 2 * modes) if interleaved else (2, cells, modes)
+    dy_storage = torch.randn(shape, generator=gen).to(dtype).float()
+    out_storage = torch.empty_like(dy_storage)
+    gr, gi = dy_storage.chunk(2, dim=-1) if interleaved else dy_storage.unbind(0)
+    real, imag = out_storage.chunk(2, dim=-1) if interleaved else out_storage.unbind(0)
+    dy = torch.stack((gr, gi), dim=-1)
+    y, dp, gradients = _projection_cpu(p, dy, params, dtype)
+    bias = params[3].to(dtype).float()
+    y = (y.to(dtype).float() + bias).to(dtype)
+    for first in range(0, cells, 2):
+        sl = slice(first, first + 2)
+        out, _, _ = _projection_cpu(p[:, sl], dy[sl], params, dtype)
+        pair = (out.to(dtype).float() + bias).to(dtype)
+        real[sl], imag[sl] = pair.unbind(-1)
+    torch.testing.assert_close(torch.stack((real, imag), dim=-1).to(dtype), y, atol=0, rtol=0)
+
+    rows = [torch.zeros((groups, *t.shape)) for t in params]
+    dplanes = torch.empty_like(p)
+    for group in range(groups):
+        for first in range(group * batch, cells, groups * batch):
+            sl = slice(first, first + batch)
+            accumulated = torch.zeros_like(p[:, sl])
+            for warp in range(4):
+                h = slice(2 * warp, 2 * warp + 2)
+                w_in, b_in, w_out, _ = params
+                local = [w_in[:, h], b_in[:, h], w_out[:, :, h]]
+                _, d, (dw, db, dwo) = _projection_cpu(p[:, sl], dy[sl], local, dtype)
+                rows[0][group, :, h] += dw
+                rows[1][group, :, h] += db
+                rows[2][group, :, :, h] += dwo
+                accumulated += d
+            rows[3][group] += dy[sl].sum(0)
+            dplanes[:, sl] = accumulated
+    torch.testing.assert_close(dplanes, dp, atol=1e-6, rtol=1e-6)
+    for partial, target in zip(rows, [*gradients, dy.sum(0)], strict=True):
+        torch.testing.assert_close(partial.sum(0), target, atol=1e-6, rtol=1e-6)
+
+
+def test_wave36a_horizontal_fp32_chunk_replay() -> None:
+    gen = torch.Generator().manual_seed(129)
+    width, modes = 56, 63
+    dy = torch.randn((width, modes), generator=gen, dtype=torch.complex64)
+    a = 0.85 * torch.randn((modes,), generator=gen, dtype=torch.complex64).sgn()
+    right = torch.zeros_like(a)
+    baseline = []
+    for value in dy:
+        right = a * right + value
+        baseline.append(right)
+    right = torch.zeros_like(a)
+    mid = (width + 1) // 2
+    for x in range(mid):
+        right = a * right + dy[x]
+    replay = []
+    for half in (1, 0):
+        begin, end = (mid, width) if half else (0, mid)
+        if not half:
+            right = torch.zeros_like(a)
+        chunk = []
+        for x in range(begin, end):
+            right = a * right + dy[x]
+            chunk.append(right)
+        replay.extend(reversed(chunk))
+    torch.testing.assert_close(torch.stack(replay), torch.stack(baseline).flip(0), rtol=0, atol=0)

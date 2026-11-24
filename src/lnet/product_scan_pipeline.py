@@ -16,6 +16,8 @@ from .general_cuda_scans import (
     _general_vertical_inputs,
     _should_save_vscan,
     _vertical_forward_saved,
+    _vertical_forward_wave36a,
+    _wave36a_saved_mode,
     can_use_general_hscan,
     general_scans_enabled,
     horizontal_backward,
@@ -1200,6 +1202,16 @@ def _run_packed_cuda_forward(
             pole_y, horizontal_storage, auxiliary, path, epilogue, kind, path_swiglu,
         )
         saved = [] if recompute else [horizontal_storage]
+        if operands is not None:
+            wave36a = _wave36a_saved_mode(horizontal_storage, operands[3], operands[-1])
+            if wave36a:
+                output, secondary, features, trajectory = _vertical_forward_wave36a(
+                    *operands, float(epsilon), planar_output, not packed_output, wave36a == 2,
+                )
+                descriptor = output.new_empty((0,), dtype=torch.float32)
+                # Trajectory and normalized features share the retain boundary.
+                marker = output.new_empty((wave36a,), dtype=torch.uint8)
+                return output, secondary, descriptor, [*saved, features, trajectory, marker]
         if operands is not None and _should_save_vscan(horizontal_storage, operands[-1]):
             output, secondary, features = _vertical_forward_saved(
                 *operands, float(epsilon), planar=planar_output,
@@ -1256,6 +1268,8 @@ def _general_packed_backward(
     kind: int,
     path_swiglu: bool,
     saved_features: Tensor | None,
+    saved_trajectory: Tensor | None,
+    saved_gs1: bool,
 ) -> list[Tensor] | None:
     x_coefficients = list(pole_x)
     operands = _general_vertical_inputs(
@@ -1268,7 +1282,8 @@ def _general_packed_backward(
     py, states, tables, weights, coarse = operands
     vertical = vertical_backward(
         py, states, tables, weights, grad_real, grad_imag, coarse, float(epsilon),
-        compact=coarse, saved_features=saved_features,
+        compact=coarse, saved_features=saved_features, saved_trajectory=saved_trajectory,
+        saved_gs1=saved_gs1,
     )
     horizontal_grads = horizontal_backward(
         x_coefficients, list(source), horizontal, vertical[4], compact=coarse,
@@ -1295,8 +1310,12 @@ def _run_packed_cuda_backward(
     pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
-    saved_features = None
-    if horizontal_states and horizontal_states[-1].ndim == 3:
+    saved_features = saved_trajectory = None
+    saved_gs1 = False
+    if horizontal_states and horizontal_states[-1].ndim == 1:
+        *horizontal_states, saved_features, saved_trajectory, marker = horizontal_states
+        saved_gs1 = marker.numel() == 2
+    elif horizontal_states and horizontal_states[-1].ndim == 3:
         *horizontal_states, saved_features = horizontal_states
     horizontal_storage = (
         horizontal_states[0] if horizontal_states
@@ -1320,6 +1339,7 @@ def _run_packed_cuda_backward(
         result = _general_packed_backward(
             pole_x, pole_y, source, horizontal_storage, auxiliary, path,
             grad_real, grad_imag, epilogue, epsilon, kind, path_swiglu, saved_features,
+            saved_trajectory, saved_gs1,
         )
         if result is not None:
             return result
