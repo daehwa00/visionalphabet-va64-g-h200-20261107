@@ -36,7 +36,10 @@ def _launch_swiglu(joint: Tensor, grad: Tensor, output: Tensor, *, backward: boo
     block_rows = 8
     wrap_triton(_swiglu_vec2d_kernel)[
         (triton.cdiv(rows, block_rows), triton.cdiv(hidden, block_cols))
-    ](joint, grad, output, rows, hidden, block_rows, block_cols, backward, enable_fp_fusion=False)
+    ](
+        joint, grad, output, rows, hidden, block_rows, block_cols, backward,
+        divisor_tiled=False, enable_fp_fusion=False,
+    )
 
 
 @triton_op("lnet::w29c_swiglu", mutates_args=())

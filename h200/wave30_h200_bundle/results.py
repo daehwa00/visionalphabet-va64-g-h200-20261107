@@ -74,7 +74,8 @@ def select(data):
     c_memory_target = {
         preset: (row["peak_allocated_gib"] - base["peak_allocated_gib"]) * 1024 <= 20
         for arm, (*_, preset) in ARMS.items() if preset != "off"
-        and valid(base) and valid(row := read(data, arm))
+        and math.isfinite(base.get("peak_allocated_gib", math.nan))
+        and math.isfinite((row := read(data, arm)).get("peak_allocated_gib", math.nan))
     }
     write(data, "selection", {
         "winners": winners, "eligible_by_track": contenders,
