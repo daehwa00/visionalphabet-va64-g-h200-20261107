@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
-import re
 from copy import deepcopy
 from itertools import product
 from types import SimpleNamespace
@@ -27,9 +24,10 @@ requires_cuda = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def isolate_reader_presets(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LNET_READER_W31B", "off")
-    monkeypatch.setenv("LNET_READER_W32B", "off")
+def isolate_reader_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LNET_READER_OPT", raising=False)
+    monkeypatch.delenv("LNET_READER_VEC", raising=False)
+    monkeypatch.delenv("LNET_READER_W35B", raising=False)
 
 
 @pytest.mark.parametrize(
@@ -127,9 +125,9 @@ def test_cpu_reduced_precision(dtype: torch.dtype) -> None:
     )
 
 
-@pytest.mark.parametrize(("wave", "preset"), [(31, "off"), (31, "full_w31b"), (32, "full_w32b")])
-def test_fake_custom_op_and_autograd_metadata(monkeypatch, wave, preset) -> None:
-    monkeypatch.setenv(f"LNET_READER_W{wave}B", preset)
+@pytest.mark.parametrize("option", ["auto", "off", "full_w35b"])
+def test_fake_custom_op_and_autograd_metadata(monkeypatch, option) -> None:
+    monkeypatch.setenv("LNET_READER_W35B" if option == "full_w35b" else "LNET_READER_OPT", option)
     with FakeTensorMode():
         projected = torch.empty(2, 3, 7, 2 * 2 * 5, dtype=torch.float16, requires_grad=True)
         weights = tuple(torch.empty(5, 2, 3, 3, requires_grad=True) for _ in range(2))
@@ -144,12 +142,14 @@ def test_fake_custom_op_and_autograd_metadata(monkeypatch, wave, preset) -> None
             assert gradient.is_contiguous()
 
 
-@pytest.mark.parametrize(("wave", "preset"), [(31, "off"), (31, "full_w31b"), (32, "full_w32b")])
-def test_compile_cpu_dynamic_fullgraph_forward_and_backward(monkeypatch, wave, preset) -> None:
-    monkeypatch.setenv(f"LNET_READER_W{wave}B", preset)
+@pytest.mark.parametrize("option", ["auto", "off", "full_w35b"])
+def test_compile_cpu_dynamic_fullgraph_forward_and_backward(monkeypatch, option) -> None:
+    w35b = option == "full_w35b"
+    monkeypatch.setenv("LNET_READER_W35B" if w35b else "LNET_READER_OPT", option)
     torch.manual_seed(37)
     reader, reference = _reader_pair(3, 5, 2, 3, rms=True, device="cpu")
-    compiled = torch.compile(reader, fullgraph=True, dynamic=True)
+    backend = {"backend": "aot_eager"} if w35b else {}
+    compiled = torch.compile(reader, fullgraph=True, dynamic=True, **backend)
     for height, width in ((3, 7), (5, 9)):
         x = torch.randn(2, height, width, 6, requires_grad=True)
         y = x.detach().clone().requires_grad_()
@@ -553,80 +553,13 @@ def test_reader_cuda_graph_replay(operation) -> None:
 
 
 @pytest.mark.parametrize(
-    ("shape", "major", "rank", "kernel", "dtype", "strict", "weight_warps"),
-    [
-        ((1024, 55, 29, 160), 9, 4, 3, torch.bfloat16, False, 8),
-        ((4, 128, 192, 160), 9, 4, 3, torch.bfloat16, False, 4),
-        ((4, 512, 768, 48), 9, 4, 3, torch.bfloat16, False, 4),
-        ((1024, 28, 28, 160), 8, 4, 3, torch.bfloat16, False, None),
-        ((1024, 28, 28, 160), 9, 2, 3, torch.bfloat16, False, None),
-        ((1024, 28, 28, 160), 9, 4, 5, torch.bfloat16, False, None),
-        ((1024, 28, 28, 160), 9, 4, 3, torch.bfloat16, True, None),
-        ((1024, 28, 28, 160), 9, 4, 3, torch.float16, False, None),
-        ((1024, 28, 28, 160), 9, 4, 3, torch.float32, False, None),
-        ((1024, 14, 14, 160), 9, 4, 3, torch.bfloat16, False, None),
-        ((4, 16, 45, 160), 9, 4, 3, torch.bfloat16, False, None),
-    ],
-)
-def test_rank_four_launch_plan(
-    monkeypatch, shape, major, rank, kernel, dtype, strict, weight_warps,
-) -> None:
-    props = SimpleNamespace(major=major, multi_processor_count=132)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _device: props)
-    projected = torch.empty((*shape[:3], rank * shape[3]), device="meta", dtype=dtype)
-    real = torch.empty((shape[3], rank, kernel, kernel), device="meta", dtype=dtype)
-    plan = kernels._rank_four_plan(projected, real, strict=strict)
-    if weight_warps is None:
-        assert plan is None
-    else:
-        assert plan is not None
-        assert plan.spatial == (4, 4)
-        assert plan.weight == (2, 4, weight_warps)
-        assert plan.weight_waves == (20 if weight_warps == 8 else 5)
-
-
-@requires_cuda
-@pytest.mark.parametrize("sms", [2, 20])
-def test_rank_four_tiled_cuda_parity(monkeypatch, sms: int) -> None:
-    torch.manual_seed(51)
-    modes, rank = 96, 4
-    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
-    projected = torch.randn(32, 21, 27, rank * modes, **kwargs)
-    grad = torch.randn(32, 21, 27, 2 * modes, **kwargs)
-    filters = (torch.randn(2, modes, rank, 3, 3, **kwargs) * 0.125).unbind()
-    planner = kernels._rank_four_plan
-    with monkeypatch.context() as patch:
-        patch.setattr(kernels, "_rank_four_plan", lambda *_args, **_kwargs: None)
-        expected = kernels._packed_spatial(projected, *filters, strict_complex=False)
-        expected_dx, expected_dw = kernels._packed_spatial_backward(
-            grad, projected, *filters, strict_complex=False,
-        )
-    properties = torch.cuda.get_device_properties
-
-    def force_plan(projected, real, grad=None, *, strict):
-        props = SimpleNamespace(major=9, multi_processor_count=sms)
-        with monkeypatch.context() as patch:
-            patch.setattr(torch.cuda, "get_device_properties", lambda _device: props)
-            return planner(projected, real, grad, strict=strict)
-
-    plan = force_plan(projected, filters[0], grad, strict=False)
-    assert plan is not None
-    assert plan.weight[2] == (8 if sms == 2 else 4)
-    monkeypatch.setattr(kernels, "_rank_four_plan", force_plan)
-    actual = kernels._packed_spatial(projected, *filters, strict_complex=False)
-    dx, dw = kernels._packed_spatial_backward(grad, projected, *filters, strict_complex=False)
-    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-4)
-    torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
-    torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=0.002)
-    assert torch.cuda.get_device_properties is properties
-
-
-@pytest.mark.parametrize(
     ("choice", "sm", "modes", "dtype", "strict", "offset", "expected"),
     [
         ("auto", 90, 160, torch.bfloat16, False, 0, 2),
         ("auto", 86, 160, torch.bfloat16, False, 0, 2),
-        ("auto", 89, 160, torch.bfloat16, False, 0, 1),
+        ("auto", 80, 160, torch.bfloat16, False, 0, 2),
+        ("auto", 89, 160, torch.bfloat16, False, 0, 2),
+        ("auto", 100, 160, torch.bfloat16, False, 0, 2),
         ("1", 90, 160, torch.bfloat16, False, 0, 1),
         ("2", 86, 34, torch.float16, False, 0, 2),
         ("2", 90, 17, torch.bfloat16, False, 0, 1),
@@ -700,376 +633,176 @@ def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None
     torch.testing.assert_close(output, reference, atol=0.008, rtol=0.005)
     _check_gradients(output, reference, (p, w), (p, w), rtol=0.005, atol=0.001)
 
-
+@pytest.mark.parametrize("option", [None, "auto", "off"])
 @pytest.mark.parametrize(
-    ("preset", "arch", "expected"),
-    [
-        (None, (9, 0), "off"),
-        ("off", (9, 0), "off"),
-        ("invalid", (9, 0), "off"),
-        ("auto", (9, 0), "keep_fwd_hopper"),
-        ("auto", (8, 6), "off"),
-        ("auto", (8, 9), "off"),
-        ("keep_fwd_hopper", (9, 0), "keep_fwd_hopper"),
-        ("dweight_3cta", (8, 6), "dweight_3cta"),
-        ("bwd_hiocc_v2", (9, 0), "bwd_hiocc_v2"),
-        ("fwd_vec2_opt", (9, 0), "fwd_vec2_opt"),
-        ("fwd_vec2_opt", (8, 9), "off"),
-    ],
+    ("width", "modes", "rank", "strict", "vec"),
+    [(11, 34, 4, False, 2), (19, 63, 3, False, 1), (19, 64, 6, False, 1),
+     (11, 34, 4, True, 1)],
 )
-def test_wave28b_preset_gate(monkeypatch, preset, arch, expected) -> None:
-    if preset is None:
-        monkeypatch.delenv("LNET_READER_W28B", raising=False)
-    else:
-        monkeypatch.setenv("LNET_READER_W28B", preset)
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: arch)
-    projected = torch.empty((96, 14, 14, 640), device="meta", dtype=torch.bfloat16)
-    real = projected.new_empty((160, 4, 3, 3))
-    assert kernels._wave28b_preset(projected, real, None, strict=False) == expected
+def test_reader_spatial_auto_dispatch(monkeypatch, option, width, modes, rank, strict, vec) -> None:
+    if option is not None:
+        monkeypatch.setenv("LNET_READER_OPT", option)
+    props = SimpleNamespace(major=8, multi_processor_count=80, shared_memory_per_block=49152,
+                            max_threads_per_multi_processor=1536)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+    monkeypatch.setattr(kernels, "_reader_module_for", lambda *_a, **kw: kw)
+    monkeypatch.setattr(kernels, "_reader_resident", lambda *_: 8)
+    projected = torch.empty((1024, 13, width, rank * modes), device="meta", dtype=torch.float16)
+    real = torch.empty((modes, rank, 3, 3), device="meta", dtype=projected.dtype)
+    launch, module = kernels._reader_spatial_plan(projected, real, None, strict=strict)
+    optimized = option != "off" and not strict and rank <= 4
+    assert module.get("updated", False) == optimized
+    assert launch.vec == (vec if optimized else 1)
+    if optimized:
+        assert launch.columns == width
+        assert launch.warps == 1
 
 
-@pytest.mark.parametrize("preset", kernels._WAVE28B_PRESETS)
-def test_wave28b_ineligible_reader_retains_existing_dispatch(monkeypatch, preset) -> None:
-    monkeypatch.setenv("LNET_READER_W28B", preset)
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    projected = torch.empty((96, 14, 14, 640), device="meta", dtype=torch.bfloat16)
-    real = projected.new_empty((160, 4, 3, 3))
-    grad = projected.new_empty((96, 14, 14, 320), dtype=torch.float16)
-    unsupported = (
-        (projected, None, True),
-        (projected, grad, False),
-        (projected[:, :, :13], None, False),
-        (projected[:1], None, False),
+def test_reader_weight_workspace_scales_with_memory(monkeypatch) -> None:
+    props = SimpleNamespace(
+        major=8, multi_processor_count=80, shared_memory_per_block=49152, total_memory=0,
     )
-    for tensor, gradient, strict in unsupported:
-        assert kernels._wave28b_preset(tensor, real, gradient, strict=strict) == "off"
-
-    monkeypatch.setenv("LNET_READER_VEC", "1")
-    assert kernels._wave28b_preset(projected, real, None, strict=False) == "off"
-
-
-@pytest.mark.parametrize(
-    ("preset", "arch", "expected"),
-    [
-        (None, (9, 0), "off"),
-        ("off", (9, 0), "off"),
-        ("unknown", (9, 0), "off"),
-        ("auto", (9, 0), "full_w29b"),
-        ("auto", (8, 6), "off"),
-        ("hiocc_dweight", (8, 9), "off"),
-        *((preset, (9, 0), preset) for preset in kernels._WAVE29B_PRESETS),
-    ],
-)
-def test_wave29b_preset_gate(monkeypatch, preset, arch, expected) -> None:
-    if preset is None:
-        monkeypatch.delenv("LNET_READER_W29B", raising=False)
-    else:
-        monkeypatch.setenv("LNET_READER_W29B", preset)
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: arch)
-    # Wave 29B also recognizes the compact stage with 128 modes.
-    projected = torch.empty((1024, 7, 7, 512), device="meta", dtype=torch.float16)
-    real = projected.new_empty((128, 4, 3, 3))
-    assert kernels._wave29b_preset(projected, real, None, strict=False) == expected
-    assert kernels._wave29b_preset(projected, real, None, strict=True) == "off"
-    assert kernels._wave29b_preset(projected[:, :, :6], real, None, strict=False) == "off"
-    wrong_grad = projected.new_empty((1024, 7, 7, 256), dtype=torch.bfloat16)
-    assert kernels._wave29b_preset(projected, real, wrong_grad, strict=False) == "off"
-    monkeypatch.setenv("LNET_READER_VEC", "1")
-    assert kernels._wave29b_preset(projected, real, None, strict=False) == "off"
-
-
-@pytest.mark.parametrize("height", [7, 14, 28, 56])
-@pytest.mark.parametrize(("op", "tuned"), [("forward", "fwd_stream_vec2"),
-                                           ("dinput", "hiocc_dinput_v2")])
-def test_wave29b_spatial_arm_composition(height, op, tuned) -> None:
-    geometry = kernels._wave29b_spatial_geometry
-    base = geometry(height, op, "hiocc_dweight")
-    assert geometry(height, op, "full_w29b") == geometry(height, op, tuned)
-    other = "hiocc_dinput_v2" if op == "forward" else "fwd_stream_vec2"
-    assert geometry(height, op, other) == base
-    if height == 7:
-        assert base is None
-    else:
-        vec, rows, warps = kernels._wave28b_spatial_geometry(height, op, "bwd_hiocc_v2")
-        assert base == (vec, kernels._reader_vector_columns(height, vec), rows, warps)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: allocated)
+    monkeypatch.setattr(kernels, "_reader_module_for", lambda *_a, **kw: kw)
+    monkeypatch.setattr(kernels, "_reader_resident", lambda *_: 3)
+    projected = torch.empty((1024, 17, 25, 256), device="meta", dtype=torch.bfloat16)
+    real = torch.empty((64, 4, 3, 3), device="meta", dtype=projected.dtype)
+    grad = torch.empty((1024, 17, 25, 128), device="meta", dtype=projected.dtype)
+    props.total_memory = 24 * 2**30
+    allocated = 0
+    roomy = kernels._reader_weight_plan(projected, real, grad, strict=False)
+    props.total_memory = 12 * 2**30
+    allocated = 7 * props.total_memory // 8 - 2**20
+    tight = kernels._reader_weight_plan(projected, real, grad, strict=False)
+    assert 0 < tight.grid[1] < roomy.grid[1]
+    assert tight.grid[1] * 2 * real.numel() * 4 <= 2**20
+    assert tight.module["weight_geometry"] == roomy.module["weight_geometry"]
+    assert roomy.reduce == tight.reduce == "dweight_reduce"
 
 
 @requires_cuda
-@pytest.mark.parametrize("height", [7, 14, 28, 56])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_wave29b_full_hopper_parity(monkeypatch, height, dtype) -> None:
-    if torch.cuda.get_device_capability() != (9, 0):
-        pytest.skip("Hopper SM 9.0 is required")
-    torch.manual_seed(103)
-    modes = 128 if height == 7 else 160
-    batch = kernels._ceildiv(kernels._SPECIALIZE_MIN_PIXELS, height**2)
-    kwargs = {"device": "cuda", "dtype": dtype}
-    projected = torch.randn(batch, height, height, 4 * modes, **kwargs) * 0.125
-    grad = torch.randn(batch, height, height, 2 * modes, **kwargs) * 0.125
-    real, imag = (torch.randn(2, modes, 4, 3, 3, **kwargs) * 0.125).unbind()
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    monkeypatch.setenv("LNET_READER_W25B", "auto")
-    monkeypatch.setenv("LNET_READER_W27B", "off")
-    monkeypatch.setenv("LNET_READER_W28B", "bwd_hiocc_v2")
-    monkeypatch.setenv("LNET_READER_W29B", "off")
-    expected = kernels._packed_spatial(projected, real, imag, strict_complex=False)
-    expected_dx, expected_dw = kernels._packed_spatial_backward(
-        grad, projected, real, imag, strict_complex=False,
-    )
-    monkeypatch.setenv("LNET_READER_W29B", "full_w29b")
-    assert kernels._wave29b_preset(projected, real, grad, strict=False) == "full_w29b"
-    actual = kernels._packed_spatial(projected, real, imag, strict_complex=False)
-    dx, dw = kernels._packed_spatial_backward(grad, projected, real, imag, strict_complex=False)
-    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-4)
-    torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
-    torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=2e-5)
-
-
-@pytest.mark.parametrize(
-    ("preset", "arch", "expected"),
-    [
-        (None, (9, 0), "off"),
-        ("off", (9, 0), "off"),
-        ("unknown", (9, 0), "off"),
-        ("auto", (9, 0), "full_w30b"),
-        ("auto", (8, 6), "off"),
-        ("dweight_low_traffic", (8, 9), "off"),
-        *((preset, (9, 0), preset) for preset in kernels._WAVE30B_PRESETS),
-    ],
-)
-def test_wave30b_preset_gate(monkeypatch, preset, arch, expected) -> None:
-    if preset is None:
-        monkeypatch.delenv("LNET_READER_W30B", raising=False)
-    else:
-        monkeypatch.setenv("LNET_READER_W30B", preset)
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: arch)
-    projected = torch.empty((1024, 7, 7, 512), device="meta", dtype=torch.float16)
-    real = projected.new_empty((128, 4, 3, 3))
-    assert kernels._wave30b_preset(projected, real, None, strict=False) == expected
-    assert kernels._wave30b_preset(projected, real, None, strict=True) == "off"
-    assert kernels._wave30b_preset(projected[:, :, :6], real, None, strict=False) == "off"
-    wrong_grad = projected.new_empty((1024, 7, 7, 256), dtype=torch.bfloat16)
-    assert kernels._wave30b_preset(projected, real, wrong_grad, strict=False) == "off"
-    monkeypatch.setenv("LNET_READER_VEC", "1")
-    assert kernels._wave30b_preset(projected, real, None, strict=False) == "off"
-
-
-@pytest.mark.parametrize("height", [7, 14, 28, 56])
-def test_wave30b_spatial_arm_composition(height) -> None:
-    geometry = kernels._wave30b_spatial_geometry
-    for op in ("forward", "dinput"):
-        wide = geometry(height, op, "wide_col_spatial")
-        assert geometry(height, op, "full_w30b") == wide
-        assert geometry(height, op, "dweight_low_traffic") == kernels._wave29b_spatial_geometry(
-            height, op, "hiocc_dinput_v2",
-        )
-        scalar = geometry(height, op, "fwd_scalar_wide")
-        if op == "forward":
-            assert scalar == (1, height, 4, 1)
-        else:
-            assert scalar == wide
-        if height >= 28:
-            assert wide.columns == height
-
-
-@requires_cuda
-@pytest.mark.parametrize("height", [7, 14, 28, 56])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("preset", ["full_w30b", "fwd_scalar_wide"])
-def test_wave30b_hopper_parity(monkeypatch, height, dtype, preset) -> None:
-    if torch.cuda.get_device_capability() != (9, 0):
-        pytest.skip("Hopper SM 9.0 is required")
-    torch.manual_seed(103)
-    modes = 128 if height == 7 else 160
-    batch = kernels._ceildiv(kernels._SPECIALIZE_MIN_PIXELS, height**2)
-    kwargs = {"device": "cuda", "dtype": dtype}
-    projected = torch.randn(batch, height, height, 4 * modes, **kwargs) * 0.125
-    grad = torch.randn(batch, height, height, 2 * modes, **kwargs) * 0.125
-    real, imag = (torch.randn(2, modes, 4, 3, 3, **kwargs) * 0.125).unbind()
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    monkeypatch.setenv("LNET_READER_W25B", "auto")
-    monkeypatch.setenv("LNET_READER_W27B", "off")
-    monkeypatch.setenv("LNET_READER_W28B", "bwd_hiocc_v2")
-    monkeypatch.setenv("LNET_READER_W29B", "hiocc_dinput_v2")
-    monkeypatch.setenv("LNET_READER_W30B", "off")
-    expected = kernels._packed_spatial(projected, real, imag, strict_complex=False)
-    expected_dx, expected_dw = kernels._packed_spatial_backward(
-        grad, projected, real, imag, strict_complex=False,
-    )
-    monkeypatch.setenv("LNET_READER_W30B", preset)
-    assert kernels._wave30b_preset(projected, real, grad, strict=False) == preset
-    actual = kernels._packed_spatial(projected, real, imag, strict_complex=False)
-    dx, dw = kernels._packed_spatial_backward(grad, projected, real, imag, strict_complex=False)
-    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-4)
-    torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
-    torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=2e-5)
-
-
-@pytest.mark.parametrize(("arch", "gib", "preset", "expected"), [
-    ((8, 6), 12, "auto", "full_w31b"),
-    ((8, 9), 24, "wide_fwd_only", "wide_fwd_only"),
-    ((9, 0), 140, "dweight_vram_split", "dweight_vram_split"),
-    ((10, 0), 140, "full_w31b", "full_w31b"),
-    ((7, 5), 24, "auto", "off"),
-    ((9, 0), 140, "off", "off"),
+@pytest.mark.usefixtures("cudnn_full_precision")
+@pytest.mark.parametrize(("shape", "modes", "rank", "strict"), [
+    ((80, 13, 19), 63, 3, False),
+    ((192, 9, 11), 34, 4, False),
+    ((32, 13, 19), 64, 6, True),
 ])
-def test_wave31b_preset_gate(monkeypatch, arch, gib, preset, expected) -> None:
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    monkeypatch.setenv("LNET_READER_W31B", preset)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: arch)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_properties", lambda _: SimpleNamespace(total_memory=gib * 1024**3),
+def test_reader_auto_and_off_cuda_parity(monkeypatch, shape, modes, rank, strict) -> None:
+    torch.manual_seed(37)
+    kwargs = {"device": "cuda", "dtype": torch.float16}
+    projected = torch.randn((*shape, modes * rank), **kwargs) * 0.125
+    filters = (torch.randn((2, modes, rank, 3, 3), **kwargs) * 0.125).unbind()
+    grad = torch.randn((*shape, 2 * modes), **kwargs) * 0.125
+    outputs = []
+    for option in ("auto", "off"):
+        monkeypatch.setenv("LNET_READER_OPT", option)
+        outputs.append((
+            kernels._packed_spatial(projected, *filters, strict_complex=strict),
+            *kernels._packed_spatial_backward(grad, projected, *filters, strict_complex=strict),
+        ))
+    for actual, expected in zip(*outputs, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
+
+
+def _simulate_reader_weight_partials(projected, grad, *, modes, rank, vec, tile, rows):
+    batch, height, width = projected.shape[:3]
+    bands = (height + rows - 1) // rows
+    workers, warps = 2, 4
+    p = projected.float().unflatten(-1, (rank, modes))
+    g = grad.float().unflatten(-1, (2, modes))
+    g = torch.nn.functional.pad(g, (0, 0, 0, 0, 1, 1, 1, 1))
+    partials = torch.zeros(workers, warps, 2, rank, 3, 3, modes)
+    for worker, warp in product(range(workers), range(warps)):
+        for band in range(worker * warps + warp, batch * bands, workers * warps):
+            b, band_y = divmod(band, bands)
+            y = band_y * rows
+            count = min(rows, height - y)
+            for x, ky, kx in product(range(width), range(3), range(3)):
+                p_window = p[b, y:y + count, x]
+                g_window = g[b, y + 2 - ky:y + 2 - ky + count, x + 2 - kx]
+                for r, m in product(range(0, rank, tile), range(0, modes, 32 * vec)):
+                    ranks, lanes = slice(r, r + tile), slice(m, m + 32 * vec)
+                    partials[worker, warp, :, ranks, ky, kx, lanes] += torch.einsum(
+                        "jrm,jcm->crm", p_window[:, ranks, lanes], g_window[:, :, lanes],
+                    )
+    return partials.sum((0, 1)).movedim(-1, 1)
+
+
+@pytest.mark.parametrize(("rank", "modes", "rows", "tile", "vec"), [
+    (1, 8, 3, 1, 1), (3, 9, 3, 3, 1), (4, 34, 3, 4, 1),
+    (4, 66, 4, 2, 2), (6, 9, 2, 4, 1),
+])
+def test_w35b_cpu_weight_partial_simulation(rank, modes, rows, tile, vec) -> None:
+    torch.manual_seed(126)
+    p = torch.randn(3, 7, 5, rank * modes, dtype=torch.bfloat16)
+    grad = torch.randn(3, 7, 5, 2 * modes, dtype=p.dtype)
+    filters = torch.randn(2, modes, rank, 3, 3, dtype=p.dtype)
+    _, expected = kernels._spatial_reference_backward(grad, p, *filters, strict_complex=False)
+    actual = _simulate_reader_weight_partials(p, grad, modes=modes, rank=rank,
+                                              vec=vec, tile=tile, rows=rows)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-5)
+
+
+def _simulate_reader_vec4(input_tensor, filters, *, backward):
+    batch, height, width = input_tensor.shape[:3]
+    _, modes, rank = filters.shape[:3]
+    padded = torch.nn.functional.pad(
+        input_tensor.float().unflatten(-1, (-1, modes)), (0, 0, 0, 0, 1, 1, 1, 1),
     )
-    projected = torch.empty(6, 56, 56, 640, dtype=torch.bfloat16)
-    weight = torch.empty(160, 4, 3, 3, dtype=projected.dtype)
-    assert kernels._wave31b_preset(projected, weight, None, strict=False) == expected
-    assert kernels._wave31b_preset(projected, weight, None, strict=True) == "off"
-    assert kernels._wave31b_preset(projected[:, :, :-1], weight, None, strict=False) == expected
-
-
-def test_wave31b_cuda_launch_signatures() -> None:
-    source = kernels._READER_CUDA
-    signatures = dict(re.findall(r"__global__ void reader_(\w+)\((.*?)\)\s*\{", source, re.DOTALL))
-    checked = set()
-    for entry in (kernels._packed_spatial, kernels._packed_spatial_backward):
-        tree = ast.parse(inspect.getsource(entry._init_fn))
-        for call in ast.walk(tree):
-            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+    out = input_tensor.new_empty((batch, height, width, modes * (rank if backward else 2)))
+    for block in range((height + 3) // 4):
+        for warp in range(4):
+            y = block * 4 + warp
+            if y >= height:
                 continue
-            if call.func.id != "_launch_reader_cuda":
-                continue
-            _, op, _, tensors, sizes = call.args
-            operations = (op.value,) if isinstance(op, ast.Constant) else (
-                "dweight_reduce", "dweight_reduce_parallel",
-            )
-            for operation in operations:
-                assert len(signatures[operation].split(",")) == len(tensors.elts) + len(sizes.elts)
-                checked.add(operation)
-    assert checked == set(signatures)
-    assert "static_cast<long long>(blockIdx.y)" in source
-    assert "static_cast<long long>(worker) * stride" in source
+            left, middle = padded[:, y:y + 3].unbind(2)[:2]
+            for x, right in enumerate(padded[:, y:y + 3, 2:].unbind(2)):
+                window = torch.stack((left, middle, right), dim=-1)
+                modes4 = window.reshape(batch, 3, -1, modes // 4, 4, 3)
+                weights4 = filters.float().reshape(2, modes // 4, 4, rank, 3, 3)
+                output = (
+                    torch.einsum("bycmvx,cmvryx->brmv", modes4, weights4.flip((-1, -2)))
+                    if backward else torch.einsum("byrmvx,cmvryx->bcmv", modes4, weights4)
+                )
+                out[:, y, x] = output.flatten(1)
+                left, middle = middle, right
+    return out
 
 
-@pytest.mark.parametrize("shape", [(56, 160, 4), (7, 128, 4), (17, 481, 3), (19, 8192, 4)])
-@pytest.mark.parametrize("gib", [12, 24, 140])
-def test_wave31b_partial_and_grid_bounds(shape, gib) -> None:
-    height, modes, rank = shape
-    stride = 2 * modes * rank * 9
-    bands = kernels._ceildiv(height, min(kernels._W31B_WEIGHT_ROWS) * 4)
-    budget = kernels._wave31b_temp_budget(gib * 1024**3, 0)
-    batch = kernels._MAX_CUDA_GRID_DIM
-    workers = kernels._wave31b_split_workers(batch, bands, stride, budget)
-    assert 0 < workers <= kernels._MAX_CUDA_GRID_DIM
-    assert batch * bands < 2**31
-    assert kernels._ceildiv(modes, 32) * rank <= 2**31 - 1
-    chunks = kernels._ceildiv(workers, kernels._W31B_REDUCE_CHUNK)
-    assert 0 < chunks <= kernels._MAX_CUDA_GRID_DIM
-    assert stride * workers < 2**63
-    assert 4 * (workers + chunks) * stride <= budget
-    if gib == 140:
-        assert 4 * workers * stride > 512 * 1024**2
-        assert workers == kernels._MAX_CUDA_GRID_DIM or (
-            workers + 1 + kernels._ceildiv(workers + 1, kernels._W31B_REDUCE_CHUNK)
-        ) * stride * 4 > budget
-    assert kernels._wave31b_temp_budget(gib * 1024**3, gib * 1024**3) == 0
-
-
-@pytest.mark.parametrize(("height", "rows", "batch", "workers"), [
-    (56, 7, 18, 35), (28, 8, 3, 2), (14, 4, 4, 4), (7, 2, 5, 3), (17, 4, 3, 5),
-])
-@pytest.mark.parametrize("batch_split", [False, True])
-@pytest.mark.parametrize("scale", [1.0, 0.125])
-def test_reader_cpu_partition_and_tree(height, rows, batch, workers, batch_split, scale) -> None:
-    torch.manual_seed(31)
-    warps = 4
-    width, modes, rank = 17, 3, 5
-    outer = width if batch_split else height
-    tiles = kernels._ceildiv(outer, rows)
-    bands = kernels._ceildiv(tiles, warps)
-    projected = torch.randint(-3, 4, (batch, height, width, rank, modes)).float() * scale
-    grad = torch.randint(-3, 4, (batch, height, width, 2, modes)).float() * scale
-    filters = torch.zeros(modes, rank, 3, 3)
-    _, expected = kernels._spatial_reference_backward(
-        grad.flatten(-2), projected.flatten(-2), filters, filters, strict_complex=False,
-    )
-    padded = torch.nn.functional.pad(grad, (0, 0, 0, 0, 1, 1, 1, 1))
-    partial = torch.zeros(workers, 2, rank, 3, 3, modes)
-    visits = torch.zeros(batch, height, width, dtype=torch.int64)
-    slices = batch if batch_split else batch * bands
-    for worker in range(workers):
-        for spatial_slice in range(worker, slices, workers):
-            image, band = (spatial_slice, 0) if batch_split else divmod(spatial_slice, bands)
-            for warp in range(warps):
-                first = band * warps + warp
-                last = tiles if batch_split else min(tiles, first + 1)
-                for tile in range(first, last, warps):
-                    lo, hi = tile * rows, min((tile + 1) * rows, outer)
-                    y0, y1, x0, x1 = (0, height, lo, hi) if batch_split else (lo, hi, 0, width)
-                    visits[image, y0:y1, x0:x1] += 1
-                    for ky, kx in product(range(3), repeat=2):
-                        adjoint = padded[
-                            image, y0 + 2 - ky:y1 + 2 - ky, x0 + 2 - kx:x1 + 2 - kx,
-                        ]
-                        partial[worker, :, :, ky, kx] += torch.einsum(
-                            "yxrm,yxcm->crm", projected[image, y0:y1, x0:x1], adjoint,
-                        )
-    torch.testing.assert_close(visits, torch.ones_like(visits), rtol=0, atol=0)
-    chunk = kernels._W31B_REDUCE_CHUNK
-    while partial.shape[0] > 1:
-        reduced = []
-        for group in partial.split(chunk):
-            lanes = [group[warp::warps].sum(dim=0) for warp in range(warps)]
-            reduced.append((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
-        partial = torch.stack(reduced)
-    torch.testing.assert_close(partial[0].movedim(-1, 1), expected, rtol=0, atol=0)
+@pytest.mark.parametrize("rank", [1, 3, 4, 6])
+def test_w35b_cpu_vec4_simulation(rank) -> None:
+    torch.manual_seed(35)
+    p = torch.randn(2, 5, 7, rank * 8, dtype=torch.float16)
+    filters = torch.randn(2, 8, rank, 3, 3, dtype=p.dtype)
+    grad = torch.randn(2, 5, 7, 16, dtype=p.dtype)
+    expected = kernels._spatial_reference(p, *filters, strict_complex=False)
+    expected_grad, _ = kernels._spatial_reference_backward(grad, p, *filters, strict_complex=False)
+    torch.testing.assert_close(_simulate_reader_vec4(p, filters, backward=False), expected)
+    torch.testing.assert_close(_simulate_reader_vec4(grad, filters, backward=True), expected_grad)
 
 
 @requires_cuda
-@pytest.mark.parametrize("shape", [
-    (56, 56, 160, 4), (28, 28, 160, 4), (14, 14, 160, 4), (7, 7, 128, 4),
-    (9, 11, 34, 4), (13, 19, 63, 3), (13, 19, 64, 6),
+@pytest.mark.usefixtures("cudnn_full_precision")
+@pytest.mark.parametrize("variant", ["auto", "dweight_rt4", "dweight_rows4",
+                                     "fwd_dinput_vec4", "full_w35b"])
+@pytest.mark.parametrize(("modes", "rank", "strict", "dtype"), [
+    (160, 4, False, torch.bfloat16), (128, 3, False, torch.float16),
+    (63, 1, False, torch.float16), (64, 6, True, torch.bfloat16),
 ])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(("wave", "preset"), [
-    *((31, preset) for preset in kernels._W31B_PRESETS),
-    *((32, preset) for preset in (*kernels._W32B_PRESETS, "auto")),
-])
-def test_reader_vram_cuda_parity(monkeypatch, shape, dtype, wave, preset) -> None:
+def test_w35b_cuda_parity(monkeypatch, variant, modes, rank, strict, dtype) -> None:
     if torch.cuda.get_device_capability() < (8, 0):
-        pytest.skip("SM 8.0 or newer is required")
-    torch.manual_seed(31)
-    height, width, modes, rank = shape
-    batch = max(33, kernels._ceildiv(kernels._SPECIALIZE_MIN_PIXELS, height * width))
+        pytest.skip("Wave 35B requires SM80 or newer")
+    monkeypatch.setenv("LNET_READER_W35B", variant)
+    torch.manual_seed(126)
     kwargs = {"device": "cuda", "dtype": dtype}
-    projected = torch.randn(batch, height, width, rank * modes, **kwargs) * 0.125
-    grad = torch.randn(batch, height, width, 2 * modes, **kwargs) * 0.125
-    real, imag = (torch.randn(2, modes, rank, 3, 3, **kwargs) * 0.125).unbind()
-    for legacy_wave, arm in ((25, "auto"), (27, "off"), (28, "bwd_hiocc_v2"),
-                      (29, "hiocc_dinput_v2"), (30, "off")):
-        monkeypatch.setenv(f"LNET_READER_W{legacy_wave}B", arm)
-    monkeypatch.setenv("LNET_READER_VEC", "auto")
-    expected = kernels._packed_spatial(projected, real, imag, strict_complex=False)
-    expected_dx, expected_dw = kernels._packed_spatial_backward(
-        grad, projected, real, imag, strict_complex=False,
-    )
-    monkeypatch.setenv(f"LNET_READER_W{wave}B", preset)
-    seen = []
-    launch = kernels._launch_reader_cuda
-
-    def capture(module, op, *args, **kwargs):  # noqa: ANN002, ANN003
-        seen.append((op, args[0], "reader_dweight_reduce_chunks" in module.functions))
-        return launch(module, op, *args, **kwargs)
-
-    monkeypatch.setattr(kernels, "_launch_reader_cuda", capture)
-    actual = kernels._packed_spatial(projected, real, imag, strict_complex=False)
-    dx, dw = kernels._packed_spatial_backward(grad, projected, real, imag, strict_complex=False)
-    _, grid, split = next(launch for launch in seen if launch[0] == "dweight")
-    assert split == (preset != "wide_fwd_only")
-    chunked = any(op == "dweight_reduce_chunks" for op, _, _ in seen)
-    assert chunked == (split and grid[1] > kernels._W31B_REDUCE_CHUNK)
-    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-4)
-    torch.testing.assert_close(dx, expected_dx, rtol=0, atol=0)
-    torch.testing.assert_close(dw, expected_dw, rtol=3e-5, atol=6e-5)
+    shape = (8, 56, 56) if rank == 4 else (2, 13, 19)
+    p = torch.randn(*shape, modes * rank * (2 if strict else 1), **kwargs) * 0.125
+    filters = torch.randn(2, modes, rank, 3, 3, **kwargs) * 0.125
+    grad = torch.randn(*shape, modes * 2, **kwargs) * 0.125
+    expected = kernels._spatial_reference(p, *filters, strict_complex=strict)
+    expected_grad = kernels._spatial_reference_backward(grad, p, *filters, strict_complex=strict)
+    actual = kernels._packed_spatial(p, *filters, strict_complex=strict)
+    actual_grad = kernels._packed_spatial_backward(grad, p, *filters, strict_complex=strict)
+    for out, ref in zip((actual, *actual_grad), (expected, *expected_grad), strict=True):
+        torch.testing.assert_close(out, ref, atol=0.002, rtol=0.008)
