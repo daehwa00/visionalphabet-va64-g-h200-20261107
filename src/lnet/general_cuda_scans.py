@@ -134,6 +134,11 @@ class Kernel:
     backward_readonly: bool = False
     uncached_trajectory: bool = False
     global_trajectory: bool = False
+    saved_scan: bool = False
+    saved_fused: bool = False
+    saved_direction: int = 0
+    saved_projection_cells: int = 0
+    saved_shared_fields: int = 0
 
 
 class Launch(NamedTuple):
@@ -1492,9 +1497,429 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 """
 
+_WAVE31A_SOURCE = r"""
+template<class T>
+struct alignas(sizeof(Quad<T>)) SavedQuad {
+    Quad<T> values;
+    __device__ float4 unpack() const { return values.unpack(); }
+    __device__ static SavedQuad pack(float4 v) { return {Quad<T>::pack(v)}; }
+};
+
+template<class T> struct SavedPairRaw;
+template<> struct SavedPairRaw<__half> { using Type = __half2_raw; };
+template<> struct SavedPairRaw<__nv_bfloat16> { using Type = __nv_bfloat162_raw; };
+
+template<class T>
+__device__ __forceinline__ float4 load_saved(const SavedQuad<T>* p) {
+    const auto address = __cvta_generic_to_global(p);
+    if constexpr (sizeof(T) == 2) {
+        uint2 bits;
+        asm("ld.global.v2.b32 {%0, %1}, [%2];"
+            : "=r"(bits.x), "=r"(bits.y) : "l"(address) : "memory");
+        using Raw = typename SavedPairRaw<T>::Type;
+        const Pair<T> a{Raw{static_cast<unsigned short>(bits.x),
+                            static_cast<unsigned short>(bits.x >> 16)}};
+        const Pair<T> b{Raw{static_cast<unsigned short>(bits.y),
+                            static_cast<unsigned short>(bits.y >> 16)}};
+        const auto x = a.unpack(), y = b.unpack();
+        return make_float4(x.r, x.i, y.r, y.i);
+    } else {
+        float4 v;
+        asm("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+            : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(address) : "memory");
+        return v;
+    }
+}
+
+template<class T>
+__device__ __forceinline__ void store_saved(SavedQuad<T>* p, SavedQuad<T> v) {
+    const auto address = __cvta_generic_to_global(p);
+    if constexpr (sizeof(T) == 2) {
+        using Raw = typename SavedPairRaw<T>::Type;
+        const Raw a = v.values.a.value, b = v.values.b.value;
+        const unsigned x = unsigned(a.x) | (unsigned(a.y) << 16);
+        const unsigned y = unsigned(b.x) | (unsigned(b.y) << 16);
+        asm volatile("st.global.v2.b32 [%0], {%1, %2};"
+                     :: "l"(address), "r"(x), "r"(y) : "memory");
+    } else {
+        const auto f = v.unpack();
+        asm volatile("st.global.v4.f32 [%0], {%1, %2, %3, %4};"
+                     :: "l"(address), "f"(f.x), "f"(f.y), "f"(f.z), "f"(f.w) : "memory");
+    }
+}
+
+template<class T>
+__device__ __forceinline__ float4 normalize_saved(const SavedQuad<T>* p, float2 gain) {
+    // The first cast in normalize<T> was already applied when the Quad was stored.
+    const auto v = load_saved(p);
+    return Quad<T>::pack(make_float4(v.x * gain.x, v.y * gain.x,
+                                     v.z * gain.y, v.w * gain.y)).unpack();
+}
+
+template<class T, class I, bool COARSE>
+__device__ __forceinline__ Column<T, I> saved_column(
+    const T* states, const float* vx, const float* vy, I b, int x, int m,
+    int B, int H, int W, int M, float eps
+) {
+    const int ow = W / (1 + COARSE), oh = H / (1 + COARSE);
+    const int xa = COARSE ? 2 * x + 1 : x, xb = COARSE ? 2 * x : x;
+    const I base = b * H * W * M + m, plane = I(B) * H * W * M;
+    return {states, vy, base + I(xa) * M, base + I(xb) * M, plane, plane,
+            (b * oh * ow + x) * M + m, 0, H, W, M, ow, m,
+            vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps};
+}
+
+__device__ __forceinline__ void saved_features(float4 p, float4 n, float (&features)[8]) {
+    features[0] = p.x; features[1] = p.z; features[2] = n.x; features[3] = n.z;
+    features[4] = p.y; features[5] = p.w; features[6] = n.y; features[7] = n.w;
+}
+
+template<bool NEGATIVE, class T>
+__device__ __forceinline__ SavedQuad<T> saved_dp(const float* dp, float2 gain) {
+    constexpr int k = NEGATIVE ? 2 : 0;
+    return {normalize_packed<T>(make_float4(dp[k], dp[k+4], dp[k+1], dp[k+5]), gain)};
+}
+
+template<class T, class I, bool COARSE, bool RI, bool II>
+struct SavedPath {
+    Column<T, I> column;
+    const SavedQuad<T>* pos;
+    const SavedQuad<T>* neg;
+    const T* gr;
+    const T* gi;
+    T* real;
+    T* imag;
+
+    __device__ float4 pos_value(int y) const {
+        return normalize_saved(pos + I(y) * column.OW * column.M, column.gain(y, false));
+    }
+    __device__ float4 neg_value(int y) const {
+        return normalize_saved(neg + I(y) * column.OW * column.M, column.gain(y, true));
+    }
+    __device__ float2 dy(int y) const {
+        const I cell = column.cell(y / (1 + COARSE));
+        return make_float2(read(gr[(cell-column.m)*(1+RI)+column.m]),
+                           read(gi[(cell-column.m)*(1+II)+column.m]));
+    }
+    __device__ void emit(int y, float2 out) const {
+        const I cell = column.cell(y / (1 + COARSE));
+        real[(cell-column.m)*(1+RI)+column.m] = write<T>(out.x);
+        imag[(cell-column.m)*(1+II)+column.m] = write<T>(out.y);
+    }
+};
+
+template<class T, int SHARED_FIELDS>
+__device__ __forceinline__ void saved_adjoint_pair(
+    const float (&p)[2][8], const float2 (&dy)[2], ProjectWeights path,
+    float* acc, float* shared_acc, int threads, float (&dp)[2][8]
+) {
+    #pragma unroll
+    for (int cell = 0; cell < 2; ++cell) {
+        acc[88 - SHARED_FIELDS] += dy[cell].x;
+        acc[89 - SHARED_FIELDS] += dy[cell].y;
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float pre[2]{}, weights[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k += 4) {
+            const auto v = path.input_group(2 * j + k / 4);
+            weights[k] = v.x;
+            weights[k + 1] = v.y;
+            weights[k + 2] = v.z;
+            weights[k + 3] = v.w;
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            pre[0] = __fmaf_rn(weights[k], p[0][k], pre[0]);
+            pre[1] = __fmaf_rn(weights[k], p[1][k], pre[1]);
+        }
+        const float bias = path.bias(j), wr = path.output(j), wi = path.output(8 + j);
+        #pragma unroll
+        for (int cell = 0; cell < 2; ++cell) {
+            const float z = rounded<T>(rounded<T>(pre[cell]) + bias);
+            const float sig = __fdividef(1.0f, 1.0f + __expf(-z));
+            const float act = rounded<T>(z * sig);
+            const auto d = dy[cell];
+            const float dz = rounded<T>(rounded<T>(d.x * wr + d.y * wi) *
+                                         (sig * (1.0f + z * (1.0f - sig))));
+            acc[64 + j - SHARED_FIELDS] += dz;
+            acc[72 + j - SHARED_FIELDS] += d.x * act;
+            acc[80 + j - SHARED_FIELDS] += d.y * act;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                dp[cell][k] += dz * weights[k];
+                if (8 * j + k < SHARED_FIELDS) {
+                    shared_acc[(8 * j + k) * threads] += dz * p[cell][k];
+                } else {
+                    acc[8 * j + k - SHARED_FIELDS] += dz * p[cell][k];
+                }
+            }
+        }
+    }
+}
+
+template<class T, class I, bool COARSE, int WARPS, bool BACKWARD, bool FUSED,
+         bool COMPACT, bool RI, bool II, bool PRECISE, int DIRECTION>
+__device__ __forceinline__ void saved_scan(
+    const float* dr, const float* di, const float* gr_decay, const float* gi_decay,
+    const T* states, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo, const void* bo,
+    SavedQuad<T>* trajectory, const T* gr, const T* gi, T* real, T* imag,
+    SavedQuad<T>* dp, T* gs, float* partial, int B, int H, int W, int M, int types, float eps
+) {
+    constexpr int threads = 32 * WARPS, fields = FUSED ? 94 : 4;
+#ifdef WAVE31A_EXTRA_SHARED_FIELDS
+    constexpr int shared_fields = WAVE31A_EXTRA_SHARED_FIELDS;
+#else
+    constexpr int shared_fields = BACKWARD && FUSED ? 32 : 0;
+#endif
+    const int ow = W / (1 + COARSE), oh = H / (1 + COARSE);
+    const I lines = I(B) * ow, plane = lines * H * M, dp_plane = lines * oh * M;
+    const int tiles = (M - 1) / 32 + 1, lane = threadIdx.x % 32;
+    const int mode0 = blockIdx.x % tiles * 32, m = mode0 + lane;
+    const int group = blockIdx.x / tiles, groups = gridDim.x / tiles;
+    const I worker = I(group) * WARPS + threadIdx.x / 32;
+    extern __shared__ float4 shared[];
+    auto* weights = reinterpret_cast<float*>(shared);
+    auto* dwi = weights + 88 * 32 + threadIdx.x;
+    auto* g2 = reinterpret_cast<SavedQuad<T>*>(weights + 88 * 32 + shared_fields * threads)
+        + threadIdx.x;
+    #pragma unroll
+    for (int j = 0; j < shared_fields; ++j) dwi[j * threads] = 0;
+    if constexpr (FUSED) {
+        load_project_weights<T, 8, threads, BACKWARD>(weights, wi, bi, wo, bo, types, mode0, M, 8);
+        __syncthreads();
+    }
+    const ProjectWeights path{weights, 8, lane};
+    float acc[BACKWARD && FUSED ? 90 - shared_fields : 1]{};
+    Complex da{}, dg{};
+    if (m < M) {
+        const Complex a{dr[m], di[m]}, g{gr_decay[m], gi_decay[m]};
+        const Complex ar = a.conj(), gg = g.conj();
+        for (I line = worker; line < lines; line += I(groups) * WARPS) {
+            const auto c = saved_column<T, I, COARSE>(
+                states, vx, vy, line / ow, line % ow, m, B, H, W, M, eps);
+            const I stride = I(ow) * M;
+            auto* pos = trajectory + line / ow * H * stride + (line % ow) * M + m;
+            auto* neg = pos + plane;
+            const SavedPath<T, I, COARSE, RI, II> op{c, pos, neg, gr, gi, real, imag};
+            if constexpr (!BACKWARD) {
+                float4 p{};
+                for (int y = 0; y < H; ++y) {
+                    p = advance(p, c.source(y), a, g);
+                    store_saved(pos + I(y) * stride, SavedQuad<T>::pack(p));
+                }
+                float4 n{};
+                for (int y = H - 1; y >= 0; --y) {
+                    n = advance(n, c.source(y), ar, gg);
+                    store_saved(neg + I(y) * stride, SavedQuad<T>::pack(n));
+                    if constexpr (FUSED) {
+                        if (COARSE && (y & 1)) continue;
+                        op.emit(y, path_mlp<T, I, 8, PRECISE, false>(
+                            op.pos_value(y + COARSE), normalize<T>(n, c.gain(y, true)),
+                            path, make_float2(path.final_bias(0), path.final_bias(1)),
+                            {}, nullptr, 0, nullptr));
+                    }
+                }
+            } else {
+                Complex adj_a{}, adj_b{};
+                if constexpr (FUSED) {
+                    constexpr int step = 1 + COARSE;
+                    int y = H - 1;
+                    for (; y >= 2 * step - 1; y -= 2 * step) {
+                        float p[2][8], d[2][8]{};
+                        float2 dy[2];
+                        #pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            const int row = y - i * step;
+                            saved_features(op.pos_value(row), op.neg_value(row - COARSE), p[i]);
+                            dy[i] = op.dy(row);
+                        }
+                        saved_adjoint_pair<T, shared_fields>(p, dy, path, acc, dwi, threads, d);
+                        #pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            const int row = y - i * step;
+                            g2[(row / step) * threads] =
+                                saved_dp<true, T>(d[i], c.gain(row - COARSE, true));
+                            column_adjoint<false, COMPACT>(
+                                c, row, row ? load_saved(pos + I(row - 1) * stride) : float4{},
+                                c.source(row),
+                                saved_dp<false, T>(d[i], c.gain(row, false)).unpack(),
+                                a, g, adj_a, adj_b, da, dg, gs);
+                            if constexpr (COARSE) {
+                                column_adjoint<false, COMPACT>(
+                                    c, row - 1,
+                                    row > 1 ? load_saved(pos + I(row - 2) * stride) : float4{},
+                                    c.source(row - 1), {}, a, g, adj_a, adj_b, da, dg, gs);
+                            }
+                        }
+                    }
+                    if (y >= 0) {
+                        float d[8]{};
+                        path_mlp<T, I, 8, false, true, shared_fields / 8>(
+                            op.pos_value(y), op.neg_value(y - COARSE), path, {}, op.dy(y),
+                            acc, I(1), d, dwi, threads);
+                        g2[0] = saved_dp<true, T>(d, c.gain(0, true));
+                        column_adjoint<false, COMPACT>(
+                            c, y, y ? load_saved(pos) : float4{}, c.source(y),
+                            saved_dp<false, T>(d, c.gain(y, false)).unpack(),
+                            a, g, adj_a, adj_b, da, dg, gs);
+                        if constexpr (COARSE) {
+                            column_adjoint<false, COMPACT>(
+                                c, 0, {}, c.source(0), {}, a, g, adj_a, adj_b, da, dg, gs);
+                        }
+                    }
+                } else if constexpr (DIRECTION != 2) {
+                    #pragma unroll 1
+                    for (int y = H - 1; y >= 0; --y) {
+                        const auto inject = !COARSE || (y & 1)
+                            ? load_saved(dp + c.cell(y / (1 + COARSE))) : float4{};
+                        column_adjoint<false, COMPACT>(
+                            c, y, y ? load_saved(pos + I(y - 1) * stride) : float4{}, c.source(y),
+                            inject, a, g, adj_a, adj_b, da, dg, gs);
+                    }
+                }
+                if constexpr (DIRECTION != 1) {
+                    adj_a = adj_b = {};
+                    #pragma unroll 1
+                    for (int y = 0; y < H; ++y) {
+                        float4 inject{};
+                        if (!COARSE || !(y & 1)) {
+                            const int yo = y / (1 + COARSE);
+                            if constexpr (FUSED) inject = g2[yo * threads].unpack();
+                            else inject = load_saved(dp + dp_plane + c.cell(yo));
+                        }
+                        column_adjoint<true, COMPACT>(
+                            c, y, y + 1 < H ? load_saved(neg + I(y + 1) * stride) : float4{},
+                            c.source(y),
+                            inject, ar, gg, adj_a, adj_b, da, dg, gs);
+                        if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (BACKWARD) {
+        if constexpr (FUSED) {
+            if (m < M) {
+                auto* row = partial + worker * fields * M + m;
+                row[0] = da.r; row[M] = da.i; row[2 * I(M)] = dg.r; row[3 * I(M)] = dg.i;
+                #pragma unroll
+                for (int j = 0; j < 90; ++j) {
+                    row[I(4 + j) * M] = j < shared_fields
+                        ? dwi[j * threads] : acc[j - shared_fields];
+                }
+            }
+        } else {
+            auto* row = partial + I(group) * fields * M + m;
+            write_vscan_partial<WARPS, fields, I>(weights, row, nullptr, da, dg, m, M);
+        }
+    }
+}
+
+template<class T, class I, bool COARSE, int WARPS, bool BACKWARD,
+         bool RI, bool II, bool PRECISE, int CELLS>
+__device__ __forceinline__ void saved_project(
+    const SavedQuad<T>* trajectory, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo, const void* bo,
+    const T* gr, const T* gi, T* real, T* imag, SavedQuad<T>* dp, float* partial,
+    int B, int H, int W, int M, int types, float eps
+) {
+    extern __shared__ float4 shared[];
+    auto* weights = reinterpret_cast<float*>(shared);
+    const int ow = W / (1 + COARSE), oh = H / (1 + COARSE);
+    const I cells = I(B) * oh * ow, plane = I(B) * H * ow * M;
+    const int tiles = (M - 1) / 32 + 1, lane = threadIdx.x % 32;
+    const int mode0 = blockIdx.x % tiles * 32, m = mode0 + lane;
+    const int group = blockIdx.x / tiles, groups = gridDim.x / tiles;
+    const I worker = I(group) * WARPS + threadIdx.x / 32;
+    load_project_weights<T, 8, WARPS * 32, BACKWARD>(weights, wi, bi, wo, bo, types, mode0, M, 8);
+    __syncthreads();
+    constexpr int threads = 32 * WARPS, shared_fields = BACKWARD && CELLS == 2 ? 64 : 0;
+    auto* dwi = weights + 88 * 32 + threadIdx.x;
+    #pragma unroll
+    for (int j = 0; j < shared_fields; ++j) dwi[j * threads] = 0;
+    const ProjectWeights path{weights, 8, lane};
+    float acc[BACKWARD ? 90 - shared_fields : 1]{};
+    if (m < M) {
+        float2 bias{};
+        if constexpr (!BACKWARD) bias = make_float2(path.final_bias(0), path.final_bias(1));
+        const auto cell_path = [&](I cell) {
+            const I b = cell / (I(oh) * ow);
+            const int x = cell % ow;
+            const auto c = saved_column<T, I, COARSE>(nullptr, vx, vy, b, x, m, B, H, W, M, eps);
+            const auto* pos = trajectory + ((b * H) * ow + x) * M + m;
+            return SavedPath<T, I, COARSE, RI, II>{c, pos, pos + plane, gr, gi, real, imag};
+        };
+        const auto row = [&](I cell) { return int(cell / ow % oh) * (1 + COARSE) + COARSE; };
+        const auto inject = [&](
+            I cell, int y, const SavedPath<T, I, COARSE, RI, II>& op, const float* d
+        ) {
+            const I offset = cell * M + m;
+            store_saved(dp + offset, saved_dp<false, T>(d, op.column.gain(y, false)));
+            store_saved(dp + cells * M + offset,
+                        saved_dp<true, T>(d, op.column.gain(y - COARSE, true)));
+        };
+        for (I first = worker * CELLS; first < cells; first += I(groups) * WARPS * CELLS) {
+            const int y = row(first);
+            const auto op = cell_path(first);
+            if constexpr (CELLS == 2) {
+                if (first + 1 < cells) {
+                    const int y2 = row(first + 1);
+                    const auto op2 = cell_path(first + 1);
+                    float p[2][8];
+                    saved_features(op.pos_value(y), op.neg_value(y - COARSE), p[0]);
+                    saved_features(op2.pos_value(y2), op2.neg_value(y2 - COARSE), p[1]);
+                    if constexpr (BACKWARD) {
+                        float d[2][8]{};
+                        const float2 dy[2] = {op.dy(y), op2.dy(y2)};
+                        saved_adjoint_pair<T, shared_fields>(p, dy, path, acc, dwi, threads, d);
+                        inject(first, y, op, d[0]);
+                        inject(first + 1, y2, op2, d[1]);
+                    } else {
+                        float2 out[2];
+                        path_mlp_batch<T, I, 8, PRECISE, 2>(p, path, bias, out);
+                        op.emit(y, out[0]);
+                        op2.emit(y2, out[1]);
+                    }
+                    continue;
+                }
+            }
+            float d[8]{};
+            float2 dy{};
+            if constexpr (BACKWARD) dy = op.dy(y);
+            const auto out = path_mlp<T, I, 8, PRECISE, BACKWARD, shared_fields / 8>(
+                op.pos_value(y), op.neg_value(y - COARSE), path, bias, dy,
+                acc, I(1), d, dwi, threads);
+            if constexpr (BACKWARD) inject(first, y, op, d);
+            else op.emit(y, out);
+        }
+    }
+    if constexpr (BACKWARD) {
+        // Give each warp one row. A separate reduction consumes the coalesced rows.
+        if (m < M) {
+            auto* row = partial + worker * 90 * M + m;
+            #pragma unroll
+            for (int j = 0; j < 90; ++j) {
+                row[I(j) * M] = j < shared_fields ? dwi[j * threads] : acc[j - shared_fields];
+            }
+        }
+    }
+}
+"""
+
 # NVRTC compilation and driver launch
 
-def _kernel_name(key: Kernel) -> str:
+def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
+    if key.saved_scan:
+        if key.saved_fused:
+            return "vscan_backward_saved_fused" if key.backward else "vscan_forward_saved_fused"
+        suffix = ("", "_pos", "_neg")[key.saved_direction]
+        name = "pure_vscan_backward_saved" if key.backward else "pure_vscan_forward_saved"
+        return name + suffix
+    if key.saved_projection_cells:
+        return "project_path_v2_backward" if key.backward else "project_path_v2_forward"
     if key.projection:
         return "path_mlp_backward" if key.backward else "path_mlp_forward"
     if key.projection_reduction:
@@ -1506,6 +1931,8 @@ def _kernel_name(key: Kernel) -> str:
 
 def _kernel_source(key: Kernel) -> str:  # noqa: C901
     """Instantiate a single entry point without modifying the device source."""
+    if key.saved_scan or key.saved_projection_cells:
+        return _wave31a_kernel_source(key)
     if key.reduction:
         return _CUDA_SOURCE + f"""
 extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
@@ -1626,6 +2053,54 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             "// HSCAN_FORWARD_UNROLL", f"#pragma unroll {key.horizontal_forward_unroll}",
         )
     return source + wrapper
+
+
+def _wave31a_kernel_source(key: Kernel) -> str:
+    io = _DTYPES[key.dtype]
+    index = "unsigned int" if key.index32 else "long long"
+    coarse = str(key.coarse).lower()
+    backward = str(key.backward).lower()
+    real_interleaved = str(key.real_interleaved).lower()
+    imag_interleaved = str(key.imag_interleaved).lower()
+    precise = str(key.precise).lower()
+    entry = (
+        f'extern "C" __global__ __launch_bounds__({key.warps * 32}) '
+        f'void {_kernel_name(key)}'
+    )
+    source = _CUDA_SOURCE + _WAVE31A_SOURCE
+    if key.saved_scan:
+        if key.saved_shared_fields:
+            source = f"#define WAVE31A_EXTRA_SHARED_FIELDS {key.saved_shared_fields}\n" + source
+        fused = str(key.saved_fused).lower()
+        compact = str(key.compact).lower()
+        return source + f"""
+{entry}(
+    const float* dr, const float* di, const float* gr_decay, const float* gi_decay,
+    const {io}* states, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo, const void* bo,
+    SavedQuad<{io}>* trajectory, const {io}* gr, const {io}* gi, {io}* real, {io}* imag,
+    SavedQuad<{io}>* dp, {io}* gs, float* partial, int B, int H, int W, int M, int types, float eps
+) {{
+    saved_scan<{io}, {index}, {coarse}, {key.warps}, {backward}, {fused}, {compact},
+               {real_interleaved}, {imag_interleaved}, {precise}, {key.saved_direction}>(
+        dr, di, gr_decay, gi_decay, states, vx, vy, wi, bi, wo, bo, trajectory,
+        gr, gi, real, imag, dp, gs, partial, B, H, W, M, types, eps);
+}}
+"""
+    return source + f"""
+{entry}(
+    const SavedQuad<{io}>* trajectory, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo, const void* bo,
+    const {io}* gr, const {io}* gi, {io}* real, {io}* imag,
+    SavedQuad<{io}>* dp, float* partial, int B, int H, int W, int M, int types, float eps
+) {{
+    saved_project<{io}, {index}, {coarse}, {key.warps}, {backward},
+                  {real_interleaved}, {imag_interleaved}, {precise},
+                  {key.saved_projection_cells}>(
+        trajectory, vx, vy, wi, bi, wo, bo, gr, gi, real, imag,
+        dp, partial, B, H, W, M, types, eps);
+}}
+"""
 
 
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
@@ -1751,6 +2226,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
             key.batch_path or key.register_path or key.horizontal_unroll8
             or key.horizontal_forward_unroll or key.backward_batch2
             or key.backward_readonly or key.uncached_trajectory or key.global_trajectory
+            or key.saved_scan or key.saved_projection_cells
             or (key.vertical and key.backward and key.chunk == 14 and key.cache_source)
         ):
             local = ct.c_int()
@@ -3082,6 +3558,8 @@ def _total_vram(device: torch.device) -> int:
 
 
 def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
+    if _wave31a_preset(states, coarse):
+        return True
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
     if not states.is_cuda or policy not in {"saved", "test_saved"}:
         return False
@@ -3423,6 +3901,12 @@ def vertical_backward(
     compact: bool = False,
     saved_features: Tensor | None = None,
 ) -> list[Tensor]:
+    if saved_features is not None and saved_features.shape[0] in _WAVE31A_PRESETS.values():
+        with torch.autocast(device_type="cuda", enabled=False):
+            return _wave31a_backward(
+                pole, states, auxiliary, path, (grad_real, grad_imag),
+                coarse, epsilon, compact, saved_features,
+            )
     out = _vscan(
         pole, states, auxiliary, path, coarse, epsilon, False, (grad_real, grad_imag),  # noqa: FBT003
         compact=compact, saved_features=saved_features,
@@ -3453,8 +3937,335 @@ def _fake_vbackward(
     ]
 
 
+_WAVE31A_FUSED, _WAVE31A_DECOUPLED, _WAVE31A_DECOUPLED_V2 = 1, 2, 4
+_WAVE31A_PRESETS = {
+    "saved_fused": _WAVE31A_FUSED,
+    "saved_decoupled": _WAVE31A_DECOUPLED,
+    "saved_decoupled_v2": _WAVE31A_DECOUPLED_V2,
+}
+_WAVE31A_PARTIAL_BYTES = 256 * 1024**2
+@torch.compiler.assume_constant_result
+def _wave31a_memory(device: torch.device) -> tuple[int, int, int]:
+    total = _total_vram(device)
+    free, _ = torch.cuda.mem_get_info(device)
+    reclaimable = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    _, smem, _ = device_limits(device.index or 0)
+    return total, free + reclaimable, smem
+
+
+def _wave31a_preset(states: Tensor, coarse: bool) -> int:
+    policy = os.environ.get("LNET_SCAN_W31A", "off")
+    if (
+        (policy != "auto" and policy not in _WAVE31A_PRESETS)
+        or not states.is_cuda or states.ndim != 5 or states.dtype not in _DTYPES
+    ):
+        return 0
+    total, available, smem_limit = _wave31a_memory(states.device)
+    _, b, h, w, m = states.shape
+    step = 1 + coarse
+    itemsize = states.element_size()
+    if policy == "saved_fused" and _wave31a_fused_smem(1, h // step, itemsize) > smem_limit:
+        return 0
+    saved_bytes = 8 * b * h * (w // step) * m * itemsize
+    adjoint_bytes = saved_bytes // step if policy != "saved_fused" else 0
+    # Keep headroom for the remaining retained scans, activations and allocator fragmentation.
+    if saved_bytes + adjoint_bytes + _WAVE31A_PARTIAL_BYTES > min(total // 2, available // 3):
+        return 0
+    return _WAVE31A_PRESETS["saved_decoupled_v2" if policy == "auto" else policy]
+
+
+def _wave31a_for_inputs(states: Tensor, coarse: bool, path: list[Tensor]) -> int:
+    preset = _wave31a_preset(states, coarse)
+    return preset if preset and path and path[0].ndim == 3 and path[0].shape[1] == 8 else 0
+
+
+def _wave31a_outputs(
+    states: Tensor, coarse: bool, preset: int, planar: bool, separate: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    _, b, h, w, m = states.shape
+    step = 1 + coarse
+    shape = (b, h // step, w // step, m)
+    primary = shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))
+    # The packed pipeline transports its saved tensor through a rank-three slot.
+    # The first dimension records the selected preset and the memory is two
+    # contiguous arrays of row-major [B, H, W_used, M] packed Quad values.
+    return (
+        states.new_empty(primary),
+        states.new_empty(shape if separate else (0,)),
+        states.new_empty((preset, b * h * (w // step), 8 * m // preset)),
+    )
+
+
+def _wave31a_grid(
+    key: Kernel, sms: int, resident: int, work: int, modes: int, fields: int,
+) -> tuple[int, int]:
+    tiles = _ceil(modes, 32)
+    groups = min(_ceil(work, key.warps * max(1, key.saved_projection_cells)),
+                 max(1, 4 * sms * resident // tiles))
+    rows_per_group = key.warps if key.saved_projection_cells or key.saved_fused else 1
+    if fields:
+        bytes_per_group = rows_per_group * fields * modes * 4
+        groups = min(groups, max(1, _WAVE31A_PARTIAL_BYTES // bytes_per_group))
+    return groups * tiles, groups * rows_per_group
+
+
+def _wave31a_scan_key(
+    states: Tensor, coarse: bool, fused: bool, *, backward: bool, compact: bool,
+    precise: bool, interleaved: tuple[bool, bool],
+) -> Kernel:
+    return Kernel(
+        states.dtype, 0, backward, vertical=True,
+        coarse=coarse, compact=compact, precise=fused and precise and states.dtype == torch.float32,
+        real_interleaved=fused and interleaved[0], imag_interleaved=fused and interleaved[1],
+        index32=states.numel() < 2**32, saved_scan=True, saved_fused=fused,
+    )
+
+
+def _wave31a_fused_smem(
+    warps: int, output_height: int, itemsize: int, shared_fields: int = 32,
+) -> int:
+    return (88 + shared_fields * warps) * 32 * 4 + output_height * 32 * warps * 4 * itemsize
+
+
+def _wave31a_smem(key: Kernel, output_height: int, itemsize: int) -> int:
+    if key.saved_projection_cells or (key.saved_fused and not key.backward):
+        weight_fields = 88 if key.backward else 90
+        shared_fields = 64 if key.backward and key.saved_projection_cells == 2 else 0
+        return (weight_fields + shared_fields * key.warps) * 32 * 4
+    if key.saved_fused:
+        return _wave31a_fused_smem(
+            key.warps, output_height, itemsize, key.saved_shared_fields or 32,
+        )
+    return 4 * 32 * key.warps * 4 if key.backward else 0
+
+
+@lru_cache(maxsize=512)
+def _wave31a_plan(
+    base: Kernel, device: int, work: int, modes: int, output_height: int,
+    itemsize: int, fields: int,
+) -> tuple[Kernel, int, int, int]:
+    sms, limit, _ = device_limits(device)
+    best = None
+    for key in _wave31a_candidates(base):
+        smem = _wave31a_smem(key, output_height, itemsize)
+        if smem > limit:
+            continue
+        resident = _resident(device, key, smem)
+        if not resident:
+            continue
+        grid, rows = _wave31a_grid(key, sms, resident, work, modes, fields)
+        score = min(sms * resident, grid) * key.warps
+        if best is None or score > best[0]:
+            best = score, key, grid, rows, smem
+    if best is None:
+        raise RuntimeError(f"Wave 31A kernel cannot launch: {_kernel_name(base)}")
+    return best[1:]
+
+
+def _wave31a_candidates(base: Kernel) -> tuple[Kernel, ...]:
+    # Keep more dW1 values in shared memory when register pressure causes Local spills.
+    shared = (0, 64) if base.saved_fused and base.backward else (0,)
+    return tuple(
+        replace(base, warps=warps, saved_shared_fields=fields)
+        for fields in shared for warps in (4, 2, 8, 1)
+    )
+
+
+def _wave31a_launch_scan(
+    key: Kernel, states: Tensor, pole: tuple[Tensor, ...], auxiliary: tuple[Tensor, ...],
+    path: tuple[Tensor, ...], trajectory: Tensor, epsilon: float,
+    output: tuple[Tensor | None, Tensor | None], grad: tuple[Tensor | None, Tensor | None],
+    dp: Tensor | None, gs: Tensor | None,
+) -> Tensor | None:
+    _, b, h, w, m = states.shape
+    step = 1 + key.coarse
+    fields = (94 if key.saved_fused else 4) if key.backward else 0
+    key, grid, rows, smem = _wave31a_plan(
+        key, states.device.index or 0, b * (w // step), m, h // step,
+        states.element_size(), fields,
+    )
+    partial = states.new_empty((rows, fields, m), dtype=torch.float32) if fields else None
+    weights = path if key.saved_fused else (None,) * 4
+    _launch_kernel(
+        states, key, grid, smem,
+        (
+            *map(_ptr, (
+                *pole, states, *auxiliary, *weights, trajectory, *grad, *output, dp, gs, partial,
+            )),
+            *map(ct.c_int, (b, h, w, m, _scalar_types(path))),
+            ct.c_float(epsilon),
+        ),
+    )
+    return partial
+
+
+def _wave31a_project_key(
+    states: Tensor, coarse: bool, preset: int, *, backward: bool, precise: bool,
+    interleaved: tuple[bool, bool],
+) -> Kernel:
+    return Kernel(
+        states.dtype, 0, backward, coarse=coarse, projection=True,
+        precise=precise and states.dtype == torch.float32,
+        real_interleaved=interleaved[0], imag_interleaved=interleaved[1],
+        index32=states.numel() < 2**32,
+        saved_projection_cells=2 if preset == _WAVE31A_DECOUPLED_V2 else 1,
+    )
+
+
+def _wave31a_launch_project(
+    key: Kernel, states: Tensor, auxiliary: tuple[Tensor, ...], path: tuple[Tensor, ...],
+    trajectory: Tensor, epsilon: float,
+    output: tuple[Tensor | None, Tensor | None], grad: tuple[Tensor | None, Tensor | None],
+) -> tuple[Tensor | None, Tensor | None]:
+    _, b, h, w, m = states.shape
+    step = 1 + key.coarse
+    cells = b * (h // step) * (w // step)
+    fields = 90 if key.backward else 0
+    key, grid, rows, smem = _wave31a_plan(
+        key, states.device.index or 0, cells, m, h // step, states.element_size(), fields,
+    )
+    partial = states.new_empty((rows, fields, m), dtype=torch.float32) if fields else None
+    dp = states.new_empty((2, b, h // step, w // step, m, 4)) if fields else None
+    _launch_kernel(
+        states, key, grid, smem,
+        (
+            *map(_ptr, (trajectory, *auxiliary, *path, *grad, *output, dp, partial)),
+            *map(ct.c_int, (b, h, w, m, _scalar_types(path))),
+            ct.c_float(epsilon),
+        ),
+    )
+    return dp, partial
+
+
+def _wave31a_validate(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],
+    coarse: bool, epsilon: float,
+) -> None:
+    if (
+        not states.is_cuda or states.dtype not in _DTYPES
+        or not _shape_supported(tuple(states.shape[1:]))
+        or not _pole_ok(pole, states)
+        or not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
+        or path[0].shape[1] != _REGISTER_HIDDEN or not 0 < epsilon < float("inf")
+    ):
+        raise ValueError("Invalid Wave 31A vertical inputs")
+
+
+def _wave31a_parameters(
+    pole: list[Tensor], auxiliary: list[Tensor], path: list[Tensor],
+) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...], tuple[Tensor, ...]]:
+    return (
+        tuple(p.float().contiguous() for p in pole),
+        tuple(p.float().contiguous() for p in auxiliary),
+        tuple(p.contiguous() for p in path),
+    )
+
+
+@torch.library.custom_op("lnet::general_vscan_forward_wave31a", mutates_args=())
+def _vertical_forward_wave31a(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],
+    coarse: bool, epsilon: float, planar: bool, precise: bool, separate: bool, preset: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    _wave31a_validate(pole, states, auxiliary, path, coarse, epsilon)
+    output = _wave31a_outputs(states, coarse, preset, planar, separate)
+    primary, secondary, trajectory = output
+    real, imag = (primary, secondary) if separate else (
+        primary.unbind(0) if planar else primary.split(states.shape[-1], dim=-1)
+    )
+    interleaved = (not separate and not planar,) * 2
+    fused = preset == _WAVE31A_FUSED
+    empty = (None, None)
+    with torch.autocast(device_type="cuda", enabled=False):
+        states = states.contiguous()
+        coefficients, gains, weights = _wave31a_parameters(pole, auxiliary, path)
+        key = _wave31a_scan_key(
+            states, coarse, fused, backward=False, compact=False,
+            precise=precise, interleaved=interleaved,
+        )
+        _wave31a_launch_scan(
+            key, states, coefficients, gains, weights, trajectory, epsilon,
+            (real, imag) if fused else empty, empty, None, None,
+        )
+        if not fused:
+            key = _wave31a_project_key(
+                states, coarse, preset, backward=False, precise=precise, interleaved=interleaved,
+            )
+            _wave31a_launch_project(
+                key, states, gains, weights, trajectory, epsilon, (real, imag), empty,
+            )
+    return output
+
+
+@_vertical_forward_wave31a.register_fake
+def _fake_vertical_forward_wave31a(
+    pole: list[Tensor],  # noqa: ARG001
+    states: Tensor,
+    auxiliary: list[Tensor],  # noqa: ARG001
+    path: list[Tensor],  # noqa: ARG001
+    coarse: bool,
+    epsilon: float,  # noqa: ARG001
+    planar: bool,
+    precise: bool,  # noqa: ARG001
+    separate: bool,
+    preset: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    return _wave31a_outputs(states, coarse, preset, planar, separate)
+
+
+def _wave31a_backward(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],
+    grad: tuple[Tensor, Tensor], coarse: bool, epsilon: float, compact: bool, trajectory: Tensor,
+) -> list[Tensor]:
+    _wave31a_validate(pole, states, auxiliary, path, coarse, epsilon)
+    preset = trajectory.shape[0]
+    _, b, h, w, m = states.shape
+    step = 1 + coarse
+    expected = (preset, b * h * (w // step), 8 * m // preset)
+    if (
+        preset not in _WAVE31A_PRESETS.values() or trajectory.shape != expected
+        or not trajectory.is_contiguous() or trajectory.device != states.device
+        or trajectory.dtype != states.dtype or (compact and not coarse)
+    ):
+        raise ValueError("Invalid saved Wave 31A trajectory")
+    grad = _vertical_adjoints(grad, states, (b, h // step, w // step, m))
+    interleaved = tuple(not plane.is_contiguous() for plane in grad)
+    empty = (None, None)
+    fused = preset == _WAVE31A_FUSED
+    gs = states.new_empty((4, b, h, w // step if compact else w, m))
+    states = states.contiguous()
+    coefficients, gains, weights = _wave31a_parameters(pole, auxiliary, path)
+    dp = path_partials = None
+    if not fused:
+        project = _wave31a_project_key(
+            states, coarse, preset, backward=True, precise=False, interleaved=interleaved,
+        )
+        dp, path_partials = _wave31a_launch_project(
+            project, states, gains, weights, trajectory, epsilon, empty, grad,
+        )
+    key = _wave31a_scan_key(
+        states, coarse, fused, backward=True, compact=compact,
+        precise=False, interleaved=interleaved,
+    )
+    partial = _wave31a_launch_scan(
+        key, states, coefficients, gains, weights, trajectory, epsilon, empty,
+        grad if fused else empty, dp, gs,
+    )
+    if partial is None:
+        raise RuntimeError("Missing Wave 31A scan partials")
+    if fused:
+        gradients = _reduce_partials(partial, [*pole, *path], _REGISTER_HIDDEN)
+        return [*gradients[:4], gs, *gradients[4:]]
+    if path_partials is None:
+        raise RuntimeError("Missing Wave 31A path partials")
+    return [
+        *_reduce_partials(partial, pole), gs,
+        *_reduce_partials(path_partials, path, _REGISTER_HIDDEN, projection=True),
+    ]
+
+
+
 @torch.library.custom_op("lnet::general_vscan_forward_saved", mutates_args=())
-def _vertical_forward_saved(
+def _vertical_forward_features(
     pole: list[Tensor],
     states: Tensor,
     auxiliary: list[Tensor],
@@ -3488,7 +4299,7 @@ def _vertical_forward_saved(
     return output, secondary, features
 
 
-@_vertical_forward_saved.register_fake
+@_vertical_forward_features.register_fake
 def _fake_vertical_forward_saved(
     pole: list[Tensor],  # noqa: ARG001
     states: Tensor,
@@ -3565,7 +4376,7 @@ def _differentiate_vertical(ctx: _AutogradContext, grad_real: Tensor, grad_imag:
 def _save_vertical_features(
     ctx: _AutogradContext, inputs: tuple, output: tuple[Tensor, Tensor, Tensor],
 ) -> None:
-    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _, _, ctx.separate = inputs
+    pole, states, auxiliary, path, ctx.coarse, ctx.epsilon, _, _, ctx.separate, *_ = inputs
     ctx.mark_non_differentiable(*(output[2:] if ctx.separate else output[1:]))
     ctx.save_for_backward(*pole, states, *auxiliary, *path, output[2])
 
@@ -3582,12 +4393,30 @@ def _differentiate_vertical_features(
         [dr, di, gr, gi], states, [vx, vy], path, real, imag, ctx.coarse, ctx.epsilon,
         saved_features=features,
     )
-    return gradients[:4], gradients[4], [None, None], gradients[5:], None, None, None, None, None
+    result = gradients[:4], gradients[4], [None, None], gradients[5:], *(None,) * 6
+    return result[:len(ctx.needs_input_grad)]
 
 
-_vertical_forward_saved.register_autograd(
+_vertical_forward_features.register_autograd(
     _differentiate_vertical_features, setup_context=_save_vertical_features,
 )
+_vertical_forward_wave31a.register_autograd(
+    _differentiate_vertical_features, setup_context=_save_vertical_features,
+)
+
+
+def _vertical_forward_saved(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],
+    coarse: bool, epsilon: float, planar: bool, precise: bool, separate: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    preset = _wave31a_for_inputs(states, coarse, path)
+    if preset:
+        return _vertical_forward_wave31a(
+            pole, states, auxiliary, path, coarse, epsilon, planar, precise, separate, preset,
+        )
+    return _vertical_forward_features(
+        pole, states, auxiliary, path, coarse, epsilon, planar, precise, separate,
+    )
 
 
 def vertical_forward(
@@ -3600,6 +4429,13 @@ def vertical_forward(
     precise: bool = True,
     mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
+    preset = _wave31a_for_inputs(states, coarse, path) if mode == "cuda" else 0
+    if preset:
+        real, imag, _ = _vertical_forward_wave31a(
+            pole, states, auxiliary, path, coarse, epsilon,
+            planar=False, precise=precise, separate=True, preset=preset,
+        )
+        return real, imag
     if mode == "cuda" and _should_save_vscan(states, coarse):
         real, imag, _ = _vertical_forward_saved(
             pole, states, auxiliary, path, coarse, epsilon,
