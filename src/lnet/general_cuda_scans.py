@@ -125,6 +125,10 @@ class Kernel:
     imag_transposed: bool = False
     vector_weights: bool = False
     batch_path: bool = False
+    register_path: bool = False
+    register_batch2: bool = False
+    horizontal_unroll8: bool = False
+    horizontal_forward_unroll: int = 0
 
 
 class Launch(NamedTuple):
@@ -299,7 +303,8 @@ __device__ void pole_grad(Complex adj, Complex prev, Complex source, Complex& da
 }
 
 template<class T, class I, int WARPS, bool BACKWARD, bool CACHE, bool COMPACT,
-         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool REAL_TRANSPOSED, bool IMAG_TRANSPOSED>
+         bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool REAL_TRANSPOSED, bool IMAG_TRANSPOSED,
+         int BACKWARD_UNROLL = 4>
 __device__ __forceinline__ void horizontal(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -335,6 +340,7 @@ __device__ __forceinline__ void horizontal(
             if constexpr (!BACKWARD) {
                 auto* cache = reinterpret_cast<Pair<T>*>(shared) + threadIdx.x;
                 Complex pos{}, neg{};
+                // HSCAN_FORWARD_UNROLL
                 for (int x = 0; x < W; ++x) {
                     const auto input = Pair<T>::from(sr[base_r + I(x) * step_r],
                                                      si[base_i + I(x) * step_i]);
@@ -343,6 +349,7 @@ __device__ __forceinline__ void horizontal(
                     pos = a * pos + g * s;
                     store_complex(out, base + I(x) * M, plane, pos);
                 }
+                // HSCAN_FORWARD_UNROLL
                 for (int x = W - 1; x >= 0; --x) {
                     const auto s = CACHE ? cache[I(x) * threads].unpack() : source(x);
                     neg = a.conj() * neg + g.conj() * s;
@@ -357,7 +364,7 @@ __device__ __forceinline__ void horizontal(
                 Complex right{}, left{}, neg{};
                 const I grad_plane = COMPACT ? plane / 2 : plane;
                 const I grad_base = COMPACT ? line * (W / 2) * M + m : base;
-                #pragma unroll 4
+                #pragma unroll BACKWARD_UNROLL
                 for (int x = 0; x < W; ++x) {
                     const I i = base + I(x) * M;
                     const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
@@ -369,7 +376,7 @@ __device__ __forceinline__ void horizontal(
                         buf[I(x / (1 + COMPACT)) * stride] = Pair<float>::pack(right);
                     }
                 }
-                #pragma unroll 4
+                #pragma unroll BACKWARD_UNROLL
                 for (int x = W - 1; x >= 0; --x) {
                     const I i = base + I(x) * M;
                     const I gi = COMPACT ? grad_base + I(x / 2) * M : i;
@@ -389,7 +396,17 @@ __device__ __forceinline__ void horizontal(
                             // This sweep already has the negative recurrence's input.
                             // Recreate its stored values without loading two more planes.
                             const auto stored = Pair<T>::pack(neg).unpack();
-                            neg = a.conj() * neg + g.conj() * s;
+                            if constexpr (BACKWARD_UNROLL == 8 && WARPS == 3 && !COMPACT) {
+                                const auto ar = a.conj(), gr = g.conj();
+                                neg = {
+                                    __fmaf_rn(ar.r, neg.r, -__fmul_rn(ar.i, neg.i)) +
+                                        __fmaf_rn(gr.r, s.r, -__fmul_rn(gr.i, s.i)),
+                                    __fmaf_rn(ar.i, neg.r, __fmul_rn(ar.r, neg.i)) +
+                                        __fmaf_rn(gr.i, s.r, __fmul_rn(gr.r, s.i)),
+                                };
+                            } else {
+                                neg = a.conj() * neg + g.conj() * s;
+                            }
                             return stored;
                         }
                     }();
@@ -872,10 +889,70 @@ __device__ __forceinline__ void write_vscan_partial(
     }
 }
 
+template<class T, bool VECTOR>
+struct RegisterPathWeights {
+    static constexpr bool vector_weights = VECTOR;
+    int size = 8;
+    Pair<T> pairs[44];
+
+    __device__ Complex input_pair(int j) const { return pairs[j].unpack(); }
+    __device__ float4 input_group(int j) const {
+        const auto a = input_pair(2 * j), b = input_pair(2 * j + 1);
+        return make_float4(a.r, a.i, b.r, b.i);
+    }
+    __device__ float bias(int j) const {
+        const auto p = pairs[32 + j / 2].unpack();
+        return j % 2 ? p.i : p.r;
+    }
+    __device__ float output(int j) const {
+        const auto p = pairs[36 + j / 2].unpack();
+        return j % 2 ? p.i : p.r;
+    }
+};
+
+template<class T, class I, bool VECTOR>
+__device__ __forceinline__ auto load_register_path_weights(
+    const void* wi, const void* bi, const void* wo, int types, int m, bool active
+) {
+    const PathWeights<T, I, false> source{wi, bi, wo, types, m, 8};
+    RegisterPathWeights<T, VECTOR> weights;
+    if (active) {
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) weights.pairs[j] = Pair<T>::pack(source.input_pair(j));
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            weights.pairs[32 + j] = Pair<T>::pack({source.bias(2 * j), source.bias(2 * j + 1)});
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            weights.pairs[36 + j] = Pair<T>::pack({source.output(2 * j), source.output(2 * j + 1)});
+    }
+    return weights;
+}
+
+// Lock the real-product contraction used by the Wave 21C vector path.
+template<bool REGISTER_VECTOR>
+__device__ __forceinline__ float4 advance_forward(
+    float4 state, float4 source, Complex a, Complex g
+) {
+    if constexpr (REGISTER_VECTOR) {
+        return make_float4(
+            __fmaf_rn(a.r, state.x, -__fmul_rn(a.i, state.y)) +
+                __fmaf_rn(g.r, source.x, -__fmul_rn(g.i, source.y)),
+            __fmaf_rn(a.r, state.y, __fmul_rn(a.i, state.x)) +
+                __fmaf_rn(g.i, source.x, __fmul_rn(g.r, source.y)),
+            __fmaf_rn(a.r, state.z, -__fmul_rn(a.i, state.w)) +
+                __fmaf_rn(g.r, source.z, -__fmul_rn(g.i, source.w)),
+            __fmaf_rn(a.r, state.w, __fmul_rn(a.i, state.z)) +
+                __fmaf_rn(g.i, source.z, __fmul_rn(g.r, source.w)));
+    } else {
+        return advance(state, source, a, g);
+    }
+}
+
 template<class T, class I, bool COARSE, int WARPS, int CHUNK, int HIDDEN, bool BACKWARD,
          bool CACHE_WEIGHT, bool GLOBAL_CKPT, bool CACHE_LINE, bool SHARED_ACC, bool PRECISE,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE, bool PURE,
-         bool VECTOR_WEIGHTS, bool BATCH_PATH>
+         bool VECTOR_WEIGHTS, bool BATCH_PATH, bool REGISTER_PATH = false, int BATCH_WIDTH = 4>
 __device__ __forceinline__ void vertical(
     const float* __restrict__ dr, const float* __restrict__ di,
     const float* __restrict__ decay_gr, const float* __restrict__ decay_gi,
@@ -907,17 +984,20 @@ __device__ __forceinline__ void vertical(
     const I target_plane = PURE && BACKWARD ? I(grad_plane) : plane;
     auto* weights_shared = reinterpret_cast<T*>(shared);
     const I weight_fields = 11 * I(size);
-    if constexpr (VECTOR_WEIGHTS) {
+    if constexpr (VECTOR_WEIGHTS && !REGISTER_PATH) {
         static_assert(CACHE_WEIGHT);
         load_project_weights<T, HIDDEN, threads, true>(
             reinterpret_cast<float*>(shared), wi, bi, wo, nullptr, types, mode0, M, size);
         __syncthreads();
-    } else if constexpr (CACHE_WEIGHT) {
+    } else if constexpr (CACHE_WEIGHT && !REGISTER_PATH) {
         load_path_weights<T, I>(weights_shared, wi, bi, wo, types, mode0, M, size, threads);
         __syncthreads();
     }
     const auto path = [&] {
-        if constexpr (VECTOR_WEIGHTS) {
+        if constexpr (REGISTER_PATH) {
+            static_assert(!BACKWARD && !PURE && HIDDEN == 8 && sizeof(T) == 2);
+            return load_register_path_weights<T, I, VECTOR_WEIGHTS>(wi, bi, wo, types, m, active);
+        } else if constexpr (VECTOR_WEIGHTS) {
             return ProjectWeights{reinterpret_cast<const float*>(shared), size, lane};
         } else {
             return path_weights<T, I, CACHE_WEIGHT>(
@@ -925,7 +1005,8 @@ __device__ __forceinline__ void vertical(
         }
     }();
     constexpr int weight_itemsize = VECTOR_WEIGHTS ? sizeof(float) : sizeof(T);
-    auto* seg = shared + (CACHE_WEIGHT ? weight_fields * 32 * weight_itemsize / 16 : 0);
+    auto* seg = shared + (CACHE_WEIGHT && !REGISTER_PATH
+        ? weight_fields * 32 * weight_itemsize / 16 : 0);
     auto* ckpt = seg + (BACKWARD ? span * threads : 0);
     auto* seg_src = reinterpret_cast<Quad<T>*>(
         ckpt + (BACKWARD && !GLOBAL_CKPT ? I(chunks - 1) * threads : 0));
@@ -980,7 +1061,8 @@ __device__ __forceinline__ void vertical(
             } else {
                 float4 state{};
                 for (int y = 0; y < H; ++y) {
-                    state = advance(state, c.source(y), a, g);
+                    state = advance_forward<REGISTER_PATH && VECTOR_WEIGHTS>(
+                        state, c.source(y), a, g);
                     if (!COARSE || (y & 1)) {
                         buf[I(COARSE ? y / 2 : y) * stride] =
                             normalize_packed<T>(state, c.gain(y, false));
@@ -989,17 +1071,20 @@ __device__ __forceinline__ void vertical(
                 state = {};
                 int remaining = H;
                 // The vertical recurrence depends on the source alone. Prepare
-                // four cells before loading each row of path weights once.
+                // several cells before loading each row of path weights once.
                 if constexpr (BATCH_PATH) {
-                    for (; remaining >= 4 * (1 + COARSE); remaining -= 4 * (1 + COARSE)) {
-                        float p[4][8];
+                    for (; remaining >= BATCH_WIDTH * (1 + COARSE);
+                         remaining -= BATCH_WIDTH * (1 + COARSE)) {
+                        float p[BATCH_WIDTH][8];
                         #pragma unroll
-                        for (int t = 0; t < 4; ++t) {
+                        for (int t = 0; t < BATCH_WIDTH; ++t) {
                             const int y = remaining - 1 - t * (1 + COARSE) - COARSE;
                             if constexpr (COARSE) {
-                                state = advance(state, c.source(y + 1), a.conj(), g.conj());
+                                state = advance_forward<REGISTER_PATH && VECTOR_WEIGHTS>(
+                                    state, c.source(y + 1), a.conj(), g.conj());
                             }
-                            state = advance(state, c.source(y), a.conj(), g.conj());
+                            state = advance_forward<REGISTER_PATH && VECTOR_WEIGHTS>(
+                                state, c.source(y), a.conj(), g.conj());
                             const auto pos = buf[I(COARSE ? y / 2 : y) * stride].unpack();
                             const auto neg = normalize<T>(state, c.gain(y, true));
                             p[t][0] = pos.x;
@@ -1011,10 +1096,10 @@ __device__ __forceinline__ void vertical(
                             p[t][6] = neg.y;
                             p[t][7] = neg.w;
                         }
-                        float2 out[4];
-                        path_mlp_batch<T, I, HIDDEN, PRECISE, 4>(p, path, bias, out);
+                        float2 out[BATCH_WIDTH];
+                        path_mlp_batch<T, I, HIDDEN, PRECISE, BATCH_WIDTH>(p, path, bias, out);
                         #pragma unroll
-                        for (int t = 0; t < 4; ++t) {
+                        for (int t = 0; t < BATCH_WIDTH; ++t) {
                             const int yo = remaining / (1 + COARSE) - 1 - t;
                             const I cell = c.cell(yo);
                             outr[(cell - m) * (1 + REAL_INTERLEAVED) + m] = write<T>(out[t].x);
@@ -1023,7 +1108,8 @@ __device__ __forceinline__ void vertical(
                     }
                 }
                 for (int y = remaining - 1; y >= 0; --y) {
-                    state = advance(state, c.source(y), a.conj(), g.conj());
+                    state = advance_forward<REGISTER_PATH && VECTOR_WEIGHTS>(
+                        state, c.source(y), a.conj(), g.conj());
                     if (COARSE && (y & 1)) continue;
                     const int yo = COARSE ? y / 2 : y;
                     const I cell = c.cell(yo);
@@ -1290,12 +1376,13 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     if key.vertical:
         hidden = _REGISTER_HIDDEN if key.hidden8 else 0
         cache_source = str(key.cache_source).lower()
+        register = ", true, 2" if key.register_batch2 else ", true" if key.register_path else ""
         targs = (
             f"{io}, {index}, {coarse}, {key.warps}, {key.chunk}, {hidden}, "
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
             f"{shared_acc}, {precise}, {compact}, {layout}, {cache_source}, "
             f"{str(key.pure_vertical).lower()}, {str(key.vector_weights).lower()}, "
-            f"{str(key.batch_path).lower()}"
+            f"{str(key.batch_path).lower()}{register}"
         )
         wrapper = f"""
 {bounds}(
@@ -1320,6 +1407,7 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
 """
     else:
         transposed = f"{str(key.real_transposed).lower()}, {str(key.imag_transposed).lower()}"
+        unroll = ", 8" if key.horizontal_unroll8 else ""
         wrapper = f"""
 {bounds}(
     const float* __restrict__ dr, const float* __restrict__ di,
@@ -1331,12 +1419,17 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     int B, int H, int W, int M, int workers
 ) {{
     horizontal<{io}, {index}, {key.warps}, {backward}, {cache_line},
-               {compact}, {layout}, {transposed}>(
+               {compact}, {layout}, {transposed}{unroll}>(
         dr, di, decay_gr, decay_gi, sr, si, states, grad, out, partials, scratch,
         B, H, W, M, workers);
 }}
 """
-    return _CUDA_SOURCE + wrapper
+    source = _CUDA_SOURCE
+    if key.horizontal_forward_unroll:
+        source = source.replace(
+            "// HSCAN_FORWARD_UNROLL", f"#pragma unroll {key.horizontal_forward_unroll}",
+        )
+    return source + wrapper
 
 
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
@@ -1455,7 +1548,10 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     blocks = ct.c_int()
     with torch.cuda.device(device):
         _ensure_context(driver, device)
-        if key.batch_path:
+        if (
+            key.batch_path or key.register_path or key.horizontal_unroll8
+            or key.horizontal_forward_unroll
+        ):
             local = ct.c_int()
             _check_cu(
                 driver.cuFuncGetAttribute(ct.byref(local), 3, func),
@@ -1860,6 +1956,50 @@ def _launch_for_shape(
     return _with_vector_path_weights(device, best, modes=m, hidden=hidden, wave_limit=wave_limit)
 
 
+def _with_wave25a(launch: Launch, device: int, shape: tuple[int, int, int, int]) -> Launch:
+    plan, key, _, _ = launch
+    if (
+        os.environ.get("LNET_SCAN_W25A", "auto") not in {"auto", "on"}
+        or key.dtype.itemsize != 2 or not key.index32
+    ):
+        return launch
+    height, width, modes = shape[1:]
+    if not key.vertical:
+        if (
+            (height, width, modes) == (56, 56, 160) and key.backward and key.cache_line
+            and key.warps <= (3 if key.compact else 2)
+        ):
+            candidate = replace(key, horizontal_unroll8=True)
+            resident = _resident(device, candidate, plan.smem)
+            if resident and resident >= _resident(device, key, plan.smem):
+                return launch._replace(key=candidate)
+        return launch
+    long_dense = (
+        (height, width, modes) == (56, 56, 160) and not key.coarse and key.batch_path
+        and key.warps == 1 and not key.cache_line
+    )
+    medium_vector = (
+        (height, width, modes) == (28, 28, 160) and not key.coarse and key.vector_weights
+        and key.warps == 4 and key.cache_line and not key.batch_path
+    )
+    if (
+        key.backward or key.pure_vertical or not (key.cache_weights and key.hidden8)
+        or not (long_dense or medium_vector)
+    ):
+        return launch
+    candidate = replace(
+        key, register_path=True, cache_weights=False,
+        batch_path=key.batch_path or medium_vector, register_batch2=medium_vector,
+    )
+    weight_itemsize = 4 if key.vector_weights else key.dtype.itemsize
+    weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * weight_itemsize
+    smem = plan.smem - weight_bytes
+    # Both supported shapes need at least twelve active warps per SM.
+    if _resident(device, candidate, smem) * key.warps < 12:
+        return launch
+    return launch._replace(key=candidate, plan=plan._replace(smem=smem, cache_weights=False))
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -1902,15 +2042,15 @@ def _plan_launch(
         or not plan.cache_weights or plan.cache_line or plan.warps != 1
         or shape[1] < 8 * (1 + key.coarse)
     ):
-        return launch
+        return _with_wave25a(launch, device, shape)
     candidate = replace(key, batch_path=True)
     sms, _, max_warps = device_limits(device)
     resident = _resident(device, candidate, plan.smem)
     original = _resident(device, key, plan.smem)
     queued = _ceil(workers * _ceil(shape[-1], _WARP_SIZE), sms)
     if resident < min(max_warps // 4, original) or queued < 2 * resident:
-        return launch
-    return launch._replace(key=candidate)
+        return _with_wave25a(launch, device, shape)
+    return _with_wave25a(launch._replace(key=candidate), device, shape)
 
 
 # Custom ops and public API
