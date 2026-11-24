@@ -1982,9 +1982,9 @@ def _with_wave25a(launch: Launch, device: int, shape: tuple[int, int, int, int])
                 return launch._replace(key=candidate)
         return launch
     long_dense = (
-        torch.cuda.get_device_capability(device) < (9, 0)
-        and (height, width, modes) == (56, 56, 160) and not key.coarse and key.batch_path
+        (height, width, modes) == (56, 56, 160) and not key.coarse and key.batch_path
         and key.warps == 1 and not key.cache_line
+        and torch.cuda.get_device_capability(device) < (9, 0)
     )
     medium_vector = (
         (height, width, modes) == (28, 28, 160) and not key.coarse and key.vector_weights
