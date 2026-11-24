@@ -1236,3 +1236,157 @@ def test_scan_wave_alignment_respects_work_and_workspace() -> None:
     assert scans._align_workers(launch, 200, 3, 64, max_workers=127).workers == 105
     assert scans._align_workers(launch, 200, 3, 64, max_workers=128).workers == 128
     assert scans._align_workers(launch, 240, 3, 64).workers == 84
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("variant", tuple(scans._W37A_KERNELS))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("coarse", [False, True])
+@pytest.mark.parametrize(("h", "w", "m"), [
+    (56, 56, 160), (28, 28, 160), (14, 14, 160), (13, 19, 63), (7, 7, 128),
+])
+def test_cuda_wave37a_parity(
+    monkeypatch: pytest.MonkeyPatch, variant: str, dtype: torch.dtype,
+    coarse: bool, h: int, w: int, m: int,
+) -> None:
+    torch.manual_seed(137)
+    _, py, real, _, aux, path = _inputs(h, w, m, 8, dtype, "cuda", batch=2)
+    states = torch.randn((4, *real.shape), dtype=dtype, device="cuda") * 0.1
+    step = 1 + int(coarse)
+    grad = [torch.randn((2, h // step, w // step, m), dtype=dtype, device="cuda") * 0.05
+            for _ in range(2)]
+    recorded = []
+    dispatch = scans._dispatch
+
+    def record(source: Tensor, launch: scans.Launch | None, args: tuple) -> None:
+        assert launch is not None
+        if launch.key.backward and launch.key.vertical:
+            recorded.append(launch.key.wave37a)
+        dispatch(source, launch, args)
+
+    monkeypatch.setattr(scans, "_dispatch", record)
+    monkeypatch.setenv("LNET_SCAN_W37A", variant)
+    actual = scans.vertical_backward(py, states, aux, path, *grad, coarse)
+    assert recorded == [variant]
+    if coarse and (h % 2 or w % 2):
+        # The last row can affect the reverse recurrence. Use the full odd
+        # source for the reference and only truncate at coarse selection.
+        operands = [*py, states.requires_grad_(), *path]
+        out = scans._reference_vertical(py, states, aux, path, coarse, 1e-6)
+        expected = torch.autograd.grad(out, operands, grad)
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference, atol=5e-4, rtol=2e-3)
+        return
+    monkeypatch.setenv("LNET_SCAN_W37A", "off")
+    expected = scans.vertical_backward(py, states, aux, path, *grad, coarse)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, atol=5e-4, rtol=2e-3)
+
+
+@pytest.mark.parametrize("variant", tuple(scans._W37A_KERNELS))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("h", "w", "m", "coarse"), [
+    (13, 19, 63, False), (13, 19, 63, True), (9, 11, 34, True),
+])
+def test_wave37a_cpu_batched_accumulation(  # noqa: C901, PLR0915
+    variant: str, dtype: torch.dtype, h: int, w: int, m: int, coarse: bool,
+) -> None:
+    rng = torch.Generator().manual_seed(132)
+
+    def sample(*shape: int) -> Tensor:
+        return (torch.randn(shape, generator=rng) * 0.15).to(dtype).float()
+
+    def rounded(value: Tensor) -> Tensor:
+        return value.to(dtype).float()
+
+    def fma(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
+        return (a.double() * b.double() + c.double()).float()
+
+    step = 1 + int(coarse)
+    wi, bi, wo = sample(m, 8, 8), sample(m, 8), sample(m, 8, 2)
+    source, gain = sample(w, h, m, 2, 4), sample(w, h, m, 2, 4).abs() + 0.5
+    # Use both recurrences, retaining the trailing source in the reverse state.
+    states = torch.zeros_like(source)
+    for direction in (0, 1):
+        carry = torch.zeros_like(source[:, 0, :, direction])
+        rows = range(h) if direction == 0 else range(h - 1, -1, -1)
+        for y in rows:
+            carry = fma(torch.tensor(0.125), carry, source[:, y, :, direction])
+            states[:, y, :, direction] = carry
+    used = h // step * step
+    pos = rounded(rounded(states[:, int(coarse):used:step, :, 0])
+                  * gain[:, int(coarse):used:step, :, 0])
+    neg = rounded(rounded(states[:, :used:step, :, 1]) * gain[:, :used:step, :, 1])
+    p = torch.stack([pos[..., 0], pos[..., 2], neg[..., 0], neg[..., 2],
+                     pos[..., 1], pos[..., 3], neg[..., 1], neg[..., 3]], dim=-1)
+    dy = sample(w, h // step, m, 2)
+
+    def adjoint(k: int, cta: bool) -> tuple[Tensor, Tensor]:
+        # Assign each column to its own warp, grouping up to three warps per CTA.
+        partial = torch.zeros(((w + 2) // 3 if cta else w, m, 90))
+        dp = torch.zeros_like(p)
+        for x in range(w):
+            row = partial[x // 3 if cta else x]
+            for end in range(h // step, 0, -k):
+                cells = torch.arange(end - 1, max(-1, end - k - 1), -1)
+                inp, grad = p[x, cells], dy[x, cells]
+                delta = torch.zeros_like(row) if cta else row
+                for jac in grad:
+                    delta[:, 88:] += jac
+                for j in range(8):
+                    z = torch.zeros_like(inp[..., 0])
+                    for i in range(8):
+                        z = fma(wi[:, j, i], inp[..., i], z)
+                    z = rounded(rounded(z) + bi[:, j])
+                    sig = 1 / (1 + (-z).exp())
+                    act = rounded(z * sig)
+                    result = fma(grad[..., 0], wo[:, j, 0], grad[..., 1] * wo[:, j, 1])
+                    dz = rounded(rounded(result) * (sig * fma(z, 1 - sig, torch.ones_like(z))))
+                    dp[x, cells] = fma(dz[..., None], wi[:, j], dp[x, cells])
+                    for t in range(len(cells)):
+                        delta[:, 8 * j:8 * (j + 1)] = fma(
+                            dz[t, :, None], inp[t], delta[:, 8 * j:8 * (j + 1)],
+                        )
+                        delta[:, 64 + j] += dz[t]
+                        delta[:, 72 + j] = fma(grad[t, :, 0], act[t], delta[:, 72 + j])
+                        delta[:, 80 + j] = fma(grad[t, :, 1], act[t], delta[:, 80 + j])
+                if cta:
+                    row += delta
+        return dp, partial.sum(0)
+
+    path_dp, reduced = adjoint(scans._W37A_KERNELS[variant][1], cta=True)
+    ref_dp, ref_reduced = adjoint(1, cta=False)
+    torch.testing.assert_close(path_dp, ref_dp, atol=0, rtol=0)
+    torch.testing.assert_close(reduced, ref_reduced, atol=3e-6, rtol=0)
+
+    def column_adjoint(dp: Tensor, chunk: int) -> tuple[Tensor, Tensor]:
+        dstate = torch.zeros_like(source)
+        dpoles = torch.zeros((m, 2, 2))
+        decay = torch.tensor(0.125)
+        for direction in (0, 1):
+            dp_indices = [0, 4, 1, 5] if direction == 0 else [2, 6, 3, 7]
+            inject = torch.zeros_like(source[..., direction, :])
+            injections = dp[..., dp_indices]
+            start = int(coarse and direction == 0)
+            inject[:, start:used:step] = rounded(
+                rounded(injections) * gain[:, start:used:step, :, direction],
+            )
+            order = list(range(h)) if direction == 0 else list(reversed(range(h)))
+            prev = {}
+            for offset in range(0, h, chunk):
+                carry = (states[:, order[offset - 1], :, direction] if offset
+                         else torch.zeros_like(source[:, 0, :, direction]))
+                for row in order[offset:offset + chunk]:
+                    prev[row] = carry
+                    carry = fma(decay, carry, source[:, row, :, direction])
+            adj = torch.zeros_like(source[:, 0, :, direction])
+            for row in reversed(order):
+                adj = fma(decay, adj, inject[:, row])
+                dstate[:, row, :, direction] = rounded(adj)
+                dpoles[:, direction, 0] += (adj * prev[row]).sum((0, 2))
+                dpoles[:, direction, 1] += (adj * source[:, row, :, direction]).sum((0, 2))
+        return dstate, dpoles
+
+    for wave, ref in zip(column_adjoint(path_dp, 6), column_adjoint(ref_dp, h), strict=True):
+        torch.testing.assert_close(wave, ref, atol=0, rtol=0)

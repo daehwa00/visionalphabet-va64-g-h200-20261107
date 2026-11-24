@@ -35,7 +35,7 @@ from .product_scan_reference import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
 # Constants and types
 
@@ -132,6 +132,8 @@ class Kernel:
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
+    wave37a: str = ""
+    odd_coarse_forward: bool = False
 
 
 class Launch(NamedTuple):
@@ -1445,7 +1447,17 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 # NVRTC compilation and driver launch
 
+_W37A_KERNELS = {
+    "cta_acc_k2": ("vscan_bwd_cta_k2", 2),
+    "cta_acc_k4": ("vscan_bwd_cta_k4", 4),
+    "cta_acc_k8_smem": ("vscan_bwd_cta_k8", 8),
+    "cta_acc_regw": ("vscan_bwd_cta_regw", 2),
+}
+
+
 def _kernel_name(key: Kernel) -> str:
+    if key.wave37a:
+        return _W37A_KERNELS[key.wave37a][0]
     if key.projection:
         return "path_mlp_backward" if key.backward else "path_mlp_forward"
     if key.projection_reduction:
@@ -1563,7 +1575,301 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             .replace("states[ib]", "__ldg(states + ib)")
             .replace("states[ib + source_plane]", "__ldg(states + ib + source_plane)")
         )
+    if key.odd_coarse_forward:
+        source = source.replace("int remaining = H;", r"""int remaining = H;
+                if (H & 1) {
+                    state = advance_forward<REGISTER_PATH && VECTOR_WEIGHTS>(
+                        state, c.source(H - 1), a.conj(), g.conj());
+                    --remaining;
+                }""")
+    if key.wave37a:
+        name, width = _W37A_KERNELS[key.wave37a]
+        source = _wave37a_source(source, width, key.register_path)
+        wrapper = wrapper.replace("void scan(", f"void {name}(")
+        if key.register_path:
+            threads = key.warps * _WARP_SIZE
+            wrapper = wrapper.replace(
+                f"__launch_bounds__({threads})",
+                f"__launch_bounds__({threads}, {16 // key.warps})",
+            )
     return source + wrapper
+
+
+_W37A_PATH = r"""
+template<class T, class I, int K, class Weights>
+__device__ __forceinline__ void path_adjoint_cta(
+    Quad<T> (&pp)[K], Quad<T> (&pn)[K], const float2 (&dy)[K],
+    float (&dp)[K][8], float* batch, int threads, Weights path, float* acc, int count
+) {
+    constexpr int packed_fields = (K == 8 || W37A_REGW) ? K * 4 : 0;
+    float2 bo{};
+    #pragma unroll
+    for (int cell = 0; cell < K; ++cell) {
+        if (cell < count) {
+            bo.x += dy[cell].x;
+            bo.y += dy[cell].y;
+        }
+    }
+    atomicAdd(acc + 88 * 32, bo.x);
+    atomicAdd(acc + 89 * 32, bo.y);
+    #pragma unroll 1
+    for (int j = 0; j < 8; ++j) {
+        float weights[8], dw[8]{}, db = 0, dwr = 0, dwi = 0;
+        float bias, wr, wi;
+#if W37A_REGW
+        Pair<T> packed[4], params[3];
+#define W37A_ROW(J) case J: \
+            packed[0] = path.pairs[4 * J]; \
+            packed[1] = path.pairs[4 * J + 1]; \
+            packed[2] = path.pairs[4 * J + 2]; \
+            packed[3] = path.pairs[4 * J + 3]; \
+            params[0] = path.pairs[32 + J / 2]; \
+            params[1] = path.pairs[36 + J / 2]; \
+            params[2] = path.pairs[40 + J / 2]; \
+            break
+        switch (j) {
+            W37A_ROW(0);
+            W37A_ROW(1);
+            W37A_ROW(2);
+            W37A_ROW(3);
+            W37A_ROW(4);
+            W37A_ROW(5);
+            W37A_ROW(6);
+            default:
+            W37A_ROW(7);
+        }
+#undef W37A_ROW
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const auto pair = packed[k].unpack();
+            weights[2 * k] = pair.r;
+            weights[2 * k + 1] = pair.i;
+        }
+        const auto b_pair = params[0].unpack(), r_pair = params[1].unpack();
+        const auto i_pair = params[2].unpack();
+        bias = j & 1 ? b_pair.i : b_pair.r;
+        wr = j & 1 ? r_pair.i : r_pair.r;
+        wi = j & 1 ? i_pair.i : i_pair.r;
+#else
+        if constexpr (Weights::vector_weights) {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 4) {
+                const auto v = path.input_group(2 * j + k / 4);
+                weights[k] = v.x;
+                weights[k + 1] = v.y;
+                weights[k + 2] = v.z;
+                weights[k + 3] = v.w;
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                const auto pair = path.input_pair(4 * I(j) + k / 2);
+                weights[k] = pair.r;
+                weights[k + 1] = pair.i;
+            }
+        }
+        bias = path.bias(j);
+        wr = path.output(j);
+        wi = path.output(8 + j);
+#endif
+        #pragma unroll
+        for (int cell = 0; cell < K; ++cell) {
+            if (cell >= count) break;
+            float4 pos, neg;
+            if constexpr (K == 8 || W37A_REGW) {
+                const auto* packed = reinterpret_cast<Quad<T>*>(batch - threadIdx.x);
+                pos = packed[(2 * cell) * threads + threadIdx.x].unpack();
+                neg = packed[(2 * cell + 1) * threads + threadIdx.x].unpack();
+            } else {
+                pos = pp[cell].unpack();
+                neg = pn[cell].unpack();
+            }
+            const float p[8] = {pos.x, pos.z, neg.x, neg.z, pos.y, pos.w, neg.y, neg.w};
+            float pre = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) pre = __fmaf_rn(weights[k], p[k], pre);
+            const float z = rounded<T>(rounded<T>(pre) + bias);
+            const float sig = __fdividef(1.0f, 1.0f + __expf(-z));
+            const float act = rounded<T>(z * sig);
+            const auto d = dy[cell];
+            const float dz = rounded<T>(rounded<T>(d.x * wr + d.y * wi) *
+                                         (sig * (1.0f + z * (1.0f - sig))));
+            db += dz;
+            dwr += d.x * act;
+            dwi += d.y * act;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                if constexpr (K >= 4 || W37A_REGW) {
+                    batch[(packed_fields + cell * 8 + k) * threads] += dz * weights[k];
+                } else {
+                    dp[cell][k] += dz * weights[k];
+                }
+                dw[k] += dz * p[k];
+            }
+        }
+        atomicAdd(acc + (64 + j) * 32, db);
+        atomicAdd(acc + (72 + j) * 32, dwr);
+        atomicAdd(acc + (80 + j) * 32, dwi);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) atomicAdd(acc + (8 * j + k) * 32, dw[k]);
+    }
+}
+"""
+
+_W37A_COLUMN = r"""
+        constexpr int K = W37A_K, step = 1 + COARSE;
+        constexpr int packed_fields = (K == 8 || W37A_REGW) ? K * 4 : 0;
+        int end = length - 1;
+        if constexpr (COARSE) {
+            if ((y0 + end) % 2 == 0) {
+                const auto source = CACHE_SOURCE ? CACHED_SOURCE_AT(end) : c.source(y0 + end);
+                const auto next = neg;
+                neg = advance(neg, source, ar, gg);
+                column_adjoint<false, COMPACT>(
+                    c, y0 + end, end ? seg[(end - 1) * THREADS] : before,
+                    source, {}, a, g, adj_a, adj_b, da, dg, gs);
+                if constexpr (full) seg[end * THREADS] = next;
+                --end;
+            }
+        }
+        for (; end >= 0; end -= K * step) {
+            const int count = min(K, (end + 1) / step);
+            Quad<T> pp[K]{}, pn[K]{};
+            float dp[K][8]{};
+            float2 dy[K]{};
+            float4 next[K]{}, next_even[K]{};
+            #pragma unroll
+            for (int i = 0; i < K; ++i) {
+                if (i >= count) break;
+                const int j = end - i * step, y = y0 + j;
+                const auto s = (COARSE || CACHE_SOURCE) ? CACHED_SOURCE_AT(j) : c.source(y);
+                if constexpr (full) next[i] = neg;
+                neg = advance(neg, s, ar, gg);
+                if constexpr (COARSE) {
+                    if constexpr (full) next_even[i] = neg;
+                    neg = advance(neg, CACHED_SOURCE_AT(j - 1), ar, gg);
+                }
+                const I cell = c.cell(COARSE ? y / 2 : y);
+                dy[i] = make_float2(read(gr[(cell - c.m) * (1 + REAL_INTERLEAVED) + c.m]),
+                                    read(gi[(cell - c.m) * (1 + IMAG_INTERLEAVED) + c.m]));
+                const auto pos = normalize_packed<T>(seg[j * THREADS], c.gain(y, false));
+                const auto neg_p = normalize_packed<T>(neg, c.gain(y - int(COARSE), true));
+                if constexpr (K == 8 || W37A_REGW) {
+                    auto* packed = reinterpret_cast<Quad<T>*>(batch - threadIdx.x);
+                    packed[(2 * i) * THREADS + threadIdx.x] = pos;
+                    packed[(2 * i + 1) * THREADS + threadIdx.x] = neg_p;
+                } else {
+                    pp[i] = pos;
+                    pn[i] = neg_p;
+                }
+                if constexpr (K >= 4 || W37A_REGW) {
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k)
+                        batch[(packed_fields + i * 8 + k) * THREADS] = 0;
+                }
+            }
+            path_adjoint_cta<T, I>(pp, pn, dy, dp, batch, THREADS, path, acc, count);
+            #pragma unroll
+            for (int i = 0; i < K; ++i) {
+                if (i >= count) break;
+                const int j = end - i * step, y = y0 + j;
+                float q[8];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    if constexpr (K >= 4 || W37A_REGW) {
+                        q[k] = batch[(packed_fields + i * 8 + k) * THREADS];
+                    } else {
+                        q[k] = dp[i][k];
+                    }
+                }
+                const auto ip = normalize<T>(
+                    make_float4(q[0], q[4], q[1], q[5]), c.gain(y, false));
+                g2[I(COARSE ? y / 2 : y) * g2_stride] = normalize_packed<T>(
+                    make_float4(q[2], q[6], q[3], q[7]), c.gain(y - int(COARSE), true));
+                column_adjoint<false, COMPACT>(
+                    c, y, j ? seg[(j - 1) * THREADS] : before,
+                    (COARSE || CACHE_SOURCE) ? CACHED_SOURCE_AT(j) : c.source(y),
+                    ip, a, g, adj_a, adj_b, da, dg, gs);
+                if constexpr (COARSE) {
+                    column_adjoint<false, COMPACT>(
+                        c, y - 1, j > 1 ? seg[(j - 2) * THREADS] : before,
+                        CACHED_SOURCE_AT(j - 1), {}, a, g, adj_a, adj_b, da, dg, gs);
+                }
+                if constexpr (full) {
+                    seg[j * THREADS] = next[i];
+                    if constexpr (COARSE) seg[(j - 1) * THREADS] = next_even[i];
+                }
+            }
+        }
+    }
+
+"""
+
+def _wave37a_source(source: str, width: int, register: bool) -> str:
+    # Keep the legacy NVRTC input byte-for-byte unchanged for opt-out.
+    source = source.replace(
+        "#ifdef BACKWARD_BATCH2\ntemplate<class T, class I, class Weights>",
+        _W37A_PATH + "#ifdef BACKWARD_BATCH2\ntemplate<class T, class I, class Weights>",
+    )
+    begin = source.index("#ifdef BACKWARD_BATCH2", source.index("void column_backward("))
+    end = source.index("    adj_a = adj_b = {};", begin)
+    source = source[:begin] + _W37A_COLUMN + source[end:]
+    source = source.replace(
+        "int chunks, Complex& da, Complex& dg",
+        "int chunks, Complex& da, Complex& dg, float* batch",
+    ).replace("buf, stride, chunks, da, dg", "buf, stride, chunks, da, dg, batch")
+    source = source.replace("BACKWARD && HIDDEN && !SHARED_ACC", "false")
+    source = source.replace(
+        "(PURE || SHARED_ACC || register_acc) && WARPS > 1", "true"
+    ).replace("!BACKWARD && !PURE && HIDDEN == 8", "!PURE && HIDDEN == 8")
+    begin = source.index("    float* row = partials;", source.index("void vertical("))
+    end = source.index("    Complex da{}, dg{};", begin)
+    source = source[:begin] + r"""
+    float* row = partials + I(group) * fields * M + m;
+    auto* acc = reinterpret_cast<float*>(line_buf + (CACHE_LINE ? I(oh) * threads : 0)) + lane;
+    auto* batch = acc - lane + 90 * 32 + threadIdx.x;
+    constexpr int acc_stride = 32;
+    for (int idx = threadIdx.x; idx < 90 * 32; idx += threads) acc[idx - lane] = 0;
+    __syncthreads();
+""" + source[end:]
+    begin = source.index("    if constexpr (BACKWARD) {\n        if constexpr (PURE && reduce)")
+    end = source.index("\n}\ntemplate", begin)
+    source = source[:begin] + r"""
+    auto* poles = reinterpret_cast<float*>(seg) + threadIdx.x;
+    poles[0] = da.r;
+    poles[threads] = da.i;
+    poles[2 * threads] = dg.r;
+    poles[3 * threads] = dg.i;
+    __syncthreads();
+    if (warp == 0 && m < M) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float sum = poles[i * threads];
+            #pragma unroll
+            for (int k = 1; k < WARPS; ++k) sum += poles[i * threads + k * 32];
+            row[I(i) * M] = sum;
+        }
+        for (int i = 0; i < 90; ++i) row[I(4 + i) * M] = acc[i * 32];
+    }
+""" + source[end:]
+    source = source.replace("        __syncthreads();\n    } else if constexpr (CACHE_WEIGHT",
+                            "    } else if constexpr (CACHE_WEIGHT")
+    source = source.replace("size, threads);\n        __syncthreads();", "size, threads);")
+    source = source.replace("!COARSE || !(y & 1)", "!COARSE || (!(y & 1) && y + 1 < c.H)")
+    source = source.replace(
+        "if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);",
+        r"""if constexpr (COARSE) {
+                clear_unused_columns<COMPACT>(c, y, gs);
+                if constexpr (!COMPACT) {
+                    if ((c.W & 1) && (c.offset_b / c.M) % c.W == c.W - 3) {
+                        const I tail = I(y) * c.W * c.M + c.offset_b + 2 * I(c.M);
+                        store_complex(gs, tail, c.plane, {});
+                        store_complex(gs, tail + 2 * c.plane, c.plane, {});
+                    }
+                }
+            }""",
+    )
+    return f"#define W37A_K {width}\n#define W37A_REGW {int(register)}\n" + source
 
 
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
@@ -1685,7 +1991,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     with torch.cuda.device(device):
         _ensure_context(driver, device)
         if (
-            key.batch_path or key.register_path or key.horizontal_unroll8
+            key.wave37a or key.batch_path or key.register_path or key.horizontal_unroll8
             or key.backward_batch2 or key.backward_readonly
             or (key.vertical and key.backward and key.chunk and key.cache_source)
         ):
@@ -2239,6 +2545,101 @@ def _plan_scan_auto(
     return launch
 
 
+def _wave37a_policy(dtype: torch.dtype, hidden: int, pure: bool) -> str:
+    if dtype.itemsize != 2 or hidden != _REGISTER_HIDDEN or pure:
+        return ""
+    policy = os.environ.get("LNET_SCAN_W37A", "off")
+    return policy if policy == "auto" or policy in _W37A_KERNELS else ""
+
+
+def _wave37a_plans(
+    base: Kernel, shape: tuple[int, int, int, int], limit: int, policy: str,
+) -> Iterator[tuple[ScanPlan, Kernel]]:
+    _, height, _, _ = shape
+    variants = _W37A_KERNELS if policy == "auto" else (policy,)
+    step = 1 + int(base.coarse)
+    for variant in variants:
+        _, width = _W37A_KERNELS[variant]
+        regw = variant == "cta_acc_regw"
+        for warps in (2, 3, 4):
+            threads = warps * _WARP_SIZE
+            for chunk in (0, 4, 6, 8, 14, 16):
+                span = chunk or height
+                if chunk and (chunk >= height or chunk < step):
+                    continue
+                replay = _ceil(height, span) - 1
+                for cache_source in ((True, False) if chunk else (True,)):
+                    source_rows = height if cache_source else span
+                    for vector in ((False,) if regw else (False, True)):
+                        weights = 0 if regw else 88 * 32 * (4 if vector else 2)
+                        fixed = 90 * _WARP_SIZE * 4 + weights
+                        staging = 96 if regw else {2: 0, 4: 128, 8: 384}[width]
+                        storage = fixed + threads * (16 * span + 8 * source_rows + staging)
+                        for cache_line in (True, False):
+                            smem = storage + threads * (height // step * 8 if cache_line else 0)
+                            for global_ckpt in ((False, True) if replay else (False,)):
+                                total = smem + (0 if global_ckpt else replay * threads * 16)
+                                if total > limit:
+                                    continue
+                                plan = ScanPlan(
+                                    warps, total, span, not regw, global_ckpt, cache_line,
+                                    full_trajectory=not chunk, cache_source=cache_source,
+                                )
+                                key = replace(
+                                    base, wave37a=variant, warps=warps, chunk=chunk,
+                                    cache_weights=not regw, register_path=regw,
+                                    vector_weights=vector, global_checkpoints=global_ckpt,
+                                    cache_line=cache_line, cache_source=cache_source,
+                                )
+                                yield plan, key
+
+
+@lru_cache(maxsize=256)
+def _plan_wave37a(
+    device: int, base: Kernel, shape: tuple[int, int, int, int],
+    index_bound: int, policy: str,
+) -> Launch | None:
+    sms, limit, max_warps = device_limits(device)
+    batch, height, width, modes = shape
+    lines = batch * (width // 2 if base.coarse else width)
+    tiles = _ceil(modes, _WARP_SIZE)
+    budget = _scan_workspace_budget(device)
+    waves = _SHORT_VSCAN_WAVES if height <= _SHORT_SCAN else _VSCAN_WAVES
+    best = None
+    best_score = None
+    for plan, candidate in _wave37a_plans(base, shape, limit, policy):
+        probe_workers = _workers(lines, modes, 94, plan.warps, sms * max_warps * waves, budget)
+        bound = max(index_bound, 94 * modes * probe_workers)
+        key = replace(candidate, index32=bound < 2**31)
+        resident = _resident(device, key, plan.smem)
+        if not resident:
+            continue
+        workers = _workers(lines, modes, 94, plan.warps, sms * resident * waves, budget)
+        scratch = modes * _scratch_per_worker(
+            plan, height, vertical=True, coarse=base.coarse, backward=True, itemsize=2,
+        )
+        if scratch:
+            workers = min(workers, budget // scratch)
+        if not workers:
+            continue
+        groups = _ceil(workers, plan.warps)
+        active = min(max_warps, plan.warps * resident)
+        achievable = min(active, _ceil(workers * tiles, sms))
+        _, k = _W37A_KERNELS[key.wave37a]
+        # Favor local checkpoints and path adjoints when occupancy is comparable.
+        locality = (6 if plan.full_trajectory else 4) + int(plan.cache_source)
+        locality += int(plan.cache_line) - int(plan.global_checkpoints)
+        score = (
+            achievable >= min(16, max_warps // 2),
+            achievable * locality * (16 + k) / 16,
+            min(sms, groups * tiles), active, plan.chunk, -plan.smem,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best = Launch(plan, key, workers, groups)
+    return best
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -2263,6 +2664,16 @@ def _plan_launch(
     if not vertical:
         index_bound *= 4
     device = source.device.index or 0
+    policy = _wave37a_policy(source.dtype, hidden, pure_vertical) if vertical else ""
+    odd_coarse = coarse and bool(shape[1] % 2 or shape[2] % 2)
+    if policy and backward:
+        base = Kernel(
+            source.dtype, 2, backward=True, vertical=True, coarse=coarse, hidden8=True,
+            compact=compact, real_interleaved=interleaved[0], imag_interleaved=interleaved[1],
+        )
+        experimental = _plan_wave37a(device, base, shape, index_bound, policy)
+        if experimental is not None or odd_coarse:
+            return experimental
     launch = _launch_for_shape(
         device, source.dtype, shape, index_bound,
         backward=backward, vertical=vertical, coarse=coarse, hidden=hidden, precise=precise,
@@ -2270,9 +2681,11 @@ def _plan_launch(
         pure_vertical=pure_vertical,
     )
 
-    if launch is None or os.environ.get("LNET_GENERAL_SCAN_OPT", "auto") == "off":
-        return launch
-    return _plan_scan_auto(device, launch, shape)
+    if launch is not None and os.environ.get("LNET_GENERAL_SCAN_OPT", "auto") != "off":
+        launch = _plan_scan_auto(device, launch, shape)
+    if policy and odd_coarse and launch is not None and not backward:
+        launch = launch._replace(key=replace(launch.key, odd_coarse_forward=True))
+    return launch
 
 
 # Custom ops and public API
@@ -2316,11 +2729,15 @@ def _vertical_inputs_ok(
     if states.ndim != 5 or states.shape[0] != 4 or len(auxiliary) != 2 or len(path) != 4:
         return False
     _, _, h, w, m = states.shape
-    if (coarse and (h % 2 or w % 2)) or not _matching(states, [*auxiliary, *path]):
+    if not _matching(states, [*auxiliary, *path]):
         return False
     if [t.shape for t in auxiliary] != [(2, w, m), (2, h, m)] or path[0].ndim != 3:
         return False
     hidden = path[0].shape[1]
+    if coarse and (h % 2 or w % 2) and (
+        min(h, w) < 2 or not _wave37a_policy(states.dtype, hidden, pure=False)
+    ):
+        return False
     return 0 < hidden < 2**31 and [t.shape for t in path] == [
         (m, hidden, 8),
         (m, hidden),
@@ -2543,7 +2960,8 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
         or not _pole_ok(pole, states)
         or not 0 < epsilon < float("inf")
-        or (compact and not coarse)
+        or (compact and (not coarse or shape[2] % 2))
+        or (pure and coarse and (shape[1] % 2 or shape[2] % 2))
     ):
         raise ValueError("Invalid vertical scan inputs")
     b, h, w, m = shape
@@ -2565,7 +2983,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or not saved_features.is_contiguous()
     ):
         raise ValueError("Invalid saved vertical features")
-    if not pure:
+    if not pure and not _wave37a_policy(states.dtype, hidden, pure):
         chunk = (
             _saved_backward_chunk(states, coarse)
             if saved_features is not None else _decoupled_chunk(states, coarse)
@@ -2887,8 +3305,9 @@ def _reference_vertical(
             value = torch.einsum("yjm,bjwm->bywm", weights, gamma * source)
             if reverse:
                 value = value.flip(1)
-            ys = slice(int(not reverse), None, 2) if coarse else slice(None)
-            xs = slice(1 - side, None, 2) if coarse else slice(None)
+            ys = slice(int(not reverse), 2 * (height // 2), 2) if coarse else slice(None)
+            width = states.shape[3]
+            xs = slice(1 - side, 2 * (width // 2), 2) if coarse else slice(None)
             inverse = vy[int(reverse), ys, None, :] * vx[side, None, xs, :]
             inverse = inverse.clamp_min(epsilon).rsqrt()
             selected = value[:, ys, xs]
