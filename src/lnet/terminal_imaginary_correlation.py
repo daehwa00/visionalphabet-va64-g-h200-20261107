@@ -405,8 +405,8 @@ def complex_correlation_descriptor(
         warp_tile = (
             fused and drive.dtype in (torch.float16, torch.bfloat16)
             and (
-                model_w29c_enabled(drive.device, "nr4")
-                or model_w28c_enabled(drive.device, "nr4")
+                model_w28c_enabled(drive.device, "nr4")
+                or model_w29c_enabled(drive.device, "nr4")
             )
         )
         h_fwd_re, h_rev_re, h_fwd_im, h_rev_im = _nr4_axis(

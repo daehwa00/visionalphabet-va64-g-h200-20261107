@@ -649,10 +649,19 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
     constexpr int Fields = ReduceRanks * 18;
     __shared__ float warp_sums[Warps][Fields][Vec][32];
     if (mode < modes) {
+#if defined(READER_W31B_SPLIT)
+        const int bands = (ytiles + Warps - 1) / Warps;
+        for (int slice = blockIdx.y; slice < batch * bands; slice += gridDim.y) {
+            const int row_tile = slice % bands * Warps + warp;
+            if (row_tile >= ytiles) continue;
+            const int y = row_tile * Rows;
+            const long long base = static_cast<long long>(slice / bands) * height * width;
+#else
         for (int row = blockIdx.y * Warps + warp; row < batch * ytiles;
              row += gridDim.y * Warps) {
             const int y = row % ytiles * Rows;
             const long long base = static_cast<long long>(row / ytiles) * height * width;
+#endif
             const T* p = projected + ((base + y * width) * R + r0) * modes + mode;
             // For long windows, convert on load so every overlapping tap can reuse FP32.
             Window left[Rows + 2][2] = {}, middle[Rows + 2][2] = {};
@@ -682,8 +691,14 @@ __device__ __forceinline__ void real_weight_gradient_3x3(
                     V v[RankTile];
                     #pragma unroll
                     for (int r = 0; r < RankTile; ++r) {
+#if defined(READER_W31B_SPLIT)
+                        const long long pixel = j * width + x;
+                        v[r] = r0 + r < R ? mode_load<Vec, T, ReadOnly>(
+                            p + (pixel * R + r) * modes) : V{};
+#else
                         const T* current = p + ((j * width + x) * R + r) * modes;
                         v[r] = r0 + r < R ? mode_load<Vec, T, ReadOnly>(current) : V{};
+#endif
                     }
                     #pragma unroll
                     for (int ky = 0; ky < 3; ++ky) {
@@ -887,11 +902,16 @@ extern "C" __global__ void reader_dweight(
     const Input* projected, const Grad* grad, float* partial,
     int h, int w, int m, int batch, int rank
 ) {
+#if defined(READER_W31B_SPLIT)
+    real_weight_gradient_3x3<Input, Grad, READER_W31B_RANK>(
+        projected, grad, partial, h, w, m, batch);
+#else
     if constexpr (Rank && Kernel == 3 && !Strict)
         real_weight_gradient_3x3<Input, Grad, Rank>(projected, grad, partial, h, w, m, batch);
     else
         weight_gradient<Input, Grad, Rank, Kernel, Strict>(
             projected, grad, partial, h, w, m, batch, rank);
+#endif
 }
 
 extern "C" __global__ void reader_dweight_reduce(
@@ -933,6 +953,29 @@ extern "C" __global__ void reader_dweight_reduce_parallel(
     const int component = field / (rank * taps);
     output[((component * modes + mode) * rank * taps) + field % (rank * taps)] = sum;
 }
+
+#if defined(READER_W31B_SPLIT)
+extern "C" __global__ void reader_dweight_reduce_chunks(
+    const float* __restrict__ partial, float* __restrict__ intermediate,
+    int stride, int workers
+) {
+    constexpr int Warps = 4, Chunk = READER_W31B_SPLIT;
+    __shared__ float sums[Warps][32];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int index = blockIdx.x * 32 + lane;
+    const int begin = blockIdx.y * Chunk;
+    const int end = min(begin + Chunk, workers);
+    float sum = 0;
+    if (index < stride)
+        for (int worker = begin + warp; worker < end; worker += Warps)
+            sum += partial[static_cast<long long>(worker) * stride + index];
+    sums[warp][lane] = sum;
+    __syncthreads();
+    if (warp == 0 && index < stride)
+        intermediate[static_cast<long long>(blockIdx.y) * stride + index] =
+            (sums[0][lane] + sums[1][lane]) + (sums[2][lane] + sums[3][lane]);
+}
+#endif
 
 """
 
@@ -1095,6 +1138,7 @@ def _reader_cuda_module(
     weight_read_only: bool = True,
     updated_spatial: bool = False,
     stream_forward: bool = False,
+    split_rank: int = 0,
 ) -> _CudaModule:
     weight_tile, weight_rows, weight_warps = weight_geometry or _DEFAULT_WEIGHT_GEOMETRY
     macros = {
@@ -1119,6 +1163,10 @@ def _reader_cuda_module(
     )
     if stream_forward:
         header += "#define READER_W29B_STREAM_FORWARD 1\n"
+    if split_rank:
+        header += f"#define READER_W31B_SPLIT {_W31B_REDUCE_CHUNK}\n"
+        header += f"#define READER_W31B_RANK {split_rank}\n"
+        operations += ("dweight_reduce_chunks",)
     # Reuse the CUDA launch interface with Reader-specific PTX and entry points.
     nvrtc = _nvrtc()
     program = ctypes.c_void_p()
@@ -1462,8 +1510,9 @@ def _wave28b_preset(
 
 def _wave29b_preset(
     projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
+    preferred: str | None = None,
 ) -> str:
-    preset = os.environ.get("LNET_READER_W29B", "off")
+    preset = preferred or os.environ.get("LNET_READER_W29B", "off")
     if preset not in (*_WAVE29B_PRESETS, "auto") or not _hopper_reader_eligible(
         projected, real, grad, strict=strict, include_compact=True,
     ):
@@ -1537,12 +1586,79 @@ def _wave30b_spatial_geometry(height: int, op: str, preset: str) -> _VectorLaunc
     return _wave29b_spatial_geometry(height, op, "hiocc_dinput_v2")
 
 
+_W31B_PRESETS = ("wide_fwd_only", "dweight_vram_split", "full_w31b")
+_W31B_REDUCE_CHUNK = 32
+_W31B_FORWARD_ROWS = (4, 7, 8)
+_W31B_WEIGHT_ROWS = (2, 4, 7, 8)
+
+
+def _wave31b_preset(
+    projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
+) -> str:
+    preset = os.environ.get("LNET_READER_W31B", "off")
+    if preset not in (*_W31B_PRESETS, "auto") or strict:
+        return "off"
+    modes, rank, kernel, _ = real.shape
+    batch, height, width, _ = projected.shape
+    if (
+        os.environ.get("LNET_READER_VEC", "auto") != "auto"
+        or kernel != _STATIC_SPATIAL_KERNEL or rank < 1
+        or not 0 < 2 * modes * rank * kernel**2 <= 2**31 - _DEFAULT_THREADS
+        or batch * height * width < _SPECIALIZE_MIN_PIXELS
+        or projected.dtype not in (torch.bfloat16, torch.float16) or real.dtype != projected.dtype
+        or (grad is not None and grad.dtype != projected.dtype)
+        or torch.cuda.get_device_capability(projected.device) < (8, 0)
+    ):
+        return "off"
+    return "full_w31b" if preset == "auto" else preset
+
+
+def _wave31b_vec2(projected: Tensor, grad: Tensor | None, modes: int) -> bool:
+    return modes % 2 == 0 and projected.data_ptr() % 4 == 0 and (
+        grad is None or grad.data_ptr() % 4 == 0
+    )
+
+
+@cache
+def _wave31b_forward_plan(
+    device: int, shape: tuple[int, int, int, int], rank: int, dtype: str, sms: int, vec: int,
+    shared: int,
+) -> tuple[_VectorLaunch, _CudaModule] | None:
+    batch, height, width, modes = shape
+    if 2 * rank * 9 * _WARP_SIZE * vec * 4 > shared:
+        return None
+    warps = 1
+    columns = width
+    best, best_score = None, 0.0
+    for rows in _W31B_FORWARD_ROWS:
+        grid = _reader_spatial_grid(batch, height, width, modes, rows, warps, vec, columns)
+        work = grid[0] * grid[1] * grid[2]
+        if grid[1] > _MAX_CUDA_GRID_DIM or work < sms:
+            continue
+        module = _reader_cuda_module(
+            device, shape, columns, rank, _STATIC_SPATIAL_KERNEL, (dtype,) * 3,
+            strict=False, spatial_geometry=(rows, warps), spatial_vec=vec, updated_spatial=True,
+            register_filters=0, keep_real=0,
+        )
+        resident = _reader_resident(module, "forward", warps)
+        # Once enough warps are active to cover the sliding-window latency,
+        # prefer fewer vertical halo loads and fewer inactive rows.
+        ytiles = grid[1]
+        traffic_rows = ytiles * (rows + 2) - 2
+        score = min(8, resident, work / sms) / traffic_rows
+        if score > best_score:
+            best, best_score = (_VectorLaunch(vec, columns, rows, warps), module), score
+    return best
+
+
 def _hopper_reader_spatial(
     projected: Tensor, real: Tensor, grad: Tensor | None, op: str, *, strict: bool,
 ) -> tuple[_VectorLaunch, _CudaModule] | None:
-    wave30b = _wave30b_preset(projected, real, grad, strict=strict)
+    wave31b = _wave31b_preset(projected, real, grad, strict=strict)
+    wave30b = _wave30b_preset(projected, real, grad, strict=strict) if wave31b == "off" else "off"
+    preferred = "hiocc_dinput_v2" if wave31b != "off" else None
     wave29b = (
-        _wave29b_preset(projected, real, grad, strict=strict)
+        _wave29b_preset(projected, real, grad, strict=strict, preferred=preferred)
         if wave30b == "off" else "hiocc_dinput_v2"
     )
     batch, height, width, _ = projected.shape
@@ -1604,12 +1720,100 @@ _WAVE29B_WEIGHT = {56: (2, 1, 8, 3), 28: (1, 2, 7, 2), 7: (1, 2, 7, 2)}
 _WAVE30B_WEIGHT = {56: (1, 4, 8, 2), 28: (1, 4, 7, 2), 7: (1, 4, 2, 1)}
 
 
+def _wave31b_split_workers(batch: int, bands: int, stride: int, budget: int) -> int:
+    capacity = budget // (4 * stride)
+    # Reserve one intermediate row per reduction chunk within the same budget.
+    limit = capacity * _W31B_REDUCE_CHUNK // (_W31B_REDUCE_CHUNK + 1)
+    return min(batch * bands, _MAX_CUDA_GRID_DIM, limit)
+
+
+def _wave31b_temp_budget(total: int, allocated: int) -> int:
+    headroom = max(0, total * 89 // 100 - allocated)
+    # Use spare capacity on large-memory devices. Scale the workspace with
+    # physical VRAM on smaller cards where it competes with the training graph.
+    return min(headroom, total // 32) if total < 70 * 1024**3 else headroom
+
+
+@cache
+def _wave31b_weight_plan(
+    device: int, shape: tuple[int, int, int, int], rank: int, dtype: str,
+    sms: int, shared: int, worker_limit: int, *, vector: bool,
+) -> tuple[int, tuple[int, int, int], _CudaModule] | None:
+    batch, height, width, modes = shape
+    best, best_score = None, 0.0
+    candidates = ((1, min(rank, _STATIC_RANK_LIMIT)),)
+    if vector and rank > 1:
+        candidates += ((2, min(_ceildiv(rank, 2), _CENTERED_WEIGHT_TILE)),)
+    warps = 4
+    for vec, tile in candidates:
+        scratch = warps * 18 * vec * _WARP_SIZE * 4
+        if scratch > shared:
+            continue
+        rank_tiles = _ceildiv(rank, tile)
+        mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
+        for rows in _W31B_WEIGHT_ROWS:
+            if rows > height and rows != _W31B_WEIGHT_ROWS[0]:
+                continue
+            geometry = tile, rows, warps
+            module = _reader_cuda_module(
+                device, shape, _reader_vector_columns(width, vec), 0, _STATIC_SPATIAL_KERNEL,
+                (dtype,) * 3, strict=False, weight_geometry=geometry, weight_vec=vec,
+                weight_read_only=vec != 2, split_rank=rank,
+            )
+            resident = _reader_resident(module, "dweight", warps)
+            row_tiles = _ceildiv(height, rows)
+            bands = _ceildiv(row_tiles, warps)
+            workers = min(batch * bands, worker_limit)
+            usable_warps = min(resident * row_tiles / bands,
+                               workers * mode_tiles * rank_tiles * row_tiles / (bands * sms))
+            # Projected reads, gradient reads including vertical halos, and one
+            # write/read of the FP32 partial per virtual CTA slice.
+            traffic = 2 * width * (rank * height + 2 * rank_tiles * (height + 2 * row_tiles - 2))
+            traffic += 2 * 4 * (2 * rank * 9) * workers / batch
+            score = usable_warps / traffic
+            if score > best_score:
+                best, best_score = (vec, geometry, module), score
+    return best
+
+
+def _wave31b_split_module(
+    projected: Tensor, real: Tensor, grad: Tensor, *, strict: bool,
+) -> tuple[int, tuple[int, int, int], _CudaModule, int] | None:
+    if _wave31b_preset(projected, real, grad, strict=strict) not in (
+        "dweight_vram_split", "full_w31b",
+    ):
+        return None
+    batch, height, width, _ = projected.shape
+    modes, rank, kernel, _ = real.shape
+    props = torch.cuda.get_device_properties(projected.device)
+    budget = _wave31b_temp_budget(props.total_memory, torch.cuda.memory_allocated(projected.device))
+    stride = 2 * modes * rank * kernel**2
+    if budget < stride * 8:
+        return None
+    max_bands = _ceildiv(height, _W31B_WEIGHT_ROWS[0] * 4)
+    worker_limit = _wave31b_split_workers(batch, max_bands, stride, budget)
+    with torch.cuda.device(projected.device):
+        plan = _wave31b_weight_plan(
+            projected.device.index or 0, (batch, height, width, modes), rank,
+            _CUDA_TYPES[projected.dtype], props.multi_processor_count,
+            props.shared_memory_per_block, worker_limit,
+            vector=_wave31b_vec2(projected, grad, modes),
+        )
+    if plan is None:
+        return None
+    vec, (tile, rows, warps), module = plan
+    workers = min(batch * _ceildiv(height, rows * warps), worker_limit)
+    return vec, (tile, rows, warps), module, workers
+
+
 def _hopper_reader_weight(
     projected: Tensor, real: Tensor, grad: Tensor, *, strict: bool, sms: int,
 ) -> tuple[int, tuple[int, int, int], _CudaModule, int] | None:
-    wave30b = _wave30b_preset(projected, real, grad, strict=strict)
+    wave31b = _wave31b_preset(projected, real, grad, strict=strict)
+    wave30b = _wave30b_preset(projected, real, grad, strict=strict) if wave31b == "off" else "off"
+    preferred = "hiocc_dinput_v2" if wave31b != "off" else None
     wave29b = (
-        _wave29b_preset(projected, real, grad, strict=strict)
+        _wave29b_preset(projected, real, grad, strict=strict, preferred=preferred)
         if wave30b == "off" else "hiocc_dinput_v2"
     )
     _, height, _, _ = projected.shape
@@ -1757,6 +1961,21 @@ def _wave25b_spatial(
     projected: Tensor, real: Tensor, grad: Tensor | None, op: str, *,
     strict: bool, plan: _RankFourPlan | None,
 ) -> tuple[_VectorLaunch, _CudaModule] | None:
+    if op == "forward" and _wave31b_preset(projected, real, grad, strict=strict) in (
+        "wide_fwd_only", "full_w31b",
+    ):
+        batch, height, width, _ = projected.shape
+        modes, rank, _, _ = real.shape
+        vec = 2 if _wave31b_vec2(projected, grad, modes) else 1
+        if width > _reader_vector_columns(width, vec):
+            props = torch.cuda.get_device_properties(projected.device)
+            wide = _wave31b_forward_plan(
+                projected.device.index or 0, (batch, height, width, modes), rank,
+                _CUDA_TYPES[projected.dtype], props.multi_processor_count, vec,
+                props.shared_memory_per_block,
+            )
+            if wide is not None:
+                return wide
     candidate = _hopper_reader_spatial(projected, real, grad, op, strict=strict)
     if candidate is not None:
         return candidate
@@ -2075,7 +2294,10 @@ def _packed_spatial_backward(  # noqa: PLR0915
         vec = _reader_vector_width(projected, real, grad, strict=strict_complex)
         baseline_vec = vec
         plan = _rank_four_plan(projected, real, grad, strict=strict_complex)
-        hopper_weight = _hopper_reader_weight(projected, real, grad, strict=strict_complex, sms=sms)
+        split_weight = _wave31b_split_module(projected, real, grad, strict=strict_complex)
+        hopper_weight = split_weight or _hopper_reader_weight(
+            projected, real, grad, strict=strict_complex, sms=sms,
+        )
         weight_candidate = (
             _wave25b_weight(projected, real, grad, vec, sms) if hopper_weight is None else None
         )
@@ -2115,7 +2337,7 @@ def _packed_spatial_backward(  # noqa: PLR0915
         mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
         available_workers = _ceildiv(batch * rows, weight_warps)
         worker_limit = hopper_weight[3] if hopper_weight else _ceildiv(waves * sms, mode_tiles)
-        workers = min(available_workers, worker_limit)
+        workers = worker_limit if split_weight else min(available_workers, worker_limit)
         if weight_warps == _WIDE_WEIGHT_WARPS and rank <= _CENTERED_WEIGHT_TILE:
             # Keep streaming warps on short row ranges as batch grows, with a
             # device-relative cap on the number of FP32 partials to reduce.
@@ -2128,7 +2350,7 @@ def _packed_spatial_backward(  # noqa: PLR0915
             (workers, 2, rank, kernel, kernel, modes), dtype=torch.float32,
         )
         weight_grad = real.new_empty((2, *real.shape), dtype=torch.float32)
-        parallel_reduce = workers >= _WEIGHT_PARALLEL_REDUCTION_WORKERS
+        parallel_reduce = split_weight is not None or workers >= _WEIGHT_PARALLEL_REDUCTION_WORKERS
         reduce_columns = _WARP_SIZE if parallel_reduce else _DEFAULT_THREADS
         reduce_op = "dweight_reduce_parallel" if parallel_reduce else "dweight_reduce"
         with torch.cuda.device(projected.device):
@@ -2145,10 +2367,23 @@ def _packed_spatial_backward(  # noqa: PLR0915
                 (projected, grad, partial), (height, width, modes, batch, rank),
                 stream=stream, threads=weight_warps * _WARP_SIZE,
             )
+            while split_weight and workers > _W31B_REDUCE_CHUNK:
+                chunks = _ceildiv(workers, _W31B_REDUCE_CHUNK)
+                stride = weight_grad.numel()
+                intermediate = partial.new_empty((chunks, stride))
+                _launch_reader_cuda(
+                    module, "dweight_reduce_chunks", (_ceildiv(stride, _WARP_SIZE), chunks, 1),
+                    (partial, intermediate), (stride, workers), stream=stream,
+                )
+                del partial
+                partial = intermediate
+                del intermediate
+                workers = chunks
             _launch_reader_cuda(
                 module, reduce_op, (_ceildiv(weight_grad.numel(), reduce_columns), 1, 1),
                 (partial, weight_grad), (modes, rank, workers), stream=stream,
             )
+            del partial
             candidate = _wave25b_spatial(
                 projected, real, grad, "dinput", strict=strict_complex, plan=plan,
             )
@@ -2158,7 +2393,7 @@ def _packed_spatial_backward(  # noqa: PLR0915
                 stream = _reader_stream(module, projected.device)
             else:
                 vec = baseline_vec
-                if hopper_weight and vec != hopper_weight[0]:
+                if split_weight or (hopper_weight and vec != hopper_weight[0]):
                     module = _reader_module_for(
                         projected, real, grad, strict=strict_complex, rank_four_plan=plan,
                         weight_vec=vec, spatial_vec=vec,

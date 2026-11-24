@@ -460,7 +460,8 @@ def _forward_fake(
 @cache
 def _worker_limit(module: _CudaModule, device: torch.device) -> int:
     # The register footprint depends on the channel tile, dtypes and bias fusion.
-    # One resident wave covers the SMs while bounding the affine partial buffer.
+    # Size the persistent grid for this kernel's occupancy on the current GPU.
+    # Extra waves would also add affine partials and reduction traffic.
     resident = ct.c_int()
     _check_cu(
         module.driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -1165,6 +1166,8 @@ def _tensor_core_conv_backward(
     dc: Tensor,
 ) -> None:
     block = 64
+    # The final kernel reduces all workers for each field in one CTA.
+    # Bound that tile to 1024 * CO elements regardless of workspace capacity.
     workers = min(1024, triton.cdiv(stats.numel() // 2, block))
     ci, co = x.shape[1], g.numel()
     fields = ci * 9 + 2 + int(cb is not None)

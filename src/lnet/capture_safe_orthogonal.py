@@ -226,6 +226,8 @@ def prepare_capture_safe_orthogonal_(
 
     The environment can force preparation on or off. In auto mode, callers
     opt in via ``auto``, which defaults to True for explicit preparation.
+    The polynomial uses ordinary PyTorch operations on CUDA and CPU and
+    derives its matrix dimensions from each original parametrization.
     """
     policy = os.environ.get("LNET_CAPTURE_SAFE_ORTHOGONAL", "auto")
     if policy not in {"auto", "on", "off"}:
