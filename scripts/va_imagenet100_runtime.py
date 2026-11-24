@@ -27,6 +27,12 @@ from va_model_builder import model_config as default_model_config
 
 from lnet.capture_safe_orthogonal import prepare_capture_safe_orthogonal_
 from lnet.classifier_heads import AffineCorrelationClassifier, expected_calibration_error
+from lnet.model_w36b import (
+    AUTOTUNE_FEATURES,
+    compile_model_w36b,
+    model_w36b_features,
+    prepare_model_w36b_,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sized
@@ -395,6 +401,8 @@ def evaluate(
 def prepare_model(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
     if bool(recipe.get("channels_last", False)):
         model.to(memory_format=torch.channels_last)  # pyright: ignore[reportCallIssue]
+    if model_w36b_features() & {"cuda_graphs", "capture_safe_ortho"}:
+        return prepare_model_w36b_(model)
     prepare_capture_safe_orthogonal_(model, auto=False)
     method = getattr(model, "prepare_for_compiled_training_", None)
     if callable(method):
@@ -442,6 +450,15 @@ def _replayed_stage_compile_options(compile_mode: str) -> dict[str, Any]:
 
 def _build_runtime(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
     compile_mode = _configure_compile_runtime(recipe)
+    features = model_w36b_features()
+    if features & (AUTOTUNE_FEATURES | {"cuda_graphs"}):
+        options = dict(torch._inductor.list_mode_options(compile_mode)) if compile_mode else {}
+        options["emulate_precision_casts"] = bool(recipe.get("emulate_precision_casts", False))
+        if not (features & {"cuda_graphs", "capture_safe_ortho"}) and (
+            compile_mode in _CUDA_GRAPH_COMPILE_MODES
+        ):
+            _exclude_capture_hostile_submodules(model, exclude_classifier=True)
+        return compile_model_w36b(model, options=options)
     if compile_mode is None:
         return model
     from lnet.general_cuda_scans import general_scans_enabled
@@ -449,7 +466,7 @@ def _build_runtime(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
     use_general = general_scans_enabled()
     requested_cudagraphs = compile_mode in _CUDA_GRAPH_COMPILE_MODES
     repeated_stages = requested_cudagraphs and _has_replayed_cudagraph_stages(model)
-    if requested_cudagraphs:
+    if requested_cudagraphs and "capture_safe_ortho" not in features:
         _exclude_capture_hostile_submodules(model, exclude_classifier=True)
     options = (
         _replayed_stage_compile_options(compile_mode)
@@ -466,12 +483,15 @@ def _build_runtime(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
 def _configure_compile_runtime(recipe: dict[str, Any]) -> str | None:
     inductor_config.emulate_precision_casts = bool(recipe.get("emulate_precision_casts", False))
     compile_mode = os.environ.get("LNET_COMPILE_MODE") or recipe.get("compile_mode")
+    w36b_graphs = "cuda_graphs" in model_w36b_features()
+    if w36b_graphs:
+        compile_mode = "reduce-overhead"
     os.environ["LNET_CUDAGRAPHS_ACTIVE"] = "1" if compile_mode in _CUDA_GRAPH_COMPILE_MODES else "0"
     if compile_mode is None:
         os.environ.pop("LNET_COMPILE_PROFILE", None)
         return None
     profile = json.dumps(
-        {"dynamic": False, "fullgraph": False, "mode": str(compile_mode)},
+        {"dynamic": False, "fullgraph": w36b_graphs, "mode": str(compile_mode)},
         separators=(",", ":"),
         sort_keys=True,
     )
