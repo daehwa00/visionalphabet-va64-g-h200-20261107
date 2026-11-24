@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SECONDS=0
+exec 3>&1
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 runner="$PWD/h200/wave27_h200_bundle"
 out=$(mktemp -d /app/output/va-t97-h200.XXXXXX)
@@ -19,11 +20,18 @@ export LNET_SCAN_W27A=off LNET_READER_W27B=off LNET_STEM_W27C=off
 finish() {
     local rc=$? archive_rc=0
     trap - EXIT
+    exec >&3 2>&3
     set +e
     printf '%d\n' "$rc" > "$data/exit-code.txt"
     printf '%d\n' "$SECONDS" > "$data/elapsed-seconds.txt"
+    if (( rc != 0 )) && [[ -s $data/environment.log ]]; then
+        printf 'Environment log retained in archive\n'
+    fi
     python3 "$runner/results.py" transport "$data" "$out" > "$out/transport.log" 2>&1
     archive_rc=$?
+    if (( archive_rc != 0 )); then
+        tail -c 512 "$out/transport.log"
+    fi
     if (( archive_rc == 0 )); then
         sha256sum "$out/task97.tar.xz" | awk '{print "VA_T97_SHA256 " $1}'
         base64 -w 240 "$out/task97.tar.xz" | sed 's/^/VA_T97_XZ /'
@@ -52,6 +60,10 @@ unset PYTHON_BIN
 for candidate in \
     /app/output/va-h200-effective1024-r3-combined-20261119/environment/bin/python \
     /app/output/va-h200-r4-marker-fix-20261119/environment/bin/python \
+    /app/output/va-t92-h200.aOb6kB/environment/venv/bin/python \
+    /app/output/va-t93-h200.TrMSFC/environment/venv/bin/python \
+    /app/output/va-t93-h200.XMqpcl/environment/venv/bin/python \
+    /app/output/va-t97-h200.*/environment/venv/bin/python \
     /app/output/va-t85-h200.*/environment/venv/bin/python \
     "$(command -v python3)"; do
     if ready "$candidate"; then
@@ -76,6 +88,7 @@ if [[ -z ${PYTHON_BIN:-} ]]; then
 fi > "$data/environment.log" 2>&1
 
 
+printf 'Python environment ready after %ss\n' "$SECONDS"
 export PYTHONPATH="$PWD/src:$PWD/scripts"
 
 run_capped() {
