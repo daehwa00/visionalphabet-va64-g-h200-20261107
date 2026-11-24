@@ -80,7 +80,9 @@ if [[ -z ${PYTHON_BIN:-} ]]; then
     timeout --kill-after=5s 60s env PYTHONPATH="$setup/bootstrap" python3 -m uv python install 3.13.11
     uv_run venv --python 3.13.11 "$setup/venv"
     export PYTHON_BIN="$setup/venv/bin/python"
-    timeout --kill-after=5s 240s env PYTHONPATH="$setup/bootstrap" python3 -m uv pip install --python "$PYTHON_BIN" \
+    # Cold downloads are several GiB and have exceeded the former 240s cap.
+    export UV_HTTP_TIMEOUT=120 UV_HTTP_RETRIES=4 UV_CONCURRENT_DOWNLOADS=6
+    timeout --kill-after=5s 900s env PYTHONPATH="$setup/bootstrap" python3 -m uv pip install --python "$PYTHON_BIN" \
         'torch @ https://download-r2.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=63381a109a569b280ed3319da89d3afe5cf9ab5c879936382a212affb5c90552' \
         'torchvision @ https://download-r2.pytorch.org/whl/cu128/torchvision-0.24.1%2Bcu128-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=5f7c5e0fa08d2cbee93b6e04bbedd59b5e11462cff6cefd07949217265df2370' \
         triton==3.5.1 numpy==2.4.6 pytest==9.0.3 timm==1.0.26
