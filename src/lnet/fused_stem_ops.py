@@ -15,7 +15,6 @@ from torch.nn import functional
 from triton.language.extra.cuda import libdevice
 
 from .cuda_nvrtc import _check_cu, _check_nvrtc, _CudaModule, _ensure_context, _include_dirs, _nvrtc
-from .model_w36b import model_w36b_features
 
 _TYPES = {torch.float32: "float", torch.float16: "__half", torch.bfloat16: "__nv_bfloat16"}
 _THREADS = 128
@@ -49,26 +48,21 @@ constexpr int tiles = (vectors + group - 1) / group;
 template<typename T>
 union Pack {
     static constexpr int words = elements * sizeof(T) / VECTOR_BYTES;
-#if VECTOR_BYTES == 16
-    using Word = uint4;
-#else
-    using Word = uint2;
-#endif
-    Word bits[words ? words : 1];
+    uint4 bits[words ? words : 1];
     T value[elements];
     __device__ Pack() : bits{} {}
 
     __device__ void load(const T* ptr, long long vector) {
         #pragma unroll
         for (int i = 0; i < words; i++)
-            bits[i] = reinterpret_cast<const Word*>(ptr)[vector * words + i];
+            bits[i] = reinterpret_cast<const uint4*>(ptr)[vector * words + i];
         if constexpr (!VEC) value[0] = ptr[vector];
     }
 
     __device__ void store(T* ptr, long long vector) {
         #pragma unroll
         for (int i = 0; i < words; i++)
-            reinterpret_cast<Word*>(ptr)[vector * words + i] = bits[i];
+            reinterpret_cast<uint4*>(ptr)[vector * words + i] = bits[i];
         if constexpr (!VEC) ptr[vector] = value[0];
     }
 };
@@ -283,12 +277,11 @@ def _compile_ptx(
     vector: bool,
     conv_bias_type: str | None = None,
     round_affine: bool = True,
-    vector_bytes: int = _VECTOR_BYTES,
 ) -> ct.Array:
     header = {
         "C": channels,
         "BLOCK_THREADS": _THREADS,
-        "VECTOR_BYTES": vector_bytes,
+        "VECTOR_BYTES": _VECTOR_BYTES,
         "REDUCE_CHANNELS": _REDUCE_CHANNELS,
         "WARP_SIZE": _WARP_SIZE,
         "INPUT": types[0],
@@ -346,7 +339,6 @@ def _module(
     vector: bool,
     conv_bias_type: str | None,
     round_affine: bool,
-    vector_bytes: int,
 ) -> _CudaModule:
     image = _compile_ptx(
         torch.cuda.get_device_capability(device),
@@ -355,7 +347,6 @@ def _module(
         vector=vector,
         conv_bias_type=conv_bias_type,
         round_affine=round_affine,
-        vector_bytes=vector_bytes,
     )
     module = _CudaModule(image, device)
     for name in ("stem_forward", "stem_backward", "stem_reduce"):
@@ -363,15 +354,13 @@ def _module(
     return module
 
 
-def _geometry(
-    x: Tensor, channels: int, *aligned: Tensor, vector_bytes: int,
-) -> tuple[bool, int]:
-    elements = vector_bytes // x.element_size()
+def _geometry(x: Tensor, channels: int, *aligned: Tensor) -> tuple[bool, int]:
+    elements = _VECTOR_BYTES // x.element_size()
     vector = (
         channels <= _MAX_VECTOR_CHANNELS
         and channels % elements == 0
         and all(
-            t.data_ptr() % vector_bytes == 0 and t.element_size() >= x.element_size()
+            t.data_ptr() % _VECTOR_BYTES == 0 and t.element_size() >= x.element_size()
             for t in (x, *aligned)
         )
     )
@@ -408,7 +397,6 @@ def _kernel_module(
     *,
     vector: bool,
     round_affine: bool,
-    vector_bytes: int,
 ) -> _CudaModule:
     types = (_TYPES[x.dtype], _TYPES[w.dtype], _TYPES[b.dtype], _TYPES[output_dtype])
     return _module(
@@ -418,24 +406,7 @@ def _kernel_module(
         vector=vector,
         conv_bias_type=_TYPES[cb.dtype] if cb is not None else None,
         round_affine=round_affine,
-        vector_bytes=vector_bytes,
     )
-
-
-def _backward_vector_bytes(x: Tensor, channels: int) -> int:
-    # Four 16-bit values per lane bound the persistent backward's register footprint.
-    if (
-        channels in (32, 64)
-        and x.element_size() == 2
-        and "stem_cudnn" in model_w36b_features()
-    ):
-        return 8
-    return _VECTOR_BYTES
-
-
-@torch.compiler.assume_constant_result
-def _stem_cuda_major(device: torch.device) -> int:
-    return torch.cuda.get_device_capability(device)[0]
 
 
 # Custom ops and autograd
@@ -453,15 +424,14 @@ def _forward(
     n = x.numel() // channels
     y = torch.empty_like(x, dtype=output_dtype)
     if n:
-        vector, rows = _geometry(x, channels, y, vector_bytes=_VECTOR_BYTES)
+        vector, rows = _geometry(x, channels, y)
         blocks = min(_MAX_FORWARD_BLOCKS, (n + rows - 1) // rows)
         with torch.cuda.device(x.device):
             module = _kernel_module(
-                x, w, b, cb, output_dtype, vector=vector, round_affine=round_affine,
-                vector_bytes=_VECTOR_BYTES,
+                x, w, b, cb, output_dtype, vector=vector, round_affine=round_affine
             )
             _ensure_context(module.driver, x.device.index or 0)
-            stream = torch.cuda.current_stream(x.device).cuda_stream
+            stream = torch.cuda.current_stream().cuda_stream
             _launch(
                 module,
                 stream,
@@ -518,17 +488,13 @@ def _backward(
         dcb = torch.zeros_like(cb) if cb is not None else x.new_empty(0)
         return torch.empty_like(x), torch.zeros_like(w), torch.zeros_like(b), dcb
     dx, dw, db, dcb = _backward_fake(x, w, b, cb, dy, eps, round_affine)
-    vector_bytes = _backward_vector_bytes(x, channels)
-    vector, rows = _geometry(x, channels, dy, dx, vector_bytes=vector_bytes)
+    vector, rows = _geometry(x, channels, dy, dx)
     with torch.cuda.device(x.device):
-        module = _kernel_module(
-            x, w, b, cb, dy.dtype, vector=vector, round_affine=round_affine,
-            vector_bytes=vector_bytes,
-        )
+        module = _kernel_module(x, w, b, cb, dy.dtype, vector=vector, round_affine=round_affine)
         _ensure_context(module.driver, x.device.index or 0)
         workers = min(_worker_limit(module, x.device), (n + rows - 1) // rows)
         partial = x.new_empty((workers, 2 + int(cb is not None), channels), dtype=torch.float32)
-        stream = torch.cuda.current_stream(x.device).cuda_stream
+        stream = torch.cuda.current_stream().cuda_stream
         _launch(
             module,
             stream,
@@ -616,6 +582,11 @@ def _fallback_norm(
     else:
         norm = functional.layer_norm(pixels, weight.shape, weight, bias, eps)
     return norm
+
+
+@torch.compiler.assume_constant_result
+def _stem_cuda_major(device: torch.device) -> int:
+    return torch.cuda.get_device_capability(device)[0]
 
 
 def fused_nhwc_layernorm_gelu(

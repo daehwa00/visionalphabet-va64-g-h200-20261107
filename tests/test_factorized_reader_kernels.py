@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from copy import deepcopy
 from itertools import product
 from types import SimpleNamespace
@@ -655,27 +656,38 @@ def test_reader_spatial_auto_dispatch(monkeypatch, option, width, modes, rank, s
         assert launch.warps == 1
 
 
-def test_reader_weight_workspace_scales_with_memory(monkeypatch) -> None:
+def test_reader_weight_workspace_is_capture_stable(monkeypatch) -> None:
     props = SimpleNamespace(
-        major=8, multi_processor_count=80, shared_memory_per_block=49152, total_memory=0,
+        major=8, multi_processor_count=80, shared_memory_per_block=49152, total_memory=24 * 2**30,
     )
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: allocated)
     monkeypatch.setattr(kernels, "_reader_module_for", lambda *_a, **kw: kw)
     monkeypatch.setattr(kernels, "_reader_resident", lambda *_: 3)
     projected = torch.empty((1024, 17, 25, 256), device="meta", dtype=torch.bfloat16)
     real = torch.empty((64, 4, 3, 3), device="meta", dtype=projected.dtype)
     grad = torch.empty((1024, 17, 25, 128), device="meta", dtype=projected.dtype)
-    props.total_memory = 24 * 2**30
-    allocated = 0
-    roomy = kernels._reader_weight_plan(projected, real, grad, strict=False)
-    props.total_memory = 12 * 2**30
-    allocated = 7 * props.total_memory // 8 - 2**20
-    tight = kernels._reader_weight_plan(projected, real, grad, strict=False)
-    assert 0 < tight.grid[1] < roomy.grid[1]
-    assert tight.grid[1] * 2 * real.numel() * 4 <= 2**20
-    assert tight.module["weight_geometry"] == roomy.module["weight_geometry"]
-    assert roomy.reduce == tight.reduce == "dweight_reduce"
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: 0)
+    warmup = kernels._reader_weight_plan(projected, real, grad, strict=False)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: props.total_memory)
+    capture = kernels._reader_weight_plan(projected, real, grad, strict=False)
+    assert warmup == capture
+    assert kernels._weight_partial_limit(2**25, 80, 1024, 128) < kernels._weight_partial_limit(
+        props.total_memory, 80, 1024, 128,
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_reject_strict_complex_projection_missing_imaginary_channels(device: str) -> None:
+    projected = torch.empty((1, 1, 1, 1), device=device)
+    real = imag = torch.empty((1, 1, 1, 1), device=device)
+    grad = torch.empty((1, 1, 1, 2), device=device)
+    with pytest.raises(ValueError, match="expected 2 projected channels, got 1"):
+        kernels.packed_spatial(projected, real, imag)
+    if device == "meta":
+        with pytest.raises(ValueError, match="expected 2 projected channels, got 1"):
+            kernels._packed_spatial(projected, real, imag)
+        with pytest.raises(ValueError, match="expected 2 projected channels, got 1"):
+            kernels._packed_spatial_backward(grad, projected, real, imag)
 
 
 @requires_cuda
@@ -688,7 +700,7 @@ def test_reader_weight_workspace_scales_with_memory(monkeypatch) -> None:
 def test_reader_auto_and_off_cuda_parity(monkeypatch, shape, modes, rank, strict) -> None:
     torch.manual_seed(37)
     kwargs = {"device": "cuda", "dtype": torch.float16}
-    projected = torch.randn((*shape, modes * rank), **kwargs) * 0.125
+    projected = torch.randn((*shape, (2 if strict else 1) * modes * rank), **kwargs) * 0.125
     filters = (torch.randn((2, modes, rank, 3, 3), **kwargs) * 0.125).unbind()
     grad = torch.randn((*shape, 2 * modes), **kwargs) * 0.125
     outputs = []
@@ -700,3 +712,37 @@ def test_reader_auto_and_off_cuda_parity(monkeypatch, shape, modes, rank, strict
         ))
     for actual, expected in zip(*outputs, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
+
+
+def test_singleton_strict_fp32_spatial_and_gradients() -> None:
+    projected = torch.tensor([[[[2., 3.]]]])
+    real = torch.full((1, 1, 1, 1), 5.)
+    imag = torch.full_like(real, 7.)
+    dout = torch.tensor([[[[11., 13.]]]])
+    actual = kernels._packed_spatial._init_fn(projected, real, imag)
+    dp, dw = kernels._packed_spatial_backward._init_fn(dout, projected, real, imag)
+    torch.testing.assert_close(actual, torch.tensor([[[[-11., 29.]]]]))
+    torch.testing.assert_close(dp, torch.tensor([[[[146., -12.]]]]))
+    torch.testing.assert_close(dw.flatten(), torch.tensor([61., -7.]))
+
+
+
+def test_cuda_launcher_buffers_follow_argument_signature() -> None:
+    tensor = torch.ones(1)
+    values = []
+
+    def launch(*args: object) -> int:
+        pointers = args[-2]
+        decode = ctypes.c_int if not values else ctypes.c_float
+        values.append((ctypes.c_void_p.from_address(pointers[0]).value,
+                       decode.from_address(pointers[1]).value))
+        return 0
+
+    module = SimpleNamespace(
+        driver=SimpleNamespace(cuLaunchKernel=launch), functions={"reader_test_signature": 1},
+    )
+    for value in (7, 0.5):
+        kernels._launch_reader_cuda(
+            module, "test_signature", (1, 1, 1), (tensor,), (value,), stream=ctypes.c_void_p(),
+        )
+    assert values == [(tensor.data_ptr(), 7), (tensor.data_ptr(), 0.5)]

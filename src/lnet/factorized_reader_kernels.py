@@ -1312,14 +1312,12 @@ def _reader_spatial_plan(
 
 
 def _weight_partial_limit(
-    total: int, sms: int, stride: int, resident_threads: int, device: torch.device,
+    total: int, sms: int, stride: int, resident_threads: int,
 ) -> int:
     # Limit the reduction's working set to the resident thread capacity,
-    # and scale the allocation with device memory and allocator headroom.
-    allocated = torch.cuda.memory_allocated(device)
-    headroom = max(0, 7 * total // 8 - allocated)
+    # and device memory so warmup and capture use the same launch grid.
     resident_bytes = sms * resident_threads * 256
-    budget = min(headroom, total // 32, resident_bytes)
+    budget = min(total // 32, resident_bytes)
     return max(1, min(_MAX_CUDA_GRID_DIM, budget // (4 * stride)))
 
 
@@ -1393,7 +1391,7 @@ def _reader_weight_plan(
                                     weight_geometry=geometry)
         resident = _reader_resident(module, "dweight", weight_warps)
     limit = _weight_partial_limit(
-        props.total_memory, sms, stride, max(resident, 1) * weight_warps * _WARP_SIZE, device,
+        props.total_memory, sms, stride, max(resident, 1) * weight_warps * _WARP_SIZE,
     )
     workers = min(available, workers, limit)
     if workers >= _WEIGHT_PARALLEL_REDUCTION_WORKERS:
@@ -1431,7 +1429,10 @@ def _launch_reader_cuda(
     buffers = getattr(_CUDA_LAUNCH_STATE, "buffers", None)
     if buffers is None:
         buffers = _CUDA_LAUNCH_STATE.buffers = {}
-    if operation not in buffers:
+    # The host ABI includes pointer count and by-value argument sizes.
+    signature = tuple(len(value) if isinstance(value, tuple) else type(value) for value in sizes)
+    key = operation, len(tensors), signature
+    if key not in buffers:
         values = [ctypes.c_void_p() for _ in tensors]
         for value in sizes:
             if isinstance(value, tuple):
@@ -1439,8 +1440,8 @@ def _launch_reader_cuda(
             else:
                 values.append(ctypes.c_float() if isinstance(value, float) else ctypes.c_int())
         pointers = (ctypes.c_void_p * len(values))(*(ctypes.addressof(arg) for arg in values))
-        buffers[operation] = values, pointers
-    values, pointers = buffers[operation]
+        buffers[key] = values, pointers
+    values, pointers = buffers[key]
     for index, tensor in enumerate(tensors):
         values[index].value = tensor.data_ptr()
     for index, value in enumerate(sizes, len(tensors)):
@@ -1567,12 +1568,34 @@ def _reader_spatial_grid(
     return _ceildiv(modes, _WARP_SIZE * vec), tiles, batch
 
 
+def _validate_packed_spatial_shape(
+    projected: Tensor, real: Tensor, strict_complex: bool,
+) -> None:
+    modes, rank = real.shape[:2]
+    expected = (2 if strict_complex else 1) * modes * rank
+    if projected.shape[-1] != expected:
+        raise ValueError(f"expected {expected} projected channels, got {projected.shape[-1]}")
+
+
+def _singleton_strict_spatial(projected: Tensor, real: Tensor, *, strict: bool) -> bool:
+    return strict and projected.shape == (1, 1, 1, 2) and real.shape == (1, 1, 1, 1)
+
+
+def _singleton_complex_product(left: Tensor, real: Tensor, imag: Tensor) -> Tensor:
+    lr, li = left.float().unbind(dim=-1)
+    wr, wi = real.float().reshape(()), imag.float().reshape(())
+    return torch.stack((lr * wr - li * wi, lr * wi + li * wr), dim=-1)
+
+
 @torch.library.custom_op("va_reader::packed_spatial", mutates_args=(), device_types="cuda")
 def _packed_spatial(
     projected: Tensor, real: Tensor, imag: Tensor, strict_complex: bool = True,
 ) -> Tensor:
+    _validate_packed_spatial_shape(projected, real, strict_complex)
     batch, height, width, _ = projected.shape
     modes, rank, _, _ = real.shape
+    if _singleton_strict_spatial(projected, real, strict=strict_complex):
+        return _singleton_complex_product(projected, real, imag).to(projected.dtype)
     if _use_reader_cuda(projected, real, imag):
         output = projected.new_empty((batch, height, width, 2 * modes))
         with torch.cuda.device(projected.device):
@@ -1592,8 +1615,9 @@ def _packed_spatial(
 
 @_packed_spatial.register_fake
 def _packed_spatial_fake(
-    projected: Tensor, real: Tensor, _imag: Tensor, _strict_complex: bool = True,
+    projected: Tensor, real: Tensor, _imag: Tensor, strict_complex: bool = True,
 ) -> Tensor:
+    _validate_packed_spatial_shape(projected, real, strict_complex)
     return projected.new_empty((*projected.shape[:-1], 2 * real.shape[0]))
 
 
@@ -1605,8 +1629,14 @@ def _packed_spatial_backward(
     imag: Tensor,
     strict_complex: bool = True,
 ) -> tuple[Tensor, Tensor]:
+    _validate_packed_spatial_shape(projected, real, strict_complex)
     batch, height, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
+    if _singleton_strict_spatial(projected, real, strict=strict_complex):
+        dp = _singleton_complex_product(grad, real, -imag)
+        pr, pi = projected.float().unbind(dim=-1)
+        dw = _singleton_complex_product(grad, pr, -pi)
+        return dp.to(projected.dtype), dw.reshape(2, 1, 1, 1, 1)
     if _use_reader_cuda(projected, real, imag, grad):
         grad = grad.contiguous()
         grad_projected = torch.empty_like(projected)
@@ -1651,8 +1681,9 @@ def _packed_spatial_backward_fake(
     projected: Tensor,
     real: Tensor,
     _imag: Tensor,
-    _strict_complex: bool = True,
+    strict_complex: bool = True,
 ) -> tuple[Tensor, Tensor]:
+    _validate_packed_spatial_shape(projected, real, strict_complex)
     return torch.empty_like(projected), real.new_empty((2, *real.shape), dtype=torch.float32)
 
 
@@ -1674,6 +1705,7 @@ _packed_spatial.register_autograd(_backward_spatial, setup_context=_save_spatial
 
 def packed_spatial(projected: Tensor, real: Tensor, imag: Tensor) -> Tensor:
     """Filter packed (component, rank, mode) projections with FP32 accumulation."""
+    _validate_packed_spatial_shape(projected, real, strict_complex=True)
     if projected.is_cuda and projected.numel() != 0:
         return _packed_spatial(projected.contiguous(), real.contiguous(), imag.contiguous())
     return _spatial_reference(projected, real, imag)
@@ -1684,6 +1716,7 @@ def real_packed_spatial(
 ) -> Tensor:
     """Apply two independent filters per mode to a shared real projection."""
     real, imag = weights.unbind(dim=0 if component_first else 1)
+    _validate_packed_spatial_shape(projected, real, strict_complex=False)
     if projected.is_cuda and projected.numel() != 0:
         return _packed_spatial(
             projected.contiguous(), real.contiguous(), imag.contiguous(), strict_complex=False,

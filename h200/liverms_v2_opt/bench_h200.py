@@ -290,7 +290,9 @@ def train_arm(args: argparse.Namespace) -> dict:
     import va_model_builder as builder
 
     from lnet.model_w36b import (
+        AUTOTUNE_FEATURES,
         compile_model_w36b,
+        count_cudagraph_replays,
         mark_model_w36b_step_begin,
         model_w36b_features,
     )
@@ -298,9 +300,13 @@ def train_arm(args: argparse.Namespace) -> dict:
     inputs = setup(args.batch)
     labels = torch.arange(args.batch, device="cuda") % 100
     model = build_model(args.variant)
+    features = model_w36b_features()
+    if "cuda_graphs" in features:
+        # The synthetic batch stays at this address for every timed iteration.
+        torch._dynamo.mark_static_address(inputs)
     compiled = (
         compile_model_w36b(model)
-        if model_w36b_features() & {"cuda_graphs", "max_autotune_gemm"}
+        if features & (AUTOTUNE_FEATURES | {"cuda_graphs"})
         else torch.compile(model, mode="default")
     )
     optimizer = builder.build_optimizer(
@@ -340,7 +346,12 @@ def train_arm(args: argparse.Namespace) -> dict:
         ema_weight_after=float(rms.ema_weight),
         running_ms_finite=bool(rms.running_ms.isfinite().all()),
     )
-    backward()
+    if "cuda_graphs" in features:
+        with count_cudagraph_replays() as replays:
+            backward()
+        result["cudagraph_replays_per_forward_backward"] = len(replays)
+    else:
+        backward()
     gradients = [p.grad for p in model.parameters() if p.grad is not None]
     terminal = getattr(model.backbone, "terminal_s3", None)
     result.update(

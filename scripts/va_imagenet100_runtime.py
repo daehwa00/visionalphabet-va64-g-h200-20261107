@@ -27,7 +27,12 @@ from va_model_builder import model_config as default_model_config
 
 from lnet.capture_safe_orthogonal import prepare_capture_safe_orthogonal_
 from lnet.classifier_heads import AffineCorrelationClassifier, expected_calibration_error
-from lnet.model_w36b import compile_model_w36b, model_w36b_features, prepare_model_w36b_
+from lnet.model_w36b import (
+    AUTOTUNE_FEATURES,
+    compile_model_w36b,
+    model_w36b_features,
+    prepare_model_w36b_,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sized
@@ -446,7 +451,7 @@ def _replayed_stage_compile_options(compile_mode: str) -> dict[str, Any]:
 def _build_runtime(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
     compile_mode = _configure_compile_runtime(recipe)
     features = model_w36b_features()
-    if features & {"cuda_graphs", "max_autotune_gemm"}:
+    if features & (AUTOTUNE_FEATURES | {"cuda_graphs"}):
         options = dict(torch._inductor.list_mode_options(compile_mode)) if compile_mode else {}
         options["emulate_precision_casts"] = bool(recipe.get("emulate_precision_casts", False))
         if not (features & {"cuda_graphs", "capture_safe_ortho"}) and (

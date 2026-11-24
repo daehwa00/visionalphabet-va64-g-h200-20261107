@@ -1,9 +1,10 @@
-"""Opt-in stem and training compiler policies for Wave 36B."""
+"""Opt-in training compiler policies for Wave 36B."""
 
 from __future__ import annotations
 
 import os
-from typing import Any
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -11,7 +12,11 @@ from torch._inductor import list_mode_options
 
 from .capture_safe_orthogonal import prepare_capture_safe_orthogonal_
 
-_FEATURES = frozenset({"stem_cudnn", "capture_safe_ortho", "cuda_graphs", "max_autotune_gemm"})
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+AUTOTUNE_FEATURES = frozenset({"max_autotune_gemm", "max_autotune_gemm_aten"})
+_FEATURES = AUTOTUNE_FEATURES | {"capture_safe_ortho", "cuda_graphs"}
 
 
 def model_w36b_features() -> frozenset[str]:
@@ -19,7 +24,7 @@ def model_w36b_features() -> frozenset[str]:
     features = frozenset(part.strip() for part in policy.split(","))
     if features == {"off"}:
         return frozenset()
-    if features - _FEATURES:
+    if features - _FEATURES or len(features & AUTOTUNE_FEATURES) > 1:
         message = "LNET_MODEL_W36B must be off or a comma-separated list of Wave 36B features"
         raise ValueError(message)
     return features
@@ -40,7 +45,7 @@ def compile_model_w36b(
     features = model_w36b_features()
     prepare_model_w36b_(model)
     graphs = "cuda_graphs" in features
-    autotune = "max_autotune_gemm" in features
+    autotune = bool(features & AUTOTUNE_FEATURES)
     if options is None and not autotune:
         if graphs:
             return torch.compile(model, mode="reduce-overhead", fullgraph=True, dynamic=False)
@@ -50,13 +55,33 @@ def compile_model_w36b(
     if autotune:
         settings.update(
             max_autotune_gemm=True,
-            max_autotune_gemm_backends="ATEN,TRITON",
+            max_autotune_gemm_backends=(
+                "ATEN" if "max_autotune_gemm_aten" in features else "ATEN,TRITON"
+            ),
             aggressive_fusion=False,
         )
-    return torch.compile(model, options=settings, fullgraph=graphs, dynamic=False)
+    fullgraph = graphs or (autotune and "capture_safe_ortho" in features)
+    return torch.compile(model, options=settings, fullgraph=fullgraph, dynamic=False)
 
 
 def mark_model_w36b_step_begin() -> None:
     """Call before the first forward of each independent training iteration."""
     if "cuda_graphs" in model_w36b_features():
         torch.compiler.cudagraph_mark_step_begin()
+
+
+@contextmanager
+def count_cudagraph_replays() -> Iterator[list[int]]:
+    """Collect CUDA Graph identities during a diagnostic step."""
+    replays: list[int] = []
+    replay = torch.cuda.CUDAGraph.replay
+
+    def counted(graph: torch.cuda.CUDAGraph) -> None:
+        replay(graph)
+        replays.append(id(graph))
+
+    torch.cuda.CUDAGraph.replay = counted
+    try:
+        yield replays
+    finally:
+        torch.cuda.CUDAGraph.replay = replay
