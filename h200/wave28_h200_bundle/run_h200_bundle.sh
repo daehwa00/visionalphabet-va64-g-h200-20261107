@@ -150,7 +150,7 @@ reader_parity() (
 
 scan_parity() {
     run_capped 180 parity_a env PYTHONPATH="$PYTHONPATH:$PWD/tests:$PWD/h200/wave28a_scan_probe" \
-        "$PYTHON_BIN" "$runner/scan_parity.py" "$data/parity_a.json" "$LNET_SCAN_W28A"
+        "$PYTHON_BIN" "$runner/scan_parity.py" "$data/parity_a.json" "$LNET_SCAN_W28A" "${1:-0}"
 }
 
 regression() {
@@ -192,7 +192,11 @@ if [[ ${1:-} == pytest-shard || ${1:-} == regression ]]; then
     printf '%s\t%s\t%s\n' "$1" "$2" "$3" > "$data/active-presets.tsv"
     shift 3
     if [[ $mode == pytest-shard ]]; then
-        shard_pytest "$@"
+        shard_pytest "${@:1:4}"
+        if [[ -n ${5:-} ]]; then
+            [[ $5 =~ ^[0-9]+$ ]] && (( $5 < 32 )) || exit 2
+            scan_parity "$5"
+        fi
     else
         regression
     fi

@@ -2,7 +2,7 @@
 
 import json
 import sys
-from itertools import product
+from itertools import islice, product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +10,8 @@ import validate
 
 
 def main() -> None:
-    output, preset = sys.argv[1:]
+    output, preset, first = sys.argv[1:]
+    start = int(first)
     # CUDA coarse requires even axes. Use the next even size for the 7x7 stage.
     cases = (
         *((size, size, 160, coarse) for size, coarse in product((56, 28, 14), (False, True))),
@@ -19,7 +20,8 @@ def main() -> None:
     )
     results = []
     with patch.object(validate, "PRESETS", ("off", preset)):
-        for case, dtype, interleaved in product(cases, validate.DTYPES, (False, True)):
+        work = product(cases, validate.DTYPES, (False, True))
+        for case, dtype, interleaved in islice(work, start, None):
             try:
                 rows = list(validate.run(case, dtype, interleaved=interleaved, forced=False))
                 results.extend(row for row in rows if row["preset"] == preset)
@@ -31,8 +33,8 @@ def main() -> None:
             passed = all("error" not in row for row in results)
             temporary = Path(output).with_suffix(".tmp")
             temporary.write_text(json.dumps({
-                "preset": preset, "expected_cases": 32,
-                "passed": len(results) == 32 and passed, "cases": results,
+                "preset": preset, "expected_cases": 32, "first": start,
+                "passed": len(results) == 32 - start and passed, "cases": results,
             }, separators=(",", ":")))
             temporary.replace(output)
     raise SystemExit(int(not passed))
