@@ -1303,25 +1303,32 @@ def _wave25b_enabled() -> bool:
 
 _WAVE27B_PRESETS = ("dweight_2cta", "scalar_hiocc", "full_hopper")
 _WAVE27B_PARTIAL_BYTES = 10_137_600
+_WAVE28B_PRESETS = ("keep_fwd_hopper", "dweight_3cta", "bwd_hiocc_v2", "fwd_vec2_opt")
+
+
+def _hopper_reader_eligible(
+    projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
+) -> bool:
+    modes, rank, kernel, _ = real.shape
+    batch, height, width, _ = projected.shape
+    dtype = projected.dtype
+    return (
+        not strict and os.environ.get("LNET_READER_VEC", "auto") == "auto"
+        and rank == _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL and modes == 160
+        and height == width and height in (14, 28, 56)
+        and batch * height * width >= _SPECIALIZE_MIN_PIXELS
+        and dtype in (torch.bfloat16, torch.float16) and real.dtype == dtype
+        and projected.data_ptr() % 4 == 0
+        and (grad is None or (grad.dtype == dtype and grad.data_ptr() % 4 == 0))
+    )
 
 
 def _wave27b_preset(
     projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
 ) -> str:
     preset = os.environ.get("LNET_READER_W27B", "off")
-    if preset not in (*_WAVE27B_PRESETS, "auto"):
-        return "off"
-    modes, rank, kernel, _ = real.shape
-    batch, height, width, _ = projected.shape
-    dtype = projected.dtype
-    if (
-        strict or os.environ.get("LNET_READER_VEC", "auto") != "auto"
-        or rank != _STATIC_RANK_LIMIT or kernel != _STATIC_SPATIAL_KERNEL or modes != 160
-        or height != width or height not in (14, 28, 56)
-        or batch * height * width < _SPECIALIZE_MIN_PIXELS
-        or dtype not in (torch.bfloat16, torch.float16) or real.dtype != dtype
-        or projected.data_ptr() % 4
-        or (grad is not None and (grad.dtype != dtype or grad.data_ptr() % 4))
+    if preset not in (*_WAVE27B_PRESETS, "auto") or not _hopper_reader_eligible(
+        projected, real, grad, strict=strict,
     ):
         return "off"
     arch = torch.cuda.get_device_capability(projected.device)
@@ -1330,22 +1337,53 @@ def _wave27b_preset(
     return preset if arch in {(8, 6), (9, 0)} else "off"
 
 
-def _wave27b_spatial(
+def _wave28b_preset(
+    projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
+) -> str:
+    preset = os.environ.get("LNET_READER_W28B", "off")
+    if preset not in (*_WAVE28B_PRESETS, "auto") or not _hopper_reader_eligible(
+        projected, real, grad, strict=strict,
+    ):
+        return "off"
+    arch = torch.cuda.get_device_capability(projected.device)
+    if preset == "auto":
+        return "keep_fwd_hopper" if arch == (9, 0) else "off"
+    # Explicit presets are also available on SM 8.6 for numerical checks.
+    return preset if arch in {(8, 6), (9, 0)} else "off"
+
+
+def _wave28b_spatial_geometry(height: int, op: str, preset: str) -> tuple[int, int, int]:
+    if op == "forward":
+        if height == 14:
+            return 2, 7, 1
+        if preset == "fwd_vec2_opt":
+            return 2, 4, 4 if height == 56 else 2
+        return 2, 8 if height == 56 else 7, 2
+    if preset == "bwd_hiocc_v2" and height in (14, 56):
+        return 1, 7, 4 if height == 56 else 2
+    return {56: (1, 8, 4), 28: (1, 4, 4), 14: (2, 7, 1)}[height]
+
+
+def _hopper_reader_spatial(
     projected: Tensor, real: Tensor, grad: Tensor | None, op: str, *, strict: bool,
 ) -> tuple[_VectorLaunch, _CudaModule] | None:
-    preset = _wave27b_preset(projected, real, grad, strict=strict)
-    if preset not in ("scalar_hiocc", "full_hopper"):
-        return None
+    preset = _wave28b_preset(projected, real, grad, strict=strict)
     batch, height, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
-    if height == 56:
-        vec, rows, warps = 1, 8, 4
-    elif height == 28 and op == "dinput":
-        vec, rows, warps = 1, 4, 4
-    elif height == 14 and preset == "full_hopper":
-        vec, rows, warps = 2, 7, 1
+    if preset != "off":
+        vec, rows, warps = _wave28b_spatial_geometry(height, op, preset)
     else:
-        return None
+        preset = _wave27b_preset(projected, real, grad, strict=strict)
+        if preset not in ("scalar_hiocc", "full_hopper"):
+            return None
+        if height == 56:
+            vec, rows, warps = 1, 8, 4
+        elif height == 28 and op == "dinput":
+            vec, rows, warps = 1, 4, 4
+        elif height == 14 and preset == "full_hopper":
+            vec, rows, warps = 2, 7, 1
+        else:
+            return None
     columns = _reader_vector_columns(width, vec)
     grid = _reader_spatial_grid(batch, height, width, modes, rows, warps, vec, columns)
     if grid[1] > _MAX_CUDA_GRID_DIM:
@@ -1362,24 +1400,42 @@ def _wave27b_spatial(
     return _VectorLaunch(vec, columns, rows, warps), module
 
 
-def _wave27b_weight(
+# Entries are vector width, rank tile, rows, and total CTAs per SM across waves.
+_HOPPER_WEIGHT = {56: (2, 2, 8, 8), 28: (2, 2, 4, 6), 14: (1, 4, 7, 5)}
+_HOPPER_WEIGHT_OVERRIDES = {
+    # Six CTAs per worker and three resident CTAs per SM fill two waves.
+    ("dweight_3cta", 56): (2, 2, 4, 6),
+    ("bwd_hiocc_v2", 14): (1, 2, 4, 8),
+}
+
+
+def _hopper_reader_weight(
     projected: Tensor, real: Tensor, grad: Tensor, *, strict: bool, sms: int,
 ) -> tuple[int, tuple[int, int, int], _CudaModule, int] | None:
-    preset = _wave27b_preset(projected, real, grad, strict=strict)
-    if preset not in ("dweight_2cta", "full_hopper"):
-        return None
+    wave28b = _wave28b_preset(projected, real, grad, strict=strict)
     _, height, _, _ = projected.shape
-    modes, rank, kernel, _ = real.shape
-    if height == 56:
-        vec, tile, rows, waves = (2, 2, 14, 6) if preset == "dweight_2cta" else (2, 2, 8, 8)
-    elif preset == "full_hopper":
-        vec, tile, rows, waves = (2, 2, 4, 6) if height == 28 else (1, 4, 7, 5)
+    if wave28b != "off":
+        config = _HOPPER_WEIGHT_OVERRIDES.get((wave28b, height), _HOPPER_WEIGHT[height])
     else:
-        return None
+        preset = _wave27b_preset(projected, real, grad, strict=strict)
+        if preset == "dweight_2cta" and height == 56:
+            config = (2, 2, 14, 6)
+        elif preset == "full_hopper":
+            config = _HOPPER_WEIGHT[height]
+        else:
+            return None
+    modes, rank, kernel, _ = real.shape
+    vec, tile, rows, ctas_per_sm = config
     geometry = tile, rows, 4
     ctas_per_worker = _ceildiv(modes, _WARP_SIZE * vec) * _ceildiv(rank, tile)
     limit = _WAVE27B_PARTIAL_BYTES // (2 * rank * kernel**2 * modes * 4)
-    workers = min(limit, _ceildiv(waves * sms, ctas_per_worker))
+    cta_budget = ctas_per_sm * sms
+    if height == 14 and wave28b == "bwd_hiocc_v2":
+        # Avoid starting a third wave on Whole H200 with a single extra worker.
+        workers = max(1, cta_budget // ctas_per_worker)
+    else:
+        workers = _ceildiv(cta_budget, ctas_per_worker)
+    workers = min(limit, workers)
     with torch.cuda.device(projected.device):
         module = _reader_module_for(
             projected, real, grad, strict=False, weight_vec=vec, spatial_vec=vec,
@@ -1489,7 +1545,7 @@ def _wave25b_spatial(
     projected: Tensor, real: Tensor, grad: Tensor | None, op: str, *,
     strict: bool, plan: _RankFourPlan | None,
 ) -> tuple[_VectorLaunch, _CudaModule] | None:
-    candidate = _wave27b_spatial(projected, real, grad, op, strict=strict)
+    candidate = _hopper_reader_spatial(projected, real, grad, op, strict=strict)
     if candidate is not None:
         return candidate
     modes, rank, kernel, _ = real.shape
@@ -1807,12 +1863,12 @@ def _packed_spatial_backward(  # noqa: PLR0915
         vec = _reader_vector_width(projected, real, grad, strict=strict_complex)
         baseline_vec = vec
         plan = _rank_four_plan(projected, real, grad, strict=strict_complex)
-        weight27b = _wave27b_weight(projected, real, grad, strict=strict_complex, sms=sms)
+        hopper_weight = _hopper_reader_weight(projected, real, grad, strict=strict_complex, sms=sms)
         weight_candidate = (
-            _wave25b_weight(projected, real, grad, vec, sms) if weight27b is None else None
+            _wave25b_weight(projected, real, grad, vec, sms) if hopper_weight is None else None
         )
-        if weight27b:
-            vec, (tile, weight_rows, weight_warps), _, _ = weight27b
+        if hopper_weight:
+            vec, (tile, weight_rows, weight_warps), _, _ = hopper_weight
             rank_tiles, tap_tiles = 1, _ceildiv(rank, tile)
             rows, waves = _ceildiv(height, weight_rows), 0
         elif vec > 1:
@@ -1846,7 +1902,7 @@ def _packed_spatial_backward(  # noqa: PLR0915
             rows, waves, weight_warps = height, 3, 4
         mode_tiles = _ceildiv(modes, _WARP_SIZE * vec)
         available_workers = _ceildiv(batch * rows, weight_warps)
-        worker_limit = weight27b[3] if weight27b else _ceildiv(waves * sms, mode_tiles)
+        worker_limit = hopper_weight[3] if hopper_weight else _ceildiv(waves * sms, mode_tiles)
         workers = min(available_workers, worker_limit)
         if weight_warps == _WIDE_WEIGHT_WARPS and rank <= _CENTERED_WEIGHT_TILE:
             # Keep streaming warps on short row ranges as batch grows, with a
@@ -1864,7 +1920,8 @@ def _packed_spatial_backward(  # noqa: PLR0915
         reduce_columns = _WARP_SIZE if parallel_reduce else _DEFAULT_THREADS
         reduce_op = "dweight_reduce_parallel" if parallel_reduce else "dweight_reduce"
         with torch.cuda.device(projected.device):
-            module = weight27b[2] if weight27b else weight_candidate[1] if weight_candidate else (
+            module = (
+                hopper_weight[2] if hopper_weight else weight_candidate[1] if weight_candidate else
                 _reader_module_for(
                     projected, real, grad, strict=strict_complex, rank_four_plan=plan,
                     weight_vec=vec, spatial_vec=vec,
@@ -1889,7 +1946,7 @@ def _packed_spatial_backward(  # noqa: PLR0915
                 stream = _reader_stream(module, projected.device)
             else:
                 vec = baseline_vec
-                if weight27b and vec != weight27b[0]:
+                if hopper_weight and vec != hopper_weight[0]:
                     module = _reader_module_for(
                         projected, real, grad, strict=strict_complex, rank_four_plan=plan,
                         weight_vec=vec, spatial_vec=vec,

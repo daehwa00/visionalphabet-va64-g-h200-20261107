@@ -686,3 +686,51 @@ def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None
     reference = kernels._spatial_reference(p, *w.unbind(1), strict_complex=False)
     torch.testing.assert_close(output, reference, atol=0.008, rtol=0.005)
     _check_gradients(output, reference, (p, w), (p, w), rtol=0.005, atol=0.001)
+
+
+@pytest.mark.parametrize(
+    ("preset", "arch", "expected"),
+    [
+        (None, (9, 0), "off"),
+        ("off", (9, 0), "off"),
+        ("invalid", (9, 0), "off"),
+        ("auto", (9, 0), "keep_fwd_hopper"),
+        ("auto", (8, 6), "off"),
+        ("auto", (8, 9), "off"),
+        ("keep_fwd_hopper", (9, 0), "keep_fwd_hopper"),
+        ("dweight_3cta", (8, 6), "dweight_3cta"),
+        ("bwd_hiocc_v2", (9, 0), "bwd_hiocc_v2"),
+        ("fwd_vec2_opt", (9, 0), "fwd_vec2_opt"),
+        ("fwd_vec2_opt", (8, 9), "off"),
+    ],
+)
+def test_wave28b_preset_gate(monkeypatch, preset, arch, expected) -> None:
+    if preset is None:
+        monkeypatch.delenv("LNET_READER_W28B", raising=False)
+    else:
+        monkeypatch.setenv("LNET_READER_W28B", preset)
+    monkeypatch.setenv("LNET_READER_VEC", "auto")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: arch)
+    projected = torch.empty((96, 14, 14, 640), device="meta", dtype=torch.bfloat16)
+    real = projected.new_empty((160, 4, 3, 3))
+    assert kernels._wave28b_preset(projected, real, None, strict=False) == expected
+
+
+@pytest.mark.parametrize("preset", kernels._WAVE28B_PRESETS)
+def test_wave28b_ineligible_reader_retains_existing_dispatch(monkeypatch, preset) -> None:
+    monkeypatch.setenv("LNET_READER_W28B", preset)
+    monkeypatch.setenv("LNET_READER_VEC", "auto")
+    projected = torch.empty((96, 14, 14, 640), device="meta", dtype=torch.bfloat16)
+    real = projected.new_empty((160, 4, 3, 3))
+    grad = projected.new_empty((96, 14, 14, 320), dtype=torch.float16)
+    unsupported = (
+        (projected, None, True),
+        (projected, grad, False),
+        (projected[:, :, :13], None, False),
+        (projected[:1], None, False),
+    )
+    for tensor, gradient, strict in unsupported:
+        assert kernels._wave28b_preset(tensor, real, gradient, strict=strict) == "off"
+
+    monkeypatch.setenv("LNET_READER_VEC", "1")
+    assert kernels._wave28b_preset(projected, real, None, strict=False) == "off"
