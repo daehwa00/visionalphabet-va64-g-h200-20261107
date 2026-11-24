@@ -20,6 +20,7 @@ from .general_cuda_scans import (
     try_general_horizontal_forward,
 )
 from .model_w28c import model_w28c_enabled
+from .model_w29c import model_w29c_enabled
 from .product_scan_reference import _causal_weights, bidirectional_product_scan_reference
 from .triton_bidirectional_product_scan import (
     _compose_complex,
@@ -403,7 +404,10 @@ def complex_correlation_descriptor(
         )
         warp_tile = (
             fused and drive.dtype in (torch.float16, torch.bfloat16)
-            and model_w28c_enabled(drive.device, "nr4")
+            and (
+                model_w29c_enabled(drive.device, "nr4")
+                or model_w28c_enabled(drive.device, "nr4")
+            )
         )
         h_fwd_re, h_rev_re, h_fwd_im, h_rev_im = _nr4_axis(
             pole_y, horizontal, normalize=normalize, fused=fused, warp_tile=warp_tile,
