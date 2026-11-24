@@ -24,7 +24,6 @@ from .model_w29c import (
     packed_swiglu_vec2d,
     rmsnorm_eligible,
 )
-from .model_w30c import model_w30c_enabled, packed_swiglu_v2
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
 
@@ -62,20 +61,20 @@ class ChannelRMSNorm(nn.Module):
             or os.environ.get(_GENERAL_SCANS_ENV) != "0"
         ):
             weight = self.weight.to(x.dtype)
-            v2 = model_w30c_enabled(x.device, "rmsnorm_bwd_v2")
             wave29 = (
                 x.dtype in (torch.bfloat16, torch.float16)
                 and x.shape[-1] == weight.numel()
-                and (v2 or model_w29c_enabled(x.device, "rmsnorm_bwd"))
+                and x.numel() > 0
+                and model_w29c_enabled(x.device, "rmsnorm_bwd")
             )
             if (
-                wave29 and not v2 and model_w29c_enabled(x.device, "rmsnorm_full")
+                wave29 and model_w29c_enabled(x.device, "rmsnorm_full")
                 and rmsnorm_eligible(x, weight)
             ):
                 save_inverse = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
                 return channel_rmsnorm(x, weight, self.epsilon, save_inverse)[0]
             if wave29 and torch.is_grad_enabled():
-                return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon, True, v2)  # noqa: FBT003
+                return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon, True)  # noqa: FBT003
             if (
                 torch.compiler.is_compiling()
                 and torch.is_grad_enabled()
@@ -83,7 +82,7 @@ class ChannelRMSNorm(nn.Module):
                 and x.shape[-1] == weight.numel()
                 and x.numel() > 0
             ):
-                return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon, False, False)  # noqa: FBT003
+                return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon, False)  # noqa: FBT003
             return functional.rms_norm(x, (x.shape[-1],), weight, self.epsilon)
         inverse = torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.epsilon).to(x.dtype)
         return x * inverse * self.weight.to(x.dtype)
@@ -129,8 +128,6 @@ class SwiGLU(nn.Module):
             and joint.is_contiguous()
             and 0 < joint.numel() < 2**31
         ):
-            if self.hidden % 16 == 0 and model_w30c_enabled(joint.device, "swiglu_v2"):
-                return x + self.output(packed_swiglu_v2(joint))
             if model_w29c_enabled(joint.device, "swiglu_vec2d"):
                 return x + self.output(packed_swiglu_vec2d(joint))
             if self.hidden % 16 == 0 and model_w28c_enabled(joint.device, "swiglu"):

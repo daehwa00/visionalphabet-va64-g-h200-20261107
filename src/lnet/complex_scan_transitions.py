@@ -15,8 +15,6 @@ from torch.nn import functional
 
 from .complex_ffn import ComplexFFN, ComplexFFNActivation
 from .complex_layers import ComplexLinear, WidelyLinear
-from .model_w29c import _CompiledChannelRMSNorm
-from .model_w30c import model_w30c_enabled
 
 if TYPE_CHECKING:
     from .complex_scan_types import ComplexCarryMerge, ComplexField
@@ -27,19 +25,6 @@ def _dtype_aligned_rms_norm(inputs: Tensor, norm: nn.Module) -> Tensor:
     if not isinstance(norm, nn.RMSNorm):
         return norm(inputs)
     weight = norm.weight
-    if (
-        inputs.is_cuda
-        and inputs.dtype in (torch.bfloat16, torch.float16)
-        and torch.is_grad_enabled()
-        and weight is not None
-        and (inputs.requires_grad or weight.requires_grad)
-        and norm.normalized_shape == (inputs.shape[-1],)
-        and inputs.numel() > 0
-        and model_w30c_enabled(inputs.device, "input_norm_v2")
-    ):
-        return _CompiledChannelRMSNorm.apply(
-            inputs, weight.to(inputs.dtype), norm.eps, True, True,  # noqa: FBT003
-        )
     if weight is None or weight.dtype == inputs.dtype:
         return norm(inputs)
     return functional.rms_norm(

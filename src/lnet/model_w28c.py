@@ -1,4 +1,4 @@
-"""Opt-in Wave 28C packed activation and terminal-correlation dispatch."""
+"""Packed activation and terminal-correlation dispatch."""
 
 # ruff: noqa: ANN001
 from __future__ import annotations
@@ -12,11 +12,21 @@ from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
 
+def model_opt_mode(legacy_env: str) -> str:
+    policy = os.environ.get("LNET_MODEL_OPT", "auto")
+    if policy not in ("auto", "off"):
+        raise ValueError("LNET_MODEL_OPT must be auto or off")
+    return "off" if policy == "off" else os.environ.get(legacy_env, "auto")
+
+
+def model_cuda_supported(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) >= (8, 0)
+
+
 def model_w28c_enabled(device: torch.device, preset: str) -> bool:
-    mode = os.environ.get("LNET_MODEL_W28C", "off")
-    if mode == "auto":
-        return torch.cuda.get_device_capability(device) == (9, 0)
-    return mode in (preset, "combined")
+    mode = model_opt_mode("LNET_MODEL_W28C")
+    selected = preset == "nr4" if mode == "auto" else mode in (preset, "combined")
+    return selected and model_cuda_supported(device)
 
 
 @triton.jit

@@ -1,4 +1,4 @@
-"""Parity, layout handling, and capture for the opt-in Wave 29C kernels."""
+"""Parity, layout handling, and capture for the Wave 29C kernels."""
 
 import pytest
 import torch
@@ -20,9 +20,47 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     ("combined_full", ("swiglu_vec2d", "rmsnorm_bwd", "rmsnorm_full", "nr4")),
 ])
 def test_presets(mode: str, features: tuple, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LNET_MODEL_OPT", raising=False)
     monkeypatch.setenv("LNET_MODEL_W29C", mode)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (8, 6))
     keys = ("swiglu_vec2d", "rmsnorm_bwd", "rmsnorm_full", "nr4")
     assert tuple(key for key in keys if model_w29c_enabled(torch.device("cuda"), key)) == features
+
+
+@pytest.mark.parametrize("capability", [(7, 5), (8, 6), (8, 9), (9, 0), (10, 0)])
+def test_auto_dispatch(capability: tuple[int, int], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LNET_MODEL_OPT", raising=False)
+    monkeypatch.delenv("LNET_MODEL_W28C", raising=False)
+    monkeypatch.delenv("LNET_MODEL_W29C", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
+    device = torch.device("cuda")
+    winners = ("swiglu_vec2d", "rmsnorm_bwd", "nr4")
+    for feature in winners:
+        assert model_w29c_enabled(device, feature) == (capability >= (8, 0))
+        assert not model_w29c_enabled(torch.device("cpu"), feature)
+    assert not model_w29c_enabled(device, "rmsnorm_full")
+    monkeypatch.setenv("LNET_MODEL_W28C", "swiglu")
+    assert not model_w29c_enabled(device, "swiglu_vec2d")
+    monkeypatch.setenv("LNET_MODEL_W29C", "combined_bwd")
+    monkeypatch.setenv("LNET_MODEL_OPT", "off")
+    assert not any(model_w29c_enabled(device, feature) for feature in winners)
+
+
+def test_auto_dispatch_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_MODEL_OPT", "auto")
+    monkeypatch.setenv("LNET_MODEL_W28C", "off")
+    monkeypatch.setenv("LNET_MODEL_W29C", "auto")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 0))
+    device = torch.device("cuda")
+
+    def run(x: Tensor) -> Tensor:
+        return x + 1 if model_w29c_enabled(device, "rmsnorm_bwd") else x - 1
+
+    sample = torch.zeros(4)
+    compiled = torch.compile(run, mode="default", fullgraph=True)
+    torch.testing.assert_close(compiled(sample), sample + 1)
+    monkeypatch.setenv("LNET_MODEL_W29C", "off")
+    torch.testing.assert_close(compiled(sample), sample - 1)
 
 
 def test_row_pitch() -> None:
