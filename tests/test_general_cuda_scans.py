@@ -1354,6 +1354,8 @@ def test_wave28a_backward_presets(
 def test_wave27a_checkpoint_and_pair_parity(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, coarse: bool, interleaved: bool,
 ) -> None:
+    # This test selects Wave 27 modes independently of the active Wave 28 arm.
+    monkeypatch.setenv("LNET_SCAN_W28A", "off")
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     torch.manual_seed(719)
     px, py, real, imag, aux, path = _inputs(56, 56, 160, 8, dtype, "cuda", batch=2)
