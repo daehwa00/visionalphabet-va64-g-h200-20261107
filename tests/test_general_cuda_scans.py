@@ -1302,6 +1302,50 @@ def test_wave27a_worker_alignment() -> None:
     assert scans._wave27a_workers(base, (1024, 56, 33, 160), 132, 4) == base
 
 
+@pytest.mark.parametrize(("vertical", "backward", "coarse", "height", "residency"), [
+    (False, True, False, 56, 4),
+    (True, False, False, 14, 8),
+    (True, False, True, 28, 8),
+])
+def test_wave28a_complete_mode_tiles(
+    vertical: bool, backward: bool, coarse: bool, height: int, residency: int,
+) -> None:
+    key = scans.Kernel(torch.bfloat16, 4, backward, vertical=vertical, coarse=coarse)
+    base = scans.Launch(scans.ScanPlan(4, 0), key, 6760, 1690 if backward else 6760)
+    assert scans._wave28a_workers(base, (1024, height, height, 160), 132, residency) == (
+        base._replace(workers=6756, partials=1689 if backward else 6756)
+    )
+    # One worker per line already gives the shortest possible loop.
+    assert scans._wave28a_workers(base, (6760, 1, 1 + coarse, 160), 132, residency) == base
+
+
+@pytest.mark.parametrize(("preset", "coarse", "height", "paired", "tail"), [
+    ("wp_batch2", False, 56, True, False),
+    ("wp_batch2", False, 28, False, False),
+    ("wp_batch2_all", True, 28, True, False),
+    ("wp_batch2_all", True, 14, True, True),
+    ("auto", False, 7, True, True),
+])
+def test_wave28a_backward_presets(
+    monkeypatch: pytest.MonkeyPatch, preset: str, coarse: bool,
+    height: int, paired: bool, tail: bool,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W28A", preset)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 2)
+    plan = scans.ScanPlan(4, 60000, chunk=8 if height == 56 else height,
+                          cache_weights=True, cache_source=True)
+    key = scans.Kernel(
+        torch.bfloat16, 4, backward=True, vertical=True, hidden8=True, coarse=coarse,
+    )
+    base = scans.Launch(plan, key, 636, 159)
+    shape = (1024, height, height, 128 if height == 7 else 160)
+    result = scans._with_wave28a(base, 0, shape)
+    assert result.key.backward_batch2 is paired
+    assert result.key.backward_batch_tail is tail
+
+
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
