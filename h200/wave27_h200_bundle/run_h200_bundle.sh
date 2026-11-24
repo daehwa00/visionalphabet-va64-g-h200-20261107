@@ -129,10 +129,14 @@ if [[ ${1:-} == pytest-wave27a ]]; then
     printf 'Collected %s scan tests\n' "${#nodes[@]}"
     printf '%s\n' "${#nodes[@]}" > "$data/collected-count.txt"
     if (( ${#nodes[@]} == 0 )); then exit 1; fi
-    for ((i=0; i<${#nodes[@]}; i+=64)); do
+    first=${2:-0}
+    size=${3:-64}
+    if [[ ! $first =~ ^[0-9]+$ || ! $size =~ ^[1-9][0-9]*$ ]]; then exit 2; fi
+    printf '%s\t%s\n' "$first" "$size" > "$data/shard-layout.tsv"
+    for ((i=first; i<${#nodes[@]}; i+=size)); do
         test_start=$SECONDS
-        name="cuda_scan_shard_$((1 + i / 64))"
-        run_capped 300 "$name" "$PYTHON_BIN" -m pytest -q -ra "${nodes[@]:i:64}"
+        name="cuda_scan_shard_$((1 + (i - first) / size))"
+        run_capped 300 "$name" "$PYTHON_BIN" -m pytest -q -ra "${nodes[@]:i:size}"
         read -r _ test_rc _ < <(tail -n 1 "$data/processes.tsv")
         bench "pytest_$name" wrap-pytest --log "$data/$name.log" \
             --exit-code "$test_rc" --elapsed "$((SECONDS - test_start))"
