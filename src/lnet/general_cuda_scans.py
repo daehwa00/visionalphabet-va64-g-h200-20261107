@@ -44,6 +44,7 @@ _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
 _MAX_CACHED_HIDDEN = 16
 _MAX_SAVED_DP_CACHE_CHUNKS = 8
+_MODEFIRST_PARTIAL_ROWS = (2 * 1024**2) // (90 * 4)
 
 # Small devices reserve more VRAM for model state. Additional scan workspace
 # on larger devices is useful up to one L2 working set.
@@ -132,6 +133,8 @@ class Kernel:
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
+    modefirst: bool = False
+    single_gradient_store: bool = False
 
 
 class Launch(NamedTuple):
@@ -1445,7 +1448,155 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 # NVRTC compilation and driver launch
 
+_MODEFIRST_SOURCE = r"""
+template<class T>
+__device__ void store_trajectory(
+    unsigned long long* tile, unsigned long long* trajectory,
+    int lane, int mode0, int M, int y0, int len, int H,
+    long long line, long long lines, int direction
+) {
+    __syncwarp();
+    if (lane < len) {
+        for (int k = 0; k < min(32, M - mode0); ++k) {
+            const auto offset = (((mode0 + k) * 2LL + direction) * lines + line) * H;
+            trajectory[offset + y0 + lane] = tile[lane * 33 + k];
+        }
+    }
+    __syncwarp();
+}
+
+template<class T>
+__device__ unsigned long long quad_bits(float4 value) {
+    union { Quad<T> quad; unsigned long long bits; } data{Quad<T>::pack(value)};
+    return data.bits;
+}
+
+template<class T>
+__device__ float4 unpack_quad(unsigned long long value) {
+    union { unsigned long long bits; Quad<T> quad; } data{value};
+    return data.quad.unpack();
+}
+
+template<class T, bool COARSE, bool BACKWARD, bool COMPACT, bool GS1>
+__device__ void modefirst_scan(
+    const float* dr, const float* di, const float* gr, const float* gi, const T* states,
+    const float* vx, const float* vy, unsigned long long* trajectory,
+    const unsigned long long* dp, T* gs, float* partials,
+    int B, int H, int W, int M, int workers, float eps,
+    long long source_plane, long long target_plane
+) {
+    constexpr int step = COARSE ? 2 : 1;
+    // Stage one previous state and one incoming adjoint per row. The smaller
+    // GS1 tile makes room for the positive adjoint without lowering residency.
+    constexpr int adjoint_rows = GS1 ? 8 : 16;
+    const int ow = W / step, oh = H / step;
+    const long long lines = static_cast<long long>(B) * ow;
+    const int lane = threadIdx.x, tiles = (M + 31) / 32;
+    const int mode0 = (blockIdx.x % tiles) * 32, m = mode0 + lane;
+    const int worker = blockIdx.x / tiles;
+    const bool active = m < M;
+    extern __shared__ unsigned long long tile[];
+    auto* positive = tile + 2 * adjoint_rows * 33;
+    const Complex a = active ? Complex{dr[m], di[m]} : Complex{};
+    const Complex g = active ? Complex{gr[m], gi[m]} : Complex{};
+    Complex da{}, dg{};
+    for (long long line = worker; line < lines; line += workers) {
+        const long long b = line / ow, x = line % ow;
+        const auto xa = x * step + COARSE, xb = x * step;
+        const auto base = b * H * W * M + m;
+        Column<T, long long> c{
+            states, vy, base + xa * M, base + xb * M, target_plane, source_plane, 0, 0,
+            H, W, M, ow, m, active ? vx[xa * M + m] : 0.f,
+            active ? vx[(W + xb) * M + m] : 0.f, eps,
+        };
+        if constexpr (!BACKWARD) {
+            #pragma unroll
+            for (int d = 0; d < 2; ++d) {
+                float4 state{};
+                for (int start = 0; start < H; start += 32) {
+                    const int len = min(32, H - start);
+                    const int y0 = d ? H - start - len : start;
+                    if (active) {
+                        for (int j = 0; j < len; ++j) {
+                            const int row = d ? len - 1 - j : j;
+                            state = advance(state, c.source(y0 + row), d ? a.conj() : a,
+                                            d ? g.conj() : g);
+                            tile[row * 33 + lane] = quad_bits<T>(state);
+                        }
+                    }
+                    store_trajectory<T>(tile, trajectory, lane, mode0, M, y0, len, H,
+                                        line, lines, d);
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int d = 0; d < 2; ++d) {
+                Complex adj_a{}, adj_b{};
+                for (int start = 0; start < H; start += adjoint_rows) {
+                    const int len = min(adjoint_rows, H - start);
+                    const int y0 = d ? start : H - start - len;
+                    const int row = lane % adjoint_rows, y = y0 + row;
+                    const int prev = y + (d ? 1 : -1);
+                    if (row < len) {
+                        for (int k = lane / adjoint_rows; k < min(32, M - mode0);
+                             k += 32 / adjoint_rows) {
+                            const auto offset = (((mode0 + k) * 2LL + d) * lines + line);
+                            tile[row * 33 + k] =
+                                prev >= 0 && prev < H ? trajectory[offset * H + prev] : 0;
+                            tile[(adjoint_rows + row) * 33 + k] =
+                                y % step == (d ? 0 : step - 1) ? dp[offset * oh + y / step] : 0;
+                        }
+                    }
+                    __syncwarp();
+                    if (active) {
+                        for (int j = 0; j < len; ++j) {
+                            const int r = d ? j : len - 1 - j;
+                            const int yy = y0 + r;
+                            const auto previous = unpack_quad<T>(tile[r * 33 + lane]);
+                            const auto incoming =
+                                unpack_quad<T>(tile[(adjoint_rows + r) * 33 + lane]);
+                            const auto inject = normalize<T>(incoming, c.gain(yy, d != 0));
+                            const auto s = c.source(yy);
+                            if (d) {
+                                const auto ds = column_adjoint_step<true>(
+                                    previous, s, inject, a.conj(), g.conj(), adj_a, adj_b, da, dg);
+                                if constexpr (GS1) {
+                                    const auto p = unpack_quad<T>(positive[yy * 32 + lane]);
+                                    write_column_gradient<true, COMPACT>(
+                                        c, yy, ds, gs, Quad<T>::pack(p));
+                                } else {
+                                    write_column_gradient<true, COMPACT, true>(c, yy, ds, gs);
+                                }
+                                if constexpr (COARSE) clear_unused_columns<COMPACT>(c, yy, gs);
+                            } else {
+                                const auto ds = column_adjoint_step<false>(
+                                    previous, s, inject, a, g, adj_a, adj_b, da, dg);
+                                if constexpr (GS1) positive[yy * 32 + lane] = quad_bits<T>(ds);
+                                else write_column_gradient<false, COMPACT>(c, yy, ds, gs);
+                            }
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+        }
+    }
+    if constexpr (BACKWARD) {
+        if (active) {
+            auto* p = partials + static_cast<long long>(worker) * 4 * M + m;
+            p[0] = da.r;
+            p[M] = da.i;
+            p[2 * M] = dg.r;
+            p[3 * M] = dg.i;
+        }
+    }
+}
+"""
+
+
 def _kernel_name(key: Kernel) -> str:
+    if key.modefirst:
+        return "modefirst_vscan_backward" if key.backward else "modefirst_vscan_forward"
     if key.projection:
         return "path_mlp_backward" if key.backward else "path_mlp_forward"
     if key.projection_reduction:
@@ -1457,6 +1608,23 @@ def _kernel_name(key: Kernel) -> str:
 
 def _kernel_source(key: Kernel) -> str:
     """Instantiate a single entry point without modifying the device source."""
+    if key.modefirst:
+        io = _DTYPES[key.dtype]
+        flags = ", ".join(str(flag).lower() for flag in (
+            key.coarse, key.backward, key.compact, key.single_gradient_store,
+        ))
+        return _CUDA_SOURCE + _MODEFIRST_SOURCE + f"""
+extern "C" __global__ __launch_bounds__(32) void {_kernel_name(key)}(
+    const float* dr, const float* di, const float* gr, const float* gi, const {io}* states,
+    const float* vx, const float* vy, unsigned long long* trajectory,
+    const unsigned long long* dp, {io}* gs, float* partials,
+    int B, int H, int W, int M, int workers, float eps,
+    long long source_plane, long long target_plane
+) {{
+    modefirst_scan<{io}, {flags}>(dr, di, gr, gi, states, vx, vy, trajectory,
+        dp, gs, partials, B, H, W, M, workers, eps, source_plane, target_plane);
+}}
+"""
     if key.reduction:
         return _CUDA_SOURCE + f"""
 extern "C" __global__ __launch_bounds__(128) void {_kernel_name(key)}(
@@ -2519,6 +2687,103 @@ def _vertical_adjoints(
     return _contiguous_or_interleaved(grad[0]), _contiguous_or_interleaved(grad[1])
 
 
+def _modefirst_policy(states: Tensor, coarse: bool) -> str:
+    policy = os.environ.get("LNET_SCAN_W34A", "off")
+    if (
+        policy not in {"auto", "modefirst_tc", "modefirst_tc_gs1"}
+        or not states.is_cuda or states.dtype not in {torch.bfloat16, torch.float16}
+        or not torch.cuda.is_available()
+    ):
+        return "off"
+    if torch.cuda.get_device_capability(states.device) < (8, 0):
+        return "off"
+    total = _total_vram(states.device)
+    _, b, h, w, m = states.shape
+    step = 2 if coarse else 1
+    trajectory = 16 * b * h * (w // step) * m
+    workspace = 20 * b * (h // step) * (w // step) * m
+    if (
+        total < 48 * 1024**3
+        or m > _MODEFIRST_PARTIAL_ROWS
+        or trajectory + workspace > total // 8
+    ):
+        return "off"
+    return policy
+
+
+def _modefirst_shape(states: Tensor, coarse: bool) -> tuple[int, int, int]:
+    # Keep the saved trajectory three-dimensional for the packed scan pipeline.
+    # Its last axis holds a Quad, and the middle folds (direction, batch, x, y).
+    _, b, h, w, m = states.shape
+    return m, 2 * b * h * (w // (2 if coarse else 1)), 4
+
+
+def _modefirst_scan(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], trajectory: Tensor,
+    coarse: bool, epsilon: float, *, dp: Tensor | None = None, compact: bool = False,
+    gs1: bool = False,
+) -> list[Tensor] | None:
+    _, b, h, w, m = states.shape
+    lines = b * (w // (2 if coarse else 1))
+    device = states.device.index or 0
+    sms, limit, _ = device_limits(device)
+    key = Kernel(states.dtype, 1, dp is not None, vertical=True, coarse=coarse,
+                 compact=compact, modefirst=True)
+    smem = 32 * 33 * 8
+    if dp is not None and gs1:
+        candidate = replace(key, single_gradient_store=True)
+        buffered = 16 * 33 * 8 + h * 32 * 8
+        if buffered <= limit and _resident(device, candidate, buffered) >= 24:
+            key, smem = candidate, buffered
+    tiles = _ceil(m, 32)
+    workers = min(lines, max(1, _ceil(48 * sms, tiles)))
+    gs = partial = None
+    if dp is not None:
+        gs = states.new_empty((4, b, h, w // 2 if compact else w, m))
+        partial = states.new_empty((workers, 4, m), dtype=torch.float32)
+    operands = [*(v.float().contiguous() for v in pole), states,
+                *(v.float().contiguous() for v in auxiliary), trajectory, dp, gs, partial]
+    _launch_kernel(states, key, workers * tiles, smem, (
+        *map(_ptr, operands), *map(ct.c_int, (b, h, w, m, workers)), ct.c_float(epsilon),
+        ct.c_longlong(states.stride(0)),
+        ct.c_longlong(gs.stride(0) * (1 + int(compact)) if gs is not None else 0),
+    ))
+    if partial is None:
+        return None
+    return [*_reduce_partials(partial, pole), gs]
+
+
+def _modefirst_vscan(
+    pole: list[Tensor], states: Tensor, auxiliary: list[Tensor], path: list[Tensor],
+    coarse: bool, epsilon: float, real: Tensor, imag: Tensor, *,
+    policy: str, backward: bool = False, compact: bool = False,
+    trajectory: Tensor | None = None,
+) -> Tensor | list[Tensor]:
+    from .scan_project_wgmma import project_modefirst  # noqa: PLC0415
+
+    _, _, h, w, _ = states.shape
+    step = 2 if coarse else 1
+    states = states.contiguous()
+    if trajectory is None:
+        trajectory = states.new_empty(_modefirst_shape(states, coarse))
+        _modefirst_scan(pole, states, auxiliary, trajectory, coarse, epsilon)
+    sms, _, _ = device_limits(states.device.index or 0)
+    projected = project_modefirst(
+        trajectory, auxiliary, path, real, imag, h, w, step, epsilon, sms,
+        partial_rows=_MODEFIRST_PARTIAL_ROWS, backward=backward,
+    )
+    if projected is None:
+        return trajectory
+    dp, path_grads = projected
+    scan_grads = _modefirst_scan(
+        pole, states, auxiliary, trajectory, coarse, epsilon,
+        dp=dp, compact=compact, gs1=policy in {"auto", "modefirst_tc_gs1"},
+    )
+    if scan_grads is None:
+        raise RuntimeError("Missing mode-first scan gradients")
+    return [*scan_grads, *path_grads]
+
+
 def _vscan(  # noqa: C901, PLR0912, PLR0915
     pole: list[Tensor],
     states: Tensor,
@@ -2557,6 +2822,32 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     if grad is not None:
         gr, gi = _vertical_adjoints(grad, states, out_shape)
         interleaved = (not gr.is_contiguous(), not gi.is_contiguous())
+    policy = _modefirst_policy(states, coarse) if hidden == _REGISTER_HIDDEN else "off"
+    if saved_features is not None and saved_features.shape == (0, 0, 0):
+        saved_features = None
+    saved_modefirst = (
+        grad is not None and hidden == _REGISTER_HIDDEN and saved_features is not None
+        and saved_features.shape == _modefirst_shape(states, coarse)
+    )
+    if saved_modefirst or (policy != "off" and saved_features is None):
+        if grad is not None:
+            if saved_features is not None and (
+                saved_features.device != states.device or saved_features.dtype != states.dtype
+                or not saved_features.is_contiguous()
+            ):
+                raise ValueError("Invalid saved mode-first trajectory")
+            return _modefirst_vscan(
+                pole, states, auxiliary, path, coarse, epsilon, gr, gi, policy=policy,
+                backward=True, compact=compact, trajectory=saved_features,
+            )
+        if packed:
+            output = states.new_empty((2, *out_shape) if planar else (b, oh, ow, 2 * m))
+            real, imag = output.unbind(0) if planar else output.split(m, dim=-1)
+        else:
+            real, imag = states.new_empty(out_shape), states.new_empty(out_shape)
+            output = real, imag
+        _modefirst_vscan(pole, states, auxiliary, path, coarse, epsilon, real, imag, policy=policy)
+        return output
     if saved_features is not None and (
         grad is None
         or saved_features.shape != (8, b * oh * ow, m)
@@ -2696,6 +2987,10 @@ def _total_vram(device: torch.device) -> int:
 
 
 def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
+    return _modefirst_policy(states, coarse) != "off" or _legacy_save_vscan(states, coarse)
+
+
+def _legacy_save_vscan(states: Tensor, coarse: bool) -> bool:
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
     if not states.is_cuda or policy not in {"saved", "test_saved"}:
         return False
@@ -3083,11 +3378,23 @@ def _vertical_forward_saved(
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
     with torch.autocast(device_type="cuda", enabled=False):
-        features = _vscan(
-            pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise, pure=True,
-        )
-        if not isinstance(features, Tensor):
-            raise TypeError("Expected normalized scan features")
+        policy = _modefirst_policy(states, coarse)
+        use_modefirst = policy != "off" and path[0].shape[1] == _REGISTER_HIDDEN
+        if not use_modefirst and policy != "off" and not _legacy_save_vscan(states, coarse):
+            result = _vscan(
+                pole, states, auxiliary, path, coarse, epsilon, precise,
+                packed=not separate, planar=planar,
+            )
+            output, secondary = result if isinstance(result, tuple) else (
+                result, states.new_empty((0,)),
+            )
+            return output, secondary, states.new_empty((0, 0, 0))
+        if not use_modefirst:
+            features = _vscan(
+                pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise, pure=True,
+            )
+            if not isinstance(features, Tensor):
+                raise TypeError("Expected normalized scan features")
         if separate:
             output, secondary = states.new_empty(shape), states.new_empty(shape)
             real, imag = output, secondary
@@ -3095,6 +3402,18 @@ def _vertical_forward_saved(
             output = states.new_empty((2, *shape) if planar else (*shape[:-1], 2 * m))
             real, imag = output.unbind(0) if planar else output.split(m, dim=-1)
             secondary = states.new_empty((0,))
+        if use_modefirst:
+            if (
+                not _shape_supported(tuple(states.shape[1:]))
+                or not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
+                or not _pole_ok(pole, states)
+                or not 0 < epsilon < float("inf")
+            ):
+                raise ValueError("Invalid vertical scan inputs")
+            features = _modefirst_vscan(
+                pole, states, auxiliary, path, coarse, epsilon, real, imag, policy=policy,
+            )
+            return output, secondary, features
         _project_path(
             features, [param.contiguous() for param in path], real, imag,
             backward=False, precise=precise,
@@ -3107,7 +3426,7 @@ def _fake_vertical_forward_saved(
     pole: list[Tensor],  # noqa: ARG001
     states: Tensor,
     auxiliary: list[Tensor],  # noqa: ARG001
-    path: list[Tensor],  # noqa: ARG001
+    path: list[Tensor],
     coarse: bool,
     epsilon: float,  # noqa: ARG001
     planar: bool,
@@ -3117,10 +3436,16 @@ def _fake_vertical_forward_saved(
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
+    feature_shape = (8, b * (h // step) * (w // step), m)
+    if _modefirst_policy(states, coarse) != "off":
+        if path[0].shape[1] == _REGISTER_HIDDEN:
+            feature_shape = _modefirst_shape(states, coarse)
+        elif not _legacy_save_vscan(states, coarse):
+            feature_shape = (0, 0, 0)
     return (
         states.new_empty(shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))),
         states.new_empty(shape if separate else (0,)),
-        states.new_empty((8, b * (h // step) * (w // step), m)),
+        states.new_empty(feature_shape),
     )
 
 

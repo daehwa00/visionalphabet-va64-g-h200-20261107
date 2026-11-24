@@ -6,11 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 from torch import Tensor
+from torch._higher_order_ops.triton_kernel_wrap import generate_ttir
 from torch._inductor import config as inductor_config
 from torch._subclasses.fake_tensor import FakeTensorMode
+from triton.backends.compiler import GPUTarget
 
 from lnet import general_cuda_scans as scans
+from lnet import scan_project_wgmma as modefirst
 from lnet import terminal_imaginary_correlation as terminal
 from lnet.general_cuda_scans import general_scans_enabled
 from lnet.product_scan_pipeline import (
@@ -504,6 +508,272 @@ def test_fake_shapes_and_autograd(dtype: torch.dtype, h: int, w: int, m: int, co
         params = [r, i, *px, *py, *path]
         gradients = torch.autograd.grad(v_real.sum(), params)
         assert [(g.shape, g.dtype) for g in gradients] == [(p.shape, p.dtype) for p in params]
+
+
+def test_modefirst_projection_launch_signatures(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = GPUTarget("cuda", 90, 32)
+    monkeypatch.setattr(
+        triton.runtime.driver, "_active", SimpleNamespace(get_current_target=lambda: target),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    launches = []
+
+    class Capture:
+        def __init__(self, kernel: object) -> None:
+            self.kernel = kernel
+
+        def __getitem__(self, _grid: tuple[int, ...]) -> object:
+            def launch(*args: object, **kwargs: object) -> None:
+                named = dict(zip(self.kernel.arg_names, args, strict=True))
+                module, _ = generate_ttir(self.kernel, {**named, **kwargs}, {})
+                assert "tt.func" in str(module)
+                launches.append(self.kernel.__name__)
+
+            return launch
+
+    kernels = ("_project_forward", "_project_backward", "_reduce_projection", "_transpose_channels")
+    for kernel in kernels:
+        monkeypatch.setattr(modefirst, kernel, Capture(getattr(modefirst, kernel)))
+    _, _, _, _, auxiliary, path = _inputs(14, 20, 63, 8, torch.bfloat16, "cpu", batch=2)
+    trajectory = torch.empty((63, 2 * 2 * 14 * 10, 4), dtype=torch.bfloat16)
+    dy = torch.empty((2, 7, 10, 126), dtype=trajectory.dtype).chunk(2, dim=-1)
+    for backward in (False, True):
+        modefirst.project_modefirst(
+            trajectory, auxiliary, path, *dy, 14, 20, 2, 1e-6, 132,
+            partial_rows=scans._MODEFIRST_PARTIAL_ROWS, backward=backward,
+        )
+    assert launches == [
+        "_project_forward", "_transpose_channels", "_transpose_channels",
+        "_project_backward", "_reduce_projection",
+    ]
+
+
+def _simulate_modefirst_trajectory(
+    pole: list[Tensor], states: Tensor, step: int,
+) -> Tensor:
+    dr, di, gr, gi = pole
+    _, b, h, w, m = states.shape
+    sides = [torch.complex(*p.float().unbind(0)) for p in states.split(2)]
+    source = torch.stack((sides[0][:, :, step - 1::step], sides[1][:, :, ::step]), dim=-1)
+    source = source.permute(3, 0, 2, 1, 4)
+    raw = []
+    for direction in range(2):
+        sign = 1 - 2 * direction
+        a = torch.complex(dr, sign * di).view(m, 1, 1, 1)
+        g = torch.complex(gr, sign * gi).view(m, 1, 1, 1)
+        state = torch.zeros_like(source[..., 0, :])
+        rows = []
+        ordered = source.flip(-2) if direction else source
+        for item in ordered.unbind(-2):
+            state = a * state + g * item
+            rows.append(torch.view_as_real(state).flatten(-2).to(states.dtype))
+        raw.append(torch.stack(rows[::-1] if direction else rows, dim=-2))
+    trajectory = torch.stack(raw, dim=1)
+    # Model the tile's row/lane exchange, including short tiles of modes and rows.
+    transposed = torch.empty_like(trajectory)
+    for mode in range(0, m, 32):
+        for y in range(0, h, 32):
+            tile = trajectory[mode:mode + 32, :, :, :, y:y + 32]
+            shared = tile.movedim(0, -2).contiguous()
+            transposed[mode:mode + 32, :, :, :, y:y + 32] = shared.movedim(-2, 0)
+    assert transposed.shape == (m, 2, b, w // step, h, 4)
+    return transposed
+
+
+def _simulate_modefirst_adjoint(
+    pole: list[Tensor], states: Tensor, trajectory: Tensor, auxiliary: list[Tensor],
+    dp: Tensor, step: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    _, b, h, w, m = states.shape
+    dtype = states.dtype
+    dr, di, gr, gi = pole
+    vx, vy = auxiliary
+    pole_gradient = torch.zeros((2, m), dtype=torch.complex64)
+    gs = states.new_zeros(states.shape)
+    sx = (slice(step - 1, None, step), slice(None, None, step))
+    for direction in range(2):
+        sign = 1 - 2 * direction
+        a = torch.complex(dr, sign * di).view(m, 1, 1, 1)
+        g = torch.complex(gr, sign * gi).view(m, 1, 1, 1)
+        raw = trajectory[:, direction]
+        input_indices = [2 * direction, 4 + 2 * direction, 2 * direction + 1, 5 + 2 * direction]
+        incoming = dp[..., input_indices].reshape(m, b, w // step, h // step, 2, 2)
+        adj = torch.zeros((m, b, w // step, 2), dtype=torch.complex64)
+        rows = range(h) if direction else reversed(range(h))
+        for y in rows:
+            yo = y // step
+            source = torch.stack([
+                torch.complex(*states[2 * i:2 * i + 2, :, y, x].float().unbind()).permute(2, 0, 1)
+                for i, x in enumerate(sx)
+            ], dim=-1)
+            inject = torch.zeros_like(adj)
+            if y % step == (0 if direction else step - 1):
+                gains = torch.stack([
+                    (vx[i, x] * vy[direction, y]).T.clamp_min(1e-6).rsqrt()
+                    for i, x in enumerate(sx)
+                ], dim=-1)
+                values = (incoming[..., yo, :, :].float() * gains[:, None, :, :, None]).to(dtype)
+                inject = torch.view_as_complex(values.float())
+            adj = a.conj() * adj + inject
+            prev = y - sign
+            if 0 <= prev < h:
+                previous = torch.view_as_complex(raw[..., prev, :].float().unflatten(-1, (2, 2)))
+                contribution = (adj * previous.conj()).sum((1, 2, 3))
+                pole_gradient[0] += contribution if not direction else contribution.conj()
+            contribution = (adj * source.conj()).sum((1, 2, 3))
+            pole_gradient[1] += contribution if not direction else contribution.conj()
+            ds = torch.view_as_real(g.conj() * adj).to(dtype)
+            for i, x in enumerate(sx):
+                dst = gs[2 * i:2 * i + 2, :, y, x]
+                value = ds[..., i, :].permute(3, 1, 2, 0)
+                dst.copy_((dst.float() + value.float()).to(dtype))
+    da, dg = pole_gradient
+    return da.real, da.imag, dg.real, dg.imag, gs
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("h", "w", "m", "step"), [(13, 19, 63, 1), (14, 20, 35, 2), (37, 13, 35, 1)],
+)
+def test_modefirst_cpu_math(dtype: torch.dtype, h: int, w: int, m: int, step: int) -> None:
+    torch.manual_seed(123)
+    px, pole, r, i, auxiliary, path = _inputs(h, w, m, 8, dtype, "cpu", batch=2)
+    path = [value.detach().to(dtype).requires_grad_() for value in path]
+    states = torch.stack(bidirectional_product_scan_reference(tuple(px), (r, i)))
+    states = states.detach().requires_grad_()
+    trajectory = _simulate_modefirst_trajectory(pole, states, step)
+    vx, vy = auxiliary
+    pos, neg = trajectory.unbind(1)
+    inputs = []
+    for k in range(8):
+        direction, side, ri = (k & 2) // 2, k & 1, (k & 4) // 4
+        y = slice(0 if direction else step - 1, None, step)
+        x = slice(0 if side else step - 1, None, step)
+        gain = (vx[side, x].T[..., None] * vy[direction, y].T[:, None]).clamp_min(1e-6)
+        raw = (neg if direction else pos)[..., y, 2 * side + ri]
+        inputs.append((raw.float() * gain.rsqrt()[:, None]).to(dtype))
+    p = torch.stack(inputs, dim=-1).reshape(m, -1, 8)
+    wi, bi, wo, bo = (v.to(dtype) for v in path)
+    z = (torch.bmm(p.float(), wi.float().transpose(1, 2)).to(dtype).float()
+         + bi[:, None].float()).to(dtype)
+    act = (z.float() * z.float().sigmoid()).to(dtype)
+    o = (torch.bmm(act.float(), wo.float().transpose(1, 2)).to(dtype).float()
+         + bo[:, None].float()).to(dtype)
+    actual = o.reshape(m, 2, w // step, h // step, 2).permute(1, 3, 2, 0, 4)
+    ref = scans._reference_vertical(pole, states, auxiliary, path, step == 2, 1e-6)
+    torch.testing.assert_close(actual, torch.stack(ref, dim=-1), atol=0.003, rtol=0.012)
+
+    dy = torch.randn_like(o)
+    sig = z.float().sigmoid()
+    dz = (torch.bmm(dy.float(), wo.float()).to(dtype).float()
+          * sig * (1 + z.float() * (1 - sig))).to(dtype)
+    dp = torch.bmm(dz.float(), wi.float()).to(dtype)
+    path_grad = [
+        torch.bmm(dz.float().transpose(1, 2), p.float()),
+        dz.float().sum(1),
+        torch.bmm(dy.float().transpose(1, 2), act.float()),
+        dy.float().sum(1),
+    ]
+    partial = [torch.zeros((3, *g.shape)) for g in path_grad]
+    for worker in range(3):
+        for start in range(worker * 128, p.shape[1], 3 * 128):
+            chunk = slice(start, start + 128)
+            g = dz[:, chunk].float()
+            out = dy[:, chunk].float()
+            partial[0][worker] += torch.bmm(g.transpose(1, 2), p[:, chunk].float())
+            partial[1][worker] += g.sum(1)
+            partial[2][worker] += torch.bmm(out.transpose(1, 2), act[:, chunk].float())
+            partial[3][worker] += out.sum(1)
+    for parts, expected in zip(partial, path_grad, strict=True):
+        torch.testing.assert_close(parts.sum(0), expected, atol=1e-4, rtol=1e-5)
+
+    # One rounded directional gradient is staged, then added to the other direction.
+    positive = torch.autograd.grad(p, states, dp * p.new_tensor([1, 1, 0, 0, 1, 1, 0, 0]),
+                                   retain_graph=True)[0]
+    negative = torch.autograd.grad(p, states, dp * p.new_tensor([0, 0, 1, 1, 0, 0, 1, 1]),
+                                   retain_graph=True)[0]
+    expected_gs = torch.autograd.grad(p, states, dp)[0]
+    summed = (positive.float() + negative.float()).to(dtype).float()
+    assert (summed - expected_gs.float()).norm() / expected_gs.float().norm() < 0.008
+
+    reference = scans._reference_vertical(pole, states.float(), auxiliary, path, step == 2, 1e-6)
+    channels = dy.reshape(m, 2, w // step, h // step, 2).permute(1, 3, 2, 0, 4)
+    gradients = torch.autograd.grad(reference, [*pole, states, *path], channels.unbind(-1))
+    adjoint = _simulate_modefirst_adjoint(pole, states, trajectory, auxiliary, dp, step)
+    torch.testing.assert_close(adjoint[4].float(), summed, atol=0.025, rtol=0.02)
+    for idx, (value, expected) in enumerate(zip((*adjoint, *path_grad), gradients, strict=True)):
+        error = (value - expected.float()).norm() / expected.float().norm()
+        assert error < 0.008, (idx, error.item())
+
+
+def test_modefirst_saved_fake_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scans, "_modefirst_policy", lambda *_: "modefirst_tc")
+    with FakeTensorMode():
+        _, pole, r, _, auxiliary, path = _inputs(13, 19, 63, 8, torch.bfloat16, "cpu", batch=2)
+        states = r.new_empty((4, *r.shape))
+
+        def forward(x: Tensor, params: list[Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+            return scans._vertical_forward_saved(
+                pole, x, auxiliary, params, False, 1e-6,  # noqa: FBT003
+                planar=False, precise=True, separate=True,
+            )
+
+        a, b, saved = torch.compile(forward, backend="eager", fullgraph=True)(states, path)
+        assert a.shape == b.shape == (2, 13, 19, 63)
+        assert saved.shape == (63, 2 * 2 * 13 * 19, 4)
+
+
+def test_modefirst_large_batch_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_SCAN_W34A", "auto")
+    with FakeTensorMode():
+        states = torch.empty((4, 1024, 56, 56, 160), device="cuda", dtype=torch.bfloat16)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+        monkeypatch.setattr(scans, "_total_vram", lambda _: 140 * 1024**3)
+        assert scans._modefirst_policy(states, coarse=False) == "auto"
+        for coarse in (False, True):
+            m, n, k = scans._modefirst_shape(states, coarse)
+            step = 2 if coarse else 1
+            assert (m, n, k) == (160, 2 * 1024 * 56 * (56 // step), 4)
+            last_quad = ((m - 1) * 2 + 1) * 1024 * (56 // step) + 1024 * (56 // step) - 1
+            assert 4 * (last_quad * 56 + 55) + 3 == m * n * k - 1
+            assert (m * n * k > 2**31 - 1) == (not coarse)
+        monkeypatch.setattr(scans, "_total_vram", lambda _: 24 * 1024**3)
+        assert scans._modefirst_policy(states, coarse=False) == "off"
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("policy", ["modefirst_tc", "modefirst_tc_gs1"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("h", "w", "coarse"), [(13, 19, False), (14, 20, True), (56, 56, False)])
+def test_modefirst_cuda_parity(
+    monkeypatch: pytest.MonkeyPatch, policy: str, dtype: torch.dtype,
+    h: int, w: int, coarse: bool,
+) -> None:
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("Tensor Core projection requires SM 8.0")
+    monkeypatch.setenv("LNET_SCAN_W34A", policy)
+    monkeypatch.setattr(scans, "_total_vram", lambda _: 140 * 1024**3)
+    torch.manual_seed(123)
+    px, pole, r, i, auxiliary, path = _inputs(h, w, 63, 8, dtype, "cuda", batch=2)
+    path = [value.detach().to(dtype).requires_grad_() for value in path]
+    states = torch.stack(bidirectional_product_scan_reference(tuple(px), (r, i)))
+    states = states.detach().requires_grad_()
+    m = r.shape[-1]
+    output, _, features = scans._vertical_forward_saved(
+        pole, states, auxiliary, path, coarse, 1e-6, planar=False, precise=True, separate=False,
+    )
+    assert features.shape == (m, 2 * 2 * h * (w // (2 if coarse else 1)), 4)
+    reference = scans._reference_vertical(pole, states.float(), auxiliary, path, coarse, 1e-6)
+    incoming = torch.randn_like(output)
+    actual_grads = torch.autograd.grad(output, [*pole, states, *path], incoming)
+    reference_grads = torch.autograd.grad(reference, [*pole, states, *path], incoming.chunk(2, -1))
+    for actual, expected in zip(
+        (*output.chunk(2, -1), *actual_grads), (*reference, *reference_grads), strict=True,
+    ):
+        error = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-6)
+        assert error < 0.008
 
 
 def test_reference_forward_mode_on_cpu() -> None:
