@@ -1244,7 +1244,7 @@ def test_scan_wave_alignment_respects_work_and_workspace() -> None:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("coarse", [False, True])
 @pytest.mark.parametrize(("h", "w", "m"), [
-    (56, 56, 160), (28, 28, 160), (14, 14, 160), (13, 19, 63), (7, 7, 128),
+    (56, 56, 160), (28, 28, 160), (14, 14, 160), (13, 19, 63), (9, 11, 34), (7, 7, 128),
 ])
 def test_cuda_wave37a_parity(
     monkeypatch: pytest.MonkeyPatch, variant: str, dtype: torch.dtype,
@@ -1287,7 +1287,8 @@ def test_cuda_wave37a_parity(
 @pytest.mark.parametrize("variant", tuple(scans._W37A_KERNELS))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(("h", "w", "m", "coarse"), [
-    (13, 19, 63, False), (13, 19, 63, True), (9, 11, 34, True),
+    (13, 19, 63, False), (13, 19, 63, True),
+    (9, 11, 34, False), (9, 11, 34, True),
 ])
 def test_wave37a_cpu_batched_accumulation(  # noqa: C901, PLR0915
     variant: str, dtype: torch.dtype, h: int, w: int, m: int, coarse: bool,
@@ -1323,36 +1324,42 @@ def test_wave37a_cpu_batched_accumulation(  # noqa: C901, PLR0915
     dy = sample(w, h // step, m, 2)
 
     def adjoint(k: int, cta: bool) -> tuple[Tensor, Tensor]:
-        # Assign each column to its own warp, grouping up to three warps per CTA.
-        partial = torch.zeros(((w + 2) // 3 if cta else w, m, 90))
+        # A warp-local path also tests the separate register and shared fields.
+        warp_local = variant.startswith("warp_acc") and cta
+        shared_fields = scans._W38A_SHARED_FIELDS if warp_local else 90
+        partial = torch.zeros(((w + 2) // 3 if cta and not warp_local else w, m, 90))
         dp = torch.zeros_like(p)
         for x in range(w):
-            row = partial[x // 3 if cta else x]
-            for end in range(h // step, 0, -k):
-                cells = torch.arange(end - 1, max(-1, end - k - 1), -1)
-                inp, grad = p[x, cells], dy[x, cells]
-                delta = torch.zeros_like(row) if cta else row
-                for jac in grad:
-                    delta[:, 88:] += jac
-                for j in range(8):
-                    z = torch.zeros_like(inp[..., 0])
-                    for i in range(8):
-                        z = fma(wi[:, j, i], inp[..., i], z)
-                    z = rounded(rounded(z) + bi[:, j])
-                    sig = 1 / (1 + (-z).exp())
-                    act = rounded(z * sig)
-                    result = fma(grad[..., 0], wo[:, j, 0], grad[..., 1] * wo[:, j, 1])
-                    dz = rounded(rounded(result) * (sig * fma(z, 1 - sig, torch.ones_like(z))))
-                    dp[x, cells] = fma(dz[..., None], wi[:, j], dp[x, cells])
-                    for t in range(len(cells)):
-                        delta[:, 8 * j:8 * (j + 1)] = fma(
-                            dz[t, :, None], inp[t], delta[:, 8 * j:8 * (j + 1)],
-                        )
-                        delta[:, 64 + j] += dz[t]
-                        delta[:, 72 + j] = fma(grad[t, :, 0], act[t], delta[:, 72 + j])
-                        delta[:, 80 + j] = fma(grad[t, :, 1], act[t], delta[:, 80 + j])
-                if cta:
-                    row += delta
+            row = partial[x // 3 if cta and not warp_local else x]
+            span = 6 // step if cta else h // step
+            for top in range((h // step - 1) // span * span, -1, -span):
+                bottom = min(h // step, top + span)
+                for end in range(bottom, top, -k):
+                    cells = torch.arange(end - 1, max(top - 1, end - k - 1), -1)
+                    inp, grad = p[x, cells], dy[x, cells]
+                    delta = torch.zeros_like(row) if cta else row
+                    for jac in grad:
+                        delta[:, 88:] += jac
+                    for j in range(8):
+                        z = torch.zeros_like(inp[..., 0])
+                        for i in range(8):
+                            z = fma(wi[:, j, i], inp[..., i], z)
+                        z = rounded(rounded(z) + bi[:, j])
+                        sig = 1 / (1 + (-z).exp())
+                        act = rounded(z * sig)
+                        result = fma(grad[..., 0], wo[:, j, 0], grad[..., 1] * wo[:, j, 1])
+                        dz = rounded(rounded(result) * (sig * fma(z, 1 - sig, torch.ones_like(z))))
+                        dp[x, cells] = fma(dz[..., None], wi[:, j], dp[x, cells])
+                        for t in range(len(cells)):
+                            delta[:, 8 * j:8 * (j + 1)] = fma(
+                                dz[t, :, None], inp[t], delta[:, 8 * j:8 * (j + 1)],
+                            )
+                            delta[:, 64 + j] += dz[t]
+                            delta[:, 72 + j] = fma(grad[t, :, 0], act[t], delta[:, 72 + j])
+                            delta[:, 80 + j] = fma(grad[t, :, 1], act[t], delta[:, 80 + j])
+                    if cta:
+                        row[:, :shared_fields] += delta[:, :shared_fields]
+                        row[:, shared_fields:] += delta[:, shared_fields:]
         return dp, partial.sum(0)
 
     path_dp, reduced = adjoint(scans._W37A_KERNELS[variant][1], cta=True)
@@ -1390,3 +1397,160 @@ def test_wave37a_cpu_batched_accumulation(  # noqa: C901, PLR0915
 
     for wave, ref in zip(column_adjoint(path_dp, 6), column_adjoint(ref_dp, h), strict=True):
         torch.testing.assert_close(wave, ref, atol=0, rtol=0)
+
+
+_W38A_PLAN_SHAPES = [
+    (56, 56, 160, False), (56, 56, 160, True),
+    (28, 28, 160, False), (28, 28, 160, True),
+    (14, 14, 160, False), (14, 14, 160, True), (7, 7, 128, False),
+    (13, 19, 63, False), (13, 19, 63, True),
+    (9, 11, 34, False), (9, 11, 34, True),
+]
+
+
+@pytest.mark.parametrize("variant", [*scans._W37A_KERNELS, "auto"])
+@pytest.mark.parametrize("batch", [2, 1024])
+@pytest.mark.parametrize(("h", "w", "m", "coarse"), _W38A_PLAN_SHAPES)
+def test_wave37a_planner_limits_probes(
+    monkeypatch: pytest.MonkeyPatch, variant: str, batch: int,
+    h: int, w: int, m: int, coarse: bool,
+) -> None:
+    probes: dict[str, list[scans.Kernel]] = {}
+
+    def resident(_device: int, key: scans.Kernel, _smem: int) -> int:
+        keys = probes.setdefault(key.wave37a, [])
+        keys.append(key)
+        # Force the planner through the entire shortlist.
+        return int(len(keys) == 4)
+
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_scan_workspace_budget", lambda _: 256 * 1024**2)
+    monkeypatch.setattr(scans, "_resident", resident)
+    key = scans.Kernel(torch.bfloat16, 2, backward=True, vertical=True, hidden8=True, coarse=coarse)
+    scans._plan_wave37a.cache_clear()
+    try:
+        result = scans._plan_wave37a(0, key, (batch, h, w, m), 4 * batch * h * w * m, variant)
+        assert result is not None
+        assert probes
+        assert all(1 <= len(keys) <= 4 for keys in probes.values())
+        if variant == "auto":
+            assert "cta_acc_k8_smem" not in probes
+        else:
+            assert set(probes) == {variant}
+        assert all(not keys[0].vector_weights for keys in probes.values())
+    finally:
+        scans._plan_wave37a.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("h", "w", "m", "coarse"), _W38A_PLAN_SHAPES)
+def test_wave38a_single_gs_storage_cast(dtype: torch.dtype, h: int, w: int, m: int,
+                                      coarse: bool) -> None:
+    rng = torch.Generator().manual_seed(135)
+    positive, negative = (torch.randn(4, h, w, m, generator=rng) * 0.1 for _ in range(2))
+    # Positive is first stored as T in both paths. Negative also rounds
+    # separately before summation, and the result rounds on the final store.
+    legacy = positive.to(dtype)
+    legacy.copy_((negative.to(dtype).float() + legacy.float()).to(dtype))
+    if coarse:
+        positive[0:2, :, 0::2] = 0
+        negative[0:2, :, 0::2] = 0
+        positive[2:4, :, 1::2] = 0
+        negative[2:4, :, 1::2] = 0
+        if w % 2:
+            positive[2:4, :, -1] = 0
+            negative[2:4, :, -1] = 0
+        legacy[0:2, :, 0::2] = 0
+        legacy[2:4, :, 1::2] = 0
+        if w % 2:
+            legacy[2:4, :, -1] = 0
+    packed_positive = positive.to(dtype)
+    single = (negative.to(dtype).float() + packed_positive.float()).to(dtype)
+    assert torch.equal(single.view(torch.int16), legacy.view(torch.int16))
+
+
+@pytest.mark.parametrize("batch", [2, 1024])
+@pytest.mark.parametrize("vector", [False, True])
+def test_wave37a_k4_chunk6_tail_layout(batch: int, vector: bool) -> None:
+    shape = (batch, 56, 56, 160)
+    base = scans.Kernel(torch.bfloat16, 2, backward=True, vertical=True, hidden8=True)
+    plan, _ = next(
+        (plan, key) for plan, key in scans._wave37a_plans(base, shape, 227 * 1024, "cta_acc_k4")
+        if key.warps == 4 and key.chunk == 6 and key.global_checkpoints
+        and key.vector_weights == vector and not (key.cache_source or key.cache_line)
+    )
+    threads = 128
+    weight_end = 88 * 32 * (4 if vector else 2)
+    seg_end = weight_end + 6 * threads * 16
+    source_end = seg_end + 6 * threads * 8
+    acc_end = source_end + 90 * 32 * 4
+    assert plan.smem == acc_end + 4 * 8 * threads * 4
+    assert weight_end % 16 == seg_end % 16 == acc_end % 8 == 0
+
+    # The 2-row final trajectory and each 6-row chunk contain short K4 batches.
+    # Simulate their accesses at the two extreme lanes, poisoning inactive cells.
+    shape_h = shape[1]
+    visited: list[int] = []
+    dtype = torch.bfloat16
+    weights = torch.arange(64, dtype=torch.float32).reshape(8, 8).mul(0.015625).to(dtype).float()
+    dz = torch.arange(shape_h * 8, dtype=torch.float32).reshape(-1, 8).mul(0.0009765625)
+    reference = torch.zeros(shape_h, 8)
+    for j in range(8):
+        reference = torch.addcmul(reference, dz[:, j, None], weights[j])
+    for top in range((shape_h - 1) // 6 * 6, -1, -6):
+        for end in range(min(top + 6, shape_h), top, -4):
+            rows = list(range(end - 1, max(top - 1, end - 5), -1))
+            visited.extend(rows)
+            for lane in (0, threads - 1):
+                shared = torch.full((32 * threads,), torch.nan)
+                for cell, row in enumerate(rows):
+                    buf = shared[cell * 8 * threads + lane: (cell + 1) * 8 * threads:threads]
+                    buf.zero_()
+                    for j in range(8):
+                        buf.addcmul_(dz[row, j], weights[j])
+                    torch.testing.assert_close(buf, reference[row], atol=0, rtol=0)
+                assert torch.isnan(shared[len(rows) * 8 * threads:]).all()
+    assert visited == list(range(shape_h - 1, -1, -1))
+
+
+@pytest.mark.parametrize("variant", ["warp_acc_single_gs", "cta_acc_single_gs"])
+def test_wave38a_single_gs_falls_back_for_tall_scan(
+    monkeypatch: pytest.MonkeyPatch, variant: str,
+) -> None:
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_scan_workspace_budget", lambda _: 256 * 1024**2)
+    monkeypatch.setattr(scans, "_resident", lambda *_: 1)
+    base = scans.Kernel(torch.bfloat16, 2, backward=True, vertical=True, hidden8=True, coarse=True)
+    shape = (2, 1025, 19, 63)
+    scans._plan_wave37a.cache_clear()
+    try:
+        result = scans._plan_wave37a(0, base, shape, 4 * 2 * 1025 * 19 * 63, variant)
+        assert result is not None
+        assert result.key.wave37a == variant.replace("single_gs", "k2")
+    finally:
+        scans._plan_wave37a.cache_clear()
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("vector", [False, True])
+def test_cuda_wave37a_k4_chunk6_tail(monkeypatch: pytest.MonkeyPatch, vector: bool) -> None:
+    torch.manual_seed(137)
+    dtype = torch.bfloat16
+    _, py, real, _, aux, path = _inputs(56, 56, 160, 8, dtype, "cuda", batch=2)
+    states = torch.randn((4, *real.shape), dtype=dtype, device="cuda") * 0.1
+    grad = [torch.randn_like(real) * 0.05 for _ in range(2)]
+    shape = tuple(real.shape)
+    base = scans.Kernel(dtype, 4, backward=True, vertical=True, hidden8=True)
+    plan, key = next(
+        (plan, key) for plan, key in scans._wave37a_plans(base, shape, 227 * 1024, "cta_acc_k4")
+        if key.warps == 4 and key.chunk == 6 and key.global_checkpoints
+        and key.vector_weights == vector and not (key.cache_source or key.cache_line)
+    )
+    monkeypatch.setenv("LNET_SCAN_W37A", "cta_acc_k4")
+    monkeypatch.setattr(scans, "_plan_wave37a", lambda *_: scans.Launch(plan, key, 112, 28))
+    actual = scans.vertical_backward(py, states, aux, path, *grad)
+    monkeypatch.setenv("LNET_SCAN_W37A", "off")
+    expected = scans.vertical_backward(py, states, aux, path, *grad)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, atol=5e-4, rtol=2e-3)

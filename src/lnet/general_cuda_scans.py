@@ -134,6 +134,7 @@ class Kernel:
     backward_readonly: bool = False
     wave37a: str = ""
     odd_coarse_forward: bool = False
+    wave38a_relaxed_regs: bool = False
 
 
 class Launch(NamedTuple):
@@ -1452,6 +1453,10 @@ _W37A_KERNELS = {
     "cta_acc_k4": ("vscan_bwd_cta_k4", 4),
     "cta_acc_k8_smem": ("vscan_bwd_cta_k8", 8),
     "cta_acc_regw": ("vscan_bwd_cta_regw", 2),
+    "warp_acc_k2": ("vscan_bwd_warp_k2", 2),
+    "warp_acc_regw": ("vscan_bwd_warp_regw", 2),
+    "warp_acc_single_gs": ("vscan_bwd_warp_single_gs", 2),
+    "cta_acc_single_gs": ("vscan_bwd_cta_single_gs", 2),
 }
 
 
@@ -1584,9 +1589,11 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
                 }""")
     if key.wave37a:
         name, width = _W37A_KERNELS[key.wave37a]
-        source = _wave37a_source(source, width, key.register_path)
+        source = _wave37a_source(source, width, key.wave37a)
         wrapper = wrapper.replace("void scan(", f"void {name}(")
-        if key.register_path:
+        if not key.wave38a_relaxed_regs and key.wave37a != "warp_acc_regw" and (
+            key.register_path or key.wave37a.startswith("warp_acc")
+        ):
             threads = key.warps * _WARP_SIZE
             wrapper = wrapper.replace(
                 f"__launch_bounds__({threads})",
@@ -1596,10 +1603,31 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
 
 
 _W37A_PATH = r"""
+#if W37A_REGW && W38A_WARP
+template<class Raw>
+__device__ __forceinline__ Raw warp_weight_bits(Raw raw) {
+    // Keep the storage pair packed across path batches.
+    const auto bits = __builtin_bit_cast(unsigned int, raw);
+    Raw result;
+    asm volatile("mov.b32 {%0, %1}, %2;" : "=h"(result.x), "=h"(result.y) : "r"(bits));
+    return result;
+}
+
+__device__ __forceinline__ Complex unpack_warp_weights(Pair<__half> pair) {
+    const auto raw = warp_weight_bits(static_cast<__half2_raw>(pair.value));
+    return {read(__ushort_as_half(raw.x)), read(__ushort_as_half(raw.y))};
+}
+
+__device__ __forceinline__ Complex unpack_warp_weights(Pair<__nv_bfloat16> pair) {
+    const auto raw = warp_weight_bits(static_cast<__nv_bfloat162_raw>(pair.value));
+    return {read(__ushort_as_bfloat16(raw.x)), read(__ushort_as_bfloat16(raw.y))};
+}
+#endif
+
 template<class T, class I, int K, class Weights>
 __device__ __forceinline__ void path_adjoint_cta(
     Quad<T> (&pp)[K], Quad<T> (&pn)[K], const float2 (&dy)[K],
-    float (&dp)[K][8], float* batch, int threads, Weights path, float* acc, int count
+    float (&dp)[K][8], float* batch, int threads, Weights path, float* acc, float* tail, int count
 ) {
     constexpr int packed_fields = (K == 8 || W37A_REGW) ? K * 4 : 0;
     float2 bo{};
@@ -1610,13 +1638,19 @@ __device__ __forceinline__ void path_adjoint_cta(
             bo.y += dy[cell].y;
         }
     }
+#if W38A_WARP
+    tail[24] += bo.x;
+    tail[25] += bo.y;
+    #pragma unroll
+#else
     atomicAdd(acc + 88 * 32, bo.x);
     atomicAdd(acc + 89 * 32, bo.y);
     #pragma unroll 1
+#endif
     for (int j = 0; j < 8; ++j) {
         float weights[8], dw[8]{}, db = 0, dwr = 0, dwi = 0;
         float bias, wr, wi;
-#if W37A_REGW
+#if W37A_REGW && !W38A_WARP
         Pair<T> packed[4], params[3];
 #define W37A_ROW(J) case J: \
             packed[0] = path.pairs[4 * J]; \
@@ -1647,6 +1681,19 @@ __device__ __forceinline__ void path_adjoint_cta(
         }
         const auto b_pair = params[0].unpack(), r_pair = params[1].unpack();
         const auto i_pair = params[2].unpack();
+        bias = j & 1 ? b_pair.i : b_pair.r;
+        wr = j & 1 ? r_pair.i : r_pair.r;
+        wi = j & 1 ? i_pair.i : i_pair.r;
+#elif W37A_REGW
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const auto pair = unpack_warp_weights(path.pairs[4 * j + k]);
+            weights[2 * k] = pair.r;
+            weights[2 * k + 1] = pair.i;
+        }
+        const auto b_pair = unpack_warp_weights(path.pairs[32 + j / 2]);
+        const auto r_pair = unpack_warp_weights(path.pairs[36 + j / 2]);
+        const auto i_pair = unpack_warp_weights(path.pairs[40 + j / 2]);
         bias = j & 1 ? b_pair.i : b_pair.r;
         wr = j & 1 ? r_pair.i : r_pair.r;
         wi = j & 1 ? i_pair.i : i_pair.r;
@@ -1699,19 +1746,32 @@ __device__ __forceinline__ void path_adjoint_cta(
             dwi += d.y * act;
             #pragma unroll
             for (int k = 0; k < 8; ++k) {
-                if constexpr (K >= 4 || W37A_REGW) {
-                    batch[(packed_fields + cell * 8 + k) * threads] += dz * weights[k];
+                if constexpr (K >= 4 || (W37A_REGW && !W38A_WARP)) {
+                    float& grad = batch[(packed_fields + cell * 8 + k) * threads];
+                    grad = __fmaf_rn(dz, weights[k], grad);
                 } else {
-                    dp[cell][k] += dz * weights[k];
+                    dp[cell][k] = __fmaf_rn(dz, weights[k], dp[cell][k]);
                 }
                 dw[k] += dz * p[k];
             }
         }
+#if W38A_WARP
+        tail[j] += db;
+        tail[8 + j] += dwr;
+        tail[16 + j] += dwi;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int field = 8 * j + k;
+            if (field < W38A_SHARED_FIELDS) acc[field * threads] += dw[k];
+            else tail[26 + field - W38A_SHARED_FIELDS] += dw[k];
+        }
+#else
         atomicAdd(acc + (64 + j) * 32, db);
         atomicAdd(acc + (72 + j) * 32, dwr);
         atomicAdd(acc + (80 + j) * 32, dwi);
         #pragma unroll
         for (int k = 0; k < 8; ++k) atomicAdd(acc + (8 * j + k) * 32, dw[k]);
+#endif
     }
 }
 """
@@ -1762,13 +1822,13 @@ _W37A_COLUMN = r"""
                     pp[i] = pos;
                     pn[i] = neg_p;
                 }
-                if constexpr (K >= 4 || W37A_REGW) {
+                if constexpr (K >= 4 || (W37A_REGW && !W38A_WARP)) {
                     #pragma unroll
                     for (int k = 0; k < 8; ++k)
                         batch[(packed_fields + i * 8 + k) * THREADS] = 0;
                 }
             }
-            path_adjoint_cta<T, I>(pp, pn, dy, dp, batch, THREADS, path, acc, count);
+            path_adjoint_cta<T, I>(pp, pn, dy, dp, batch, THREADS, path, acc, tail, count);
             #pragma unroll
             for (int i = 0; i < K; ++i) {
                 if (i >= count) break;
@@ -1776,7 +1836,7 @@ _W37A_COLUMN = r"""
                 float q[8];
                 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
-                    if constexpr (K >= 4 || W37A_REGW) {
+                    if constexpr (K >= 4 || (W37A_REGW && !W38A_WARP)) {
                         q[k] = batch[(packed_fields + i * 8 + k) * THREADS];
                     } else {
                         q[k] = dp[i][k];
@@ -1805,7 +1865,37 @@ _W37A_COLUMN = r"""
 
 """
 
-def _wave37a_source(source: str, width: int, register: bool) -> str:
+_W38A_SINGLE_GS = r"""
+template<class T, class I, int THREADS>
+__device__ __forceinline__ void column_adjoint_positive(
+    Column<T, I> c, int y, float4 prev, float4 source, float4 inject,
+    Complex a, Complex g, Complex& adj_a, Complex& adj_b, Complex& da, Complex& dg,
+    T*, Quad<T>* pos_grad
+) {
+    pos_grad[I(y) * THREADS] = Quad<T>::pack(column_adjoint_step<false>(
+        prev, source, inject, a, g, adj_a, adj_b, da, dg));
+}
+
+template<class T, class I, bool COMPACT, int THREADS>
+__device__ __forceinline__ void column_adjoint_negative(
+    Column<T, I> c, int y, float4 prev, float4 source, float4 inject,
+    Complex a, Complex g, Complex& adj_a, Complex& adj_b, Complex& da, Complex& dg,
+    T* gs, const Quad<T>* pos_grad
+) {
+    const auto ds = column_adjoint_step<true>(
+        prev, source, inject, a, g, adj_a, adj_b, da, dg);
+    write_column_gradient<true, COMPACT, false>(c, y, ds, gs, pos_grad[I(y) * THREADS]);
+}
+"""
+
+
+_W38A_SHARED_FIELDS = 64
+
+
+def _wave37a_source(source: str, width: int, variant: str) -> str:
+    register = variant.endswith("regw")
+    warp_acc = variant.startswith("warp_acc")
+    single_gs = variant.endswith("single_gs")
     # Keep the legacy NVRTC input byte-for-byte unchanged for opt-out.
     source = source.replace(
         "#ifdef BACKWARD_BATCH2\ntemplate<class T, class I, class Weights>",
@@ -1816,8 +1906,8 @@ def _wave37a_source(source: str, width: int, register: bool) -> str:
     source = source[:begin] + _W37A_COLUMN + source[end:]
     source = source.replace(
         "int chunks, Complex& da, Complex& dg",
-        "int chunks, Complex& da, Complex& dg, float* batch",
-    ).replace("buf, stride, chunks, da, dg", "buf, stride, chunks, da, dg, batch")
+        "int chunks, Complex& da, Complex& dg, float* batch, float* tail, Quad<T>* pos_grad",
+    ).replace("buf, stride, chunks, da, dg", "buf, stride, chunks, da, dg, batch, tail, pos_grad")
     source = source.replace("BACKWARD && HIDDEN && !SHARED_ACC", "false")
     source = source.replace(
         "(PURE || SHARED_ACC || register_acc) && WARPS > 1", "true"
@@ -1826,30 +1916,84 @@ def _wave37a_source(source: str, width: int, register: bool) -> str:
     end = source.index("    Complex da{}, dg{};", begin)
     source = source[:begin] + r"""
     float* row = partials + I(group) * fields * M + m;
-    auto* acc = reinterpret_cast<float*>(line_buf + (CACHE_LINE ? I(oh) * threads : 0)) + lane;
-    auto* batch = acc - lane + 90 * 32 + threadIdx.x;
+    auto* extra = line_buf + (CACHE_LINE ? I(oh) * threads : 0);
+    auto* pos_grad = extra + threadIdx.x;
+    auto* accum = reinterpret_cast<float*>(extra + (W38A_SINGLE_GS ? I(H) * threads : 0));
+#if W38A_WARP
+    const int wide_rows = span + (GLOBAL_CKPT ? 0 : chunks - 1);
+    const int narrow_rows = (CACHE_SOURCE ? H : span) + (CACHE_LINE ? oh : 0)
+        + (W38A_SINGLE_GS ? H : 0);
+    accum += max(0, 94 - W38A_SHARED_FIELDS - 4 * wide_rows - 2 * narrow_rows) * threads;
+    auto* acc = accum + threadIdx.x;
+    auto* batch = acc + W38A_SHARED_FIELDS * threads;
+    constexpr int acc_stride = threads;
+    float tail[90 - W38A_SHARED_FIELDS]{};
+    #pragma unroll 1
+    for (int idx = 0; idx < W38A_SHARED_FIELDS; ++idx) acc[idx * threads] = 0;
+#else
+    auto* acc = accum + lane;
+    auto* batch = accum + 90 * 32 + threadIdx.x;
     constexpr int acc_stride = 32;
-    for (int idx = threadIdx.x; idx < 90 * 32; idx += threads) acc[idx - lane] = 0;
-    __syncthreads();
+    float* tail = nullptr;
+    for (int idx = threadIdx.x; idx < 90 * 32; idx += threads) accum[idx] = 0;
+#endif
+    // Both weight layouts are cooperatively loaded, including by inactive warps.
+    if constexpr (CACHE_WEIGHT || !W38A_WARP) __syncthreads();
 """ + source[end:]
     begin = source.index("    if constexpr (BACKWARD) {\n        if constexpr (PURE && reduce)")
     end = source.index("\n}\ntemplate", begin)
     source = source[:begin] + r"""
     auto* poles = reinterpret_cast<float*>(seg) + threadIdx.x;
-    poles[0] = da.r;
-    poles[threads] = da.i;
-    poles[2 * threads] = dg.r;
-    poles[3 * threads] = dg.i;
+    if constexpr (!W38A_WARP) {
+        poles[0] = da.r;
+        poles[threads] = da.i;
+        poles[2 * threads] = dg.r;
+        poles[3 * threads] = dg.i;
+    }
+#if W38A_WARP
+    // Every retired slot below belongs exclusively to its scan thread.
+    const auto stage = [&](int field, int thread) {
+        if (field < 4 * wide_rows)
+            return reinterpret_cast<float*>(seg) + (field / 4 * threads + thread) * 4 + field % 4;
+        field -= 4 * wide_rows;
+        return reinterpret_cast<float*>(seg_src) + (field / 2 * threads + thread) * 2 + field % 2;
+    };
+    seg[threadIdx.x] = make_float4(da.r, da.i, dg.r, dg.i);
+    #pragma unroll
+    for (int i = 0; i < 90 - W38A_SHARED_FIELDS; ++i)
+        *stage(4 + i, threadIdx.x) = tail[i];
+    poles = reinterpret_cast<float*>(seg) + 4 * threadIdx.x;
+#endif
     __syncthreads();
     if (warp == 0 && m < M) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
+#if W38A_WARP
+            float sum = poles[i];
+            #pragma unroll
+            for (int k = 1; k < WARPS; ++k) sum += poles[i + k * 32 * 4];
+#else
             float sum = poles[i * threads];
             #pragma unroll
             for (int k = 1; k < WARPS; ++k) sum += poles[i * threads + k * 32];
+#endif
             row[I(i) * M] = sum;
         }
+#if W38A_WARP
+        for (int i = 0; i < 90; ++i) {
+            const int tail_index = (i < 64 ? 26 + i - W38A_SHARED_FIELDS : i - 64) + 4;
+            const auto field = [&](int k) {
+                return i < W38A_SHARED_FIELDS ? acc[i * threads + 32 * k]
+                    : *stage(tail_index, lane + 32 * k);
+            };
+            float sum = field(0);
+            #pragma unroll
+            for (int k = 1; k < WARPS; ++k) sum += field(k);
+            row[I(4 + i) * M] = sum;
+        }
+#else
         for (int i = 0; i < 90; ++i) row[I(4 + i) * M] = acc[i * 32];
+#endif
     }
 """ + source[end:]
     source = source.replace("        __syncthreads();\n    } else if constexpr (CACHE_WEIGHT",
@@ -1869,7 +2013,28 @@ def _wave37a_source(source: str, width: int, register: bool) -> str:
                 }
             }""",
     )
-    return f"#define W37A_K {width}\n#define W37A_REGW {int(register)}\n" + source
+    if single_gs:
+        start = source.index("void column_backward(")
+        end = source.index("#undef CACHED_SOURCE_AT", start)
+        column = source[start:end].replace(
+            "column_adjoint<false, COMPACT>(", "column_adjoint_positive<T, I, THREADS>(",
+        ).replace("da, dg, gs);", "da, dg, gs, pos_grad);")
+        column = column.replace(
+            "column_adjoint<true, COMPACT>(",
+            "column_adjoint_negative<T, I, COMPACT, THREADS>(",
+        )
+        source = source[:start] + column + source[end:]
+        source = source.replace(
+            "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
+            _W38A_SINGLE_GS
+            + "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
+        )
+    return (
+        f"#define W37A_K {width}\n#define W37A_REGW {int(register)}\n"
+        f"#define W38A_WARP {int(warp_acc)}\n#define W38A_SINGLE_GS {int(single_gs)}\n"
+        f"#define W38A_SHARED_FIELDS {_W38A_SHARED_FIELDS}\n"
+        + source
+    )
 
 
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
@@ -2552,18 +2717,27 @@ def _wave37a_policy(dtype: torch.dtype, hidden: int, pure: bool) -> str:
     return policy if policy == "auto" or policy in _W37A_KERNELS else ""
 
 
-def _wave37a_plans(
+def _wave37a_plans(  # noqa: C901
     base: Kernel, shape: tuple[int, int, int, int], limit: int, policy: str,
 ) -> Iterator[tuple[ScanPlan, Kernel]]:
     _, height, _, _ = shape
-    variants = _W37A_KERNELS if policy == "auto" else (policy,)
+    variants = (
+        (variant for variant in _W37A_KERNELS if variant != "cta_acc_k8_smem")
+        if policy == "auto" else (policy,)
+    )
     step = 1 + int(base.coarse)
     for variant in variants:
         _, width = _W37A_KERNELS[variant]
-        regw = variant == "cta_acc_regw"
+        regw = variant.endswith("regw")
+        warp_acc = variant.startswith("warp_acc")
+        single_gs = variant.endswith("single_gs")
+        chunks = (0, 4, 6, 8, 14, 16)
+        if warp_acc and single_gs and not base.coarse and _SHORT_SCAN < height <= 28:
+            # A two-row replay can free a residency slot for positive gradients.
+            chunks += (2,)
         for warps in (2, 3, 4):
             threads = warps * _WARP_SIZE
-            for chunk in (0, 4, 6, 8, 14, 16):
+            for chunk in chunks:
                 span = chunk or height
                 if chunk and (chunk >= height or chunk < step):
                     continue
@@ -2572,13 +2746,23 @@ def _wave37a_plans(
                     source_rows = height if cache_source else span
                     for vector in ((False,) if regw else (False, True)):
                         weights = 0 if regw else 88 * 32 * (4 if vector else 2)
-                        fixed = 90 * _WARP_SIZE * 4 + weights
-                        staging = 96 if regw else {2: 0, 4: 128, 8: 384}[width]
-                        storage = fixed + threads * (16 * span + 8 * source_rows + staging)
+                        acc = (_W38A_SHARED_FIELDS * threads if warp_acc else 90 * _WARP_SIZE) * 4
+                        staging_floor = weights + acc + (94 - _W38A_SHARED_FIELDS) * threads * 4
+                        staging = (
+                            (32 if warp_acc else 96) if regw else {2: 0, 4: 128, 8: 384}[width]
+                        )
+                        storage = weights + acc + threads * (
+                            8 * source_rows
+                            + (8 * height if single_gs else 0)
+                        )
                         for cache_line in (True, False):
                             smem = storage + threads * (height // step * 8 if cache_line else 0)
                             for global_ckpt in ((False, True) if replay else (False,)):
-                                total = smem + (0 if global_ckpt else replay * threads * 16)
+                                trajectory = span + (0 if global_ckpt else replay)
+                                total = smem + trajectory * threads * 16
+                                if warp_acc:
+                                    total = max(total, staging_floor)
+                                total += staging * threads
                                 if total > limit:
                                     continue
                                 plan = ScanPlan(
@@ -2594,8 +2778,23 @@ def _wave37a_plans(
                                 yield plan, key
 
 
+def _wave37a_relaxed_candidate(
+    candidates: list[tuple[tuple, int, ScanPlan, Kernel]],
+) -> tuple[tuple, int, ScanPlan, Kernel]:
+    # With no register ceiling, favor a small thread block and cached
+    # checkpoint addresses. Full scans keep more recurrence state live.
+    def rank(entry: tuple[tuple, int, ScanPlan, Kernel]) -> tuple:
+        _, _, plan, key = entry
+        return (
+            -plan.warps, not plan.global_checkpoints, not plan.full_trajectory,
+            not plan.cache_source, not plan.cache_line, not key.vector_weights, -abs(key.chunk - 6),
+        )
+
+    return max(candidates, key=rank)
+
+
 @lru_cache(maxsize=256)
-def _plan_wave37a(
+def _plan_wave37a(  # noqa: C901
     device: int, base: Kernel, shape: tuple[int, int, int, int],
     index_bound: int, policy: str,
 ) -> Launch | None:
@@ -2605,15 +2804,9 @@ def _plan_wave37a(
     tiles = _ceil(modes, _WARP_SIZE)
     budget = _scan_workspace_budget(device)
     waves = _SHORT_VSCAN_WAVES if height <= _SHORT_SCAN else _VSCAN_WAVES
-    best = None
-    best_score = None
-    for plan, candidate in _wave37a_plans(base, shape, limit, policy):
-        probe_workers = _workers(lines, modes, 94, plan.warps, sms * max_warps * waves, budget)
-        bound = max(index_bound, 94 * modes * probe_workers)
-        key = replace(candidate, index32=bound < 2**31)
-        resident = _resident(device, key, plan.smem)
-        if not resident:
-            continue
+    ranked: dict[str, list[tuple[tuple, int, ScanPlan, Kernel]]] = {}
+
+    def evaluate(plan: ScanPlan, key: Kernel, resident: int) -> tuple[tuple, Launch] | None:
         workers = _workers(lines, modes, 94, plan.warps, sms * resident * waves, budget)
         scratch = modes * _scratch_per_worker(
             plan, height, vertical=True, coarse=base.coarse, backward=True, itemsize=2,
@@ -2621,23 +2814,69 @@ def _plan_wave37a(
         if scratch:
             workers = min(workers, budget // scratch)
         if not workers:
-            continue
+            return None
         groups = _ceil(workers, plan.warps)
         active = min(max_warps, plan.warps * resident)
         achievable = min(active, _ceil(workers * tiles, sms))
         _, k = _W37A_KERNELS[key.wave37a]
-        # Favor local checkpoints and path adjoints when occupancy is comparable.
         locality = (6 if plan.full_trajectory else 4) + int(plan.cache_source)
         locality += int(plan.cache_line) - int(plan.global_checkpoints)
+        single_gs = key.wave37a.endswith("single_gs")
+        target = 16 if not single_gs or height <= 14 else 12 if height <= 28 else 8
         score = (
-            achievable >= min(16, max_warps // 2),
-            achievable * locality * (16 + k) / 16,
-            min(sms, groups * tiles), active, plan.chunk, -plan.smem,
+            active >= min(target, max_warps // 2),
+            achievable * locality * (16 + k),
+            active, not plan.global_checkpoints,
+            single_gs, key.wave37a.startswith("warp_acc"),
+            -plan.smem,
         )
-        if best_score is None or score > best_score:
-            best_score = score
-            best = Launch(plan, key, workers, groups)
-    return best
+        return score, Launch(plan, key, workers, groups)
+
+    # CUDA reserves 1 KiB per CTA above the dynamic allocation. The supported
+    # architectures expose the per-SM capacity as opt-in block limit + 1 KiB.
+    for plan, candidate in _wave37a_plans(base, shape, limit, policy):
+        probe_workers = _workers(lines, modes, 94, plan.warps, sms * max_warps * waves, budget)
+        bound = max(index_bound, 94 * modes * probe_workers)
+        key = replace(candidate, index32=bound < 2**31)
+        threads = plan.warps * _WARP_SIZE
+        resident = min(
+            max_warps // plan.warps, (limit + 1024) // (plan.smem + 1024),
+            65536 // (128 * threads),
+        )
+        estimate = evaluate(plan, key, resident)
+        if estimate is not None:
+            ranked.setdefault(key.wave37a, []).append((estimate[0], resident, plan, key))
+
+    best = None
+    for variant, candidates in ranked.items():
+        candidates.sort(key=lambda entry: entry[0], reverse=True)
+        selected = None
+        for probe in range(min(4, len(candidates))):
+            # The last probe may trade occupancy for zero spills when every
+            # higher-ranked candidate spilled.
+            relaxed = (
+                probe == 3 and selected is None
+                and variant in {"warp_acc_k2", "warp_acc_single_gs", "cta_acc_regw"}
+            )
+            _, ceiling, plan, key = (
+                _wave37a_relaxed_candidate(candidates)
+                if relaxed and variant.startswith("warp") else candidates[0 if relaxed else probe]
+            )
+            if relaxed:
+                key = replace(key, wave38a_relaxed_regs=True)
+            verified = _resident(device, key, plan.smem)
+            if not verified:
+                continue
+            result = evaluate(plan, key, verified)
+            if result is not None and (selected is None or result[0] > selected[0]):
+                selected = result
+            if verified >= ceiling:
+                break
+        if selected is not None and (best is None or selected[0] > best[0]):
+            best = selected
+    if best is None and policy.endswith("single_gs"):
+        return _plan_wave37a(device, base, shape, index_bound, policy.replace("single_gs", "k2"))
+    return best[1] if best is not None else None
 
 
 def _plan_launch(
