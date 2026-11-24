@@ -218,18 +218,19 @@ def prepare_capture_safe_orthogonal_(
     scaling_steps: int = DEFAULT_SCALING_STEPS,
     compute_dtype: torch.dtype | None = None,
     auto: bool = True,
+    respect_env: bool = True,
 ) -> tuple[str, ...]:
     """Replace every existing matrix-exp orthogonal parametrization in ``model``.
 
     Returns the qualified tensor paths that were changed.  Calling the
     function again is idempotent and returns an empty tuple.
 
-    The environment can force preparation on or off. In auto mode, callers
-    opt in via ``auto``, which defaults to True for explicit preparation.
+    With ``respect_env``, the environment can force preparation on or off.
+    In auto mode, callers opt in via ``auto``, which defaults to True.
     The polynomial uses ordinary PyTorch operations on CUDA and CPU and
     derives its matrix dimensions from each original parametrization.
     """
-    policy = os.environ.get("LNET_CAPTURE_SAFE_ORTHOGONAL", "auto")
+    policy = os.environ.get("LNET_CAPTURE_SAFE_ORTHOGONAL", "auto") if respect_env else "on"
     if policy not in {"auto", "on", "off"}:
         raise ValueError(f"invalid LNET_CAPTURE_SAFE_ORTHOGONAL: {policy!r}")
     if policy == "off" or (policy == "auto" and not auto):

@@ -124,7 +124,10 @@ def build_model(variant: str) -> torch.nn.Module:
     import torch
     from run_va_eight_ablations import build_variant
 
-    return build_variant(variant).to(device="cuda", memory_format=torch.channels_last)
+    from lnet.model_w36b import prepare_model_w36b_
+
+    model = build_variant(variant).to(device="cuda", memory_format=torch.channels_last)
+    return prepare_model_w36b_(model)
 
 
 def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dict, list]:
@@ -286,10 +289,20 @@ def train_arm(args: argparse.Namespace) -> dict:
     import torch
     import va_model_builder as builder
 
+    from lnet.model_w36b import (
+        compile_model_w36b,
+        mark_model_w36b_step_begin,
+        model_w36b_features,
+    )
+
     inputs = setup(args.batch)
     labels = torch.arange(args.batch, device="cuda") % 100
     model = build_model(args.variant)
-    compiled = torch.compile(model, mode="default")
+    compiled = (
+        compile_model_w36b(model)
+        if model_w36b_features() & {"cuda_graphs", "max_autotune_gemm"}
+        else torch.compile(model, mode="default")
+    )
     optimizer = builder.build_optimizer(
         model,
         {
@@ -302,6 +315,7 @@ def train_arm(args: argparse.Namespace) -> dict:
     )
 
     def backward() -> torch.Tensor:
+        mark_model_w36b_step_begin()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = torch.nn.functional.cross_entropy(compiled(inputs)[0], labels)
         loss.backward()
