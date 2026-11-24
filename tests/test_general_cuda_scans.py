@@ -1289,3 +1289,74 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     ):
         for value, target in zip(values, reference, strict=True):
             torch.testing.assert_close(value, target, rtol=rtol, atol=atol)
+
+
+def test_wave27a_worker_alignment() -> None:
+    shape = (1024, 56, 56, 160)
+    plan = scans.ScanPlan(2, 54272, cache_weights=True, cache_source=True)
+    key = scans.Kernel(torch.bfloat16, 2, backward=True, vertical=True, hidden8=True)
+    base = scans.Launch(plan, key, 1690, 845)
+    assert scans._wave27a_workers(base, shape, 132, 4) == base._replace(
+        workers=1688, partials=844,
+    )
+    assert scans._wave27a_workers(base, (1024, 56, 33, 160), 132, 4) == base
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("coarse", [False, True])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_wave27a_checkpoint_and_pair_parity(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, coarse: bool, interleaved: bool,
+) -> None:
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    torch.manual_seed(719)
+    px, py, real, imag, aux, path = _inputs(56, 56, 160, 8, dtype, "cuda", batch=2)
+    states = scans.horizontal_forward(px, real, imag).detach()
+    out = scans.vertical_forward(py, states, aux, path, coarse=coarse)
+    if interleaved:
+        grad = torch.randn((*out[0].shape[:-1], 320), device="cuda", dtype=dtype).chunk(2, -1)
+    else:
+        grad = tuple(torch.randn_like(part) for part in out)
+    original = scans._scan_plans
+
+    def cached_checkpoint(*args: object, **kwargs: bool | int) -> list[scans.ScanPlan]:
+        kwargs["cache_trajectories"] = True
+        plans = original(*args, **kwargs)
+        if not (kwargs["vertical"] and kwargs["backward"]):
+            return plans
+        # One warp lets the full trajectory fit on the auxiliary GPU.
+        return [
+            p for p in plans if p.warps == 1 and p.cache_weights and p.cache_source
+            and p.chunk == 8 and not p.cache_line and not p.shared_acc
+        ]
+
+    monkeypatch.setattr(scans, "_scan_plans", cached_checkpoint)
+    scans._launch_for_shape.cache_clear()
+    result = []
+    try:
+        for preset in ("off", "bwd_chunk", "bwd_batch2"):
+            monkeypatch.setenv("LNET_SCAN_W27A", preset)
+            launch = scans._plan_launch(
+                states, tuple(states.shape[1:]), backward=True, vertical=True, coarse=coarse,
+                hidden=8, precise=False, compact=coarse, interleaved=(interleaved,) * 2,
+            )
+            assert launch is not None
+            assert launch.plan.full_trajectory == (preset == "bwd_chunk")
+            assert launch.key.backward_batch2 == (preset == "bwd_batch2")
+            result.append(scans.vertical_backward(
+                py, states, aux, path, *grad, coarse=coarse, compact=coarse,
+            ))
+    finally:
+        scans._launch_for_shape.cache_clear()
+    for preset, candidate in zip(("bwd_chunk", "bwd_batch2"), result[1:], strict=True):
+        for field, (actual, expected) in enumerate(zip(candidate, result[0], strict=True)):
+            label = (preset, field)
+            reference = expected.float()
+            diff = actual.float() - reference
+            # The two specializations can contract FP32 arithmetic differently at
+            # storage cast boundaries. Bound both isolated and distributed changes.
+            max_relative = 1e-4 if actual.dtype == torch.float32 else 2 * torch.finfo(dtype).eps
+            assert diff.abs().max() <= max_relative * reference.abs().max() + 3e-5, label
+            assert diff.norm() <= 1e-4 * reference.norm().clamp_min(1e-6), label
