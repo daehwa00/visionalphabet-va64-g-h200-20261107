@@ -1464,7 +1464,7 @@ def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
         return "reduce_path_mlp_partials"
     if key.reduction:
         return "reduce_vscan_partials" if key.vertical else "reduce_hscan_partials"
-    return "scan"
+    return "legacy_vscan" if key.vertical else "legacy_hscan"
 
 
 def _wave36a_horizontal_source(source: str) -> str:
@@ -1498,7 +1498,7 @@ def _wave36a_horizontal_source(source: str) -> str:
 """
     source = source[:start] + replay + sweep + "\n                }" + source[end:]
     return (
-        source.replace("void scan(", "void hscan_bwd_hiocc(")
+        source.replace("void legacy_hscan(", "void hscan_bwd_hiocc(")
         .replace("sr[base_r + I(x) * step_r]", "__ldg(sr + base_r + I(x) * step_r)")
         .replace("si[base_i + I(x) * step_i]", "__ldg(si + base_i + I(x) * step_i)")
         .replace("load_complex(states, i - M, plane)",
@@ -1602,7 +1602,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             key.cache_line, key.shared_acc, key.precise,
         )
     )
-    bounds = f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}) void scan'
+    bounds = (
+        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}) '
+        f'void {_kernel_name(key)}'
+    )
     compact = str(key.compact).lower()
     layout = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
     if key.vertical:

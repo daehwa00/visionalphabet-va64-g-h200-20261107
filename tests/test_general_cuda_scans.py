@@ -444,7 +444,8 @@ def test_source_and_offline_nvrtc(dtype: torch.dtype) -> None:
     for arch in architectures:
         for key in keys:
             ptx = scans._compile_ptx(key, arch)
-            assert b".entry scan(" in ptx.value
+            entry = b"legacy_vscan" if key.vertical else b"legacy_hscan"
+            assert b".entry " + entry + b"(" in ptx.value
 
 
 def _inputs(
