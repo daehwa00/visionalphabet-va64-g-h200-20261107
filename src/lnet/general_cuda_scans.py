@@ -132,6 +132,8 @@ class Kernel:
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
+    uncached_trajectory: bool = False
+    global_trajectory: bool = False
 
 
 class Launch(NamedTuple):
@@ -496,10 +498,15 @@ struct Column {
     }
 
     __device__ float4 source(int y) const {
+#ifdef WAVE30A_UNCACHED_TRAJECTORY
+        // Reuse the packed source loader so this specialization can use __ldg.
+        return packed_source(y).unpack();
+#else
         const I row = I(y) * W * M;
         const Complex a = load_complex(states, row + offset_a, source_plane);
         const Complex b = load_complex(states, row + offset_b + 2 * source_plane, source_plane);
         return make_float4(a.r, a.i, b.r, b.i);
+#endif
     }
 
     __device__ float2 gain(int y, bool reverse) const {
@@ -797,11 +804,28 @@ __device__ __forceinline__ void column_backward(
     const T* gr, const T* gi, T* gs, float* acc, I acc_stride,
     float4* seg, Quad<T>* seg_src, float4* ckpt, I ckpt_stride, Quad<T>* g2, I g2_stride,
     int chunks, Complex& da, Complex& dg
+#ifdef WAVE30A_GLOBAL_TRAJECTORY
+    , I seg_stride
+#endif
 ) {
     const auto ar = a.conj(), gg = g.conj();
     // CHUNK == 0 keeps the whole trajectory and needs no boundaries.
     constexpr bool full = CHUNK == 0;
+#ifdef WAVE30A_UNCACHED_TRAJECTORY
+    static_assert(!CACHE_SOURCE);
+#else
     static_assert(!full || CACHE_SOURCE);
+#endif
+#ifdef WAVE30A_GLOBAL_TRAJECTORY
+#define WAVE30A_SEG_STRIDE seg_stride
+#else
+#define WAVE30A_SEG_STRIDE THREADS
+#endif
+#ifdef WAVE30A_UNCACHED_TRAJECTORY
+#define WAVE30A_SOURCE_AT(j) c.source(y0 + (j))
+#else
+#define WAVE30A_SOURCE_AT(j) source_cache[(j) * THREADS].unpack()
+#endif
     const int span = full ? c.H : CHUNK;
     float4 pos{}, neg{};
     for (int block = 0; block < chunks; ++block) {
@@ -819,8 +843,10 @@ __device__ __forceinline__ void column_backward(
             }
             pos = advance(pos, source, a, g);
             if (last) {
-                seg[j * THREADS] = pos;
+                seg[j * WAVE30A_SEG_STRIDE] = pos;
+#ifndef WAVE30A_UNCACHED_TRAJECTORY
                 if constexpr (COARSE && !CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(source);
+#endif
             }
         }
         if (!last) ckpt[I(block) * ckpt_stride] = pos;
@@ -841,13 +867,15 @@ __device__ __forceinline__ void column_backward(
                 const auto source = CACHE_SOURCE
                     ? source_cache[j * THREADS].unpack() : c.source(y0 + j);
                 pos = advance(pos, source, a, g);
-                seg[j * THREADS] = pos;
+                seg[j * WAVE30A_SEG_STRIDE] = pos;
+#ifndef WAVE30A_UNCACHED_TRAJECTORY
                 if constexpr (COARSE && !CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(source);
+#endif
             }
         }
 
 #ifdef WAVE27A_BACKWARD_BATCH2
-        static_assert(HIDDEN == 8 && CACHE_SOURCE && !PURE);
+        static_assert(HIDDEN == 8 && !PURE);
         constexpr int step = 1 + COARSE;
 #ifdef WAVE28A_BACKWARD_BATCH_TAIL
         // A short odd-sized segment can leave one cell for the scalar path.
@@ -863,15 +891,15 @@ __device__ __forceinline__ void column_backward(
             for (int i = 0; i < 2; ++i) {
                 const int j = end - i * step, y = y0 + j;
                 next[i] = neg;
-                neg = advance(neg, source_cache[j * THREADS].unpack(), ar, gg);
+                neg = advance(neg, WAVE30A_SOURCE_AT(j), ar, gg);
                 if constexpr (COARSE) {
                     next_even[i] = neg;
-                    neg = advance(neg, source_cache[(j - 1) * THREADS].unpack(), ar, gg);
+                    neg = advance(neg, WAVE30A_SOURCE_AT(j - 1), ar, gg);
                 }
                 const I cell = c.cell(COARSE ? y / 2 : y);
                 dy[i] = make_float2(read(gr[(cell - c.m) * (1 + REAL_INTERLEAVED) + c.m]),
                                     read(gi[(cell - c.m) * (1 + IMAG_INTERLEAVED) + c.m]));
-                const auto pp = normalize<T>(seg[j * THREADS], c.gain(y, false));
+                const auto pp = normalize<T>(seg[j * WAVE30A_SEG_STRIDE], c.gain(y, false));
                 const auto pn = normalize<T>(neg, c.gain(y - int(COARSE), true));
                 p[i][0] = pp.x; p[i][1] = pp.z; p[i][2] = pn.x; p[i][3] = pn.z;
                 p[i][4] = pp.y; p[i][5] = pp.w; p[i][6] = pn.y; p[i][7] = pn.w;
@@ -886,17 +914,17 @@ __device__ __forceinline__ void column_backward(
                     make_float4(dp[i][2], dp[i][6], dp[i][3], dp[i][7]),
                     c.gain(y - int(COARSE), true));
                 column_adjoint<false, COMPACT>(
-                    c, y, j ? seg[(j - 1) * THREADS] : before,
-                    source_cache[j * THREADS].unpack(), ip, a, g, adj_a, adj_b, da, dg, gs);
+                    c, y, j ? seg[(j - 1) * WAVE30A_SEG_STRIDE] : before,
+                    WAVE30A_SOURCE_AT(j), ip, a, g, adj_a, adj_b, da, dg, gs);
                 if constexpr (COARSE) {
                     column_adjoint<false, COMPACT>(
-                        c, y - 1, j > 1 ? seg[(j - 2) * THREADS] : before,
-                        source_cache[(j - 1) * THREADS].unpack(), {}, a, g,
+                        c, y - 1, j > 1 ? seg[(j - 2) * WAVE30A_SEG_STRIDE] : before,
+                        WAVE30A_SOURCE_AT(j - 1), {}, a, g,
                         adj_a, adj_b, da, dg, gs);
                 }
                 if constexpr (full) {
-                    seg[j * THREADS] = next[i];
-                    if constexpr (COARSE) seg[(j - 1) * THREADS] = next_even[i];
+                    seg[j * WAVE30A_SEG_STRIDE] = next[i];
+                    if constexpr (COARSE) seg[(j - 1) * WAVE30A_SEG_STRIDE] = next_even[i];
                 }
             }
         }
@@ -909,13 +937,13 @@ __device__ __forceinline__ void column_backward(
 #endif
             const int y = y0 + j;
             const auto s = (COARSE || CACHE_SOURCE)
-                ? source_cache[j * THREADS].unpack() : c.source(y);
+                ? WAVE30A_SOURCE_AT(j) : c.source(y);
             const auto next = neg;
             neg = advance(neg, s, ar, gg);
             auto se = s;
             const auto next_even = neg;
             if constexpr (COARSE) {
-                se = source_cache[(j - 1) * THREADS].unpack();
+                se = WAVE30A_SOURCE_AT(j - 1);
                 neg = advance(neg, se, ar, gg);
             }
             const int yo = COARSE ? y / 2 : y;
@@ -926,7 +954,7 @@ __device__ __forceinline__ void column_backward(
                 #pragma unroll
                 for (int k = 0; k < 8; ++k) dp[k] = read(gr[I(k) * c.feature_plane + cell]);
             } else path_mlp<T, I, HIDDEN, false, true>(
-                normalize<T>(seg[j * THREADS], gp), normalize<T>(neg, gn),
+                normalize<T>(seg[j * WAVE30A_SEG_STRIDE], gp), normalize<T>(neg, gn),
                 path, {},
                 make_float2(read(gr[(cell - c.m) * (1 + REAL_INTERLEAVED) + c.m]),
                             read(gi[(cell - c.m) * (1 + IMAG_INTERLEAVED) + c.m])),
@@ -936,18 +964,18 @@ __device__ __forceinline__ void column_backward(
                 normalize_packed<T>(make_float4(dp[2], dp[6], dp[3], dp[7]), gn);
 
             column_adjoint<false, COMPACT>(
-                c, y, j ? seg[(j - 1) * THREADS] : before, s, ip, a, g,
+                c, y, j ? seg[(j - 1) * WAVE30A_SEG_STRIDE] : before, s, ip, a, g,
                 adj_a, adj_b, da, dg, gs);
             if constexpr (COARSE) {
                 column_adjoint<false, COMPACT>(
-                    c, y - 1, j > 1 ? seg[(j - 2) * THREADS] : before, se, {}, a, g,
+                    c, y - 1, j > 1 ? seg[(j - 2) * WAVE30A_SEG_STRIDE] : before, se, {}, a, g,
                     adj_a, adj_b, da, dg, gs);
             }
             if constexpr (full) {
                 // The positive adjoint consumed these states. Reuse the slots
                 // for the inputs of the negative recurrence.
-                seg[j * THREADS] = next;
-                if constexpr (COARSE) seg[(j - 1) * THREADS] = next_even;
+                seg[j * WAVE30A_SEG_STRIDE] = next;
+                if constexpr (COARSE) seg[(j - 1) * WAVE30A_SEG_STRIDE] = next_even;
             }
         }
 #endif
@@ -964,8 +992,10 @@ __device__ __forceinline__ void column_backward(
             for (int j = length - 1; j >= 0; --j) {
                 const auto s = CACHE_SOURCE
                     ? source_cache[j * THREADS].unpack() : c.source(y0 + j);
-                seg[j * THREADS] = neg;
+                seg[j * WAVE30A_SEG_STRIDE] = neg;
+#ifndef WAVE30A_UNCACHED_TRAJECTORY
                 if constexpr (!CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(s);
+#endif
                 neg = advance(neg, s, ar, gg);
             }
         }
@@ -974,12 +1004,15 @@ __device__ __forceinline__ void column_backward(
             const auto in = !COARSE || !(y & 1)
                 ? g2[I(COARSE ? y / 2 : y) * g2_stride].unpack() : float4{};
             column_adjoint<true, COMPACT>(
-                c, y, seg[j * THREADS], source_cache[j * THREADS].unpack(), in, ar, gg,
+                c, y, seg[j * WAVE30A_SEG_STRIDE], WAVE30A_SOURCE_AT(j), in, ar, gg,
                 adj_a, adj_b, da, dg, gs);
             if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);
         }
     }
 }
+
+#undef WAVE30A_SOURCE_AT
+#undef WAVE30A_SEG_STRIDE
 
 // Tile the CTA reduction so all scan warps can share one small staging buffer.
 constexpr int vscan_reduce_tile = 32;
@@ -1130,11 +1163,20 @@ __device__ __forceinline__ void vertical(
     constexpr int weight_itemsize = VECTOR_WEIGHTS ? sizeof(float) : sizeof(T);
     auto* seg = shared + (CACHE_WEIGHT && !REGISTER_PATH
         ? weight_fields * 32 * weight_itemsize / 16 : 0);
+#ifdef WAVE30A_GLOBAL_TRAJECTORY
+    static_assert(BACKWARD && full && !GLOBAL_CKPT);
+    auto* ckpt = seg;
+#else
     auto* ckpt = seg + (BACKWARD ? span * threads : 0);
+#endif
     auto* seg_src = reinterpret_cast<Quad<T>*>(
         ckpt + (BACKWARD && !GLOBAL_CKPT ? I(chunks - 1) * threads : 0));
     auto* acc_base = reinterpret_cast<float*>(
+#ifdef WAVE30A_UNCACHED_TRAJECTORY
+        seg_src);
+#else
         seg_src + (BACKWARD ? I(CACHE_SOURCE ? H : span) * threads : 0));
+#endif
     auto* line_buf = reinterpret_cast<Quad<T>*>(acc_base + (SHARED_ACC ? fields * threads : 0));
     float* row = partials;
     float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};
@@ -1176,11 +1218,22 @@ __device__ __forceinline__ void vertical(
             if constexpr (BACKWARD) {
                 auto* boundaries = GLOBAL_CKPT
                     ? global_checkpoints + I(worker) * M + m : ckpt + threadIdx.x;
+#ifdef WAVE30A_GLOBAL_TRAJECTORY
+                // Each worker owns one float4 per mode per row and reuses it on the next line.
+#define WAVE30A_SEG_PTR (global_checkpoints + I(worker) * M + m)
+#else
+#define WAVE30A_SEG_PTR (seg + threadIdx.x)
+#endif
                 column_backward<T, I, COARSE, CHUNK, threads, HIDDEN, COMPACT,
                                 REAL_INTERLEAVED, IMAG_INTERLEAVED, CACHE_SOURCE, PURE>(
                     c, a, g, path, gr, gi, gs,
-                    acc, acc_stride, seg + threadIdx.x, seg_src + threadIdx.x, boundaries,
-                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg);
+                    acc, acc_stride, WAVE30A_SEG_PTR, seg_src + threadIdx.x, boundaries,
+                    GLOBAL_CKPT ? I(workers) * M : threads, buf, stride, chunks, da, dg
+#ifdef WAVE30A_GLOBAL_TRAJECTORY
+                    , I(workers) * M
+#endif
+                );
+#undef WAVE30A_SEG_PTR
             } else {
                 float4 state{};
                 for (int y = 0; y < H; ++y) {
@@ -1451,7 +1504,7 @@ def _kernel_name(key: Kernel) -> str:
     return "scan"
 
 
-def _kernel_source(key: Kernel) -> str:
+def _kernel_source(key: Kernel) -> str:  # noqa: C901
     """Instantiate a single entry point without modifying the device source."""
     if key.reduction:
         return _CUDA_SOURCE + f"""
@@ -1548,6 +1601,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
 }}
 """
     source = _CUDA_SOURCE
+    if key.uncached_trajectory:
+        source = "#define WAVE30A_UNCACHED_TRAJECTORY\n" + source
+    if key.global_trajectory:
+        source = "#define WAVE30A_GLOBAL_TRAJECTORY\n" + source
     if key.backward_batch2:
         source = "#define WAVE27A_BACKWARD_BATCH2\n" + source
         if key.backward_batch_tail:
@@ -1693,7 +1750,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
         if (
             key.batch_path or key.register_path or key.horizontal_unroll8
             or key.horizontal_forward_unroll or key.backward_batch2
-            or key.backward_readonly
+            or key.backward_readonly or key.uncached_trajectory or key.global_trajectory
             or (key.vertical and key.backward and key.chunk == 14 and key.cache_source)
         ):
             local = ct.c_int()
@@ -2349,7 +2406,7 @@ def _wave29a_vbackward(
 def _wave29a_forward(
     launch: Launch, device: int, shape: tuple[int, int, int, int], sms: int, resident: int,
 ) -> Launch:
-    batch, height, width, modes = shape
+    batch, height, _, modes = shape
     plan, key, _, _ = launch
     if key.vertical and key.hidden8 and not key.register_path and plan.cache_weights:
         weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (4 if key.vector_weights else 2)
@@ -2372,14 +2429,23 @@ def _wave29a_forward(
         if _ceil(launch.workers, 2) <= workers < launch.workers:
             return launch._replace(workers=workers, partials=workers)
     if key.vertical and height == 56 and aligned == launch:
-        # Round up only when trimming would increase the maximum loop count.
-        tiles = _ceil(modes, _WARP_SIZE)
-        slots = sms * resident
-        waves = _ceil(_ceil(launch.workers, plan.warps) * tiles, slots)
-        workers = (waves * slots // tiles) * plan.warps
-        if launch.workers < workers <= batch * (width // (1 + key.coarse)):
-            return launch._replace(workers=workers, partials=workers)
+        return _align_vscan_forward_up(launch, shape, sms, resident)
     return aligned
+
+
+def _align_vscan_forward_up(
+    launch: Launch, shape: tuple[int, int, int, int], sms: int, resident: int,
+) -> Launch:
+    # Round up when trimming would increase the maximum loop count.
+    batch, _, width, modes = shape
+    plan, key, workers, _ = launch
+    tiles = _ceil(modes, _WARP_SIZE)
+    slots = sms * resident
+    waves = _ceil(_ceil(workers, plan.warps) * tiles, slots)
+    aligned = (waves * slots // tiles) * plan.warps
+    if workers < aligned <= batch * (width // (1 + key.coarse)):
+        return launch._replace(workers=aligned, partials=aligned)
+    return launch
 
 
 def _with_wave29a(  # noqa: PLR0911
@@ -2427,6 +2493,117 @@ def _with_wave29a(  # noqa: PLR0911
     return launch
 
 
+_W30A_PRESETS = {"auto", "surgical_w29", "chunk28_nocache", "smem_full_56", "l2_full_56"}
+
+
+def _wave30a_storage(
+    launch: Launch, device: int, shape: tuple[int, int, int, int], preset: str,
+    sms: int, limit: int, resident: int,
+) -> Launch:
+    plan, key, workers, partials = launch
+    batch, height, width, modes = shape
+    full = preset != "chunk28_nocache"
+    global_seg = preset == "l2_full_56"
+    chunk = height if full else 28
+    warps = (3 if key.coarse else 2) if preset == "smem_full_56" else plan.warps
+    row_bytes = warps * _WARP_SIZE * 16
+    weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (4 if key.vector_weights else 2)
+    source_bytes = height * warps * _WARP_SIZE * 4 * key.dtype.itemsize if global_seg else 0
+    trajectory_bytes = 0 if global_seg else (chunk + (height - 1) // chunk) * row_bytes
+    smem = weight_bytes + source_bytes + trajectory_bytes
+    if plan.cache_line:
+        smem += height // (1 + key.coarse) * warps * _WARP_SIZE * 4 * key.dtype.itemsize
+    if smem > limit:
+        return launch
+    candidate = replace(
+        key, warps=warps, chunk=0 if full else chunk, cache_source=global_seg,
+        backward_batch_tail=False, backward_readonly=key.backward_readonly or not global_seg,
+        uncached_trajectory=not global_seg, global_trajectory=global_seg,
+    )
+    new_resident = _resident(device, candidate, smem)
+    min_warps = 6 if preset == "smem_full_56" else resident * plan.warps
+    if new_resident * warps < min_warps:
+        return launch
+    tiles = _ceil(modes, _WARP_SIZE)
+    slots = sms * new_resident
+    lines = batch * (width // (1 + key.coarse))
+    if global_seg:
+        partials = slots // tiles
+        workers = partials * warps
+        elements = height * workers * modes * 4
+        if not workers or lines < workers * 4 or elements >= 2**31 or elements * 4 > 36 * 2**20:
+            return launch
+    elif full:
+        # Keep partial and adjoint workspace within the composed launch's budget.
+        groups = min(partials, workers // warps)
+        if not groups:
+            return launch
+        waves = _ceil(groups * tiles, slots)
+        aligned = waves * slots // tiles
+        if aligned > groups:
+            aligned = (waves - 1) * slots // tiles
+        # A small wave remainder costs less than dropping a substantial fraction
+        # of workers, particularly when changing the coarse CTA width.
+        partials = aligned if aligned * 10 >= groups * 9 else groups
+        workers = partials * warps
+    return Launch(
+        plan._replace(warps=warps, smem=smem, chunk=chunk, full_trajectory=full,
+                      cache_source=global_seg),
+        candidate, workers, partials,
+    )
+
+
+def _with_wave30a(  # noqa: C901, PLR0911, PLR0912
+    launch: Launch, device: int, shape: tuple[int, int, int, int], *,
+    legacy: bool = True, preset: str | None = None,
+) -> Launch:
+    if preset is None:
+        preset = os.environ.get("LNET_SCAN_W30A", "off")
+    if preset not in _W30A_PRESETS:
+        return _with_wave29a(launch, device, shape, legacy=legacy)
+    _, height, width, modes = shape
+    key = launch.key
+    if (
+        key.dtype.itemsize != 2 or not key.index32 or key.pure_vertical
+        or torch.cuda.get_device_capability(device) != (9, 0)
+    ):
+        return _with_wave29a(launch, device, shape, legacy=legacy)
+    launch = _with_wave29a(launch, device, shape, legacy=legacy, preset="compose_ckpt")
+    plan, key, _, _ = launch
+    if not key.vertical:
+        return launch
+    sms, limit, _ = device_limits(device)
+    resident = _resident(device, key, plan.smem)
+    if not resident:
+        return launch
+    if not key.backward:
+        if (height, width, modes) == (56, 56, 160):
+            aligned = _wave28a_workers(launch, shape, sms, resident)
+            if aligned == launch:
+                return _align_vscan_forward_up(launch, shape, sms, resident)
+            return aligned
+        return launch
+    if not key.hidden8 or not plan.cache_weights or not plan.cache_source or (
+        key.shared_acc or key.global_checkpoints
+    ):
+        return launch
+    # A coarse pair needs four rows. On rejection keep the original cached kernel.
+    if height == 56 and key.coarse and key.backward_batch_tail:
+        launch = launch._replace(key=replace(key, backward_batch2=False, backward_batch_tail=False))
+    if (height, width, modes) in {(56, 56, 160), (28, 28, 160), (14, 14, 160)} and (
+        (height == 56) == key.coarse
+    ):
+        launch = _wave29a_readonly(launch, device, resident)
+    if preset == "auto":
+        preset = "surgical_w29"
+    if (
+        preset != "surgical_w29" and height == 56 and width % (1 + key.coarse) == 0
+        and launch.key.backward_batch2
+    ):
+        return _wave30a_storage(launch, device, shape, preset, sms, limit, resident)
+    return launch
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -2469,15 +2646,15 @@ def _plan_launch(
         or not plan.cache_weights or plan.cache_line or plan.warps != 1
         or shape[1] < 8 * (1 + key.coarse)
     ):
-        return _with_wave29a(_with_wave25a(launch, device, shape), device, shape)
+        return _with_wave30a(_with_wave25a(launch, device, shape), device, shape)
     candidate = replace(key, batch_path=True)
     sms, _, max_warps = device_limits(device)
     resident = _resident(device, candidate, plan.smem)
     original = _resident(device, key, plan.smem)
     queued = _ceil(workers * _ceil(shape[-1], _WARP_SIZE), sms)
     if resident < min(max_warps // 4, original) or queued < 2 * resident:
-        return _with_wave29a(_with_wave25a(launch, device, shape), device, shape)
-    return _with_wave29a(
+        return _with_wave30a(_with_wave25a(launch, device, shape), device, shape)
+    return _with_wave30a(
         _with_wave25a(launch._replace(key=candidate), device, shape), device, shape, legacy=False,
     )
 
@@ -2811,7 +2988,10 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         fields = 4 if pure else 11 * hidden + 6
         partial = states.new_empty((launch.partials, fields, m), dtype=torch.float32)
         checkpoint_rows = _ceil(h, launch.plan.chunk) - 1
-        if launch.plan.global_checkpoints and checkpoint_rows:
+        if launch.key.global_trajectory:
+            # A full trajectory uses the checkpoint argument and has no checkpoint rows.
+            checkpoints = states.new_empty((h, launch.workers, m, 4), dtype=torch.float32)
+        elif launch.plan.global_checkpoints and checkpoint_rows:
             checkpoints = states.new_empty(
                 (checkpoint_rows, launch.workers, m, 4), dtype=torch.float32
             )

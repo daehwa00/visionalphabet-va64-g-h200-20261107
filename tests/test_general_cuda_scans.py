@@ -663,6 +663,7 @@ def test_packed_vertical_index_bound(
     monkeypatch.setenv("LNET_SCAN_W27A", "off")
     monkeypatch.setenv("LNET_SCAN_W28A", "off")
     monkeypatch.setenv("LNET_SCAN_W29A", "off")
+    monkeypatch.setenv("LNET_SCAN_W30A", "off")
     monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
     monkeypatch.setattr(scans, "_resident", lambda *_: 3)
     monkeypatch.setattr(scans, "_extra_workspace_budget", lambda _: 0)
@@ -1359,6 +1360,7 @@ def test_wave27a_checkpoint_and_pair_parity(
 ) -> None:
     monkeypatch.setenv("LNET_SCAN_W28A", "off")
     monkeypatch.setenv("LNET_SCAN_W29A", "off")
+    monkeypatch.setenv("LNET_SCAN_W30A", "off")
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
     torch.manual_seed(719)
     px, py, real, imag, aux, path = _inputs(56, 56, 160, 8, dtype, "cuda", batch=2)
@@ -1427,6 +1429,7 @@ def test_wave29a_checkpoint_composition(
     chunk: int, paired: bool,
 ) -> None:
     monkeypatch.setenv("LNET_SCAN_W29A", preset)
+    monkeypatch.setenv("LNET_SCAN_W30A", "off")
     monkeypatch.setenv("LNET_SCAN_W28A", "off")
     monkeypatch.setenv("LNET_SCAN_W27A", "off")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
@@ -1467,3 +1470,130 @@ def test_wave29a_forward_alignment(
     assert 0 <= (-launch.workers // warps * 5) % slots < 5
     assert scans._ceil(1024 * 56 // (1 + coarse), launch.workers) <= max_lines
     assert launch.partials == launch.workers
+
+
+def _wave30a_base(coarse: bool) -> scans.Launch:
+    warps = 4 if coarse else 2
+    plan = scans.ScanPlan(warps, 97280 if coarse else 54272,
+                          cache_weights=True, cache_source=True)
+    key = scans.Kernel(
+        torch.bfloat16, warps, backward=True, vertical=True, coarse=coarse,
+        hidden8=True, compact=coarse, vector_weights=True, cache_weights=True, cache_source=True,
+    )
+    workers = 1692 if coarse else 1690
+    return scans.Launch(plan, key, workers, workers // warps)
+
+
+@pytest.mark.parametrize("coarse", [False, True])
+@pytest.mark.parametrize(
+    "preset", ["surgical_w29", "chunk28_nocache", "smem_full_56", "l2_full_56"],
+)
+def test_wave30a_trajectory_dispatch(
+    monkeypatch: pytest.MonkeyPatch, coarse: bool, preset: str,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
+    monkeypatch.setattr(scans, "_resident", lambda _, k, smem: min(
+        8 // k.warps, (228 * 1024) // (smem + 1024),
+    ))
+    base = _wave30a_base(coarse)
+    shape = (1024, 56, 56, 160)
+    actual = scans._with_wave30a(base, 0, shape, preset=preset)
+    plan, key, workers, partials = actual
+    assert key.backward_batch2
+    assert not key.backward_batch_tail
+    assert partials == workers // plan.warps
+    assert partials <= base.partials
+    assert plan.full_trajectory == (preset in {"l2_full_56", "smem_full_56"})
+    assert key.global_trajectory == (preset == "l2_full_56")
+    assert key.uncached_trajectory == (preset in {"chunk28_nocache", "smem_full_56"})
+    assert plan.cache_source == (not key.uncached_trajectory)
+    if preset == "surgical_w29":
+        assert plan.chunk == (20 if coarse else 14)
+        assert key.backward_readonly == coarse
+    elif preset == "chunk28_nocache":
+        assert plan.chunk == key.chunk == 28
+        assert plan.smem == (70656 if coarse else 40960)
+    elif preset == "smem_full_56":
+        assert key.chunk == 0
+        assert plan.smem == (97280 if coarse else 68608)
+    else:
+        assert key.chunk == 0
+        assert plan.smem == (68608 if coarse else 39936)
+        assert workers == (208 if coarse else 210)
+        upstream = scans._with_wave30a(base, 0, (1, 56, 56, 160), preset="surgical_w29")
+        assert scans._with_wave30a(base, 0, (1, 56, 56, 160), preset=preset) == upstream
+        upstream = scans._with_wave30a(base, 0, shape, preset="surgical_w29")
+        resident = 2 if coarse else 4
+        assert scans._wave30a_storage(
+            upstream, 0, shape, preset, 264, 232448, resident,
+        ) == upstream
+
+
+@pytest.mark.parametrize(("coarse", "workers", "resident", "grid"), [
+    (False, 1813, 19, 10030), (True, 3627, 21, 19400),
+])
+def test_wave30a_forward_workers_only(
+    monkeypatch: pytest.MonkeyPatch, coarse: bool, workers: int, resident: int, grid: int,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
+    monkeypatch.setattr(scans, "_resident", lambda *_: resident)
+    plan = scans.ScanPlan(1, 11264, cache_weights=True)
+    key = scans.Kernel(
+        torch.bfloat16, 1, backward=False, vertical=True, coarse=coarse,
+        hidden8=True, cache_weights=True, batch_path=True,
+    )
+    launch = scans.Launch(plan, key, workers, workers)
+    shape = (1024, 56, 56, 160)
+    actual = scans._with_wave30a(launch, 0, shape, preset="surgical_w29")
+    assert actual == launch._replace(workers=grid // 5, partials=grid // 5)
+    assert scans._with_wave30a(launch, 0, shape, preset="auto") == actual
+    horizontal = launch._replace(key=scans.Kernel(torch.bfloat16, 1, backward=False))
+    assert scans._with_wave30a(horizontal, 0, shape, preset="surgical_w29") == horizontal
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("coarse", [False, True])
+def test_wave30a_trajectory_parity(monkeypatch: pytest.MonkeyPatch, coarse: bool) -> None:
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM 9.0 required")
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", "auto")
+    torch.manual_seed(106)
+    px, py, real, imag, aux, path = _inputs(56, 56, 160, 8, torch.bfloat16, "cuda", batch=32)
+    states = scans.horizontal_forward(px, real, imag).detach()
+    out = scans.vertical_forward(py, states, aux, path, coarse=coarse)
+    grad = tuple(torch.randn_like(part) for part in out)
+    # Use the measured #821 geometry while keeping the parity inputs small.
+    launch_for_shape = scans._launch_for_shape
+
+    def measured_launch(*args: object, **kwargs: bool | int) -> scans.Launch | None:
+        if kwargs["vertical"] and kwargs["backward"]:
+            base = _wave30a_base(coarse)
+            groups = 132 if coarse else 264
+            return base._replace(workers=groups * base.plan.warps, partials=groups)
+        return launch_for_shape(*args, **kwargs)
+
+    monkeypatch.setattr(scans, "_launch_for_shape", measured_launch)
+    reference = None
+    for preset in ("surgical_w29", "chunk28_nocache", "smem_full_56", "l2_full_56"):
+        monkeypatch.setenv("LNET_SCAN_W30A", preset)
+        launch = scans._plan_launch(
+            states, tuple(states.shape[1:]), backward=True, vertical=True, coarse=coarse,
+            hidden=8, precise=False, compact=coarse,
+        )
+        assert launch is not None
+        assert launch.key.global_trajectory == (preset == "l2_full_56")
+        assert launch.key.uncached_trajectory == (preset in {"smem_full_56", "chunk28_nocache"})
+        actual = scans.vertical_backward(
+            py, states, aux, path, *grad, coarse=coarse, compact=coarse,
+        )
+        if reference is None:
+            reference = actual
+        else:
+            for value, expected in zip(actual, reference, strict=True):
+                diff = value.float() - expected.float()
+                assert diff.abs().max() <= 0.016 * expected.abs().max() + 3e-5, preset
+                assert diff.norm() <= 2e-4 * expected.float().norm().clamp_min(1e-6), preset
