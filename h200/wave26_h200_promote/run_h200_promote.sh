@@ -139,9 +139,9 @@ train() (
 )
 
 cuda_tests() (
-    local name=$1 rc
-    shift
-    config wave25bc_hscan8_ps14
+    local arm=$1 name=$2 rc
+    shift 2
+    config "$arm"
     tests_start=$SECONDS
     # Explicit preparation API tests manage their own orthogonal policy.
     run_capped 600 "$name" env -u LNET_CAPTURE_SAFE_ORTHOGONAL "$PYTHON_BIN" -m pytest -q -ra "$@"
@@ -151,15 +151,21 @@ cuda_tests() (
     return "$rc"
 )
 
+cuda_groups() {
+    local arm=$1 failed=0
+    cuda_tests "$arm" cuda-scans tests/test_general_cuda_scans.py || failed=1
+    cuda_tests "$arm" cuda-reader tests/test_factorized_reader_kernels.py || failed=1
+    cuda_tests "$arm" cuda-stem tests/test_fused_conv_stem_ln_gelu.py || failed=1
+    cuda_tests "$arm" cuda-model tests/test_capture_safe_orthogonal.py tests/test_p1_nr4.py \
+        tests/test_live_complex_rms.py || failed=1
+    return "$failed"
+}
+
 if [[ ${1:-} == --followup ]]; then
     bench 120 device probe
     "$PYTHON_BIN" "$runner/results.py" device "$data"
     failed=0
-    cuda_tests cuda-scans tests/test_general_cuda_scans.py || failed=1
-    cuda_tests cuda-reader tests/test_factorized_reader_kernels.py || failed=1
-    cuda_tests cuda-stem tests/test_fused_conv_stem_ln_gelu.py || failed=1
-    cuda_tests cuda-model tests/test_capture_safe_orthogonal.py tests/test_p1_nr4.py \
-        tests/test_live_complex_rms.py || failed=1
+    cuda_groups wave25bc_hscan8_ps14 || failed=1
 
     export VA_T93_LONG_B128=1
     train 128 wave25bc_hscan8_ps14 best_long_rev
@@ -200,16 +206,8 @@ train 1024 wave21c_base wave21c_base_rev
     bench 120 best-probe probe
     bench 360 dynamo dynamo
     bench 360 fold infer-fold --variant "$variant" --batch 2
-    tests_start=$SECONDS
-    # Unit tests of the explicit preparation API manage their own orthogonal policy.
-    run_capped 600 cuda-tests env -u LNET_CAPTURE_SAFE_ORTHOGONAL "$PYTHON_BIN" -m pytest -v -ra \
-        tests/test_general_cuda_scans.py tests/test_factorized_reader_kernels.py \
-        tests/test_fused_conv_stem_ln_gelu.py tests/test_capture_safe_orthogonal.py \
-        tests/test_p1_nr4.py tests/test_live_complex_rms.py
-    pytest_rc=$(awk -F '\t' '$1 == "cuda-tests" {print $2}' "$data/processes.tsv")
-    bench 30 pytest wrap-pytest --log "$data/cuda-tests.log" --exit-code "$pytest_rc" \
-        --elapsed "$((SECONDS - tests_start))"
 )
+cuda_groups "$best" || true
 for batch in 128 512 1024 2048; do
     for arm in wave21c_base "$best"; do
         train "$batch" "$arm" "${arm}_sweep"

@@ -96,7 +96,9 @@ def select(out):
 def regressions(out):
     graphs = read(out, "dynamo").get("graphs", {})
     fold = read(out, "fold")
-    pytest = read(out, "pytest")
+    test_groups = [
+        read(out, f"pytest_cuda-{group}") for group in ("scans", "reader", "stem", "model")
+    ]
     gates = {
         "probe": whole_h200(read(out, "best-probe")),
         "dynamo": len(graphs) == 6
@@ -109,8 +111,11 @@ def regressions(out):
             and fold.get("strict_reload_max_abs_logit_diff") == 0.0
             and fold.get("folded_train_guard") is True
         ),
-        "cuda_pytest": pytest.get("exit_code") == 0
-        and (pytest.get("counts") or {}).get("passed", 0) > 0,
+        "cuda_pytest": all(
+            result.get("exit_code") == 0
+            and (result.get("counts") or {}).get("passed", 0) > 0
+            for result in test_groups
+        ),
     }
     selection = read(out, "selection")
     best = selection["winner"]
