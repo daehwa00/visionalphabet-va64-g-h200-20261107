@@ -13,7 +13,7 @@ from torch.nn import functional
 from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import make_backend
 
-from lnet import model_w29c
+from lnet import model_w29c, model_w34c
 from lnet.memory_backbone import ChannelRMSNorm
 from lnet.model_w29c import _row_pitch, model_w29c_enabled, packed_swiglu_vec2d
 
@@ -255,12 +255,18 @@ def test_representative_triton_launches_generate_ttir(monkeypatch: pytest.Monkey
         return {(1,): launch, (1, 1): launch}
 
     monkeypatch.setattr(model_w29c, "wrap_triton", wrap)
+    monkeypatch.setattr(model_w34c, "wrap_triton", wrap)
     x = torch.empty(4, 64, dtype=torch.bfloat16, device="cpu")
     model_w29c._channel_rmsnorm_backward(
         x, x[0], torch.ones(4, device="cpu"), x, need_dx=True, need_dw=True,
     )
     model_w29c._launch_swiglu(x, x, x[:, :32], backward=False)
-    assert len(modules) == 2
+    model_w34c.rmsnorm_w34c(x, None, x[0], 1e-6, save_inverse=False)
+    model_w34c.rmsnorm_w34c(x, x, x[0], 1e-6, save_inverse=True)
+    model_w34c._residual_rmsnorm_backward(
+        x, x[0], torch.ones(4, device="cpu"), x, x, need_dx=True, need_dw=True,
+    )
+    assert len(modules) == 5
     assert all("tt.func" in module for module in modules)
 
 

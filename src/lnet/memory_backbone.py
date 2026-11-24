@@ -21,9 +21,11 @@ from .model_w29c import (
     _CompiledChannelRMSNorm,
     channel_rmsnorm,
     model_w29c_enabled,
+    model_w34c_mode,
     packed_swiglu_vec2d,
     rmsnorm_eligible,
 )
+from .model_w34c import rmsnorm_w34c, rmsnorm_w34c_supported
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
 
@@ -61,6 +63,12 @@ class ChannelRMSNorm(nn.Module):
             or os.environ.get(_GENERAL_SCANS_ENV) != "0"
         ):
             weight = self.weight.to(x.dtype)
+            if (
+                model_w34c_mode() in ("auto", "rmsnorm_fwd_v2", "full_w34c")
+                and rmsnorm_w34c_supported(x, weight)
+            ):
+                save_inverse = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
+                return rmsnorm_w34c(x, None, weight, self.epsilon, save_inverse=save_inverse)[0]
             wave29 = (
                 x.dtype in (torch.bfloat16, torch.float16)
                 and x.shape[-1] == weight.numel()
@@ -121,7 +129,10 @@ class SwiGLU(nn.Module):
         return result
 
     def forward(self, x: Tensor) -> Tensor:
-        joint = self.value_gate(self.norm(x))
+        return self._forward_normalized(x, self.norm(x))
+
+    def _forward_normalized(self, x: Tensor, normalized: Tensor) -> Tensor:
+        joint = self.value_gate(normalized)
         if (
             joint.is_cuda
             and joint.dtype in (torch.bfloat16, torch.float16)
@@ -136,6 +147,23 @@ class SwiGLU(nn.Module):
         return x + self.output(value * functional.silu(gate))
 
     def forward_residual_packed(self, left: Tensor, right: Tensor) -> Tensor:
+        if (
+            left.is_cuda
+            and model_w34c_mode() in ("auto", "fused_res_norm", "full_w34c")
+            and (_fused_factorized_reader_enabled() or os.environ.get(_GENERAL_SCANS_ENV) != "0")
+            and left.shape == right.shape
+            and left.device == right.device
+            and left.dtype == right.dtype
+        ):
+            weight = self.norm.weight.to(left.dtype)
+            if rmsnorm_w34c_supported(left, weight) and rmsnorm_eligible(right, weight):
+                save_inverse = torch.is_grad_enabled() and (
+                    left.requires_grad or right.requires_grad or weight.requires_grad
+                )
+                normalized, added, _ = rmsnorm_w34c(
+                    left, right, weight, self.norm.epsilon, save_inverse=save_inverse,
+                )
+                return self._forward_normalized(added, normalized)
         return self(left + right)
 
 
