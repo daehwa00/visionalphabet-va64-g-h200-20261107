@@ -10,10 +10,13 @@ from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
 from .model_w28c import _differentiate_swiglu, _save_joint, model_cuda_supported, model_opt_mode
+from .model_w35c import model_w35c_enabled
 
 
 def model_w29c_enabled(device: torch.device, feature: str) -> bool:
     mode = model_opt_mode("LNET_MODEL_W29C")
+    if feature == "swiglu_vec2d" and mode != "off" and model_w35c_enabled("swiglu_v3"):
+        return model_cuda_supported(device)
     if mode == "auto":
         if feature == "swiglu_vec2d" and model_opt_mode("LNET_MODEL_W28C") in (
             "swiglu", "combined",
@@ -66,6 +69,16 @@ def _swiglu_vec2d_kernel(
 def _launch_swiglu(joint: Tensor, grad: Tensor, output: Tensor, *, backward: bool) -> None:
     hidden = joint.shape[-1] // 2
     rows = joint.numel() // (2 * hidden)
+    if model_w35c_enabled("swiglu_v3") and hidden % 8 == 0:
+        block_cols = min(128, hidden & -hidden)
+        block_rows = 1024 // block_cols
+        wrap_triton(_swiglu_vec2d_kernel)[
+            (triton.cdiv(rows, block_rows) * (hidden // block_cols),)
+        ](
+            joint, grad, output, rows, hidden, block_rows, block_cols, backward,
+            divisor_tiled=True, num_warps=4, enable_fp_fusion=False,
+        )
+        return
     block_cols = min(512, triton.next_power_of_2(hidden))
     block_rows = 8
     wrap_triton(_swiglu_vec2d_kernel)[

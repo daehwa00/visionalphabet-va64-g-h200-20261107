@@ -71,6 +71,7 @@ def main() -> None:
                 64 if backward else 32,
                 32,
                 True,
+                False,
             )
             print(arch, dtype, layout, bias, backward, hw, flush=True)
             audit(stem_conv_tensor_stages, arch, pointers, constants, output)

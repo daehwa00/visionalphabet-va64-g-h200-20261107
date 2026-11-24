@@ -1,6 +1,7 @@
 """Parity, layout handling, and capture for the Wave 29C kernels."""
 
 import ast
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,7 +14,11 @@ from torch.nn import functional
 from triton.backends.compiler import GPUTarget
 from triton.compiler.compiler import make_backend
 
-from lnet import model_w29c
+from lnet import fused_stem_ops, model_w28c, model_w29c
+from lnet import product_scan_normalization as norm
+from lnet import product_scan_ops as scan
+from lnet import terminal_imaginary_correlation as terminal
+from lnet import triton_bidirectional_product_scan as horizontal
 from lnet.memory_backbone import ChannelRMSNorm
 from lnet.model_w29c import _row_pitch, model_w29c_enabled, packed_swiglu_vec2d
 
@@ -185,7 +190,7 @@ def _launch_positional_count(call: ast.Call, tree: ast.Module, location: str) ->
     return positional
 
 
-def test_triton_launch_signatures() -> None:
+def _verified_triton_launch_sites() -> set[tuple[str, int]]:
     source = Path(model_w29c.__file__).parent
     trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in source.rglob("*.py")}
     signatures = {}
@@ -201,7 +206,7 @@ def test_triton_launch_signatures() -> None:
 
     target = GPUTarget("cuda", 90, 32)
     backend_options = vars(make_backend(target).parse_options({}))
-    launches = 0
+    launches = set()
     errors = []
     for path, tree in trees.items():
         aliases = {
@@ -220,7 +225,7 @@ def test_triton_launch_signatures() -> None:
             name = aliases.get(name, name)
             if not wrapped and name not in signatures:
                 continue
-            launches += 1
+            launches.add((path.name, call.lineno))
             location = f"{path.relative_to(source)}:{call.lineno} ({name})"
             assert name in signatures, f"{location}: unresolved Triton kernel"
             positional = _launch_positional_count(call, tree, location)
@@ -233,9 +238,16 @@ def test_triton_launch_signatures() -> None:
                 errors.append(f"{location}: passed {passed}, expected {arg_names}")
     assert launches, "No Triton launches found"
     assert not errors, "\n".join(errors)
+    return launches
 
 
-def test_representative_triton_launches_generate_ttir(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_triton_launch_signatures() -> None:
+    assert _verified_triton_launch_sites()
+
+
+def test_all_triton_launch_sites_generate_ttir(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The target is the only driver information required to generate TTIR.
     target = GPUTarget("cuda", 90, 32)
     monkeypatch.setattr(
@@ -244,6 +256,7 @@ def test_representative_triton_launches_generate_ttir(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda _: SimpleNamespace(multi_processor_count=132),
     )
+    sites = set()
     modules = []
 
     def wrap(kernel):
@@ -251,16 +264,75 @@ def test_representative_triton_launches_generate_ttir(monkeypatch: pytest.Monkey
             named = dict(zip(kernel.arg_names[:len(args)], args, strict=True))
             module, _ = generate_ttir(kernel, {**named, **kwargs}, {})
             modules.append(str(module))
+            caller = sys._getframe(1)
+            sites.add((Path(caller.f_code.co_filename).name, caller.f_lineno))
 
-        return {(1,): launch, (1, 1): launch}
+        class Launcher:
+            def __getitem__(self, grid):  # noqa: ANN204
+                return launch
 
-    monkeypatch.setattr(model_w29c, "wrap_triton", wrap)
+        return Launcher()
+
+    for module in (model_w28c, model_w29c, norm, scan, terminal, horizontal):
+        monkeypatch.setattr(module, "wrap_triton", wrap)
+    for kernel_name in ("stem_conv_tensor_stages", "stem_conv_tensor_reduce"):
+        monkeypatch.setattr(fused_stem_ops, kernel_name, wrap(getattr(fused_stem_ops, kernel_name)))
+    # Enter CUDA dispatch branches using CPU allocations and intercepted launches.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+    monkeypatch.setenv("LNET_MODEL_W35C", "off")
     x = torch.empty(4, 64, dtype=torch.bfloat16, device="cpu")
     model_w29c._channel_rmsnorm_backward(
         x, x[0], torch.ones(4, device="cpu"), x, need_dx=True, need_dw=True,
     )
     model_w29c._launch_swiglu(x, x, x[:, :32], backward=False)
-    assert len(modules) == 2
+    monkeypatch.setenv("LNET_MODEL_W35C", "swiglu_v3")
+    model_w29c._launch_swiglu(x, x[:, :32].contiguous(), x, backward=True)
+    model_w29c._launch_swiglu(x, x, x[:, :32], backward=False)
+    model_w28c.packed_swiglu._init_fn(x)
+    model_w28c._packed_swiglu_backward._init_fn(x, x[:, :32].contiguous())
+    model_w29c.channel_rmsnorm._init_fn(x, x[0], 1e-6, save_inverse=True)
+    source = torch.empty(1, 4, 4, 32, dtype=torch.bfloat16)
+    pole = torch.empty(1, 1, 1, 32)
+    poles = (pole,) * 4
+    horizontal._forward_op._init_fn(*poles, source, source)
+    horizontal._forward_planes_op._init_fn(*poles, source, source)
+    horizontal._launch_backward(poles, (source, source), None, (source,) * 4, launch_name="ttir")
+    norm.static_global_inverse_gain._init_fn(*poles, *poles, 4, 4, 1e-6)
+    norm.static_variance_tables._init_fn(*poles, *poles, 4, 4)
+    terminal._vertical_scan._init_fn(source.float(), source.float(), pole, pole, reverse=False)
+    terminal._nr4_launch(
+        (source,) * 4, poles, source, source, source, source,
+        normalize=True, backward=False, warp_tile=False,
+    )
+    variance = torch.empty(2, 4, 32)
+    empty = torch.empty(0)
+    scan_args = (*poles, *((source,) * 4), variance, variance, empty)
+    scan._launch_product_scan4_forward(*scan_args, 1e-6, 0, emit_coarse=False, launch_name="ttir")
+    scan._launch_product_scan4_backward(
+        *scan_args, empty, empty, torch.empty(1, 128), 1e-6, 0,
+        emit_coarse=False, launch_name="ttir",
+    )
+    image = torch.empty(2, 3, 35, 133, dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last,
+    )
+    weight = torch.empty(27, 64, dtype=image.dtype)
+    affine = torch.empty(64)
+    out = torch.empty(2, 18, 67, 64, dtype=image.dtype)
+    stats = torch.empty(2, 18, 67, 2)
+    for backward in (False, True):
+        fused_stem_ops._launch_tensor_core_stem(
+            image, weight, affine, affine, affine, out, out, stats, stats, 1e-5, 2,
+            backward=backward, rgb_tile=True, tile_reduce=False,
+            block=16 if backward else 32, warps=8 if backward else 4,
+        )
+    monkeypatch.setenv("LNET_MODEL_W35C", "stem_v2")
+    fused_stem_ops._tensor_core_conv_backward(
+        image, weight, affine, affine, affine, out, stats, 1e-5,
+        weight, affine, affine, affine,
+    )
+    expected_sites = _verified_triton_launch_sites()
+    assert sites == expected_sites, expected_sites.symmetric_difference(sites)
     assert all("tt.func" in module for module in modules)
 
 
