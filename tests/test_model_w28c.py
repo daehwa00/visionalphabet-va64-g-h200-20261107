@@ -6,10 +6,26 @@ from torch import Tensor
 from torch.nn import functional
 
 from lnet.memory_backbone import SwiGLU
-from lnet.model_w28c import packed_swiglu
+from lnet.model_w28c import model_w28c_enabled, packed_swiglu
 from lnet.terminal_imaginary_correlation import _nr4_axis
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@pytest.mark.parametrize("capability", [(7, 5), (8, 6), (8, 9), (9, 0), (10, 0)])
+def test_auto_dispatch(capability: tuple[int, int], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LNET_MODEL_OPT", raising=False)
+    monkeypatch.delenv("LNET_MODEL_W28C", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
+    assert not model_w28c_enabled(torch.device("cpu"), "nr4")
+    device = torch.device("cuda")
+    assert model_w28c_enabled(device, "nr4") == (capability >= (8, 0))
+    assert not model_w28c_enabled(device, "swiglu")
+    monkeypatch.setenv("LNET_MODEL_W28C", "combined")
+    assert model_w28c_enabled(device, "swiglu") == (capability >= (8, 0))
+    monkeypatch.setenv("LNET_MODEL_OPT", "off")
+    assert not model_w28c_enabled(device, "swiglu")
+    assert not model_w28c_enabled(device, "nr4")
 
 
 def _outputs_and_grads(output: Tensor, upstream: Tensor, *inputs: Tensor) -> tuple[Tensor, ...]:
@@ -24,6 +40,7 @@ def _near_fp32(
         assert error <= 2 * torch.finfo(dtype).eps * want.float().norm() + 1e-6
 
 
+@CUDA
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("hidden", [96, 144, 192, 384])
 def test_packed_swiglu(dtype: torch.dtype, hidden: int) -> None:
@@ -43,6 +60,7 @@ def test_packed_swiglu(dtype: torch.dtype, hidden: int) -> None:
     _near_fp32(actual, reference_fp32, dtype)
 
 
+@CUDA
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_swiglu_projection_parity(dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch) -> None:
     torch.manual_seed(501)
@@ -60,6 +78,7 @@ def test_swiglu_projection_parity(dtype: torch.dtype, monkeypatch: pytest.Monkey
     _near_fp32(actual_grads, expected_grads, dtype)
 
 
+@CUDA
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("normalize", [False, True])
 def test_nr4_warp_tile(dtype: torch.dtype, normalize: bool) -> None:
