@@ -1256,6 +1256,44 @@ def test_wave36a_mode(monkeypatch: pytest.MonkeyPatch, mode: str, expected: tupl
     assert scans._wave36a_mode() == expected
 
 
+@pytest.mark.parametrize(
+    ("sms", "smem_kib", "resident", "modes", "cells", "batch", "expected"),
+    [
+        (132, 227, 6, 160, 56 * 56 * 1024, 8, 159),
+        (80, 99, 5, 160, 56 * 56 * 1024, 4, 80),
+        (84, 99, 5, 160, 56 * 56 * 1024, 4, 84),
+        (108, 163, 4, 160, 56 * 56 * 1024, 8, 87),
+        (132, 227, 6, 160, 9, 8, 2),
+        (132, 227, 6, 160, 1, 8, 1),
+        (300, 227, 6, 160, 56 * 56 * 1024, 8, 291),
+    ],
+    ids=("h200", "80-sm", "84-sm", "108-sm", "cell-tail", "one-cell", "workspace-limit"),
+)
+def test_wave36a_backward_projection_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    sms: int, smem_kib: int, resident: int, modes: int, cells: int, batch: int, expected: int,
+) -> None:
+    planner = scans._plan_wave36a_projection.__wrapped__
+    monkeypatch.setattr(scans, "device_limits", lambda _: (sms, smem_kib * 1024, 64))
+
+    def occupancy(device: int, key: scans.Kernel, dynamic_smem: int) -> int:
+        assert device == 0
+        assert key.projection_batch == batch
+        assert key.warps == 4
+        assert dynamic_smem == 0
+        return resident
+
+    monkeypatch.setattr(scans, "_resident", occupancy)
+    base = scans.Kernel(torch.bfloat16, warps=0, backward=True, projection=True, hidden8=True)
+    _, groups, smem = planner(0, base, cells, modes)
+    assert groups == expected
+    assert smem == 0
+    assert groups * 90 * modes * 4 <= 16 * 1024**2
+    if sms == 132 and cells == 56 * 56 * 1024:
+        assert groups * 5 == 795
+        assert groups * 5 >= 132 * 6
+
+
 def test_wave36a_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LNET_SCAN_W36A", "saved_fast_proj_gs1")
     with FakeTensorMode():

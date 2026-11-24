@@ -45,7 +45,7 @@ _SCAN_WARPS = (4, 3, 2, 1)
 _REGISTER_HIDDEN = 8
 _MAX_CACHED_HIDDEN = 16
 _MAX_SAVED_DP_CACHE_CHUNKS = 8
-_WAVE36A_PARTIAL_BYTES = 4 * 1024**2
+_WAVE36A_PARTIAL_BYTES = 16 * 1024**2
 
 # Small devices reserve more VRAM for model state. Additional scan workspace
 # on larger devices is useful up to one L2 working set.
@@ -2888,11 +2888,16 @@ def _plan_wave36a_projection(
     tiles = _ceil(modes, _WARP_SIZE)
     batch = 8 if limit >= 128 * 1024 else 4
     key = replace(base, warps=4, projection_batch=batch)
+    # Static shared allocation is part of the kernel's occupancy query.
+    resident = _resident(device, key, 0)
     if base.backward:
-        # Static shared allocation is part of the kernel's occupancy query.
-        groups = min(_ceil(cells, batch), max(1, _WAVE36A_PARTIAL_BYTES // (90 * modes * 4)))
+        group_bytes = 90 * modes * 4
+        groups = min(
+            _ceil(cells, batch),
+            max(1, _ceil(sms * resident, tiles)),
+            max(1, _WAVE36A_PARTIAL_BYTES // group_bytes),
+        )
     else:
-        resident = _resident(device, key, 0)
         groups = min(_ceil(cells, 8), max(1, _ceil(4 * sms * resident, tiles)))
     return key, min(groups, 65535), 0
 
