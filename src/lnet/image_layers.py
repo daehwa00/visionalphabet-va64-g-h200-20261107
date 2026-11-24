@@ -125,11 +125,16 @@ def _fused_stem_large_enough(inputs: Tensor, first: nn.Conv2d, second: nn.Conv2d
     return inputs.shape[0] * second.out_channels * h2 * w2 >= _FUSED_STEM_MIN_ELEMENTS
 
 
-def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d) -> bool:
+def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d, *, hybrid: bool = False) -> bool:
     mode = os.environ.get("LNET_FUSED_STEM_CONV", "auto")
     if mode not in ("auto", "off", "on"):
         raise ValueError("LNET_FUSED_STEM_CONV must be auto, off, or on")
-    if mode == "off" or not inputs.is_cuda or inputs.requires_grad or inputs.ndim != 4:
+    if (
+        mode == "off"
+        or not inputs.is_cuda
+        or inputs.ndim != 4
+        or (inputs.requires_grad and not hybrid)
+    ):
         return False
     autocast = torch.is_autocast_enabled("cuda")
     dtype = torch.get_autocast_dtype("cuda") if autocast else inputs.dtype
@@ -139,8 +144,11 @@ def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d) -> bool:
         and inputs.dtype in eligible_types
         and conv.weight.dtype in eligible_types
         and inputs.shape[1] == conv.in_channels
-        and 1 <= conv.in_channels <= 4
-        and conv.out_channels in (32, 64)
+        and (
+            (conv.in_channels == 32 and conv.out_channels == 64)
+            if hybrid
+            else (1 <= conv.in_channels <= 4 and conv.out_channels in (32, 64))
+        )
         and conv.kernel_size == (3, 3)
         and conv.stride == (2, 2)
         and conv.padding == (1, 1)
@@ -158,12 +166,25 @@ def _fused_stem_block(
     *,
     nhwc_output: bool = False,
 ) -> Tensor:
-    if not nhwc_output and _fused_conv_stem_supported(inputs, conv):
+    mode = os.environ.get("LNET_STEM_W27C", "auto")
+    if mode not in ("off", "stage0_opt", "stage0_v2", "stage01", "auto"):
+        raise ValueError("LNET_STEM_W27C must be off, stage0_opt, stage0_v2, stage01, or auto")
+    # Auto retains Wave 26 until Whole H200 measures the explicit candidates.
+    hybrid = mode == "stage01" and conv.in_channels == 32
+    if (hybrid or not nhwc_output) and _fused_conv_stem_supported(inputs, conv, hybrid=hybrid):
         dtype = (
             torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else inputs.dtype
         )
         return fused_conv_stem(
-            inputs, conv.weight, conv.bias, norm.norm.weight, norm.norm.bias, norm.norm.eps, dtype
+            inputs,
+            conv.weight,
+            conv.bias,
+            norm.norm.weight,
+            norm.norm.bias,
+            norm.norm.eps,
+            dtype,
+            mode="hybrid" if hybrid else mode,
+            nhwc_output=nhwc_output,
         )
     hidden = functional.conv2d(
         inputs, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
