@@ -850,6 +850,9 @@ def _compile_conv_stem_ptx(
         "CHANNELS_LAST": int(channels_last),
         "HAS_BIAS": int(has_bias),
     }
+    if ci != 3:
+        for phase in ("forward", "backward", "reduce"):
+            defines[f"conv_stem_{phase}"] = f"conv_stem_stage1_{phase}"
     header = "".join(f"#define {name} {value}\n" for name, value in defines.items())
     return _compile_source(capability, header + _CONV_CUDA)
 
@@ -862,8 +865,11 @@ def _conv_stem_module(
         torch.cuda.get_device_capability(device), dtype, ci, co, channels_last, has_bias
     )
     module = _CudaModule(image, device)
-    for name in ("conv_stem_forward", "conv_stem_backward", "conv_stem_reduce"):
-        module.load_function(name, 0)
+    for phase in ("forward", "backward", "reduce"):
+        name = f"conv_stem_{phase}"
+        symbol = name if ci == 3 else f"conv_stem_stage1_{phase}"
+        module.load_function(symbol, 0)
+        module.functions[name] = module.functions[symbol]
     return module
 
 
@@ -954,7 +960,12 @@ def _tensor_core_rgb_tile(  # noqa: ANN202
     return tl.reshape(tl.gather(tile, indices, 0), (M, 32))
 
 
-@triton.jit
+def _stem_stage_name(specialization) -> str:
+    phase = "bwd" if specialization.constants["BWD"] else "fwd"
+    return f"stem_conv_tensor_stage0_{phase}"
+
+
+@triton.jit(repr=_stem_stage_name)
 def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
     X,
     KERNEL,

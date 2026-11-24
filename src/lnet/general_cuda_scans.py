@@ -1452,7 +1452,7 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 # NVRTC compilation and driver launch
 
-def _kernel_name(key: Kernel) -> str:
+def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
     if key.projection:
         if key.aosoa:
             return "project_path_bwd_aosoa" if key.backward else "project_path_fwd_aosoa"
@@ -1461,7 +1461,14 @@ def _kernel_name(key: Kernel) -> str:
         return "reduce_path_mlp_partials"
     if key.reduction:
         return "reduce_vscan_partials" if key.vertical else "reduce_hscan_partials"
-    return "scan"
+    phase = "bwd" if key.backward else "fwd"
+    if key.cooperative:
+        return "vscan_coop_bwd"
+    if key.aosoa:
+        return f"vscan_aosoa_pure_{phase}"
+    if key.horizontal_vec2:
+        return f"hscan_vec2_{phase}"
+    return "vscan_legacy" if key.vertical else "hscan_legacy"
 
 
 def _kernel_source(key: Kernel) -> str:  # noqa: C901, PLR0912
@@ -1516,7 +1523,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             key.cache_line, key.shared_acc, key.precise,
         )
     )
-    bounds = f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}) void scan'
+    bounds = (
+        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE})'
+        f" void {_kernel_name(key)}"
+    )
     compact = str(key.compact).lower()
     layout = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
     if key.vertical:
@@ -2527,7 +2537,7 @@ def _horizontal_layout(real: Tensor, imag: Tensor) -> dict[str, tuple[bool, bool
 
 def _wave35a_enabled(track: str) -> bool:
     mode = os.environ.get("LNET_SCAN_W35A", "off")
-    return mode in (track, "full_w35a", "auto")
+    return mode in ("full_w35a", "auto") or track in mode.split(",")
 
 
 def _plan_horizontal_vec2(

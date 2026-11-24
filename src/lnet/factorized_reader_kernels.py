@@ -1359,7 +1359,7 @@ def _reader_spatial_plan(
     backward = grad is not None
     op = "dinput" if backward else "forward"
     if (
-        _reader_w35b() in ("auto", "fwd_dinput_vec4", "full_w35b")
+        any(mode in _reader_w35b().split(",") for mode in ("auto", "fwd_dinput_vec4", "full_w35b"))
         and _reader_w35b_eligible(projected, real, grad, strict=strict, vec=4)
     ):
         # Distribute full-width row strips across warps to avoid horizontal halos.
@@ -1448,8 +1448,9 @@ def _reader_weight_candidate(
 def _reader_w35b_weight_candidate(
     projected: Tensor, real: Tensor, grad: Tensor, spatial: _VectorLaunch, *, strict: bool,
 ) -> tuple[tuple[int, int, int], int, _CudaModule, int] | None:
-    variant = _reader_w35b()
-    if variant not in ("auto", "dweight_rt4", "dweight_rows4", "full_w35b"):
+    variant = next((mode for mode in _reader_w35b().split(",")
+                    if mode in ("auto", "dweight_rt4", "dweight_rows4", "full_w35b")), None)
+    if variant is None:
         return None
     vec = 2 if variant == "dweight_rows4" else 1
     if (

@@ -13,9 +13,10 @@ _MODES = {
 
 def model_w35c_enabled(feature: str) -> bool:
     mode = os.environ.get("LNET_MODEL_W35C", "off")
-    if mode not in _MODES:
+    modes = mode.split(",")
+    if not all(item in _MODES for item in modes):
         raise ValueError(f"Invalid LNET_MODEL_W35C mode: {mode}")
-    return mode in (feature, "full_w35c")
+    return feature in modes or "full_w35c" in modes
 
 
 def apply_inductor_tune() -> AbstractContextManager[None]:
