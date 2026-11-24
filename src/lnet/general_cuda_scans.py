@@ -2390,6 +2390,8 @@ def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
         suffix = ("", "_pos", "_neg")[key.saved_direction]
         name = "pure_vscan_backward_saved" if key.backward else "pure_vscan_forward_saved"
         return name + suffix
+    if key.reduction and key.tensor_core:
+        return "vscan_tc_reduce"
     if key.tensor_core:
         return "project_path_tc_backward" if key.backward else "project_path_tc_forward"
     if key.saved_projection_cells:
@@ -3729,6 +3731,7 @@ def _scalar_types(tensors: list[Tensor]) -> int:
 
 def _reduce_partials(
     partial: Tensor, params: list[Tensor], hidden: int = 0, *, projection: bool = False,
+    tensor_core: bool = False,
 ) -> list[Tensor]:
     rows, fields, modes = partial.shape
     gradients = [p.new_empty(p.shape) for p in params]
@@ -3738,7 +3741,7 @@ def _reduce_partials(
     types = _scalar_types(params) << (8 if projection else 0)
     key = Kernel(
         torch.float32, 4, backward=True, vertical=bool(hidden), reduction=True,
-        projection_reduction=projection,
+        projection_reduction=projection, tensor_core=tensor_core,
     )
     _launch_kernel(
         partial,
@@ -4829,13 +4832,18 @@ def _wave31a_backward(
     if partial is None:
         raise RuntimeError("Missing Wave 31A scan partials")
     if fused:
-        gradients = _reduce_partials(partial, [*pole, *path], _REGISTER_HIDDEN)
+        gradients = _reduce_partials(
+            partial, [*pole, *path], _REGISTER_HIDDEN, tensor_core=key.tensor_core,
+        )
         return [*gradients[:4], gs, *gradients[4:]]
     if path_partials is None:
         raise RuntimeError("Missing Wave 31A path partials")
+    tensor_core = preset == _WAVE32A_DECOUPLED
     return [
-        *_reduce_partials(partial, pole), gs,
-        *_reduce_partials(path_partials, path, _REGISTER_HIDDEN, projection=True),
+        *_reduce_partials(partial, pole, tensor_core=tensor_core), gs,
+        *_reduce_partials(
+            path_partials, path, _REGISTER_HIDDEN, projection=True, tensor_core=tensor_core,
+        ),
     ]
 
 
