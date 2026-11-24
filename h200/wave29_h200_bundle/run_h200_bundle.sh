@@ -134,7 +134,7 @@ train() (
 pytest_run() {
     local limit=$1 name=$2 test_start=$SECONDS test_rc
     shift 2
-    run_capped "$limit" "$name" "$PYTHON_BIN" -m pytest -q -ra "$@"
+    run_capped "$limit" "$name" "$PYTHON_BIN" -m pytest -v -ra "$@"
     read -r _ test_rc _ < <(tail -n 1 "$data/processes.tsv")
     if [[ -f $data/$name.log ]]; then
         "$PYTHON_BIN" "$runner/audit.py" wrap-pytest --log "$data/$name.log" \
@@ -145,18 +145,18 @@ pytest_run() {
 reader_parity() (
     git show a670a752:src/lnet/factorized_reader_kernels.py > "$out/wave26_reader.py"
     export PYTHONPATH="$PYTHONPATH:$PWD/h200/wave17b_vec_reader_probe:$PWD/h200/wave25b_reader_probe"
-    run_capped 180 parity_b "$PYTHON_BIN" "$runner/reader_parity.py" \
+    run_capped "${1:-180}" parity_b "$PYTHON_BIN" "$runner/reader_parity.py" \
         --baseline "$out/wave26_reader.py" --out "$out/parity_b.jsonl"
     "$PYTHON_BIN" "$runner/results.py" reader-parity "$data" "$out/parity_b.jsonl"
 )
 
 scan_parity() {
-    run_capped 180 parity_a env PYTHONPATH="$PYTHONPATH:$PWD/tests:$PWD/h200/wave28a_scan_probe" \
+    run_capped "${2:-180}" parity_a env PYTHONPATH="$PYTHONPATH:$PWD/tests:$PWD/h200/wave28a_scan_probe" \
         "$PYTHON_BIN" "$runner/scan_parity.py" "$data/parity_a.json" "$LNET_SCAN_W29A" "${1:-0}"
 }
 
 model_probe() {
-    run_capped 480 model_probe env PYTHON="$PYTHON_BIN" bash \
+    run_capped "${1:-480}" model_probe env PYTHON="$PYTHON_BIN" bash \
         h200/wave29c_model_probe/run.sh "$data" verify
 }
 
@@ -194,7 +194,7 @@ shard_pytest() {
 bench 90 device probe
 "$PYTHON_BIN" "$runner/results.py" device "$data"
 
-if [[ ${1:-} == pytest-shard || ${1:-} == regression ]]; then
+if [[ ${1:-} == pytest-shard || ${1:-} == regression || ${1:-} == verify ]]; then
     mode=$1
     shift
     set_combo "$1" "$2" "$3"
@@ -204,8 +204,20 @@ if [[ ${1:-} == pytest-shard || ${1:-} == regression ]]; then
         shard_pytest "${@:1:4}"
         if [[ -n ${5:-} ]]; then
             [[ $5 =~ ^[0-9]+$ ]] && (( $5 < 32 )) || exit 2
-            scan_parity "$5"
+            scan_parity "$5" 600
         fi
+    elif [[ $mode == verify ]]; then
+        for gate in "$@"; do
+            case "$gate" in
+                parity_a) scan_parity 0 600 ;;
+                parity_b) reader_parity 600 ;;
+                parity_c) pytest_run 300 parity_c tests/test_model_w28c.py tests/test_model_w29c.py ;;
+                dynamo) bench 240 dynamo dynamo ;;
+                fold) bench 240 fold infer-fold --variant "$variant" --batch 2 ;;
+                model_probe) model_probe 900 ;;
+                *) exit 2 ;;
+            esac
+        done
     else
         regression
     fi
