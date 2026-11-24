@@ -27,6 +27,7 @@ requires_cuda = pytest.mark.skipif(
 def isolate_reader_options(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LNET_READER_OPT", raising=False)
     monkeypatch.delenv("LNET_READER_VEC", raising=False)
+    monkeypatch.delenv("LNET_READER_W34B", raising=False)
 
 
 @pytest.mark.parametrize(
@@ -127,6 +128,7 @@ def test_cpu_reduced_precision(dtype: torch.dtype) -> None:
 @pytest.mark.parametrize("option", ["auto", "off"])
 def test_fake_custom_op_and_autograd_metadata(monkeypatch, option) -> None:
     monkeypatch.setenv("LNET_READER_OPT", option)
+    monkeypatch.setenv("LNET_READER_W34B", "full_w34b" if option == "auto" else "off")
     with FakeTensorMode():
         projected = torch.empty(2, 3, 7, 2 * 2 * 5, dtype=torch.float16, requires_grad=True)
         weights = tuple(torch.empty(5, 2, 3, 3, requires_grad=True) for _ in range(2))
@@ -144,6 +146,7 @@ def test_fake_custom_op_and_autograd_metadata(monkeypatch, option) -> None:
 @pytest.mark.parametrize("option", ["auto", "off"])
 def test_compile_cpu_dynamic_fullgraph_forward_and_backward(monkeypatch, option) -> None:
     monkeypatch.setenv("LNET_READER_OPT", option)
+    monkeypatch.setenv("LNET_READER_W34B", "full_w34b" if option == "auto" else "off")
     torch.manual_seed(37)
     reader, reference = _reader_pair(3, 5, 2, 3, rms=True, device="cpu")
     compiled = torch.compile(reader, fullgraph=True, dynamic=True)
@@ -700,3 +703,69 @@ def test_reader_auto_and_off_cuda_parity(monkeypatch, shape, modes, rank, strict
         ))
     for actual, expected in zip(*outputs, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
+
+
+@pytest.mark.parametrize(("height", "width", "modes", "rank", "workers", "columns"), [
+    (5, 7, 63, 3, 2, 3), (3, 11, 34, 4, 2, 11), (4, 9, 64, 6, 3, 4),
+    (1, 1, 1, 1, 1, 1),
+])
+def test_warp_rank_window_cpu(height, width, modes, rank, workers, columns) -> None:
+    generator = torch.Generator().manual_seed(41)
+    batch = 5
+    p = torch.randint(-2, 3, (batch, height, width, rank, modes), generator=generator).float()
+    g = torch.randint(-2, 3, (batch, height, width, 2, modes), generator=generator).float()
+    w = torch.randint(-2, 3, (2, modes, rank, 3, 3), generator=generator).float()
+    expected_dp, expected_dw = kernels._spatial_reference_backward(
+        g.flatten(-2), p.flatten(-2), *w.unbind(), strict_complex=False,
+    )
+    tiles = (width + columns - 1) // columns
+    partial = torch.zeros((workers, tiles, 2, rank, 9, modes))
+    dp = torch.zeros_like(p)
+    weights = w.reshape(2, modes, rank, 9).permute(0, 2, 3, 1).flip(2)
+    for worker, tile in product(range(workers), range(tiles)):
+        x0 = tile * columns
+        for b in range(worker, batch, workers):
+            window = torch.zeros((3, columns + 2, 2, modes))
+            left, right = max(0, x0 - 1), min(width, x0 + columns + 1)
+            destination = slice(left - x0 + 1, right - x0 + 1)
+            window[1, destination] = g[b, 0, left:right]
+            for y in range(height):
+                top, middle, bottom = y % 3, (y + 1) % 3, (y + 2) % 3
+                window[bottom].zero_()
+                if y + 1 < height:
+                    window[bottom, destination] = g[b, y + 1, left:right]
+                for x in range(x0, min(width, x0 + columns)):
+                    taps = window[[top, middle, bottom], x - x0:x - x0 + 3]
+                    taps = taps.reshape(9, 2, modes).permute(1, 0, 2)
+                    partial[worker, tile] += (
+                        p[b, y, x][None, :, None, :] * taps[:, None, :, :].flip(2)
+                    )
+                    dp[b, y, x] = (taps[:, None, :, :] * weights).sum(dim=(0, 2))
+    dw = partial.sum(dim=(0, 1)).permute(0, 3, 1, 2).reshape_as(expected_dw)
+    torch.testing.assert_close(dw, expected_dw, rtol=0, atol=0)
+    torch.testing.assert_close(dp.flatten(-2), expected_dp, rtol=0, atol=0)
+
+
+@requires_cuda
+@pytest.mark.usefixtures("cudnn_full_precision")
+@pytest.mark.parametrize("preset", ["off", "auto", "dweight_wpr", "dweight_wpr_waves",
+                                   "dinput_wpr", "full_w34b"])
+@pytest.mark.parametrize(("shape", "modes", "rank", "strict", "dtype"), [
+    ((2, 1, 7), 32, 1, False, torch.float16),
+    ((3, 9, 11), 34, 2, False, torch.bfloat16),
+    ((5, 13, 19), 63, 3, False, torch.float16),
+    ((5, 56, 56), 160, 4, False, torch.bfloat16),
+    ((3, 13, 19), 64, 6, False, torch.float16),
+    ((2, 9, 11), 34, 4, True, torch.bfloat16),
+])
+def test_warp_rank_cuda_parity(monkeypatch, preset, shape, modes, rank, strict, dtype) -> None:
+    monkeypatch.setenv("LNET_READER_W34B", preset)
+    torch.manual_seed(47)
+    options = {"device": "cuda", "dtype": dtype}
+    p = torch.randn((*shape, modes * rank * (2 if strict else 1)), **options) * 0.125
+    g = torch.randn((*shape, 2 * modes), **options) * 0.125
+    real, imag = (torch.randn((2, modes, rank, 3, 3), **options) * 0.125).unbind()
+    expected = kernels._spatial_reference_backward(g, p, real, imag, strict_complex=strict)
+    actual = kernels._packed_spatial_backward(g, p, real, imag, strict_complex=strict)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0.01, atol=0.002)

@@ -972,6 +972,151 @@ extern "C" __global__ void reader_gram_normalize_backward(
 """
 
 
+_READER_WPR_CUDA = r"""
+// One warp owns one rank. A circular three-row window is filled by the CTA;
+// all rank warps consume each grad value before the oldest row is overwritten.
+template <int Vec, class G, int Columns, int Warps>
+__device__ __forceinline__ void wpr_load_row(
+    typename PackedModes<Vec, G>::Type* row, const G* grad,
+    long long image, int y, int x0, int height, int width, int modes, int mode
+) {
+    using Packed = typename PackedModes<Vec, G>::Type;
+    const int lane = threadIdx.x % 32;
+    for (int field = threadIdx.x / 32; field < 2 * (Columns + 2); field += Warps) {
+        const int x = x0 + field / 2 - 1;
+        Packed value{};
+        if (y >= 0 && y < height && x >= 0 && x < width && mode < modes)
+            value = packed_load<Vec, true>(grad +
+                ((image + static_cast<long long>(y) * width + x) * 2 + field % 2)
+                * modes + mode);
+        row[field * 32 + lane] = value;
+    }
+}
+
+template <bool Dinput, int Vec, int Columns, int Warps, class T, class W, class G>
+__device__ __forceinline__ void wpr_spatial(
+    const T* projected, const G* grad, const W* real, const W* imag, T* dp, float* partial,
+    int height, int width, int modes, int batch, int rank
+) {
+    using V = ModeValues<Vec>;
+    using Packed = typename PackedModes<Vec, G>::Type;
+    constexpr int RowElements = (Columns + 2) * 2 * 32;
+    __shared__ Packed window[3][RowElements];
+    const int lane = threadIdx.x % 32;
+    const int mode = (blockIdx.x * 32 + lane) * Vec;
+    const int xtiles = (width + Columns - 1) / Columns;
+    const int x0 = blockIdx.z % xtiles * Columns;
+    const int r = blockIdx.z / xtiles * Warps + threadIdx.x / 32;
+    const bool active = r < rank && mode < modes;
+    V re[9] = {}, im[9] = {};
+    if constexpr (Dinput) {
+        if (active) {
+            #pragma unroll
+            for (int tap = 0; tap < 9; ++tap) {
+                #pragma unroll
+                for (int v = 0; v < Vec; ++v) {
+                    const long long index = ((static_cast<long long>(mode + v) * rank + r)
+                                             * 9 + 8 - tap);
+                    re[tap].value[v] = as_float(real[index]);
+                    im[tap].value[v] = as_float(imag[index]);
+                }
+            }
+        }
+    }
+    const int end_x = min(width, x0 + Columns);
+    for (int b = blockIdx.y; b < batch; b += gridDim.y) {
+        const long long image = static_cast<long long>(b) * height * width;
+        wpr_load_row<Vec, G, Columns, Warps>(
+            window[0], grad, image, -1, x0, height, width, modes, mode);
+        wpr_load_row<Vec, G, Columns, Warps>(
+            window[1], grad, image, 0, x0, height, width, modes, mode);
+        int top = 0;
+        for (int y = 0; y < height; ++y) {
+            const int middle = top == 2 ? 0 : top + 1;
+            const int bottom = middle == 2 ? 0 : middle + 1;
+            wpr_load_row<Vec, G, Columns, Warps>(
+                window[bottom], grad, image, y + 1, x0, height, width, modes, mode);
+            __syncthreads();
+            if (active) {
+                const Packed* rows[] = {window[top], window[middle], window[bottom]};
+                V left[3][2], center[3][2];
+                #pragma unroll
+                for (int ky = 0; ky < 3; ++ky) {
+                    #pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        left[ky][c] = unpack_modes<Vec, G>(rows[ky][c * 32 + lane]);
+                        center[ky][c] = unpack_modes<Vec, G>(rows[ky][(2 + c) * 32 + lane]);
+                    }
+                }
+                for (int x = x0; x < end_x; ++x) {
+                    const long long index = ((image + static_cast<long long>(y) * width + x)
+                                             * rank + r) * modes + mode;
+                    V value{};
+                    if constexpr (!Dinput) value = mode_load<Vec, T, true>(projected + index);
+                    #pragma unroll
+                    for (int ky = 0; ky < 3; ++ky) {
+                        const int offset = ((x - x0 + 2) * 2) * 32 + lane;
+                        const V right[] = {unpack_modes<Vec, G>(rows[ky][offset]),
+                                           unpack_modes<Vec, G>(rows[ky][offset + 32])};
+                        #pragma unroll
+                        for (int kx = 0; kx < 3; ++kx) {
+                            const V gr = kx == 0 ? left[ky][0] : kx == 1 ? center[ky][0] : right[0];
+                            const V gi = kx == 0 ? left[ky][1] : kx == 1 ? center[ky][1] : right[1];
+                            if constexpr (Dinput) {
+                                value = fmaf(gr, re[ky * 3 + kx], value);
+                                value = fmaf(gi, im[ky * 3 + kx], value);
+                            } else {
+                                const int tap = 8 - (ky * 3 + kx);
+                                re[tap] = fmaf(value, gr, re[tap]);
+                                im[tap] = fmaf(value, gi, im[tap]);
+                            }
+                        }
+                        #pragma unroll
+                        for (int c = 0; c < 2; ++c) {
+                            left[ky][c] = center[ky][c];
+                            center[ky][c] = right[c];
+                        }
+                    }
+                    if constexpr (Dinput) mode_store<Vec>(dp + index, value);
+                }
+            }
+            __syncthreads();
+            top = middle;
+        }
+    }
+    if constexpr (!Dinput) {
+        if (!active) return;
+        const long long worker = static_cast<long long>(blockIdx.y) * xtiles + blockIdx.z % xtiles;
+        #pragma unroll
+        for (int tap = 0; tap < 9; ++tap) {
+            const long long index = ((worker * 2 * rank + r) * 9 + tap) * modes + mode;
+            #pragma unroll
+            for (int v = 0; v < Vec; ++v) {
+                partial[index + v] = re[tap].value[v];
+                partial[index + static_cast<long long>(rank) * 9 * modes + v] = im[tap].value[v];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void reader_dweight_wpr(
+    const Input* projected, const Grad* grad, float* partial,
+    int h, int w, int m, int batch, int rank
+) {
+    wpr_spatial<false, READER_WPR_VEC, READER_WPR_COLUMNS, READER_WPR_WARPS, Input, Weight, Grad>(
+        projected, grad, nullptr, nullptr, nullptr, partial, h, w, m, batch, rank);
+}
+
+extern "C" __global__ void reader_dinput_wpr(
+    const Grad* grad, const Weight* real, const Weight* imag, Input* dp,
+    int h, int w, int m, int batch, int rank
+) {
+    wpr_spatial<true, READER_WPR_VEC, READER_WPR_COLUMNS, READER_WPR_WARPS>(
+        static_cast<const Input*>(nullptr), grad, real, imag, dp, nullptr, h, w, m, batch, rank);
+}
+"""
+
+
 # NVRTC compilation
 
 @cache
@@ -994,6 +1139,7 @@ def _reader_cuda_module(
     spatial_read_only: bool = False,
     weight_read_only: bool = True,
     updated_spatial: bool = False,
+    wpr_geometry: tuple[int, int, int] | None = None,
 ) -> _CudaModule:
     weight_tile, weight_rows, weight_warps = weight_geometry or _DEFAULT_WEIGHT_GEOMETRY
     macros = {
@@ -1016,6 +1162,13 @@ def _reader_cuda_module(
             ("forward", "dinput", "dweight", "dweight_reduce", "dweight_reduce_parallel"),
         )
     )
+    if wpr_geometry is not None:
+        vec, wpr_columns, wpr_warps = wpr_geometry
+        header += (f"#define READER_WPR_VEC {vec}\n"
+                   f"#define READER_WPR_COLUMNS {wpr_columns}\n"
+                   f"#define READER_WPR_WARPS {wpr_warps}\n")
+        source += _READER_WPR_CUDA
+        operations += ("dweight_wpr", "dinput_wpr")
     # Reuse the CUDA launch interface with Reader-specific PTX and entry points.
     nvrtc = _nvrtc()
     program = ctypes.c_void_p()
@@ -1186,6 +1339,8 @@ class _WeightLaunch(NamedTuple):
     reduce: str
     reduce_columns: int
     module: _CudaModule
+    operation: str = "dweight"
+    column_tiles: int = 1
 
 
 def _reader_vector_width(
@@ -1313,14 +1468,77 @@ def _reader_spatial_plan(
 
 def _weight_partial_limit(
     total: int, sms: int, stride: int, resident_threads: int, device: torch.device,
+    *, workspace_waves: int = 2,
 ) -> int:
     # Limit the reduction's working set to the resident thread capacity,
     # and scale the allocation with device memory and allocator headroom.
     allocated = torch.cuda.memory_allocated(device)
     headroom = max(0, 7 * total // 8 - allocated)
-    resident_bytes = sms * resident_threads * 256
+    resident_bytes = sms * resident_threads * 256 * workspace_waves // 2
     budget = min(headroom, total // 32, resident_bytes)
     return max(1, min(_MAX_CUDA_GRID_DIM, budget // (4 * stride)))
+
+
+class _WarpRankLaunch(NamedTuple):
+    module: _CudaModule
+    warps: int
+    resident: int
+    mode_tiles: int
+    column_tiles: int
+    rank_tiles: int
+
+
+def _reader_wpr_plan(  # noqa: PLR0911
+    projected: Tensor, real: Tensor, grad: Tensor, *, strict: bool, dinput: bool,
+) -> _WarpRankLaunch | None:
+    preset = os.environ.get("LNET_READER_W34B", "off")
+    presets = ("auto", "full_w34b", "dinput_wpr") if dinput else (
+        "auto", "full_w34b", "dweight_wpr", "dweight_wpr_waves",
+    )
+    if preset not in presets or strict or os.environ.get("LNET_READER_OPT", "auto") != "auto":
+        return None
+    _, _, width, _ = projected.shape
+    modes, rank, kernel, _ = real.shape
+    dtype = projected.dtype
+    if kernel != 3 or dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if real.dtype != dtype or grad.dtype != dtype:
+        return None
+    props = torch.cuda.get_device_properties(projected.device)
+    if props.major < 8:
+        return None
+    alignment = 2 * projected.element_size()
+    aligned = (
+        modes % 2 == 0 and projected.data_ptr() % alignment == grad.data_ptr() % alignment == 0
+    )
+    vec = 2 if aligned else 1
+    warps = min(rank, 8)
+    mode_tiles, rank_tiles = _ceildiv(modes, _WARP_SIZE * vec), _ceildiv(rank, warps)
+    if dinput and (vec != 2 or rank_tiles != 1):
+        return None
+    # Reserve capacity for at least sixteen warps when the hardware permits it.
+    row_bytes = 2 * _WARP_SIZE * vec * projected.element_size()
+    blocks = _ceildiv(16, warps)
+    device_shared = getattr(
+        props, "shared_memory_per_multiprocessor", props.shared_memory_per_block,
+    )
+    block_shared = min(props.shared_memory_per_block, 48 * 1024, device_shared // blocks - 1024)
+    max_columns = block_shared // (3 * row_bytes) - 2
+    if max_columns < 1:
+        return None
+    column_tiles = _ceildiv(width, max_columns)
+    columns = _ceildiv(width, column_tiles)
+    if column_tiles * rank_tiles > _MAX_CUDA_GRID_DIM or (dinput and column_tiles != 1):
+        return None
+    cuda_type = _CUDA_TYPES[dtype]
+    module = _reader_cuda_module(
+        projected.device.index or 0, (0, 0, 0, 0), columns, 0, kernel,
+        (cuda_type, cuda_type, cuda_type), strict=False, wpr_geometry=(vec, columns, warps),
+    )
+    resident = _reader_resident(module, "dinput_wpr" if dinput else "dweight_wpr", warps)
+    if not resident or (dinput and resident * warps < 16):
+        return None
+    return _WarpRankLaunch(module, warps, resident, mode_tiles, column_tiles, rank_tiles)
 
 
 def _reader_weight_candidate(
@@ -1356,6 +1574,21 @@ def _reader_weight_plan(
     device = projected.device
     props = torch.cuda.get_device_properties(device)
     sms = props.multi_processor_count
+    wpr = _reader_wpr_plan(projected, real, grad, strict=strict, dinput=False)
+    if wpr is not None:
+        waves = 3 if os.environ.get("LNET_READER_W34B") == "dweight_wpr_waves" else 2
+        tiles = wpr.column_tiles * wpr.rank_tiles
+        workers = _ceildiv(waves * sms * wpr.resident, wpr.mode_tiles * tiles)
+        stride = 2 * real.numel()
+        limit = _weight_partial_limit(
+            props.total_memory, sms, stride, wpr.resident * wpr.warps * _WARP_SIZE, device,
+            workspace_waves=waves,
+        )
+        if limit >= wpr.column_tiles:
+            workers = min(batch, workers, limit // wpr.column_tiles)
+            return _WeightLaunch((wpr.mode_tiles, workers, tiles), wpr.warps,
+                                 "dweight_reduce_parallel", _WARP_SIZE, wpr.module,
+                                 "dweight_wpr", wpr.column_tiles)
     static = not strict and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL
     baseline = _weight_geometry(projected, modes, rank, grad.dtype) if static else None
     columns = _reader_columns(width)
@@ -1612,24 +1845,37 @@ def _packed_spatial_backward(
         grad_projected = torch.empty_like(projected)
         with torch.cuda.device(projected.device):
             plan = _reader_weight_plan(projected, real, grad, strict=strict_complex)
+            partial_workers = plan.grid[1] * plan.column_tiles
             partial = projected.new_empty(
-                (plan.grid[1], 2, rank, kernel, kernel, modes), dtype=torch.float32,
+                (partial_workers, 2, rank, kernel, kernel, modes), dtype=torch.float32,
             )
             weight_grad = real.new_empty((2, *real.shape), dtype=torch.float32)
             stream = _reader_stream(plan.module, projected.device)
             _launch_reader_cuda(
-                plan.module, "dweight", plan.grid, (projected, grad, partial),
+                plan.module, plan.operation, plan.grid, (projected, grad, partial),
                 (height, width, modes, batch, rank), stream=stream, threads=plan.warps * _WARP_SIZE,
             )
             reduce_blocks = _ceildiv(weight_grad.numel(), plan.reduce_columns)
             _launch_reader_cuda(
                 plan.module, plan.reduce, (reduce_blocks, 1, 1),
-                (partial, weight_grad), (modes, rank, plan.grid[1]), stream=stream,
+                (partial, weight_grad), (modes, rank, partial_workers), stream=stream,
             )
             del partial
             (vec, columns, spatial_rows, warps), module = _reader_spatial_plan(
                 projected, real, grad, strict=strict_complex,
             )
+            wpr = None
+            if height > spatial_rows or width > columns:
+                wpr = _reader_wpr_plan(projected, real, grad, strict=strict_complex, dinput=True)
+            if wpr is not None:
+                grid = (wpr.mode_tiles, min(batch, _MAX_CUDA_GRID_DIM), 1)
+                _launch_reader_cuda(
+                    wpr.module, "dinput_wpr", grid, (grad, real, imag, grad_projected),
+                    (height, width, modes, batch, rank),
+                    stream=_reader_stream(wpr.module, projected.device),
+                    threads=wpr.warps * _WARP_SIZE,
+                )
+                return grad_projected, weight_grad
             stream = _reader_stream(module, projected.device)
             grid = _reader_spatial_grid(
                 batch, height, width, modes, spatial_rows, warps, vec, columns,
