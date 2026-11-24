@@ -292,6 +292,7 @@ def train_arm(args: argparse.Namespace) -> dict:
     from lnet.model_w36b import (
         AUTOTUNE_FEATURES,
         compile_model_w36b,
+        compile_model_w36b_update,
         count_cudagraph_replays,
         mark_model_w36b_step_begin,
         model_w36b_features,
@@ -327,10 +328,12 @@ def train_arm(args: argparse.Namespace) -> dict:
         loss.backward()
         return loss.detach()
 
-    def update() -> None:
+    def eager_update() -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
+    update = compile_model_w36b_update(model, optimizer) or eager_update
 
     def step() -> torch.Tensor:
         loss = backward()

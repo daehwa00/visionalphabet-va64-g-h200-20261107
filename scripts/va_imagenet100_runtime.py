@@ -30,6 +30,7 @@ from lnet.classifier_heads import AffineCorrelationClassifier, expected_calibrat
 from lnet.model_w36b import (
     AUTOTUNE_FEATURES,
     compile_model_w36b,
+    compile_model_w36b_update,
     model_w36b_features,
     prepare_model_w36b_,
 )
@@ -289,9 +290,10 @@ def train_epoch(
     count = 0
     batch_count = len(loader)
     batches = data_runtime.device_batches(loader, device, channels_last=channels_last)
+    update = compile_model_w36b_update(model, optimizer)
     for batch_index, (inputs, targets) in enumerate(batches):
         group_offset = batch_index % gradient_accumulation_steps
-        if group_offset == 0:
+        if group_offset == 0 and (update is None or batch_index == 0):
             optimizer.zero_grad(set_to_none=True)
         group_size = min(
             gradient_accumulation_steps,
@@ -321,8 +323,11 @@ def train_epoch(
             (loss / group_size).backward()
             group_complete = group_offset + 1 == group_size or batch_index + 1 == batch_count
             if group_complete:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                if update is None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                else:
+                    update()
         loss_terms.append(loss.detach() * targets.numel())
         correct_terms.append(logits.argmax(dim=-1).eq(targets).sum())
         for name, value in active_diagnostics.items():

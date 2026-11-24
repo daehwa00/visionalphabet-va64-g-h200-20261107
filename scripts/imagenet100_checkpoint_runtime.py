@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import Tensor, nn
 
+from lnet.model_w36b import model_w36b_features
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -147,12 +149,21 @@ def train_epoch_with_step_count(
     original_step = optimizer.step
     optimizer_steps = 0
 
-    def step_and_count(*args: Any, **kwargs: Any) -> Any:
+    def record_step() -> None:
         nonlocal optimizer_steps
-        result = original_step(*args, **kwargs)
         optimizer_steps += 1
         if on_step is not None:
             on_step(optimizer_steps)
+
+    record = (
+        torch.compiler.disable(record_step)
+        if "compiled_update" in model_w36b_features()
+        else record_step
+    )
+
+    def step_and_count(*args: Any, **kwargs: Any) -> Any:
+        result = original_step(*args, **kwargs)
+        record()
         return result
 
     optimizer.step = step_and_count  # type: ignore[method-assign]
