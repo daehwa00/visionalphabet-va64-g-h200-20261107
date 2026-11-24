@@ -186,6 +186,19 @@ def instrument(step, original, **options):  # noqa: C901, PLR0915
     )
     if "kernels" in result:
         result.pop("top_kernels", None)
+        annotations = [
+            row for row in result["kernels"]
+            if row["name"] in {"va_t93_step", "va_t101_backward"}
+            or row["name"].startswith(("## Call CompiledFxGraph ", "Optimizer.step#"))
+        ]
+        result["cuda_annotations"] = annotations
+        result["kernels"] = [row for row in result["kernels"] if row not in annotations]
+        result["self_cuda_ms_by_bucket"]["other"] -= sum(
+            row["self_cuda_ms"] for row in annotations
+        )
+        result["dispatches_by_profiler_bucket"]["other"] -= sum(
+            row["count"] for row in annotations
+        )
     result["scan_dispatch"] = [
         {**dict(zip(fields, key, strict=True)), "count": count}
         for key, count in Counter(scan_dispatch).items()
