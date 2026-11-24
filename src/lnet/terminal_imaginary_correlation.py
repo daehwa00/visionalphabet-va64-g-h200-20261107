@@ -19,6 +19,8 @@ from .general_cuda_scans import (
     horizontal_forward,
     try_general_horizontal_forward,
 )
+from .model_w28c import model_w28c_enabled
+from .model_w29c import model_w29c_enabled
 from .product_scan_reference import _causal_weights, bidirectional_product_scan_reference
 from .triton_bidirectional_product_scan import (
     _compose_complex,
@@ -289,36 +291,42 @@ def _nr4_correlation_kernel(
 
 def _nr4_launch(
     states: StateQuad, pole: PoleTensors, partials: Tensor, upstream: Tensor,
-    grad_source: Tensor, grad_pole: Tensor, *, normalize: bool, backward: bool,
+    grad_source: Tensor, grad_pole: Tensor, *, normalize: bool, backward: bool, warp_tile: bool,
 ) -> None:
     batch, height, width, modes = states[0].shape
     block_rows = triton.next_power_of_2(height)
     block_cols = max(4, min(32, 512 // block_rows))
+    # For a 32-column tile, one warp can scan complete columns without
+    # exchanging intermediate states across warps.
+    warps = 1 if warp_tile and block_rows <= 16 and modes % 32 == 0 else 4
     grid = (triton.cdiv(width * modes, block_cols), batch, 2)
     wrap_triton(_nr4_correlation_kernel)[grid](
         *states, *(p.contiguous() for p in pole),
         partials, upstream, grad_source, grad_pole,
         height, width, modes, states[0].stride(), block_rows, block_cols,
-        normalize, backward, enable_fp_fusion=False,
+        normalize, backward, num_warps=warps, enable_fp_fusion=False,
     )
 
 
 @triton_op("lnet::nr4_correlation", mutates_args=())
-def _nr4_correlation(states: list[Tensor], pole: list[Tensor], normalize: bool) -> Tensor:  # noqa: FBT001
+def _nr4_correlation(
+    states: list[Tensor], pole: list[Tensor], normalize: bool, warp_tile: bool,  # noqa: FBT001
+) -> Tensor:
     batch, height, width, modes = states[0].shape
     partials = states[0].new_empty(
         (3 if normalize else 2, 2, batch, width, modes), dtype=torch.float32,
     )
     _nr4_launch(
         cast("StateQuad", tuple(states)), cast("PoleTensors", tuple(pole)),
-        partials, partials, partials, partials, normalize=normalize, backward=False,
+        partials, partials, partials, partials,
+        normalize=normalize, backward=False, warp_tile=warp_tile,
     )
     return partials.sum(dim=-2) / (height * width)
 
 
 @triton_op("lnet::nr4_correlation_backward", mutates_args=())
 def _nr4_correlation_backward(
-    states: list[Tensor], pole: list[Tensor], upstream: Tensor,
+    states: list[Tensor], pole: list[Tensor], upstream: Tensor, warp_tile: bool,  # noqa: FBT001
 ) -> tuple[Tensor, Tensor]:
     batch, height, width, modes = states[0].shape
     grad_source = states[0].new_empty((4, batch, height, width, modes))
@@ -326,23 +334,26 @@ def _nr4_correlation_backward(
     upstream = (upstream / (height * width)).contiguous()
     _nr4_launch(
         cast("StateQuad", tuple(states)), cast("PoleTensors", tuple(pole)),
-        grad_pole, upstream, grad_source, grad_pole, normalize=False, backward=True,
+        grad_pole, upstream, grad_source, grad_pole,
+        normalize=False, backward=True, warp_tile=warp_tile,
     )
     return grad_source, grad_pole.sum((1, 2, 3))
 
 
 def _save_nr4_correlation(ctx, inputs, output) -> None:  # noqa: ARG001
-    states, pole, _ = inputs
+    states, pole, _, ctx.warp_tile = inputs
     ctx.save_for_backward(*states, *pole)
 
 
 def _differentiate_nr4_correlation(ctx, grad) -> tuple:
     states, pole = ctx.saved_tensors[:4], ctx.saved_tensors[4:]
-    grad_source, adjoints = _nr4_correlation_backward(list(states), list(pole), grad)
+    grad_source, adjoints = _nr4_correlation_backward(
+        list(states), list(pole), grad, ctx.warp_tile,
+    )
     grad_pole = [
         value.reshape_as(p).to(p.dtype) for value, p in zip(adjoints.unbind(0), pole, strict=True)
     ]
-    return list(grad_source.unbind(0)), grad_pole, None
+    return list(grad_source.unbind(0)), grad_pole, None, None
 
 
 _nr4_correlation.register_autograd(
@@ -351,10 +362,10 @@ _nr4_correlation.register_autograd(
 
 
 def _nr4_axis(
-    pole: PoleTensors, states: StateQuad, *, normalize: bool, fused: bool,
+    pole: PoleTensors, states: StateQuad, *, normalize: bool, fused: bool, warp_tile: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     if fused:
-        stats = _nr4_correlation(list(states), list(pole), normalize)
+        stats = _nr4_correlation(list(states), list(pole), normalize, warp_tile)
         correlation = stats[:2]
         if normalize:
             correlation = correlation / stats[2].clamp_min(1e-6).detach()
@@ -391,15 +402,22 @@ def complex_correlation_descriptor(
             and drive.shape[0] <= 65_535
             and os.environ.get("LNET_NR4_FUSED") != "0"
         )
+        warp_tile = (
+            fused and drive.dtype in (torch.float16, torch.bfloat16)
+            and (
+                model_w29c_enabled(drive.device, "nr4")
+                or model_w28c_enabled(drive.device, "nr4")
+            )
+        )
         h_fwd_re, h_rev_re, h_fwd_im, h_rev_im = _nr4_axis(
-            pole_y, horizontal, normalize=normalize, fused=fused,
+            pole_y, horizontal, normalize=normalize, fused=fused, warp_tile=warp_tile,
         )
         transposed_drive = drive.transpose(1, 2)
         if not fused:
             transposed_drive = transposed_drive.contiguous()
         vertical = _scan(pole_y, transposed_drive.chunk(2, dim=-1), transposed=fused)
         v_fwd_re, v_rev_re, v_fwd_im, v_rev_im = _nr4_axis(
-            pole_x, vertical, normalize=normalize, fused=fused,
+            pole_x, vertical, normalize=normalize, fused=fused, warp_tile=warp_tile,
         )
         return torch.cat(
             (h_fwd_re, h_rev_re, v_fwd_re, v_rev_re, h_fwd_im, h_rev_im, v_fwd_im, v_rev_im),
