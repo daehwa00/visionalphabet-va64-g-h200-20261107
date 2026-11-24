@@ -12,9 +12,12 @@ from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
 from .model_w28c import _differentiate_swiglu, _save_joint
+from .model_w30c import _swiglu_vec2d_kernel, model_w30c_enabled
 
 
 def model_w29c_enabled(device: torch.device, feature: str) -> bool:
+    if feature == "nr4" and model_w30c_enabled(device, "nr4"):
+        return True
     mode = os.environ.get("LNET_MODEL_W29C", "off")
     if mode == "auto":
         mode = "combined_full" if torch.cuda.get_device_capability(device) == (9, 0) else "off"
@@ -24,31 +27,6 @@ def model_w29c_enabled(device: torch.device, feature: str) -> bool:
         "rmsnorm_full": ("rmsnorm_full", "combined_full"),
         "nr4": ("combined_bwd", "combined_full"),
     }[feature]
-
-
-@triton.jit
-def _swiglu_vec2d_kernel(
-    joint, gradient, output, rows, hidden: tl.constexpr,
-    block_rows: tl.constexpr, block_cols: tl.constexpr, backward: tl.constexpr,
-) -> None:
-    row = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
-    col = tl.program_id(1) * block_cols + tl.arange(0, block_cols)
-    packed = row[:, None] * (2 * hidden) + col[None, :]
-    dense = row[:, None] * hidden + col[None, :]
-    active = (row[:, None] < rows) & (col[None, :] < hidden)
-    dtype: tl.constexpr = joint.dtype.element_ty
-    value = tl.load(joint + packed, active, 0).to(tl.float32)
-    gate = tl.load(joint + packed + hidden, active, 0).to(tl.float32)
-    sigmoid = 1.0 / (1.0 + tl.exp(-gate))
-    activated = (gate * sigmoid).to(dtype).to(tl.float32)
-    if backward:
-        grad = tl.load(gradient + dense, active, 0).to(tl.float32)
-        gate_grad = (grad * value).to(dtype).to(tl.float32)
-        tl.store(output + packed, grad * activated, active)
-        derivative = sigmoid * (1 + gate * (1 - sigmoid))
-        tl.store(output + packed + hidden, gate_grad * derivative, active)
-    else:
-        tl.store(output + dense, value * activated, active)
 
 
 def _launch_swiglu(joint: Tensor, grad: Tensor, output: Tensor, *, backward: bool) -> None:
@@ -131,13 +109,17 @@ def _rmsnorm_backward_kernel(
     width: tl.constexpr, x_pitch, dy_pitch,
     block_rows: tl.constexpr, block_cols: tl.constexpr,
     need_dx: tl.constexpr, need_dw: tl.constexpr,
+    reduce_in_loop: tl.constexpr = False,  # noqa: FBT002
 ) -> None:
     pid = tl.program_id(0)
     col = tl.arange(0, block_cols)
     if need_dx:
         scale = tl.load(weight + col, col < width, 0).to(tl.float32)
     if need_dw:
-        accum = tl.full((block_rows, block_cols), 0, tl.float32)
+        if reduce_in_loop:
+            accum = tl.zeros((block_cols,), tl.float32)
+        else:
+            accum = tl.full((block_rows, block_cols), 0, tl.float32)
     for start in range(pid * block_rows, rows, tl.num_programs(0) * block_rows):
         row = start + tl.arange(0, block_rows)
         active = (row[:, None] < rows) & (col[None, :] < width)
@@ -151,9 +133,13 @@ def _rmsnorm_backward_kernel(
             delta = (scaled - (normalized / width) * projection[:, None]) * inv[:, None]
             tl.store(dx + row[:, None] * width + col[None, :], delta, active)
         if need_dw:
-            accum += grad * normalized
+            if reduce_in_loop:
+                accum += tl.sum(grad * normalized, 0)
+            else:
+                accum += grad * normalized
     if need_dw:
-        tl.store(partial + pid * width + col, tl.sum(accum, 0), col < width)
+        result = accum if reduce_in_loop else tl.sum(accum, 0)
+        tl.store(partial + pid * width + col, result, col < width)
 
 
 @triton_op("lnet::w29c_rmsnorm_forward", mutates_args=())
@@ -170,31 +156,35 @@ def channel_rmsnorm(x: Tensor, weight: Tensor, epsilon: float, save_inverse: boo
     return output, inverse
 
 
-def _rmsnorm_backward_rows(width: int) -> int:
+def _rmsnorm_backward_rows(width: int, *, v2: bool = False) -> int:
     # Scalar tails use smaller tiles to bound register pressure.
-    return min(32 if width % 16 == 0 else 8, 4096 // triton.next_power_of_2(width))
+    max_rows = 16 if v2 else 32
+    max_elements = 2048 if v2 and width <= 256 else 4096
+    return min(max_rows if width % 16 == 0 else 8, max_elements // triton.next_power_of_2(width))
 
 
 @triton_op("lnet::w29c_rmsnorm_backward", mutates_args=())
 def _channel_rmsnorm_backward(
-    x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *, need_dx: bool, need_dw: bool,
+    x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *,
+    need_dx: bool, need_dw: bool, v2: bool = False,
 ) -> tuple[Tensor, Tensor]:
     width = x.shape[-1]
     rows = x.numel() // width
     dx = x.new_empty(x.shape if need_dx else (0,))
-    block_rows = _rmsnorm_backward_rows(width)
-    ctas = min(264, triton.cdiv(rows, block_rows))
+    block_rows = _rmsnorm_backward_rows(width, v2=v2)
+    ctas = min(1056 if v2 else 264, triton.cdiv(rows, block_rows))
     partial = x.new_empty((ctas, width) if need_dw else (0,), dtype=torch.float32)
     wrap_triton(_rmsnorm_backward_kernel)[(ctas,)](
         x, weight, inverse, grad, dx, partial, rows, width, _row_pitch(x), _row_pitch(grad),
-        block_rows, triton.next_power_of_2(width), need_dx, need_dw, enable_fp_fusion=False,
+        block_rows, triton.next_power_of_2(width), need_dx, need_dw, v2, enable_fp_fusion=False,
     )
     dw = partial.sum(0).to(weight.dtype) if need_dw else weight.new_empty((0,))
     return dx, dw
 
 
 def channel_rmsnorm_vjp(
-    x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *, need_dx: bool, need_dw: bool,
+    x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *,
+    need_dx: bool, need_dw: bool, v2: bool = False,
 ) -> tuple[Tensor | None, Tensor | None]:
     if (
         not torch.is_grad_enabled() and (need_dx or need_dw)
@@ -203,7 +193,7 @@ def channel_rmsnorm_vjp(
         pitch = _row_pitch(grad)
         if pitch != 0 and grad.numel() // grad.shape[-1] * pitch < 2**31:
             dx, dw = _channel_rmsnorm_backward(
-                x, weight, inverse, grad, need_dx=need_dx, need_dw=need_dw,
+                x, weight, inverse, grad, need_dx=need_dx, need_dw=need_dw, v2=v2,
             )
             return dx if need_dx else None, dw if need_dw else None
 
@@ -239,3 +229,40 @@ def _differentiate_rmsnorm(ctx, grad: Tensor, inverse_grad: Tensor | None) -> tu
 
 
 channel_rmsnorm.register_autograd(_differentiate_rmsnorm, setup_context=_save_rmsnorm)
+
+
+class _CompiledChannelRMSNorm(torch.autograd.Function):
+    """Keep strided activations and output gradients in their original layouts."""
+
+    @staticmethod
+    def forward(
+        ctx, x: Tensor, weight: Tensor, epsilon: float | None, fused: bool, v2: bool,  # noqa: FBT001
+    ) -> Tensor:
+        result, inverse = torch.ops.aten._fused_rms_norm(  # noqa: SLF001
+            x, [x.shape[-1]], weight, epsilon,
+        )
+        ctx.fused = fused
+        ctx.v2 = v2
+        ctx.save_for_backward(x, weight, inverse.reshape(*x.shape[:-1], 1))
+        return result
+
+    @staticmethod
+    def backward(ctx, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None, None, None]:
+        x, weight, inverse = ctx.saved_tensors
+        if ctx.fused:
+            dx, dw = channel_rmsnorm_vjp(
+                x, weight, inverse, grad,
+                need_dx=ctx.needs_input_grad[0], need_dw=ctx.needs_input_grad[1], v2=ctx.v2,
+            )
+            return dx, dw, None, None, None
+        # Promotion keeps the reductions in FP32 without requesting contiguous copies
+        # of the activation and output gradient in the ATen backward decomposition.
+        normalized = x * inverse
+        dx = dw = None
+        if ctx.needs_input_grad[0]:
+            scaled_grad = grad * weight.float()
+            projection = (normalized * scaled_grad).sum(-1, keepdim=True)
+            dx = ((scaled_grad - (normalized / x.shape[-1]) * projection) * inverse).to(x.dtype)
+        if ctx.needs_input_grad[1]:
+            dw = (grad * normalized).reshape(-1, x.shape[-1]).sum(0).to(weight.dtype)
+        return dx, dw, None, None, None
