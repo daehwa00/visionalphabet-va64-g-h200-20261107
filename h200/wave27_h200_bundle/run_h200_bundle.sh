@@ -121,6 +121,24 @@ train() (
 
 bench device probe
 "$PYTHON_BIN" "$runner/results.py" device "$data"
+if [[ ${1:-} == pytest-wave27a ]]; then
+    export LNET_SCAN_W27A=wave_plan
+    test_file=tests/test_general_cuda_scans.py
+    run_capped 60 collect "$PYTHON_BIN" -m pytest --collect-only -q "$test_file"
+    mapfile -t nodes < <(awk -v prefix="$test_file::" 'index($0, prefix) == 1' "$data/collect.log")
+    printf 'Collected %s scan tests\n' "${#nodes[@]}"
+    printf '%s\n' "${#nodes[@]}" > "$data/collected-count.txt"
+    if (( ${#nodes[@]} == 0 )); then exit 1; fi
+    for ((i=0; i<${#nodes[@]}; i+=64)); do
+        test_start=$SECONDS
+        name="cuda_scan_shard_$((1 + i / 64))"
+        run_capped 300 "$name" "$PYTHON_BIN" -m pytest -q -ra "${nodes[@]:i:64}"
+        read -r _ test_rc _ < <(tail -n 1 "$data/processes.tsv")
+        bench "pytest_$name" wrap-pytest --log "$data/$name.log" \
+            --exit-code "$test_rc" --elapsed "$((SECONDS - test_start))"
+    done
+    exit 0
+fi
 while read -r arm a b c; do
     train "$arm" "$a" "$b" "$c"
 done < <("$PYTHON_BIN" "$runner/results.py" arms)
