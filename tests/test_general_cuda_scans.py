@@ -50,11 +50,14 @@ def test_general_scans_default_and_opt_out(monkeypatch: pytest.MonkeyPatch) -> N
     assert not general_scans_enabled()
 
 
-@pytest.mark.parametrize(("policy", "enabled"), [("off", False), ("auto", True), ("on", True)])
+@pytest.mark.parametrize("sm", [(8, 6), (9, 0)])
+@pytest.mark.parametrize("policy", ["off", "auto", "on"])
 def test_wave25a_register_path_policy(
-    monkeypatch: pytest.MonkeyPatch, policy: str, enabled: bool,
+    monkeypatch: pytest.MonkeyPatch, policy: str, sm: tuple[int, int],
 ) -> None:
     monkeypatch.setenv("LNET_SCAN_W25A", policy)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: sm)
+    enabled = policy != "off" and sm < (9, 0)
     monkeypatch.setattr(scans, "_resident", lambda *_args: 12)
     key = scans.Kernel(
         torch.bfloat16, 1, backward=False, vertical=True, hidden8=True,
@@ -71,6 +74,7 @@ def test_wave25a_register_path_policy(
 
 def test_wave25a_vector_batch2_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LNET_SCAN_W25A", "auto")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
     key = scans.Kernel(
         torch.bfloat16, 4, backward=False, vertical=True, hidden8=True,
         cache_weights=True, cache_line=True, vector_weights=True,

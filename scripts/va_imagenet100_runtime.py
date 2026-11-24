@@ -395,7 +395,7 @@ def evaluate(
 def prepare_model(model: nn.Module, recipe: dict[str, Any]) -> nn.Module:
     if bool(recipe.get("channels_last", False)):
         model.to(memory_format=torch.channels_last)  # pyright: ignore[reportCallIssue]
-    prepare_capture_safe_orthogonal_(model)
+    prepare_capture_safe_orthogonal_(model, auto=False)
     method = getattr(model, "prepare_for_compiled_training_", None)
     if callable(method):
         return cast("nn.Module", method())

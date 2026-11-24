@@ -1433,6 +1433,9 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
 
 
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
+    if capability >= (9, 0) and key.warps == 1 and (key.real_interleaved or key.imag_interleaved):
+        # Task 92 observed inexact forced unrolls on this Hopper layout.
+        key = replace(key, horizontal_unroll8=False, horizontal_forward_unroll=0)
     nvrtc = _nvrtc()
     program = ct.c_void_p()
     source = _kernel_source(key).encode()
@@ -1968,6 +1971,10 @@ def _with_wave25a(launch: Launch, device: int, shape: tuple[int, int, int, int])
         if (
             (height, width, modes) == (56, 56, 160) and key.backward and key.cache_line
             and key.warps <= (3 if key.compact else 2)
+            and not (
+                key.warps == 1 and (key.real_interleaved or key.imag_interleaved)
+                and torch.cuda.get_device_capability(device) >= (9, 0)
+            )
         ):
             candidate = replace(key, horizontal_unroll8=True)
             resident = _resident(device, candidate, plan.smem)
@@ -1975,7 +1982,8 @@ def _with_wave25a(launch: Launch, device: int, shape: tuple[int, int, int, int])
                 return launch._replace(key=candidate)
         return launch
     long_dense = (
-        (height, width, modes) == (56, 56, 160) and not key.coarse and key.batch_path
+        torch.cuda.get_device_capability(device) < (9, 0)
+        and (height, width, modes) == (56, 56, 160) and not key.coarse and key.batch_path
         and key.warps == 1 and not key.cache_line
     )
     medium_vector = (

@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 import va_model_builder as builder
 
+from lnet.capture_safe_orthogonal import prepare_capture_safe_orthogonal_
+
 if TYPE_CHECKING:
     from argparse import Namespace
 
@@ -109,6 +111,7 @@ def build_variant(key: str, config: ComplexScanConfig | None = None) -> builder.
         for stage in model.modules():
             if isinstance(stage, builder.ComplexScanStage):
                 stage.enable_pole_unclamp_()
+    prepare_capture_safe_orthogonal_(model, auto=False)
     return model
 
 

@@ -9,6 +9,7 @@ from torch.nn.utils.parametrizations import orthogonal
 
 from lnet.capture_safe_orthogonal import (
     CaptureSafeMatrixExpOrthogonal,
+    fixed_taylor_matrix_exp,
     prepare_capture_safe_orthogonal_,
 )
 
@@ -205,3 +206,71 @@ def test_capture_safe_map_captures_forward_and_backward_in_cuda_graph(
     assert static_output.dtype == torch.float32
     assert original.grad is not None
     assert torch.isfinite(original.grad).all()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+)])
+@pytest.mark.parametrize("norm", [0.1, 1.0, 5.0, 10.0, "rank2"])
+def test_ps14_fp64_reference_and_autocast(device: str, norm: float | str) -> None:
+    generator = torch.Generator().manual_seed(501)
+    random = torch.randn(64, 64, generator=generator)
+    if norm == "rank2":
+        skew = torch.zeros_like(random)
+        skew[1, 0], skew[0, 1] = 10 / 2**0.5, -10 / 2**0.5
+    else:
+        skew = random - random.mT
+        skew = skew * (norm / skew.norm())
+    matrix = skew.to(device).requires_grad_()
+    probe = torch.randn(64, 64, generator=generator).to(device)
+    double = matrix.detach().double().requires_grad_()
+    expected = torch.matrix_exp(double)
+    (expected_grad,) = torch.autograd.grad(expected, double, probe.double())
+    actual = fixed_taylor_matrix_exp(matrix)
+    (actual_grad,) = torch.autograd.grad(actual, matrix, probe)
+    with torch.autocast(device, dtype=torch.bfloat16):
+        autocast = fixed_taylor_matrix_exp(matrix)
+    (autocast_grad,) = torch.autograd.grad(autocast, matrix, probe)
+
+    torch.testing.assert_close(autocast, actual, atol=0, rtol=0)
+    torch.testing.assert_close(autocast_grad, actual_grad, atol=0, rtol=0)
+    torch.testing.assert_close(actual.double(), expected, atol=1e-6, rtol=0)
+    torch.testing.assert_close(actual_grad.double(), expected_grad, atol=1e-6, rtol=0)
+    assert _gram_error(actual) < 1e-6
+
+
+def test_ps14_gradcheck() -> None:
+    torch.manual_seed(501)
+    matrix = torch.randn(4, 4, dtype=torch.float64)
+    skew = (matrix - matrix.mT).requires_grad_()
+    assert torch.autograd.gradcheck(fixed_taylor_matrix_exp, skew)
+
+
+@pytest.mark.parametrize(("policy", "auto", "enabled"), [
+    ("auto", True, True), ("auto", False, False), ("on", False, True), ("off", True, False),
+])
+def test_capture_safe_toggle(
+    monkeypatch: pytest.MonkeyPatch, policy: str, auto: bool, enabled: bool,
+) -> None:
+    monkeypatch.setenv("LNET_CAPTURE_SAFE_ORTHOGONAL", policy)
+    layer = _orthogonal_linear(8, 8)
+    assert bool(prepare_capture_safe_orthogonal_(layer, auto=auto)) is enabled
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+)])
+def test_ps14_compiled_autocast_keeps_backward_in_fp32(device: str) -> None:
+    torch.manual_seed(501)
+    matrix = torch.randn(64, 64, device=device) / 64
+    skew = (matrix - matrix.mT).requires_grad_()
+    probe = torch.randn_like(skew)
+    compiled = torch.compile(fixed_taylor_matrix_exp, fullgraph=True)
+    with torch.autocast(device, dtype=torch.bfloat16):
+        actual = compiled(skew)
+    (actual_grad,) = torch.autograd.grad(actual, skew, probe)
+    double = skew.detach().double().requires_grad_()
+    expected = torch.matrix_exp(double)
+    (expected_grad,) = torch.autograd.grad(expected, double, probe.double())
+    torch.testing.assert_close(actual.double(), expected, atol=1e-6, rtol=0)
+    torch.testing.assert_close(actual_grad.double(), expected_grad, atol=1e-6, rtol=0)
