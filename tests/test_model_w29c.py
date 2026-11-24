@@ -268,6 +268,8 @@ def test_representative_triton_launches_generate_ttir(monkeypatch: pytest.Monkey
     )
     assert len(modules) == 5
     assert all("tt.func" in module for module in modules)
+    assert "@_rmsnorm_w34c_forward_kernel(" in modules[2]
+    assert "@_fused_res_rmsnorm_forward_kernel(" in modules[3]
 
 
 def test_row_pitch() -> None:

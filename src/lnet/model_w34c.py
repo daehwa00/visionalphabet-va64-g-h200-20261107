@@ -38,7 +38,7 @@ def _forward_tile(width: int, rows: int, sms: int) -> tuple[int, int, int]:
 
 
 @triton.jit
-def _rmsnorm_w34c_forward_kernel(
+def _rmsnorm_w34c_forward_tile(
     x, residual, weight, y, x_sum, inverse, rows,
     width: tl.constexpr, x_pitch: tl.constexpr, residual_pitch: tl.constexpr,
     eps: tl.constexpr, block_rows: tl.constexpr, block_cols: tl.constexpr,
@@ -62,6 +62,31 @@ def _rmsnorm_w34c_forward_kernel(
     tl.store(y + dense, (value * inv[:, None]) * scale[None, :], mask)
     if save_inverse:
         tl.store(inverse + row, inv, row < rows)
+
+
+@triton.jit
+def _rmsnorm_w34c_forward_kernel(
+    x, weight, y, inverse, rows,
+    width: tl.constexpr, x_pitch: tl.constexpr, eps: tl.constexpr,
+    block_rows: tl.constexpr, block_cols: tl.constexpr, save_inverse: tl.constexpr,
+) -> None:
+    _rmsnorm_w34c_forward_tile(
+        x, x, weight, y, y, inverse, rows, width, x_pitch, 0,
+        eps, block_rows, block_cols, add_residual=False, save_inverse=save_inverse,
+    )
+
+
+@triton.jit
+def _fused_res_rmsnorm_forward_kernel(
+    x, residual, weight, y, x_sum, inverse, rows,
+    width: tl.constexpr, x_pitch: tl.constexpr, residual_pitch: tl.constexpr,
+    eps: tl.constexpr, block_rows: tl.constexpr, block_cols: tl.constexpr,
+    save_inverse: tl.constexpr,
+) -> None:
+    _rmsnorm_w34c_forward_tile(
+        x, residual, weight, y, x_sum, inverse, rows, width, x_pitch, residual_pitch,
+        eps, block_rows, block_cols, add_residual=True, save_inverse=save_inverse,
+    )
 
 
 @triton.jit
@@ -110,12 +135,20 @@ def rmsnorm_w34c(
     added = x.new_empty(x.shape if residual is not None else (0,))
     inverse = x.new_empty((*x.shape[:-1], 1) if save_inverse else (0,), dtype=torch.float32)
     block_rows, warps, stages = _forward_tile(width, rows, _sm_count(x.device))
-    wrap_triton(_rmsnorm_w34c_forward_kernel)[(triton.cdiv(rows, block_rows),)](
-        x, residual if residual is not None else x, weight, output, added, inverse, rows,
-        width, _row_pitch(x), _row_pitch(residual) if residual is not None else 0,
-        epsilon, block_rows, triton.next_power_of_2(width), residual is not None, save_inverse,
-        num_warps=warps, num_stages=stages, enable_fp_fusion=False,
-    )
+    grid = (triton.cdiv(rows, block_rows),)
+    block_cols = triton.next_power_of_2(width)
+    if residual is None:
+        wrap_triton(_rmsnorm_w34c_forward_kernel)[grid](
+            x, weight, output, inverse, rows, width, _row_pitch(x),
+            epsilon, block_rows, block_cols, save_inverse,
+            num_warps=warps, num_stages=stages, enable_fp_fusion=False,
+        )
+    else:
+        wrap_triton(_fused_res_rmsnorm_forward_kernel)[grid](
+            x, residual, weight, output, added, inverse, rows,
+            width, _row_pitch(x), _row_pitch(residual), epsilon, block_rows, block_cols,
+            save_inverse, num_warps=warps, num_stages=stages, enable_fp_fusion=False,
+        )
     return output, added, inverse
 
 
