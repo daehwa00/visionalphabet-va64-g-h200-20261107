@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
+from lnet.model_w36b import mark_model_w36b_step_begin, model_w36b_features
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -27,6 +29,9 @@ WANDB_MODEL_ALIASES = {"product_four": "Product4", "pole_free": "PoleFree"}
 
 def begin_cudagraph_step(device: torch.device) -> None:
     """Declare one model invocation boundary for compiled CUDA Graph runtimes."""
+    if device.type == "cuda" and "cuda_graphs" in model_w36b_features():
+        mark_model_w36b_step_begin()
+        return
     if (
         device.type == "cuda"
         and os.environ.get("LNET_COMPILE_MODE") in CUDA_GRAPH_COMPILE_MODES

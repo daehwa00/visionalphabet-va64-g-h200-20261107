@@ -9,6 +9,8 @@ from torch import Tensor, nn
 from torch.nn import functional
 
 from .fused_stem_ops import fused_conv_stem, fused_nhwc_layernorm_gelu
+from .model_w28c import model_cuda_supported
+from .model_w36b import model_w36b_features
 
 _FUSED_FACTORIZED_READER_ENV = "LNET_FUSED_FACTORIZED_READER"
 _GENERAL_SCANS_ENV = "LNET_GENERAL_SCANS"
@@ -147,7 +149,7 @@ def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d) -> bool:
         and conv.dilation == (1, 1)
         and conv.groups == 1
         and (inputs.is_contiguous() or inputs.is_contiguous(memory_format=torch.channels_last))
-        and torch.cuda.get_device_capability(inputs.device)[0] >= 8
+        and model_cuda_supported(inputs.device)
     )
 
 
@@ -157,16 +159,21 @@ def _fused_stem_block(
     norm: LayerNorm2d,
     *,
     nhwc_output: bool = False,
+    stem_cudnn: bool = False,
 ) -> Tensor:
-    if not nhwc_output and _fused_conv_stem_supported(inputs, conv):
+    if not stem_cudnn and not nhwc_output and _fused_conv_stem_supported(inputs, conv):
         dtype = (
             torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else inputs.dtype
         )
         return fused_conv_stem(
             inputs, conv.weight, conv.bias, norm.norm.weight, norm.norm.bias, norm.norm.eps, dtype
         )
+    weight = conv.weight
+    if stem_cudnn:
+        # cuDNN propagates the channels-last format from either convolution operand.
+        weight = weight.contiguous(memory_format=torch.channels_last)
     hidden = functional.conv2d(
-        inputs, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
+        inputs, weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
     )
     return fused_nhwc_layernorm_gelu(
         hidden,
@@ -231,13 +238,16 @@ class ModeScaledTwoConvStem(nn.Module):
 
     def forward(self, inputs: Tensor) -> Tensor:
         first, first_norm, first_activation, second, second_norm, second_activation = self.layers
+        stem_cudnn = inputs.is_cuda and "stem_cudnn" in model_w36b_features()
         if (
-            _fused_stem_enabled(inputs)
+            (stem_cudnn or _fused_stem_enabled(inputs))
             and _supports_fused_stem_block(first, first_norm, first_activation)
             and _supports_fused_stem_block(second, second_norm, second_activation)
-            and _fused_stem_large_enough(inputs, first, second)
+            and (stem_cudnn or _fused_stem_large_enough(inputs, first, second))
         ):
-            hidden = _fused_stem_block(inputs, first, first_norm)
+            hidden = _fused_stem_block(
+                inputs, first, first_norm, stem_cudnn=stem_cudnn,
+            )
             return _fused_stem_block(hidden, second, second_norm, nhwc_output=True)
         hidden = first_activation(first_norm(first(inputs)))
         features = second(hidden)
