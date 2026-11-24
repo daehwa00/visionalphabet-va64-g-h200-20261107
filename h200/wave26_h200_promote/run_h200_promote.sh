@@ -138,6 +138,41 @@ train() (
     bench 360 "b${batch}_$name" train-arm --variant "$variant" --batch "$batch" "${opts[@]}"
 )
 
+cuda_tests() (
+    local name=$1 rc
+    shift
+    config wave25bc_hscan8_ps14
+    tests_start=$SECONDS
+    # Explicit preparation API tests manage their own orthogonal policy.
+    run_capped 600 "$name" env -u LNET_CAPTURE_SAFE_ORTHOGONAL "$PYTHON_BIN" -m pytest -q -ra "$@"
+    rc=$(awk -F '\t' -v name="$name" '$1 == name {print $2}' "$data/processes.tsv")
+    bench 30 "pytest_$name" wrap-pytest --log "$data/$name.log" --exit-code "$rc" \
+        --elapsed "$((SECONDS - tests_start))"
+    return "$rc"
+)
+
+if [[ ${1:-} == --followup ]]; then
+    bench 120 device probe
+    "$PYTHON_BIN" "$runner/results.py" device "$data"
+    failed=0
+    cuda_tests cuda-scans tests/test_general_cuda_scans.py || failed=1
+    cuda_tests cuda-reader tests/test_factorized_reader_kernels.py || failed=1
+    cuda_tests cuda-stem tests/test_fused_conv_stem_ln_gelu.py || failed=1
+    cuda_tests cuda-model tests/test_capture_safe_orthogonal.py tests/test_p1_nr4.py \
+        tests/test_live_complex_rms.py || failed=1
+
+    export VA_T93_LONG_B128=1
+    train 128 wave25bc_hscan8_ps14 best_long_rev
+    train 128 wave21c_base wave21c_base_long_rev
+    train 128 wave25bc wave25bc_long
+    train 128 wave25bc_hscan8 wave25bc_hscan8_long
+    train 128 wave21c_base wave21c_base_long
+    train 128 wave25bc_hscan8_ps14 best_long
+    train 1024 wave25bc_hscan8_ps14 best_recheck
+    train 1024 wave21c_base wave21c_base_recheck
+    exit "$failed"
+fi
+
 bench 120 device probe
 "$PYTHON_BIN" "$runner/results.py" device "$data"
 # Preserve the original failure's traceback independently of promotion tests.

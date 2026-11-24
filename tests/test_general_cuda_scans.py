@@ -797,6 +797,7 @@ def test_cuda_register_path_exact(
     px, py, real, imag, auxiliary, path = _inputs(56, 56, 160, 8, dtype, "cuda", batch=2)
     states = scans.horizontal_forward(px, real, imag)
     launch = scans._plan_launch
+    supported = torch.cuda.get_device_capability() < (9, 0)
 
     def force_path(
         source: Tensor, shape: tuple[int, int, int, int], **options: object,
@@ -811,7 +812,7 @@ def test_cuda_register_path_exact(
         plan = scans.ScanPlan(1, weights, cache_weights=True)
         baseline = scans.Launch(plan, key, base.workers, base.partials)
         selected = scans._with_wave25a(baseline, source.device.index or 0, shape)
-        assert selected.key.register_path == (policy != "off")
+        assert selected.key.register_path == (supported and policy != "off")
         return selected
 
     monkeypatch.setattr(scans, "_plan_launch", force_path)

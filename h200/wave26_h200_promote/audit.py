@@ -165,7 +165,10 @@ def main():
             return model
 
         def measured(*args, **kwargs):
+            if args[1] == 128 and os.environ.get("VA_T93_LONG_B128") == "1":
+                kwargs.update(warmup=8, count=32)
             metrics, losses = measure(*args, **kwargs)
+            metrics["measured_steps"] = kwargs.get("count")
             metrics["loss_samples"] = [float(loss) for loss in losses]
             metrics["orthogonal"] = orthogonal
             return metrics, losses
