@@ -3,6 +3,8 @@
 # ruff: noqa: ANN001
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -12,8 +14,17 @@ from torch.library import triton_op, wrap_triton
 from .model_w28c import _differentiate_swiglu, _save_joint, model_cuda_supported, model_opt_mode
 
 
+def model_w34c_mode() -> str:
+    mode = os.environ.get("LNET_MODEL_W34C", "off")
+    if mode not in ("off", "auto", "rmsnorm_fwd_v2", "fused_res_norm", "full_w34c"):
+        raise ValueError("invalid LNET_MODEL_W34C preset")
+    return mode if os.environ.get("LNET_MODEL_OPT", "auto") != "off" else "off"
+
+
 def model_w29c_enabled(device: torch.device, feature: str) -> bool:
     mode = model_opt_mode("LNET_MODEL_W29C")
+    if model_w34c_mode() in ("auto", "full_w34c"):
+        mode = "combined_bwd"
     if mode == "auto":
         if feature == "swiglu_vec2d" and model_opt_mode("LNET_MODEL_W28C") in (
             "swiglu", "combined",
