@@ -31,3 +31,6 @@ bash h200/wave25c_stem_probe/verify.sh /path/to/python
 Tensor Core 비교는 `WAVE25C_TENSOR=1 WAVE25C_MAIN_ONLY=1`을 지정해 같은 CUDA Graph
 프로브에서 실행한다. 실험용 backward의 타일 행 수, 워프 수, 타일 합산, CTA 수는 각각
 `WAVE25C_TC_M`, `WAVE25C_TC_WARPS`, `WAVE25C_TC_TILE_REDUCE`, `WAVE25C_TC_CTA`로 바꿀 수 있다.
+
+검증 스크립트는 cuDNN benchmark 쌍과 controlled ABAB 각각의 실행 중 GPU 락을 유지한다.
+중단한 실행을 이어갈 때 `WAVE25C_RESUME=1`을 지정하면 종료 코드 0이 기록된 arm을 건너뛴다.

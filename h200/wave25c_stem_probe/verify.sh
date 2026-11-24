@@ -8,22 +8,30 @@ mkdir -p results
 python_path=${1:-python}
 variant=17-p1-nr4-1024d-v3
 
+with_gpu() (
+    flock -w 2400 9 || exit
+    "$@"
+) 9>/tmp/va-gpu.lock
+
 record() {
     local label=$1
     shift
+    if [[ ${WAVE25C_RESUME:-0} == 1 && -f results/$label.status ]] &&
+        [[ $(<"results/$label.status") == 0 ]]; then
+        return
+    fi
     (
-        flock -w 2400 9 || exit
         nvidia-smi --query-gpu=clocks.sm,temperature.gpu --format=csv
         "$python_path" -u "$@"
         result=$?
         nvidia-smi --query-gpu=clocks.sm,temperature.gpu --format=csv
         exit "$result"
-    ) 9>/tmp/va-gpu.lock >"results/$label.log" 2>&1
+    ) >"results/$label.log" 2>&1
     printf '%s\n' "$?" >"results/$label.status"
 }
 
-if [[ ${2:-} != regression ]]; then
-    for pair in forward reverse controlled1 controlled2; do
+train() {
+    for pair in "$@"; do
         modes=(off on)
         [[ $pair != reverse ]] || modes=(on off)
         export WAVE25C_CUDNN_BENCHMARK=1
@@ -35,9 +43,9 @@ if [[ ${2:-} != regression ]]; then
                 --variant "$variant" --batch 128 --out "results/$name.json"
         done
     done
-fi
+}
 
-if [[ ${2:-} != training ]]; then
+regression() {
     export LNET_FUSED_STEM_CONV=on
     record pytest -m pytest -q tests/test_p1_nr4.py tests/test_eight_ablation_model.py \
         tests/test_live_complex_rms.py tests/test_fused_conv_stem_ln_gelu.py
@@ -46,4 +54,12 @@ if [[ ${2:-} != training ]]; then
         record "fold-$model" h200/wave25c_stem_probe/training.py infer-fold \
             --variant "$model" --batch 2 --out "results/fold-$model.json"
     done
+}
+
+if [[ ${2:-} != regression ]]; then
+    with_gpu train forward reverse
+    with_gpu train controlled1 controlled2
+fi
+if [[ ${2:-} != training ]]; then
+    with_gpu regression
 fi
