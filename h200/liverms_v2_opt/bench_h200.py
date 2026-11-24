@@ -12,11 +12,12 @@ import sys
 import time
 import traceback
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     import torch
 
@@ -133,10 +134,15 @@ def build_model(variant: str) -> torch.nn.Module:
 def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dict, list]:
     import torch
 
-    for _ in range(warmup):
-        step()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    step()
+    torch.cuda.synchronize()
+    first_step_s = time.perf_counter() - start
+    for _ in range(warmup - 1):
+        step()
+    torch.cuda.synchronize()
     timings, outputs = [], []
     for _ in range(count):
         start = time.perf_counter()
@@ -147,6 +153,9 @@ def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dic
     p25, _, p75 = statistics.quantiles(timings, n=4, method="inclusive")
     return {
         "median_ms": median,
+        "mean_ms": statistics.mean(timings),
+        "p95_ms": statistics.quantiles(timings, n=20, method="inclusive")[-1],
+        "compile_time_s": first_step_s,
         "min_ms": min(timings),
         "max_ms": max(timings),
         "p25_ms": p25,
@@ -166,6 +175,9 @@ def kernel_bucket(name: str) -> str:
     if name in scan_kernels:
         return scan_kernels[name]
     for prefix, bucket in (
+        ("legacy_vscan", "general_vscan"),
+        ("legacy_hscan", "general_hscan"),
+        ("vscan_bwd_cta_", "general_vscan"),
         ("reader_", "factorized_reader"),
         ("stem_", "fused_stem"),
         ("triton", "triton"),
@@ -183,7 +195,8 @@ def kernel_bucket(name: str) -> str:
     return "other"
 
 
-def profile_step(step: Callable) -> dict:
+@contextmanager
+def track_scan_events() -> Iterator[list]:
     import torch
 
     from lnet import general_cuda_scans as scans
@@ -208,11 +221,53 @@ def profile_step(step: Callable) -> dict:
 
     scans._dispatch = track
     try:
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-            step()
-            torch.cuda.synchronize()
+        yield launches
     finally:
         scans._dispatch = original
+
+
+def summarize_scan_events(launches: list) -> tuple[dict, list]:
+    event_ms = {"general_hscan": 0.0, "general_vscan": 0.0}
+    shapes: dict[tuple, dict] = {}
+    for shape, launch, start, end in launches:
+        vertical, backward, coarse, height, width, modes = shape
+        elapsed = start.elapsed_time(end)
+        event_ms["general_vscan" if vertical else "general_hscan"] += elapsed
+        if shape not in shapes:
+            axis, phase = ("vscan" if vertical else "hscan"), ("bwd" if backward else "fwd")
+            shapes[shape] = {
+                "name": f"{axis}_{phase}_{height}_{'c' if coarse else 'd'}",
+                "vertical": vertical,
+                "backward": backward,
+                "coarse": coarse,
+                "height": height,
+                "width": width,
+                "modes": modes,
+                "cuda_event_ms": 0.0,
+                "count": 0,
+                "plans": Counter(),
+            }
+        row = shapes[shape]
+        row["cuda_event_ms"] += elapsed
+        row["count"] += 1
+        row["plans"][launch.plan, launch.key.wave37a, launch.workers, launch.partials] += 1
+    for row in shapes.values():
+        row["plans"] = [
+            {**plan._asdict(), "preset": preset or "legacy",
+             "workers": workers, "partials": partials, "count": count}
+            for (plan, preset, workers, partials), count in row["plans"].items()
+        ]
+    return event_ms, sorted(shapes.values(), key=lambda row: -row["cuda_event_ms"])
+
+
+def profile_step(step: Callable) -> dict:
+    import torch
+
+    with track_scan_events() as launches, torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+    ) as prof:
+        step()
+        torch.cuda.synchronize()
 
     buckets = dict.fromkeys(
         (
@@ -239,37 +294,9 @@ def profile_step(step: Callable) -> dict:
         dispatches[bucket] += event.count
         kernels.append({"name": event.key, "count": event.count, "self_cuda_ms": elapsed})
 
-    event_ms = {"general_hscan": 0.0, "general_vscan": 0.0}
-    shapes: dict[tuple, dict] = {}
-    for shape, launch, start, end in launches:
-        vertical, backward, coarse, height, width, modes = shape
-        elapsed = start.elapsed_time(end)
-        event_ms["general_vscan" if vertical else "general_hscan"] += elapsed
-        if shape not in shapes:
-            axis, phase = ("vscan" if vertical else "hscan"), ("bwd" if backward else "fwd")
-            shapes[shape] = {
-                "name": f"{axis}_{phase}_{height}_{'c' if coarse else 'd'}",
-                "vertical": vertical,
-                "backward": backward,
-                "coarse": coarse,
-                "height": height,
-                "width": width,
-                "modes": modes,
-                "cuda_event_ms": 0.0,
-                "count": 0,
-                "plans": Counter(),
-            }
-        row = shapes[shape]
-        row["cuda_event_ms"] += elapsed
-        row["count"] += 1
-        row["plans"][launch.plan, launch.workers, launch.partials] += 1
-    for row in shapes.values():
-        row["plans"] = [
-            {**plan._asdict(), "workers": workers, "partials": partials, "count": count}
-            for (plan, workers, partials), count in row["plans"].items()
-        ]
+    event_ms, shapes = summarize_scan_events(launches)
     event_total = sum(event_ms.values())
-    if event_total:
+    if event_total and buckets["general_scan_shared"]:
         shared = buckets.pop("general_scan_shared")
         for axis, elapsed in event_ms.items():
             buckets[axis] += shared * elapsed / event_total
@@ -277,15 +304,20 @@ def profile_step(step: Callable) -> dict:
         "self_cuda_ms_by_bucket": buckets,
         "dispatches_by_profiler_bucket": dispatches,
         "general_cuda_scans": len(launches),
-        "general_cuda_scans_verified": len(launches) > 0 and dispatches["general_scan_shared"] > 0,
+        "general_cuda_scans_verified": len(launches) > 0 and any(
+            dispatches[bucket]
+            for bucket in ("general_scan_shared", "general_hscan", "general_vscan")
+        ),
         "scan_axis_cuda_event_ms": event_ms,
-        "scan_shape_cuda_events": sorted(shapes.values(), key=lambda row: -row["cuda_event_ms"]),
+        "scan_shape_cuda_events": shapes,
         "scan_axis_attribution": "Profiler shared scan time apportioned by CUDA event durations",
         "top_kernels": sorted(kernels, key=lambda row: -row["self_cuda_ms"])[:25],
     }
 
 
-def train_arm(args: argparse.Namespace) -> dict:
+def train_arm(  # noqa: C901, PLR0915 - keep the timing and diagnostic phases together
+    args: argparse.Namespace, *, profiler: Callable[[Callable, Callable], dict] | None = None,
+) -> dict:
     import torch
     import va_model_builder as builder
 
@@ -321,10 +353,13 @@ def train_arm(args: argparse.Namespace) -> dict:
         },
     )
 
-    def backward() -> torch.Tensor:
+    def forward() -> torch.Tensor:
         mark_model_w36b_step_begin()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = torch.nn.functional.cross_entropy(compiled(inputs)[0], labels)
+            return torch.nn.functional.cross_entropy(compiled(inputs)[0], labels)
+
+    def backward() -> torch.Tensor:
+        loss = forward()
         loss.backward()
         return loss.detach()
 
@@ -350,9 +385,17 @@ def train_arm(args: argparse.Namespace) -> dict:
         running_ms_finite=bool(rms.running_ms.isfinite().all()),
     )
     if "cuda_graphs" in features:
-        with count_cudagraph_replays() as replays:
-            backward()
-        result["cudagraph_replays_per_forward_backward"] = len(replays)
+        with count_cudagraph_replays() as forward_replays:
+            diagnostic_loss = forward()
+        with count_cudagraph_replays() as backward_replays:
+            diagnostic_loss.backward()
+        result["cudagraph_replays_per_forward_backward"] = (
+            len(forward_replays) + len(backward_replays)
+        )
+        result["cudagraph_replays_by_phase"] = {
+            "forward": len(forward_replays), "backward": len(backward_replays),
+        }
+        del diagnostic_loss
     else:
         backward()
     gradients = [p.grad for p in model.parameters() if p.grad is not None]
@@ -366,10 +409,29 @@ def train_arm(args: argparse.Namespace) -> dict:
             else None
         ),
     )
-    optimizer.zero_grad(set_to_none=True)
+    if "cuda_graphs" in features and "compiled_update" in features:
+        with count_cudagraph_replays() as update_replays:
+            update()
+        result["cudagraph_replays_by_phase"]["update"] = len(update_replays)
+    else:
+        optimizer.zero_grad(set_to_none=True)
+    def eager_scan_diagnostic() -> None:
+        # A replay bypasses Python launch hooks. Observe the same scan policy
+        # through eager dispatch without changing the timed graph or profiler.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = torch.nn.functional.cross_entropy(model(inputs)[0], labels)
+        try:
+            loss.backward()
+        finally:
+            optimizer.zero_grad(set_to_none=True)
+
     if args.profile:
         write_json(args.out, {**result, "status": "profiling"})
-        result["profiler"] = profile_step(step)
+        try:
+            result["profiler"] = (profiler(step, eager_scan_diagnostic)
+                                  if profiler else profile_step(step))
+        except Exception:  # noqa: BLE001 - preserve timing after a profiler failure
+            result["profiler_error"] = traceback.format_exc()
     return result
 
 
@@ -411,6 +473,8 @@ def infer_fold(args: argparse.Namespace) -> dict:
     from lnet.image_layers import fold_terminal_rms_for_inference
 
     inputs = setup(args.batch)
+    torch.set_float32_matmul_precision(getattr(args, "precision", "high"))
+    torch.backends.cudnn.benchmark = False
     model = build_model(args.variant)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         # Initialize evaluation scales from a clean synthetic batch.
@@ -470,6 +534,7 @@ def infer_fold(args: argparse.Namespace) -> dict:
             guard = False
     diff = float((expected - actual).abs().max())
     return {
+        "precision": precision,
         "unfolded": unfolded,
         "folded": folded,
         "max_abs_logit_diff": diff,
@@ -752,6 +817,8 @@ def main() -> None:
         if name in {"train-arm", "infer-fold"}:
             sub.add_argument("--variant", required=True, choices=VARIANTS)
             sub.add_argument("--batch", required=True, type=int)
+        if name == "infer-fold":
+            sub.add_argument("--precision", choices=("high", "highest"), default="high")
         if name == "train-arm":
             sub.add_argument("--profile", action="store_true")
         if name == "dynamo":
