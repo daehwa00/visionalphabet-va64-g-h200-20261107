@@ -15,6 +15,7 @@ from torch.nn import functional
 from triton.language.extra.cuda import libdevice
 
 from .cuda_nvrtc import _check_cu, _check_nvrtc, _CudaModule, _ensure_context, _include_dirs, _nvrtc
+from .model_w35c import model_w35c_enabled
 
 _TYPES = {torch.float32: "float", torch.float16: "__half", torch.bfloat16: "__nv_bfloat16"}
 _THREADS = 128
@@ -924,6 +925,36 @@ def _tensor_core_patch(  # noqa: ANN202
 
 
 @triton.jit
+def _tensor_core_rgb_tile(  # noqa: ANN202
+    X, start, batch_valid, H: tl.constexpr, W: tl.constexpr, M: tl.constexpr,
+):
+    # One contiguous RGB strip per filter row. Only the right halo overlaps
+    # the next horizontal tile.
+    ow: tl.constexpr = (W + 1) // 2
+    oh: tl.constexpr = (H + 1) // 2
+    tiles: tl.constexpr = (ow + M - 1) // M
+    batch = start // (M * tiles * oh)
+    row = start // (M * tiles) % oh * 2 - 1
+    col = start // M % tiles * (2 * M) - 1
+    strip: tl.constexpr = 8 * M
+    lane = tl.arange(0, 4 * strip)
+    ky = lane // strip
+    rgb = lane % strip
+    iy = row + ky
+    ix = col + rgb // 3
+    tile = tl.load(
+        X + ((batch * H + iy) * W + col) * 3 + rgb,
+        batch_valid & (ky < 3) & (rgb < (2 * M + 1) * 3)
+        & (iy >= 0) & (iy < H) & (ix >= 0) & (ix < W),
+        0,
+    )
+    element = tl.arange(0, M * 32)
+    tap = element % 32
+    indices = tl.where(tap < 27, tap // 9 * strip + element // 32 * 6 + tap % 9, 3 * strip)
+    return tl.reshape(tl.gather(tile, indices, 0), (M, 32))
+
+
+@triton.jit
 def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
     X,
     KERNEL,
@@ -946,7 +977,14 @@ def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
     M: tl.constexpr,
     K: tl.constexpr,
     TILE_REDUCE: tl.constexpr,
+    RGB_TILE: tl.constexpr,
 ):
+    if RGB_TILE:
+        ow: tl.constexpr = (W + 1) // 2
+        tiles: tl.constexpr = (ow + M - 1) // M
+        end: tl.constexpr = N // ow * tiles * M
+    else:
+        end: tl.constexpr = N
     k = tl.arange(0, K)
     c = tl.arange(0, CO)
     m = tl.arange(0, M)
@@ -968,30 +1006,38 @@ def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
             dc = tl.full((CO,), 0, tl.float32)
         stride = tl.num_programs(0) * M
     else:
-        stride = N
-    for start in range(worker * M, N, stride):
-        pixel = start + m
-        offset, valid = _tensor_core_patch(pixel, k, H, W, CI, CL)
-        a = tl.load(X + offset, valid & (pixel[:, None] < N), 0)
+        stride = end
+    for start in range(worker * M, end, stride):
+        if RGB_TILE:
+            col = start // M % tiles * M + m
+            pixel = start // (tiles * M) * ow + col
+            active = col < ow
+            a = _tensor_core_rgb_tile(X, start, start < end, H, W, M)
+            a = tl.where(active[:, None], a, 0)
+        else:
+            pixel = start + m
+            active = pixel < N
+            offset, valid = _tensor_core_patch(pixel, k, H, W, CI, CL)
+            a = tl.load(X + offset, valid & active[:, None], 0)
         values = tl.dot(a, weights).to(X.dtype.element_ty).to(tl.float32)
         if BIAS:
             values += bias[None, :]
         if BWD:
-            mean = tl.load(STAT + 2 * pixel, pixel < N, 0)
-            inv = tl.load(STAT + 2 * pixel + 1, pixel < N, 0)
+            mean = tl.load(STAT + 2 * pixel, active, 0)
+            inv = tl.load(STAT + 2 * pixel + 1, active, 0)
             centered = values - mean[:, None]
         else:
             mean = tl.sum(values, 1) / CO
             centered = values - mean[:, None]
             inv = tl.rsqrt(tl.sum(centered * centered, 1) / CO + EP)
-            tl.store(STAT + 2 * pixel, mean, pixel < N)
-            tl.store(STAT + 2 * pixel + 1, inv, pixel < N)
+            tl.store(STAT + 2 * pixel, mean, active)
+            tl.store(STAT + 2 * pixel + 1, inv, active)
         norm = centered * inv[:, None]
         affine = tl.fma(norm, gamma[None, :], beta[None, :])
         cdf = 0.5 * (1.0 + libdevice.erf(affine * 0.7071067811865476))
         output_offsets = pixel[:, None] * CO + c[None, :]
         if BWD:
-            dy = tl.load(DY + output_offsets, pixel[:, None] < N, 0).to(tl.float32)
+            dy = tl.load(DY + output_offsets, active[:, None], 0).to(tl.float32)
             grad = dy * (cdf + affine * 0.3989422804014327 * tl.exp(-0.5 * affine * affine))
             projected = grad * gamma[None, :]
             v = (
@@ -1011,7 +1057,7 @@ def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
                 if BIAS:
                     dc += tl.sum(v, 0)
         else:
-            tl.store(Y + output_offsets, affine * cdf, pixel[:, None] < N)
+            tl.store(Y + output_offsets, affine * cdf, active[:, None])
     if BWD:
         fields: tl.constexpr = 9 * CI + 2 + BIAS
         dst = PART + worker * fields * CO
@@ -1070,6 +1116,7 @@ def _launch_tensor_core_stem(
     block: int = 32,
     warps: int = 4,
     tile_reduce: bool = True,
+    rgb_tile: bool = False,
 ) -> None:
     ci, h, width = x.shape[1:]
     co = w.shape[-1]
@@ -1097,13 +1144,21 @@ def _launch_tensor_core_stem(
         block,
         triton.next_power_of_2(ci * 9),
         tile_reduce,
+        rgb_tile,
         num_warps=warps,
     )
 
 
+def _stem_v2_enabled(x: Tensor) -> bool:
+    return x.dtype in (torch.bfloat16, torch.float16) and model_w35c_enabled("stem_v2")
+
+
 def _use_tensor_core_stem(x: Tensor, w: Tensor) -> bool:
     # This geometry is the first block in the three target models.
-    return x.shape[1] == 3 and w.shape[-1] == 32
+    return x.shape[1] == 3 and (
+        w.shape[-1] == 32
+        or (w.shape[-1] == 64 and _stem_v2_enabled(x))
+    )
 
 
 @torch.library.custom_op("va_stem::conv_forward", mutates_args=(), device_types="cuda")
@@ -1115,9 +1170,16 @@ def _conv_forward(
         return y, stats
     with torch.cuda.device(x.device):
         if _use_tensor_core_stem(x, w):
-            workers = triton.cdiv(stats.numel() // 2, 32)
+            rgb_tile = _stem_v2_enabled(x) and x.is_contiguous(
+                memory_format=torch.channels_last,
+            )
+            batch, oh, ow, _ = y.shape
+            workers = batch * oh * triton.cdiv(ow, 32) if rgb_tile else triton.cdiv(
+                stats.numel() // 2, 32,
+            )
             _launch_tensor_core_stem(
-                x, w, g, b, cb, y, y, stats, stats, eps, workers, backward=False
+                x, w, g, b, cb, y, y, stats, stats, eps, workers,
+                backward=False, rgb_tile=rgb_tile,
             )
         else:
             module, stream, n, sizes = _conv_launch_setup(x, w, cb, eps)
@@ -1165,10 +1227,17 @@ def _tensor_core_conv_backward(
     db: Tensor,
     dc: Tensor,
 ) -> None:
-    block = 64
+    tuned = _stem_v2_enabled(x)
+    block = (16 if w.shape[-1] == 64 else 32) if tuned else 64
+    warps = 8 if tuned and w.shape[-1] == 64 else 4
     # The final kernel reduces all workers for each field in one CTA.
     # Bound that tile to 1024 * CO elements regardless of workspace capacity.
-    workers = min(1024, triton.cdiv(stats.numel() // 2, block))
+    rgb_tile = tuned and x.is_contiguous(memory_format=torch.channels_last)
+    batch, oh, ow, _ = dy.shape
+    blocks = batch * oh * triton.cdiv(ow, block) if rgb_tile else triton.cdiv(
+        stats.numel() // 2, block,
+    )
+    workers = min(1024, blocks)
     ci, co = x.shape[1], g.numel()
     fields = ci * 9 + 2 + int(cb is not None)
     part = g.new_empty((workers, fields, co))
@@ -1186,6 +1255,9 @@ def _tensor_core_conv_backward(
         workers,
         backward=True,
         block=block,
+        warps=warps,
+        tile_reduce=not tuned,
+        rgb_tile=rgb_tile,
     )
     stem_conv_tensor_reduce[(fields,)](
         part,

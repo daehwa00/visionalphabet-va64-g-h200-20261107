@@ -24,6 +24,7 @@ from .model_w29c import (
     packed_swiglu_vec2d,
     rmsnorm_eligible,
 )
+from .model_w35c import model_w35c_enabled
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
 
@@ -61,8 +62,10 @@ class ChannelRMSNorm(nn.Module):
             or os.environ.get(_GENERAL_SCANS_ENV) != "0"
         ):
             weight = self.weight.to(x.dtype)
+            native_backward = model_w35c_enabled("rmsnorm_bwd_inductor")
             wave29 = (
-                x.dtype in (torch.bfloat16, torch.float16)
+                not native_backward
+                and x.dtype in (torch.bfloat16, torch.float16)
                 and x.shape[-1] == weight.numel()
                 and x.numel() > 0
                 and model_w29c_enabled(x.device, "rmsnorm_bwd")
@@ -76,7 +79,7 @@ class ChannelRMSNorm(nn.Module):
             if wave29 and torch.is_grad_enabled():
                 return _CompiledChannelRMSNorm.apply(x, weight, self.epsilon, True)  # noqa: FBT003
             if (
-                torch.compiler.is_compiling()
+                (torch.compiler.is_compiling() or native_backward)
                 and torch.is_grad_enabled()
                 and x.dtype in (torch.bfloat16, torch.float16)
                 and x.shape[-1] == weight.numel()
