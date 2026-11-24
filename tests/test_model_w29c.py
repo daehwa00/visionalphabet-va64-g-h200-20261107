@@ -34,12 +34,24 @@ def test_row_pitch() -> None:
     assert _row_pitch(tensor[..., :1].expand_as(tensor)) == 0
 
 
-def _compare(output: Tensor, ref: Tensor, grad: Tensor, params: tuple[Tensor, ...]) -> None:
-    actual = output, *torch.autograd.grad(output, params, grad)
-    expected = ref, *torch.autograd.grad(ref, params, grad)
+def _output_and_grads(
+    output: Tensor, grad: Tensor, params: tuple[Tensor, ...],
+) -> tuple[Tensor, ...]:
+    return output, *torch.autograd.grad(output, params, grad)
+
+
+def _assert_close(
+    actual: tuple[Tensor, ...], expected: tuple[Tensor, ...], dtype: torch.dtype,
+) -> None:
     for got, want in zip(actual, expected, strict=True):
         error = (got.float() - want.float()).norm()
-        assert error <= 2 * torch.finfo(want.dtype).eps * want.float().norm() + 1e-6
+        assert error <= 2 * torch.finfo(dtype).eps * want.float().norm() + 1e-6
+
+
+def _compare(output: Tensor, ref: Tensor, grad: Tensor, params: tuple[Tensor, ...]) -> None:
+    _assert_close(
+        _output_and_grads(output, grad, params), _output_and_grads(ref, grad, params), ref.dtype,
+    )
 
 
 @CUDA
@@ -83,6 +95,7 @@ def test_channel_rmsnorm(
 @pytest.mark.parametrize("mode", ["combined_bwd", "combined_full"])
 def test_compile_fullgraph(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LNET_MODEL_W29C", mode)
+    torch.manual_seed(503)
     norm = ChannelRMSNorm(96).cuda()
     packed = torch.randn(29, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
@@ -91,4 +104,18 @@ def test_compile_fullgraph(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
 
     eager = run(packed)
     compiled = torch.compile(run, fullgraph=True)(packed)
-    _compare(compiled, eager, torch.randn_like(eager), (packed, norm.weight))
+    upstream = torch.randn_like(eager)
+    params = packed, norm.weight
+    actual = _output_and_grads(compiled, upstream, params)
+    expected = _output_and_grads(eager, upstream, params)
+    # The scale gradient is stored as FP32 after low-precision activation math.
+    # Check at activation precision and independently against FP32 arithmetic.
+    _assert_close(actual, expected, packed.dtype)
+
+    packed_fp32 = packed.detach().float().requires_grad_()
+    weight_fp32 = norm.weight.detach().float().requires_grad_()
+    value, gate = packed_fp32.chunk(2, -1)
+    reference = functional.rms_norm(value * functional.silu(gate), (96,), weight_fp32, norm.epsilon)
+    fp32 = _output_and_grads(reference, upstream.float(), (packed_fp32, weight_fp32))
+    _assert_close(expected, fp32, packed.dtype)
+    _assert_close(actual, fp32, packed.dtype)

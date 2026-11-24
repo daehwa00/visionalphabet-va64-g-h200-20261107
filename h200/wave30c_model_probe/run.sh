@@ -13,6 +13,10 @@ mkdir -p "$out"
 
 case "$phase" in
     verify)
+        if [[ ${VA_T109_ACTIVE_COMBO:-0} == 1 ]]; then
+            "$python_bin" -m pytest -v -ra tests/test_model_w30c.py
+            exit
+        fi
         LNET_MODEL_W28C=off LNET_MODEL_W29C=off LNET_MODEL_W30C=combined_v2 \
             "$python_bin" -m pytest -q tests/test_model_w30c.py
         export LNET_MODEL_W28C=off LNET_MODEL_W29C=off LNET_MODEL_W30C=combined_v2
