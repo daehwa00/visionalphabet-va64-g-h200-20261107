@@ -129,6 +129,8 @@ class Kernel:
     register_batch2: bool = False
     horizontal_unroll8: bool = False
     horizontal_forward_unroll: int = 0
+    backward_batch2: bool = False
+    backward_batch_tail: bool = False
 
 
 class Launch(NamedTuple):
@@ -727,6 +729,65 @@ __device__ void load_project_weights(
     }
 }
 
+#ifdef WAVE27A_BACKWARD_BATCH2
+template<class T, class I, class Weights>
+__device__ __forceinline__ void path_adjoint_pair(
+    const float (&p)[2][8], const float2 (&dy)[2], Weights path,
+    float* acc, I stride, float (&dp)[2][8]
+) {
+    #pragma unroll
+    for (int cell = 0; cell < 2; ++cell) {
+        acc[88 * stride] += dy[cell].x;
+        acc[89 * stride] += dy[cell].y;
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float pre[2]{}, weights[8];
+        if constexpr (Weights::vector_weights) {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 4) {
+                const auto v = path.input_group(2 * j + k / 4);
+                weights[k] = v.x;
+                weights[k + 1] = v.y;
+                weights[k + 2] = v.z;
+                weights[k + 3] = v.w;
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                const auto pair = path.input_pair(4 * I(j) + k / 2);
+                weights[k] = pair.r;
+                weights[k + 1] = pair.i;
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            pre[0] = __fmaf_rn(weights[k], p[0][k], pre[0]);
+            pre[1] = __fmaf_rn(weights[k], p[1][k], pre[1]);
+        }
+        // Keep each accumulator's updates in descending cell order.
+        const float bias = path.bias(j), wr = path.output(j), wi = path.output(8 + j);
+        #pragma unroll
+        for (int cell = 0; cell < 2; ++cell) {
+            const float z = rounded<T>(rounded<T>(pre[cell]) + bias);
+            const float sig = __fdividef(1.0f, 1.0f + __expf(-z));
+            const float act = rounded<T>(z * sig);
+            const auto d = dy[cell];
+            const float dz = rounded<T>(rounded<T>(d.x * wr + d.y * wi) *
+                                         (sig * (1.0f + z * (1.0f - sig))));
+            acc[(64 + j) * stride] += dz;
+            acc[(72 + j) * stride] += d.x * act;
+            acc[(80 + j) * stride] += d.y * act;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                dp[cell][k] += dz * weights[k];
+                acc[(8 * j + k) * stride] += dz * p[cell][k];
+            }
+        }
+    }
+}
+#endif
+
 template<class T, class I, bool COARSE, int CHUNK, int THREADS, int HIDDEN,
          bool COMPACT, bool REAL_INTERLEAVED, bool IMAG_INTERLEAVED, bool CACHE_SOURCE,
          bool PURE, class Weights>
@@ -784,7 +845,67 @@ __device__ __forceinline__ void column_backward(
             }
         }
 
+#ifdef WAVE27A_BACKWARD_BATCH2
+        static_assert(HIDDEN == 8 && CACHE_SOURCE && !PURE);
+        constexpr int step = 1 + COARSE;
+#ifdef WAVE28A_BACKWARD_BATCH_TAIL
+        // A short odd-sized segment can leave one cell for the scalar path.
+        int end = length - 1;
+        for (; end >= 2 * step - 1; end -= 2 * step) {
+#else
+        for (int end = length - 1; end >= 0; end -= 2 * step) {
+#endif
+            float p[2][8], dp[2][8]{};
+            float2 dy[2];
+            float4 next[2], next_even[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int j = end - i * step, y = y0 + j;
+                next[i] = neg;
+                neg = advance(neg, source_cache[j * THREADS].unpack(), ar, gg);
+                if constexpr (COARSE) {
+                    next_even[i] = neg;
+                    neg = advance(neg, source_cache[(j - 1) * THREADS].unpack(), ar, gg);
+                }
+                const I cell = c.cell(COARSE ? y / 2 : y);
+                dy[i] = make_float2(read(gr[(cell - c.m) * (1 + REAL_INTERLEAVED) + c.m]),
+                                    read(gi[(cell - c.m) * (1 + IMAG_INTERLEAVED) + c.m]));
+                const auto pp = normalize<T>(seg[j * THREADS], c.gain(y, false));
+                const auto pn = normalize<T>(neg, c.gain(y - int(COARSE), true));
+                p[i][0] = pp.x; p[i][1] = pp.z; p[i][2] = pn.x; p[i][3] = pn.z;
+                p[i][4] = pp.y; p[i][5] = pp.w; p[i][6] = pn.y; p[i][7] = pn.w;
+            }
+            path_adjoint_pair<T, I>(p, dy, path, acc, acc_stride, dp);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int j = end - i * step, y = y0 + j;
+                const auto ip = normalize<T>(
+                    make_float4(dp[i][0], dp[i][4], dp[i][1], dp[i][5]), c.gain(y, false));
+                g2[I(COARSE ? y / 2 : y) * g2_stride] = normalize_packed<T>(
+                    make_float4(dp[i][2], dp[i][6], dp[i][3], dp[i][7]),
+                    c.gain(y - int(COARSE), true));
+                column_adjoint<false, COMPACT>(
+                    c, y, j ? seg[(j - 1) * THREADS] : before,
+                    source_cache[j * THREADS].unpack(), ip, a, g, adj_a, adj_b, da, dg, gs);
+                if constexpr (COARSE) {
+                    column_adjoint<false, COMPACT>(
+                        c, y - 1, j > 1 ? seg[(j - 2) * THREADS] : before,
+                        source_cache[(j - 1) * THREADS].unpack(), {}, a, g,
+                        adj_a, adj_b, da, dg, gs);
+                }
+                if constexpr (full) {
+                    seg[j * THREADS] = next[i];
+                    if constexpr (COARSE) seg[(j - 1) * THREADS] = next_even[i];
+                }
+            }
+        }
+#endif
+#if !defined(WAVE27A_BACKWARD_BATCH2) || defined(WAVE28A_BACKWARD_BATCH_TAIL)
+#ifdef WAVE28A_BACKWARD_BATCH_TAIL
+        for (int j = end; j >= 0; j -= step) {
+#else
         for (int j = length - 1; j >= 0; j -= COARSE ? 2 : 1) {
+#endif
             const int y = y0 + j;
             const auto s = (COARSE || CACHE_SOURCE)
                 ? source_cache[j * THREADS].unpack() : c.source(y);
@@ -828,6 +949,7 @@ __device__ __forceinline__ void column_backward(
                 if constexpr (COARSE) seg[(j - 1) * THREADS] = next_even;
             }
         }
+#endif
     }
 
     adj_a = adj_b = {};
@@ -1425,6 +1547,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
 }}
 """
     source = _CUDA_SOURCE
+    if key.backward_batch2:
+        source = "#define WAVE27A_BACKWARD_BATCH2\n" + source
+        if key.backward_batch_tail:
+            source = "#define WAVE28A_BACKWARD_BATCH_TAIL\n" + source
     if key.horizontal_forward_unroll:
         source = source.replace(
             "// HSCAN_FORWARD_UNROLL", f"#pragma unroll {key.horizontal_forward_unroll}",
@@ -1553,7 +1679,8 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
         _ensure_context(driver, device)
         if (
             key.batch_path or key.register_path or key.horizontal_unroll8
-            or key.horizontal_forward_unroll
+            or key.horizontal_forward_unroll or key.backward_batch2
+            or (key.vertical and key.backward and key.chunk == 14 and key.cache_source)
         ):
             local = ct.c_int()
             _check_cu(
@@ -2008,6 +2135,158 @@ def _with_wave25a(launch: Launch, device: int, shape: tuple[int, int, int, int])
     return launch._replace(key=candidate, plan=plan._replace(smem=smem, cache_weights=False))
 
 
+def _wave27a_workers(launch: Launch, shape: tuple[int, ...], sms: int, resident: int) -> Launch:
+    # Each partial row launches one CTA per mode tile. Only trim a trailing
+    # wave when this preserves the maximum number of lines per worker.
+    plan, key, workers, partials = launch
+    batch, _, width, modes = shape
+    tiles = _ceil(modes, _WARP_SIZE)
+    slots = sms * resident
+    groups = (partials * tiles // slots) * slots // tiles
+    lines = batch * (width // (1 + key.coarse))
+    if groups and groups < partials and _ceil(lines, groups * plan.warps) == _ceil(lines, workers):
+        return Launch(plan, key, groups * plan.warps, groups)
+    return launch
+
+
+def _wave27a_full_trajectory(launch: Launch, device: int, height: int, limit: int) -> Launch:
+    plan, key, workers, partials = launch
+    threads = plan.warps * _WARP_SIZE
+    # Keep the existing source and adjoint cache placement. The full FP32
+    # trajectory replaces both the segment and its FP32 boundaries.
+    smem = plan.smem + threads * 16 * (height - plan.chunk - (height - 1) // plan.chunk)
+    if smem > limit:
+        return launch
+    full = replace(key, chunk=0)
+    if not _resident(device, full, smem):
+        return launch
+    return Launch(
+        plan._replace(smem=smem, full_trajectory=True, chunk=height), full, workers, partials,
+    )
+
+
+def _wave27a_horizontal(launch: Launch, device: int) -> Launch:
+    plan, key, _, _ = launch
+    if key.backward and key.warps == 4 and not key.compact:
+        candidate = replace(key, horizontal_unroll8=True)
+    elif not key.backward and key.warps == 3:
+        candidate = replace(key, horizontal_forward_unroll=8)
+    else:
+        return launch
+    return launch._replace(key=candidate) if _resident(device, candidate, plan.smem) else launch
+
+
+def _with_wave27a(  # noqa: PLR0911
+    launch: Launch, device: int, shape: tuple[int, int, int, int],
+) -> Launch:
+    preset = os.environ.get("LNET_SCAN_W27A", "off")
+    if preset not in {"auto", "wave_plan", "bwd_chunk", "bwd_batch2", "hscan_unroll"}:
+        return launch
+    plan, key, _, _ = launch
+    _, height, width, modes = shape
+    if key.dtype.itemsize != 2 or not key.index32 or (height, width, modes) not in {
+        (56, 56, 160), (28, 28, 160), (14, 14, 160), (7, 7, 128),
+    }:
+        return launch
+    if preset == "hscan_unroll":
+        if not key.vertical and height == 56 and plan.cache_line:
+            return _wave27a_horizontal(launch, device)
+        return launch
+    if (
+        not (key.vertical and key.backward and key.hidden8
+             and plan.cache_weights and plan.cache_source)
+        or key.shared_acc or key.global_checkpoints
+    ):
+        return launch
+    sms, limit, _ = device_limits(device)
+    if preset in {"auto", "wave_plan"}:
+        resident = _resident(device, key, plan.smem)
+        return _wave27a_workers(launch, shape, sms, resident) if resident else launch
+    if preset == "bwd_chunk" and height == 56 and not plan.full_trajectory:
+        return _wave27a_full_trajectory(launch, device, height, limit)
+    if preset == "bwd_batch2" and height == 56 and plan.chunk % (2 * (1 + key.coarse)) == 0:
+        candidate = replace(key, backward_batch2=True)
+        if _resident(device, candidate, plan.smem):
+            return launch._replace(key=candidate)
+    return launch
+
+
+def _wave28a_workers(
+    launch: Launch, shape: tuple[int, int, int, int], sms: int, resident: int,
+) -> Launch:
+    plan, key, workers, partials = launch
+    batch, height, width, modes = shape
+    tiles = _ceil(modes, _WARP_SIZE)
+    slots = sms * resident
+    groups = _ceil(workers, plan.warps)
+    # Keep complete mode tiles even when a wave has a few spare CTA slots.
+    aligned = (groups * tiles // slots) * slots // tiles
+    new_workers = aligned * plan.warps
+    lines = batch * (width // (1 + key.coarse) if key.vertical else height)
+    if 0 < aligned < groups and _ceil(lines, new_workers) == _ceil(lines, workers):
+        # Per-worker partials (and forward bookkeeping) follow workers.
+        new_partials = aligned if key.backward and partials == groups else new_workers
+        return launch._replace(workers=new_workers, partials=new_partials)
+    return launch
+
+
+def _wave28a_backward(
+    launch: Launch, device: int, height: int, preset: str, resident: int, limit: int,
+) -> Launch:
+    plan, key, _, _ = launch
+    if preset == "wp_vscan_opt":
+        if height != 56 or plan.full_trajectory or plan.chunk != 8:
+            return launch
+        chunk = 14
+        old_rows = plan.chunk + _ceil(height, plan.chunk) - 1
+        new_rows = chunk + _ceil(height, chunk) - 1
+        smem = plan.smem + (new_rows - old_rows) * 16 * _WARP_SIZE * plan.warps
+        candidate = replace(key, chunk=chunk)
+        if smem <= limit and _resident(device, candidate, smem) == resident:
+            return launch._replace(key=candidate, plan=plan._replace(chunk=chunk, smem=smem))
+        return launch
+    if height != 56 and preset == "wp_batch2":
+        return launch
+    cells = 2 * (1 + key.coarse)
+    tail = bool(plan.chunk % cells or height % cells)
+    candidate = replace(key, backward_batch2=True, backward_batch_tail=tail)
+    if _resident(device, candidate, plan.smem) == resident:
+        return launch._replace(key=candidate)
+    return launch
+
+
+def _with_wave28a(
+    launch: Launch, device: int, shape: tuple[int, int, int, int], *, legacy: bool = True,
+) -> Launch:
+    preset = os.environ.get("LNET_SCAN_W28A", "off")
+    if preset not in {"auto", "wp_all_waves", "wp_batch2", "wp_batch2_all", "wp_vscan_opt"}:
+        return _with_wave27a(launch, device, shape) if legacy else launch
+    plan, key, _, _ = launch
+    _, height, width, modes = shape
+    if key.dtype.itemsize != 2 or not key.index32 or (height, width, modes) not in {
+        (56, 56, 160), (28, 28, 160), (14, 14, 160), (7, 7, 128),
+    }:
+        return launch
+    cached_backward = (
+        key.vertical and key.backward and key.hidden8 and not key.pure_vertical
+        and plan.cache_weights and plan.cache_source
+        and not key.shared_acc and not key.global_checkpoints
+    )
+    hopper = torch.cuda.get_device_capability(device) == (9, 0)
+    all_waves = preset == "wp_all_waves"
+    if not (hopper if all_waves else cached_backward):
+        return launch
+    sms, limit, _ = device_limits(device)
+    resident = _resident(device, key, plan.smem)
+    if not resident:
+        return launch
+    if all_waves:
+        return _wave28a_workers(launch, shape, sms, resident)
+    if hopper:
+        launch = _wave27a_workers(launch, shape, sms, resident)
+    return _wave28a_backward(launch, device, height, preset, resident, limit)
+
+
 def _plan_launch(
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -2050,15 +2329,17 @@ def _plan_launch(
         or not plan.cache_weights or plan.cache_line or plan.warps != 1
         or shape[1] < 8 * (1 + key.coarse)
     ):
-        return _with_wave25a(launch, device, shape)
+        return _with_wave28a(_with_wave25a(launch, device, shape), device, shape)
     candidate = replace(key, batch_path=True)
     sms, _, max_warps = device_limits(device)
     resident = _resident(device, candidate, plan.smem)
     original = _resident(device, key, plan.smem)
     queued = _ceil(workers * _ceil(shape[-1], _WARP_SIZE), sms)
     if resident < min(max_warps // 4, original) or queued < 2 * resident:
-        return _with_wave25a(launch, device, shape)
-    return _with_wave25a(launch._replace(key=candidate), device, shape)
+        return _with_wave28a(_with_wave25a(launch, device, shape), device, shape)
+    return _with_wave28a(
+        _with_wave25a(launch._replace(key=candidate), device, shape), device, shape, legacy=False,
+    )
 
 
 # Custom ops and public API
