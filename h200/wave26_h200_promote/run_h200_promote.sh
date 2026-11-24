@@ -33,6 +33,12 @@ finish() {
     done
     tar -C "$transport" -cf - . | xz -9e > "$out/task93.tar.xz"
     archive_rc=$?
+    if (( archive_rc == 0 )) && (( $(wc -c < "$out/task93.tar.xz") > 45000 )); then
+        mv "$out/task93.tar.xz" "$out/task93-full.tar.xz"
+        "${PYTHON_BIN:-python3}" "$runner/compact.py" "$transport"
+        tar -C "$transport" -cf - . | xz -9e > "$out/task93.tar.xz"
+        archive_rc=$?
+    fi
     if (( archive_rc == 0 )); then
         sha256sum "$out/task93.tar.xz" | awk '{print "VA_T93_SHA256 " $1}'
         base64 -w 240 "$out/task93.tar.xz" | split -l 160 -a 4 -d - "$out/chunk-"

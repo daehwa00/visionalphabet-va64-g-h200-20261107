@@ -122,11 +122,12 @@ def regressions(out):
         )
     )
     gates["sweep"] = all(
-        (finite(row) and bool(row.get("profiler", {}).get("top_kernels") or row["profiler"].get("kernels")))
+        (finite(row) and bool(profile.get("top_kernels") or profile.get("kernels")))
         or (batch == 2048 and row.get("status") == "oom")
         for batch in (128, 512, 1024, 2048)
         for arm in ("wave21c_base", best)
         for row in (read(out, f"b{batch}_{arm}_sweep"),)
+        for profile in (row.get("profiler", {}),)
     )
     gates["no_timeouts"] = all(
         line.split("\t")[1] not in {"124", "137"}
