@@ -139,6 +139,9 @@ class Kernel:
     saved_direction: int = 0
     saved_projection_cells: int = 0
     saved_shared_fields: int = 0
+    tensor_core: bool = False
+    tc_columns: int = 0
+    tc_replay: bool = False
 
 
 class Launch(NamedTuple):
@@ -717,9 +720,9 @@ struct ProjectWeights {
     __device__ float final_bias(int field) const { return cache[(11 * size + field) * 32 + lane]; }
 };
 
-template<class T, int HIDDEN, int THREADS, bool BACKWARD>
+template<class T, int HIDDEN, int THREADS, bool BACKWARD, class W>
 __device__ void load_project_weights(
-    float* __restrict__ weights, const void* __restrict__ wi, const void* __restrict__ bi,
+    W* __restrict__ weights, const void* __restrict__ wi, const void* __restrict__ bi,
     const void* __restrict__ wo, const void* __restrict__ bo, int types, int mode0, int M,
     int hidden
 ) {
@@ -736,8 +739,10 @@ __device__ void load_project_weights(
             // Group four weights per lane so a warp can load them as float4.
             const int slot = matrix == 0
                 ? (field / 4 * 32 + mode) * 4 + field % 4 : (field0 + field) * 32 + mode;
-            weights[slot] =
-                rounded<T>(load_scalar(src, static_cast<long long>(mode0) * width + idx, dtype));
+            const float value = load_scalar(src, static_cast<long long>(mode0) * width + idx,
+                                            dtype);
+            if constexpr (sizeof(W) == sizeof(float)) weights[slot] = rounded<T>(value);
+            else weights[slot] = write<W>(value);
         }
     }
 }
@@ -1909,15 +1914,484 @@ __device__ __forceinline__ void saved_project(
 }
 """
 
+_WAVE32A_SOURCE = r"""
+template<class T> constexpr bool tc_is_half = false;
+template<> constexpr bool tc_is_half<__half> = true;
+
+template<class T>
+__device__ __forceinline__ unsigned tc_pair(float a, float b) {
+    if constexpr (sizeof(T) == 2) {
+        const typename SavedPairRaw<T>::Type pair = Pair<T>::pack({a, b}).value;
+        return unsigned(pair.x) | (unsigned(pair.y) << 16);
+    }
+}
+
+template<class T>
+__device__ __forceinline__ void tc_k8(unsigned a, unsigned b, unsigned w, float4& d) {
+#define TC_K8(DTYPE) \
+    asm("mma.sync.aligned.m16n8k8.row.col.f32." DTYPE "." DTYPE ".f32 " \
+        "{%0,%1,%2,%3},{%4,%5},{%6},{0f00000000,0f00000000,0f00000000,0f00000000};" \
+        : "=f"(d.x), "=f"(d.y), "=f"(d.z), "=f"(d.w) : "r"(a), "r"(b), "r"(w))
+    if constexpr (tc_is_half<T>) { TC_K8("f16"); }
+    else { TC_K8("bf16"); }
+#undef TC_K8
+}
+
+template<class T>
+__device__ __forceinline__ void tc_k16(unsigned a, unsigned b, unsigned c, unsigned d,
+                                      unsigned e, unsigned f, float& lo, float& hi) {
+    float unused0, unused1;
+#define TC_K16(DTYPE) \
+    asm("mma.sync.aligned.m16n8k16.row.col.f32." DTYPE "." DTYPE ".f32 " \
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,0f00000000,0f00000000};" \
+        : "=f"(lo), "=f"(hi), "=f"(unused0), "=f"(unused1) \
+        : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f), "f"(lo), "f"(hi))
+    if constexpr (tc_is_half<T>) { TC_K16("f16"); }
+    else { TC_K16("bf16"); }
+#undef TC_K16
+}
+
+template<class T>
+struct TcTile {
+    T* values;
+    int channels = 8;
+    __device__ int offset(int row, int mode, int channel) const {
+        const int index = row * channels + channel;
+        return index * 32 + (mode ^ (index % 32));
+    }
+    __device__ float get(int row, int mode, int channel) const {
+        return channel < channels ? read(values[offset(row, mode, channel)]) : 0;
+    }
+    __device__ void set(int row, int mode, int channel, float value) const {
+        values[offset(row, mode, channel)] = write<T>(value);
+    }
+    __device__ unsigned across_channels(int row, int mode, int channel) const {
+        return tc_pair<T>(get(row, mode, channel), get(row, mode, channel + 1));
+    }
+    __device__ unsigned across_rows(int row, int mode, int channel) const {
+        return tc_pair<T>(get(row, mode, channel), get(row + 1, mode, channel));
+    }
+};
+
+constexpr int tc_tile_size = 16 * 32 * 8;
+
+// Each lane owns two FP32 output elements from the low eight MMA rows.
+// dWi and dWo stay in these fragments until the CTA writes its partial row.
+struct TcGrad {
+    float wi0, wi1, wo0, wo1, bi0, bi1, bo0, bo1;
+};
+
+
+template<class T, bool BACKWARD>
+__device__ __forceinline__ void tc_path(
+    TcTile<T> x, TcTile<T> dy, TcTile<T> scratch,
+    const T* weights, int mode, int valid, TcGrad& grad
+) {
+    const int group = (threadIdx.x % 32) / 4, n = (threadIdx.x % 4) * 2;
+    const auto w1 = [&](int row, int col) {
+        return read(weights[(row * 2 + col / 4) * 128 + mode * 4 + col % 4]);
+    };
+    const auto w2 = [&](int row, int col) {
+        return read(weights[(72 + row * 8 + col) * 32 + mode]);
+    };
+    const unsigned xa = x.across_channels(group, mode, n);
+    const unsigned xb = x.across_channels(group + 8, mode, n);
+    float4 pre;
+    tc_k8<T>(xa, xb, tc_pair<T>(w1(group, n), w1(group, n + 1)), pre);
+    float2 dy0{}, dy1{};
+    if constexpr (BACKWARD) {
+        dy0 = make_float2(dy.get(group, mode, 0), dy.get(group, mode, 1));
+        dy1 = make_float2(dy.get(group + 8, mode, 0), dy.get(group + 8, mode, 1));
+    }
+    const auto activation = [&](int row, int col, float input, float2 d, float& dz) {
+        const float z = row < valid
+            ? rounded<T>(rounded<T>(input) + read(weights[(64 + col) * 32 + mode])) : 0.0f;
+        const float sig = 1.0f / (1.0f + expf(-z));
+        if constexpr (BACKWARD) {
+            const float da = rounded<T>(d.x * w2(0, col) + d.y * w2(1, col));
+            dz = row < valid ? rounded<T>(da * (sig * (1.0f + z * (1.0f - sig)))) : 0.0f;
+        }
+        return z * sig;
+    };
+    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    const float a0 = activation(group, n, pre.x, dy0, d0);
+    const float a1 = activation(group, n + 1, pre.y, dy0, d1);
+    const float a2 = activation(group + 8, n, pre.z, dy1, d2);
+    const float a3 = activation(group + 8, n + 1, pre.w, dy1, d3);
+    const unsigned aa = tc_pair<T>(a0, a1), ab = tc_pair<T>(a2, a3);
+    float4 result;
+    if constexpr (BACKWARD) {
+        const unsigned za = tc_pair<T>(d0, d1), zb = tc_pair<T>(d2, d3);
+        tc_k8<T>(za, zb, tc_pair<T>(w1(n,group), w1(n + 1,group)), result);
+        // Transpose the cell tiles via shared memory for the K=16 updates.
+        // Reuse dZ storage for activations after all lanes finish reading it.
+        scratch.set(group, mode, n, d0);
+        scratch.set(group, mode, n + 1, d1);
+        scratch.set(group + 8, mode, n, d2);
+        scratch.set(group + 8, mode, n + 1, d3);
+        __syncwarp();
+        tc_k16<T>(x.across_rows(n, mode, group), 0, x.across_rows(n + 8, mode, group), 0,
+                  scratch.across_rows(n, mode, group), scratch.across_rows(n + 8, mode, group),
+                  grad.wi0, grad.wi1);
+        if (group == 0) {
+            #pragma unroll
+            for (int row = 0; row < 16; ++row) {
+                grad.bi0 += scratch.get(row, mode, n);
+                grad.bi1 += scratch.get(row, mode, n + 1);
+                if (n == 0) {
+                    grad.bo0 += dy.get(row, mode, 0);
+                    grad.bo1 += dy.get(row, mode, 1);
+                }
+            }
+        }
+        __syncwarp();
+        scratch.set(group, mode, n, a0);
+        scratch.set(group, mode, n + 1, a1);
+        scratch.set(group + 8, mode, n, a2);
+        scratch.set(group + 8, mode, n + 1, a3);
+        __syncwarp();
+        tc_k16<T>(scratch.across_rows(n, mode, group), 0,
+                  scratch.across_rows(n + 8, mode, group), 0,
+                  dy.across_rows(n, mode, group), dy.across_rows(n + 8, mode, group),
+                  grad.wo0, grad.wo1);
+    } else {
+        const unsigned w = group < 2 ? tc_pair<T>(w2(group,n), w2(group,n + 1)) : 0;
+        tc_k8<T>(aa, ab, w, result);
+        if (n == 0) {
+            result.x = rounded<T>(result.x) + read(weights[88 * 32 + mode]);
+            result.y = rounded<T>(result.y) + read(weights[89 * 32 + mode]);
+            result.z = rounded<T>(result.z) + read(weights[88 * 32 + mode]);
+            result.w = rounded<T>(result.w) + read(weights[89 * 32 + mode]);
+        }
+    }
+    __syncwarp();
+    if (BACKWARD || n == 0) {
+        x.set(group, mode, n, result.x);
+        x.set(group, mode, n + 1, result.y);
+        x.set(group + 8, mode, n, result.z);
+        x.set(group + 8, mode, n + 1, result.w);
+    }
+}
+
+template<class I>
+__device__ __forceinline__ void tc_partial(
+    float* partial, int m, int M, const TcGrad& grad
+) {
+    const int group = (threadIdx.x % 32) / 4, n = (threadIdx.x % 4) * 2;
+    partial[I(8 * n + group) * M + m] = grad.wi0;
+    partial[I(8 * (n + 1) + group) * M + m] = grad.wi1;
+    if (n == 0) {
+        partial[I(72 + group) * M + m] = grad.wo0;
+        partial[I(80 + group) * M + m] = grad.wo1;
+    }
+    if (group == 0) {
+        partial[I(64 + n) * M + m] = grad.bi0;
+        partial[I(65 + n) * M + m] = grad.bi1;
+        if (n == 0) {
+            partial[I(88) * M + m] = grad.bo0;
+            partial[I(89) * M + m] = grad.bo1;
+        }
+    }
+}
+
+template<class T, class I, bool COARSE, int WARPS, bool BACKWARD, bool RI, bool II>
+__device__ __forceinline__ void tc_project(
+    const SavedQuad<T>* trajectory, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo, const void* bo,
+    const T* gr, const T* gi, T* real, T* imag, SavedQuad<T>* dp, float* partial,
+    int B, int H, int W, int M, int types, float eps
+) {
+    extern __shared__ float4 shared[];
+    auto* weights = reinterpret_cast<T*>(shared);
+    auto* values = weights + 90 * 32;
+    const TcTile<T> x{values}, dy{values + tc_tile_size, 2};
+    const TcTile<T> scratch{values + tc_tile_size + tc_tile_size / 4};
+    const int ow = W / (1 + COARSE), oh = H / (1 + COARSE);
+    const I cells = I(B) * oh * ow, plane = I(B) * H * ow * M;
+    const int tiles = (M - 1) / 32 + 1, lane = threadIdx.x % 32;
+    const int mode0 = blockIdx.x % tiles * 32, m = mode0 + lane;
+    const int group = blockIdx.x / tiles, groups = gridDim.x / tiles;
+    constexpr int modes_per_warp = 32 / WARPS;
+    load_project_weights<T, 8, WARPS * 32, BACKWARD>(weights, wi, bi, wo, bo, types, mode0, M, 8);
+    TcGrad grad[modes_per_warp]{};
+    const auto path = [&](I cell) {
+        const I b = cell / (I(oh) * ow);
+        const int col = cell % ow;
+        const auto c = saved_column<T, I, COARSE>(nullptr, vx, vy, b, col, m, B, H, W, M, eps);
+        const auto* pos = trajectory + (b * H * ow + col) * M + m;
+        return SavedPath<T, I, COARSE, RI, II>{c, pos, pos + plane, gr, gi, real, imag};
+    };
+    const auto row = [&](I cell) { return int(cell / ow % oh) * (1 + COARSE) + COARSE; };
+    for (I first = I(group) * 16; first < cells; first += I(groups) * 16) {
+        const int valid = int(min(I(16), cells - first));
+        for (int slot = threadIdx.x / 32; slot < 16; slot += WARPS) {
+            float features[8]{};
+            float2 g{};
+            if (m < M && slot < valid) {
+                const auto op = path(first + slot);
+                const int y = row(first + slot);
+                saved_features(op.pos_value(y), op.neg_value(y - COARSE), features);
+                if constexpr (BACKWARD) g = op.dy(y);
+            }
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) x.set(slot, lane, k, features[k]);
+            if constexpr (BACKWARD) {
+                dy.set(slot, lane, 0, g.x);
+                dy.set(slot, lane, 1, g.y);
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < modes_per_warp; ++i) {
+            const int mode = (threadIdx.x / 32) * modes_per_warp + i;
+            if (mode0 + mode < M) {
+                tc_path<T, BACKWARD>(x, dy, scratch, weights, mode, valid, grad[i]);
+            }
+        }
+        __syncthreads();
+        for (int slot = threadIdx.x / 32; slot < 16; slot += WARPS) {
+            const I cell = first + slot;
+            if (m < M && cell < cells) {
+                const auto op = path(cell);
+                const int y = row(cell);
+                if constexpr (BACKWARD) {
+                    float d[8];
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) d[k] = x.get(slot, lane, k);
+                    store_saved(dp + cell * M + m, saved_dp<false, T>(d, op.column.gain(y, false)));
+                    store_saved(dp + (cells + cell) * M + m,
+                                saved_dp<true, T>(d, op.column.gain(y - COARSE, true)));
+                } else {
+                    op.emit(y, make_float2(x.get(slot, lane, 0), x.get(slot, lane, 1)));
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if constexpr (BACKWARD) {
+        #pragma unroll
+        for (int i = 0; i < modes_per_warp; ++i) {
+            const int mode = mode0 + (threadIdx.x / 32) * modes_per_warp + i;
+            if (mode < M) tc_partial<I>(partial + I(group) * 90 * M, mode, M, grad[i]);
+        }
+    }
+}
+
+template<class T, class I, bool COARSE, int WARPS, int SLOTS, bool SAVED,
+         bool BACKWARD, bool COMPACT, bool RI, bool II>
+__device__ __forceinline__ void tc_scan(
+    const float* dr, const float* di, const float* gr_decay, const float* gi_decay,
+    const T* states, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo, const void* bo,
+    SavedQuad<T>* trajectory, const T* gr, const T* gi, T* real, T* imag,
+    SavedQuad<T>* dp, T* gs, float* partial, int B, int H, int W, int M, int types, float eps
+) {
+    constexpr int step = 1 + COARSE, stride_local = SLOTS * 32, modes_per_warp = 32 / WARPS;
+    const int ow = W / step, oh = H / step;
+    const I lines = I(B) * ow, plane = lines * H * M;
+    const int tiles = (M - 1) / 32 + 1, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int mode0 = blockIdx.x % tiles * 32, m = mode0 + lane;
+    const int group = blockIdx.x / tiles, groups = gridDim.x / tiles;
+    extern __shared__ float4 shared[];
+    auto* weights = reinterpret_cast<T*>(shared);
+    auto* values = weights + 90 * 32;
+    const TcTile<T> x{values}, dy{values + tc_tile_size, 2};
+    const TcTile<T> scratch{values + tc_tile_size + tc_tile_size / 4};
+    auto* local = reinterpret_cast<SavedQuad<T>*>(
+        values + (BACKWARD ? 2 * tc_tile_size + tc_tile_size / 4 : tc_tile_size));
+    auto* inject_neg = local + (SAVED ? 0 : (1 + BACKWARD) * I(H) * stride_local);
+    // Backward buffers the negative injections until the positive sweep finishes.
+    // Forward instead keeps the current negative recurrence beside the positive trajectory.
+    auto* adjoints = reinterpret_cast<float4*>(inject_neg + (BACKWARD ? I(oh) * stride_local : 0));
+    load_project_weights<T, 8, WARPS * 32, BACKWARD>(weights, wi, bi, wo, bo, types, mode0, M, 8);
+    TcGrad grad[modes_per_warp]{};
+    Complex da{}, dg{}, a{}, g{};
+    if (m < M) {
+        a = {dr[m], di[m]};
+        g = {gr_decay[m], gi_decay[m]};
+    }
+    const Complex ar = a.conj(), gg = g.conj();
+    const auto column = [&](I line) {
+        return saved_column<T, I, COARSE>(states, vx, vy, line / ow, line % ow, m,
+                                          B, H, W, M, eps);
+    };
+    const auto address = [&](I line, int slot, int y, bool neg) {
+        if constexpr (SAVED) {
+            return trajectory + (neg ? plane : 0) + ((line / ow * H + y) * ow + line % ow) * M + m;
+        } else {
+            return local + ((neg ? H : 0) + I(y)) * stride_local + slot * 32 + lane;
+        }
+    };
+    const auto get = [&](I line, int slot, int y, bool neg) {
+        const auto* loc = address(line, slot, y, neg);
+        if constexpr (SAVED) return load_saved(loc);
+        else return loc->unpack();
+    };
+    for (I first = I(group) * SLOTS; first < lines; first += I(groups) * SLOTS) {
+        const int valid = int(min(I(SLOTS), lines - first));
+        if constexpr (!BACKWARD || !SAVED) {
+            for (int slot = warp; slot < SLOTS; slot += WARPS) {
+                const I line = first + slot;
+                if (line < lines && m < M) {
+                    const auto c = column(line);
+                    float4 p{};
+                    #pragma unroll 1
+                    for (int y = 0; y < H; ++y) {
+                        p = advance(p, c.source(y), a, g);
+                        auto* dst = address(line, slot, y, false);
+                        if constexpr (SAVED) store_saved(dst, SavedQuad<T>::pack(p));
+                        else *dst = SavedQuad<T>::pack(p);
+                    }
+                    if constexpr (BACKWARD) {
+                        float4 n{};
+                        #pragma unroll 1
+                        for (int y = H - 1; y >= 0; --y) {
+                            n = advance(n, c.source(y), ar, gg);
+                            *address(line, slot, y, true) = SavedQuad<T>::pack(n);
+                        }
+                    }
+                }
+            }
+        }
+        for (int slot = warp; slot < SLOTS; slot += WARPS) {
+            adjoints[slot * 32 + lane] = {};
+        }
+        for (int row = oh - 1; row >= 0; --row) {
+            const int y = row * step + COARSE;
+            for (int slot = warp; slot < 16; slot += WARPS) {
+                float features[8]{};
+                float2 upstream{};
+                if (slot < valid && m < M) {
+                    const I line = first + slot;
+                    const auto c = column(line);
+                    const auto p = get(line, slot, y, false);
+                    float4 n;
+                    if constexpr (BACKWARD) {
+                        n = get(line, slot, y - COARSE, true);
+                    } else {
+                        const int offset = slot * 32 + lane;
+                        n = advance(adjoints[offset], c.source(y), ar, gg);
+                        if constexpr (SAVED) {
+                            store_saved(address(line, slot, y, true), SavedQuad<T>::pack(n));
+                        }
+                        if constexpr (COARSE) {
+                            n = advance(n, c.source(y - 1), ar, gg);
+                            if constexpr (SAVED) {
+                                store_saved(
+                                    address(line, slot, y - 1, true), SavedQuad<T>::pack(n));
+                            }
+                        }
+                        adjoints[offset] = n;
+                        n = SavedQuad<T>::pack(n).unpack();
+                    }
+                    const auto gp = c.gain(y, false), gn = c.gain(y - COARSE, true);
+                    saved_features(
+                        Quad<T>::pack(make_float4(p.x * gp.x, p.y * gp.x,
+                                                  p.z * gp.y, p.w * gp.y)).unpack(),
+                        Quad<T>::pack(make_float4(n.x * gn.x, n.y * gn.x,
+                                                  n.z * gn.y, n.w * gn.y)).unpack(), features);
+                    if constexpr (BACKWARD) {
+                        upstream = SavedPath<T, I, COARSE, RI, II>{
+                            c, nullptr, nullptr, gr, gi, real, imag}.dy(y);
+                    }
+                }
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) x.set(slot, lane, k, features[k]);
+                if constexpr (BACKWARD) {
+                    dy.set(slot, lane, 0, upstream.x);
+                    dy.set(slot, lane, 1, upstream.y);
+                }
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int i = 0; i < modes_per_warp; ++i) {
+                const int mode = warp * modes_per_warp + i;
+                if (mode0 + mode < M) {
+                    tc_path<T, BACKWARD>(x, dy, scratch, weights, mode, valid, grad[i]);
+                }
+            }
+            __syncthreads();
+            for (int slot = warp; slot < SLOTS; slot += WARPS) {
+                const I line = first + slot;
+                if (line < lines && m < M) {
+                    const auto c = column(line);
+                    if constexpr (BACKWARD) {
+                        float d[8];
+                        #pragma unroll
+                        for (int k = 0; k < 8; ++k) d[k] = x.get(slot, lane, k);
+                        const int offset = slot * 32 + lane;
+                        inject_neg[I(row) * stride_local + offset] =
+                            saved_dp<true, T>(d, c.gain(y - COARSE, true));
+                        const float4 prev_adj = adjoints[offset];
+                        Complex adj_a{prev_adj.x, prev_adj.y}, adj_b{prev_adj.z, prev_adj.w};
+                        column_adjoint<false, COMPACT>(
+                            c, y, y ? get(line, slot, y - 1, false) : float4{}, c.source(y),
+                            saved_dp<false, T>(d, c.gain(y, false)).unpack(),
+                            a, g, adj_a, adj_b, da, dg, gs);
+                        if constexpr (COARSE) {
+                            column_adjoint<false, COMPACT>(
+                                c, y - 1, y > 1 ? get(line, slot, y - 2, false) : float4{},
+                                c.source(y - 1), {}, a, g, adj_a, adj_b, da, dg, gs);
+                        }
+                        adjoints[offset] = make_float4(adj_a.r, adj_a.i, adj_b.r, adj_b.i);
+                    } else {
+                        const SavedPath<T, I, COARSE, RI, II> op{
+                            c, nullptr, nullptr, gr, gi, real, imag};
+                        op.emit(y, make_float2(x.get(slot, lane, 0), x.get(slot, lane, 1)));
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if constexpr (BACKWARD) {
+            for (int slot = warp; slot < SLOTS; slot += WARPS) {
+                const I line = first + slot;
+                if (line < lines && m < M) {
+                    const auto c = column(line);
+                    Complex adj_a{}, adj_b{};
+                    #pragma unroll 1
+                    for (int y = 0; y < H; ++y) {
+                        const auto inject = !COARSE || !(y & 1)
+                            ? inject_neg[I(y / step) * stride_local + slot * 32 + lane].unpack()
+                            : float4{};
+                        column_adjoint<true, COMPACT>(
+                            c, y, y + 1 < H ? get(line, slot, y + 1, true) : float4{},
+                            c.source(y), inject, ar, gg, adj_a, adj_b, da, dg, gs);
+                        if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if constexpr (BACKWARD) {
+        auto* row = partial + I(group) * 94 * M;
+        write_vscan_partial<WARPS, 4, I>(
+            reinterpret_cast<float*>(shared), row + m, nullptr, da, dg, m, M);
+        #pragma unroll
+        for (int i = 0; i < modes_per_warp; ++i) {
+            const int mode = mode0 + warp * modes_per_warp + i;
+            if (mode < M) tc_partial<I>(row + 4 * I(M), mode, M, grad[i]);
+        }
+    }
+}
+"""
+
 # NVRTC compilation and driver launch
 
 def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
     if key.saved_scan:
+        if key.tensor_core:
+            action = "backward" if key.backward else "forward"
+            storage = "fused_tc" if key.tc_replay else "saved_fused_tc"
+            return f"vscan_{action}_{storage}"
         if key.saved_fused:
             return "vscan_backward_saved_fused" if key.backward else "vscan_forward_saved_fused"
         suffix = ("", "_pos", "_neg")[key.saved_direction]
         name = "pure_vscan_backward_saved" if key.backward else "pure_vscan_forward_saved"
         return name + suffix
+    if key.tensor_core:
+        return "project_path_tc_backward" if key.backward else "project_path_tc_forward"
     if key.saved_projection_cells:
         return "project_path_v2_backward" if key.backward else "project_path_v2_forward"
     if key.projection:
@@ -2068,11 +2542,22 @@ def _wave31a_kernel_source(key: Kernel) -> str:
         f'void {_kernel_name(key)}'
     )
     source = _CUDA_SOURCE + _WAVE31A_SOURCE
+    if key.tensor_core:
+        source += _WAVE32A_SOURCE
     if key.saved_scan:
         if key.saved_shared_fields:
             source = f"#define WAVE31A_EXTRA_SHARED_FIELDS {key.saved_shared_fields}\n" + source
         fused = str(key.saved_fused).lower()
         compact = str(key.compact).lower()
+        scan = (
+            f"tc_scan<{io}, {index}, {coarse}, {key.warps}, {key.tc_columns}, "
+            f"{str(not key.tc_replay).lower()}, {backward}, {compact}, "
+            f"{real_interleaved}, {imag_interleaved}>"
+            if key.tensor_core else
+            f"saved_scan<{io}, {index}, {coarse}, {key.warps}, {backward}, {fused}, {compact},\n"
+            f"               {real_interleaved}, {imag_interleaved}, {precise}, "
+            f"{key.saved_direction}>"
+        )
         return source + f"""
 {entry}(
     const float* dr, const float* di, const float* gr_decay, const float* gi_decay,
@@ -2081,12 +2566,19 @@ def _wave31a_kernel_source(key: Kernel) -> str:
     SavedQuad<{io}>* trajectory, const {io}* gr, const {io}* gi, {io}* real, {io}* imag,
     SavedQuad<{io}>* dp, {io}* gs, float* partial, int B, int H, int W, int M, int types, float eps
 ) {{
-    saved_scan<{io}, {index}, {coarse}, {key.warps}, {backward}, {fused}, {compact},
-               {real_interleaved}, {imag_interleaved}, {precise}, {key.saved_direction}>(
+    {scan}(
         dr, di, gr_decay, gi_decay, states, vx, vy, wi, bi, wo, bo, trajectory,
         gr, gi, real, imag, dp, gs, partial, B, H, W, M, types, eps);
 }}
 """
+    project = (
+        f"tc_project<{io}, {index}, {coarse}, {key.warps}, {backward}, "
+        f"{real_interleaved}, {imag_interleaved}>"
+        if key.tensor_core else
+        f"saved_project<{io}, {index}, {coarse}, {key.warps}, {backward},\n"
+        f"                  {real_interleaved}, {imag_interleaved}, {precise},\n"
+        f"                  {key.saved_projection_cells}>"
+    )
     return source + f"""
 {entry}(
     const SavedQuad<{io}>* trajectory, const float* vx, const float* vy,
@@ -2094,9 +2586,7 @@ def _wave31a_kernel_source(key: Kernel) -> str:
     const {io}* gr, const {io}* gi, {io}* real, {io}* imag,
     SavedQuad<{io}>* dp, float* partial, int B, int H, int W, int M, int types, float eps
 ) {{
-    saved_project<{io}, {index}, {coarse}, {key.warps}, {backward},
-                  {real_interleaved}, {imag_interleaved}, {precise},
-                  {key.saved_projection_cells}>(
+    {project}(
         trajectory, vx, vy, wi, bi, wo, bo, gr, gi, real, imag,
         dp, partial, B, H, W, M, types, eps);
 }}
@@ -3558,7 +4048,7 @@ def _total_vram(device: torch.device) -> int:
 
 
 def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
-    if _wave31a_preset(states, coarse):
+    if _wave32a_preset(states, coarse) or _wave31a_preset(states, coarse):
         return True
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
     if not states.is_cuda or policy not in {"saved", "test_saved"}:
@@ -3901,7 +4391,7 @@ def vertical_backward(
     compact: bool = False,
     saved_features: Tensor | None = None,
 ) -> list[Tensor]:
-    if saved_features is not None and saved_features.shape[0] in _WAVE31A_PRESETS.values():
+    if saved_features is not None and saved_features.shape[0] in _SAVED_SCAN_PRESETS:
         with torch.autocast(device_type="cuda", enabled=False):
             return _wave31a_backward(
                 pole, states, auxiliary, path, (grad_real, grad_imag),
@@ -3943,6 +4433,13 @@ _WAVE31A_PRESETS = {
     "saved_decoupled": _WAVE31A_DECOUPLED,
     "saved_decoupled_v2": _WAVE31A_DECOUPLED_V2,
 }
+_WAVE32A_FUSED, _WAVE32A_SAVED_FUSED, _WAVE32A_DECOUPLED = 16, 32, 64
+_WAVE32A_PRESETS = {
+    "fused_tc": _WAVE32A_FUSED,
+    "saved_fused_tc": _WAVE32A_SAVED_FUSED,
+    "decoupled_tc": _WAVE32A_DECOUPLED,
+}
+_SAVED_SCAN_PRESETS = (*_WAVE31A_PRESETS.values(), *_WAVE32A_PRESETS.values())
 _WAVE31A_PARTIAL_BYTES = 256 * 1024**2
 @torch.compiler.assume_constant_result
 def _wave31a_memory(device: torch.device) -> tuple[int, int, int]:
@@ -3974,8 +4471,62 @@ def _wave31a_preset(states: Tensor, coarse: bool) -> int:
     return _WAVE31A_PRESETS["saved_decoupled_v2" if policy == "auto" else policy]
 
 
+@torch.compiler.assume_constant_result
+def _wave32a_capable(device: torch.device) -> bool:
+    return torch.cuda.get_device_capability(device) >= (8, 0)
+
+
+def _wave32a_preset(states: Tensor, coarse: bool) -> int:
+    policy = os.environ.get("LNET_SCAN_W32A", "off")
+    if (
+        (policy != "auto" and policy not in _WAVE32A_PRESETS)
+        or not states.is_cuda or states.ndim != 5
+        or states.dtype not in (torch.float16, torch.bfloat16)
+        or not _wave32a_capable(states.device)
+    ):
+        return 0
+    total, available, shared = _wave31a_memory(states.device)
+    _, b, h, w, m = states.shape
+    step = 1 + coarse
+    if coarse and (h % 2 or w % 2):
+        return 0
+    # Keep at least one eighth of total VRAM free beyond the new allocations.
+    budget = min(available * 7 // 8, available - total // 8)
+    for candidate in (
+        (_WAVE32A_SAVED_FUSED, _WAVE32A_DECOUPLED) if policy == "auto"
+        else (_WAVE32A_PRESETS[policy],)
+    ):
+        if candidate == _WAVE32A_FUSED:
+            break
+        shape = _wave31a_trajectory_shape(states, coarse, candidate)
+        saved = 2 * shape[0] * shape[1] * shape[2]
+        if candidate == _WAVE32A_DECOUPLED:
+            saved += 16 * b * (h // step) * (w // step) * m
+            smem = _wave32a_project_smem(backward=True)
+        else:
+            smem = _wave32a_project_smem(backward=True) + 32 * (8 * (h // step) + 16)
+        if saved + _WAVE31A_PARTIAL_BYTES <= budget and shared >= smem:
+            return candidate
+    fused_smem = _wave32a_project_smem(backward=True) + 32 * (16 * h + 8 * (h // step) + 16)
+    return _WAVE32A_FUSED if shared >= fused_smem else 0
+
+
+def _wave32a_project_smem(*, backward: bool) -> int:
+    return 90 * 32 * 2 + (36 if backward else 16) * 16 * 32
+
+
+def _wave31a_trajectory_shape(states: Tensor, coarse: bool, preset: int) -> tuple[int, int, int]:
+    if preset == _WAVE32A_FUSED:
+        return preset, 0, 0
+    _, b, h, w, m = states.shape
+    if preset in _WAVE32A_PRESETS.values():
+        # Round the whole allocation so odd mode counts cannot truncate the tail.
+        return preset, 1, _ceil(8 * b * h * (w // (1 + coarse)) * m, preset)
+    return preset, b * h * (w // (1 + coarse)), 8 * m // preset
+
+
 def _wave31a_for_inputs(states: Tensor, coarse: bool, path: list[Tensor]) -> int:
-    preset = _wave31a_preset(states, coarse)
+    preset = _wave32a_preset(states, coarse) or _wave31a_preset(states, coarse)
     return preset if preset and path and path[0].ndim == 3 and path[0].shape[1] == 8 else 0
 
 
@@ -3992,7 +4543,7 @@ def _wave31a_outputs(
     return (
         states.new_empty(primary),
         states.new_empty(shape if separate else (0,)),
-        states.new_empty((preset, b * h * (w // step), 8 * m // preset)),
+        states.new_empty(_wave31a_trajectory_shape(states, coarse, preset)),
     )
 
 
@@ -4000,9 +4551,14 @@ def _wave31a_grid(
     key: Kernel, sms: int, resident: int, work: int, modes: int, fields: int,
 ) -> tuple[int, int]:
     tiles = _ceil(modes, 32)
-    groups = min(_ceil(work, key.warps * max(1, key.saved_projection_cells)),
-                 max(1, 4 * sms * resident // tiles))
-    rows_per_group = key.warps if key.saved_projection_cells or key.saved_fused else 1
+    cells_per_group = (
+        (key.tc_columns or 16) if key.tensor_core
+        else key.warps * max(1, key.saved_projection_cells)
+    )
+    groups = min(_ceil(work, cells_per_group), max(1, 4 * sms * resident // tiles))
+    rows_per_group = (
+        key.warps if (key.saved_projection_cells or key.saved_fused) and not key.tensor_core else 1
+    )
     if fields:
         bytes_per_group = rows_per_group * fields * modes * 4
         groups = min(groups, max(1, _WAVE31A_PARTIAL_BYTES // bytes_per_group))
@@ -4011,13 +4567,15 @@ def _wave31a_grid(
 
 def _wave31a_scan_key(
     states: Tensor, coarse: bool, fused: bool, *, backward: bool, compact: bool,
-    precise: bool, interleaved: tuple[bool, bool],
+    precise: bool, interleaved: tuple[bool, bool], preset: int = 0,
 ) -> Kernel:
     return Kernel(
         states.dtype, 0, backward, vertical=True,
         coarse=coarse, compact=compact, precise=fused and precise and states.dtype == torch.float32,
         real_interleaved=fused and interleaved[0], imag_interleaved=fused and interleaved[1],
         index32=states.numel() < 2**32, saved_scan=True, saved_fused=fused,
+        tensor_core=preset in (_WAVE32A_FUSED, _WAVE32A_SAVED_FUSED),
+        tc_replay=preset == _WAVE32A_FUSED,
     )
 
 
@@ -4028,6 +4586,16 @@ def _wave31a_fused_smem(
 
 
 def _wave31a_smem(key: Kernel, output_height: int, itemsize: int) -> int:
+    if key.tensor_core:
+        smem = _wave32a_project_smem(backward=key.backward)
+        if key.tc_columns:
+            per_column = 16
+            if key.tc_replay:
+                per_column += 8 * output_height * (1 + key.coarse) * (1 + key.backward)
+            if key.backward:
+                per_column += 8 * output_height
+            smem += key.tc_columns * 32 * per_column
+        return smem
     if key.saved_projection_cells or (key.saved_fused and not key.backward):
         weight_fields = 88 if key.backward else 90
         shared_fields = 64 if key.backward and key.saved_projection_cells == 2 else 0
@@ -4054,7 +4622,8 @@ def _wave31a_plan(
         if not resident:
             continue
         grid, rows = _wave31a_grid(key, sms, resident, work, modes, fields)
-        score = min(sms * resident, grid) * key.warps
+        active = min(sms * resident, grid)
+        score = (active * (key.tc_columns or key.warps), active if key.tensor_core else 0)
         if best is None or score > best[0]:
             best = score, key, grid, rows, smem
     if best is None:
@@ -4063,6 +4632,12 @@ def _wave31a_plan(
 
 
 def _wave31a_candidates(base: Kernel) -> tuple[Kernel, ...]:
+    if base.tensor_core:
+        if base.saved_scan:
+            return tuple(replace(base, warps=8, tc_columns=count) for count in (16, 8, 4, 2, 1))
+        key = replace(base, warps=8)
+        # CUDA 12.8 can spill the 32-bit project indexing on SM 10.0.
+        return (key, replace(key, index32=False)) if key.index32 else (key,)
     # Keep more dW1 values in shared memory when register pressure causes Local spills.
     shared = (0, 64) if base.saved_fused and base.backward else (0,)
     return tuple(
@@ -4109,6 +4684,7 @@ def _wave31a_project_key(
         real_interleaved=interleaved[0], imag_interleaved=interleaved[1],
         index32=states.numel() < 2**32,
         saved_projection_cells=2 if preset == _WAVE31A_DECOUPLED_V2 else 1,
+        tensor_core=preset == _WAVE32A_DECOUPLED,
     )
 
 
@@ -4173,14 +4749,14 @@ def _vertical_forward_wave31a(
         primary.unbind(0) if planar else primary.split(states.shape[-1], dim=-1)
     )
     interleaved = (not separate and not planar,) * 2
-    fused = preset == _WAVE31A_FUSED
+    fused = preset in (_WAVE31A_FUSED, _WAVE32A_FUSED, _WAVE32A_SAVED_FUSED)
     empty = (None, None)
     with torch.autocast(device_type="cuda", enabled=False):
         states = states.contiguous()
         coefficients, gains, weights = _wave31a_parameters(pole, auxiliary, path)
         key = _wave31a_scan_key(
             states, coarse, fused, backward=False, compact=False,
-            precise=precise, interleaved=interleaved,
+            precise=precise, interleaved=interleaved, preset=preset,
         )
         _wave31a_launch_scan(
             key, states, coefficients, gains, weights, trajectory, epsilon,
@@ -4220,9 +4796,9 @@ def _wave31a_backward(
     preset = trajectory.shape[0]
     _, b, h, w, m = states.shape
     step = 1 + coarse
-    expected = (preset, b * h * (w // step), 8 * m // preset)
+    expected = _wave31a_trajectory_shape(states, coarse, preset)
     if (
-        preset not in _WAVE31A_PRESETS.values() or trajectory.shape != expected
+        preset not in _SAVED_SCAN_PRESETS or trajectory.shape != expected
         or not trajectory.is_contiguous() or trajectory.device != states.device
         or trajectory.dtype != states.dtype or (compact and not coarse)
     ):
@@ -4230,7 +4806,7 @@ def _wave31a_backward(
     grad = _vertical_adjoints(grad, states, (b, h // step, w // step, m))
     interleaved = tuple(not plane.is_contiguous() for plane in grad)
     empty = (None, None)
-    fused = preset == _WAVE31A_FUSED
+    fused = preset in (_WAVE31A_FUSED, _WAVE32A_FUSED, _WAVE32A_SAVED_FUSED)
     gs = states.new_empty((4, b, h, w // step if compact else w, m))
     states = states.contiguous()
     coefficients, gains, weights = _wave31a_parameters(pole, auxiliary, path)
@@ -4244,7 +4820,7 @@ def _wave31a_backward(
         )
     key = _wave31a_scan_key(
         states, coarse, fused, backward=True, compact=compact,
-        precise=False, interleaved=interleaved,
+        precise=False, interleaved=interleaved, preset=preset,
     )
     partial = _wave31a_launch_scan(
         key, states, coefficients, gains, weights, trajectory, epsilon, empty,
