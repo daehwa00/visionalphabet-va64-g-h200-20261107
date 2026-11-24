@@ -1464,7 +1464,9 @@ def _kernel_name(key: Kernel) -> str:
         return "reduce_path_mlp_partials"
     if key.reduction:
         return "reduce_vscan_partials" if key.vertical else "reduce_hscan_partials"
-    return "scan"
+    if key.vertical:
+        return "legacy_vscan_bwd" if key.backward else "legacy_vscan_fwd"
+    return "legacy_hscan"
 
 
 def _kernel_source(key: Kernel) -> str:
@@ -1509,7 +1511,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             key.cache_line, key.shared_acc, key.precise,
         )
     )
-    bounds = f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}) void scan'
+    bounds = (
+        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE})'
+        f" void {_kernel_name(key)}"
+    )
     compact = str(key.compact).lower()
     layout = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
     if key.vertical:
@@ -1583,9 +1588,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
                     --remaining;
                 }""")
     if key.wave37a:
-        name, width = _W37A_KERNELS[key.wave37a]
+        _, width = _W37A_KERNELS[key.wave37a]
         source = _wave37a_source(source, width, key.register_path)
-        wrapper = wrapper.replace("void scan(", f"void {name}(")
         if key.register_path:
             threads = key.warps * _WARP_SIZE
             wrapper = wrapper.replace(

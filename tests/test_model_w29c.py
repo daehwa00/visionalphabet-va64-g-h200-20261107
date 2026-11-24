@@ -186,8 +186,12 @@ def _launch_positional_count(call: ast.Call, tree: ast.Module, location: str) ->
 
 
 def test_triton_launch_signatures() -> None:
-    source = Path(model_w29c.__file__).parent
-    trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in source.rglob("*.py")}
+    source = Path(__file__).resolve().parents[1]
+    trees = {
+        path: ast.parse(path.read_text(encoding="utf-8"))
+        for folder in ("src", "tests", "scripts", "h200")
+        for path in (source / folder).rglob("*.py")
+    }
     signatures = {}
     for tree in trees.values():
         for node in ast.walk(tree):

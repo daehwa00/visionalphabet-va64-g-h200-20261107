@@ -133,10 +133,15 @@ def build_model(variant: str) -> torch.nn.Module:
 def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dict, list]:
     import torch
 
-    for _ in range(warmup):
-        step()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
+    start = time.perf_counter()
+    step()
+    torch.cuda.synchronize()
+    first_step_s = time.perf_counter() - start
+    for _ in range(warmup - 1):
+        step()
+    torch.cuda.synchronize()
     timings, outputs = [], []
     for _ in range(count):
         start = time.perf_counter()
@@ -147,6 +152,9 @@ def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dic
     p25, _, p75 = statistics.quantiles(timings, n=4, method="inclusive")
     return {
         "median_ms": median,
+        "mean_ms": statistics.mean(timings),
+        "p95_ms": statistics.quantiles(timings, n=20, method="inclusive")[-1],
+        "compile_time_s": first_step_s,
         "min_ms": min(timings),
         "max_ms": max(timings),
         "p25_ms": p25,
@@ -166,6 +174,9 @@ def kernel_bucket(name: str) -> str:
     if name in scan_kernels:
         return scan_kernels[name]
     for prefix, bucket in (
+        ("legacy_vscan", "general_vscan"),
+        ("legacy_hscan", "general_hscan"),
+        ("vscan_bwd_cta_", "general_vscan"),
         ("reader_", "factorized_reader"),
         ("stem_", "fused_stem"),
         ("triton", "triton"),
@@ -269,7 +280,7 @@ def profile_step(step: Callable) -> dict:
             for (plan, workers, partials), count in row["plans"].items()
         ]
     event_total = sum(event_ms.values())
-    if event_total:
+    if event_total and buckets["general_scan_shared"]:
         shared = buckets.pop("general_scan_shared")
         for axis, elapsed in event_ms.items():
             buckets[axis] += shared * elapsed / event_total
@@ -277,7 +288,10 @@ def profile_step(step: Callable) -> dict:
         "self_cuda_ms_by_bucket": buckets,
         "dispatches_by_profiler_bucket": dispatches,
         "general_cuda_scans": len(launches),
-        "general_cuda_scans_verified": len(launches) > 0 and dispatches["general_scan_shared"] > 0,
+        "general_cuda_scans_verified": len(launches) > 0 and any(
+            dispatches[bucket]
+            for bucket in ("general_scan_shared", "general_hscan", "general_vscan")
+        ),
         "scan_axis_cuda_event_ms": event_ms,
         "scan_shape_cuda_events": sorted(shapes.values(), key=lambda row: -row["cuda_event_ms"]),
         "scan_axis_attribution": "Profiler shared scan time apportioned by CUDA event durations",
@@ -285,7 +299,9 @@ def profile_step(step: Callable) -> dict:
     }
 
 
-def train_arm(args: argparse.Namespace) -> dict:
+def train_arm(
+    args: argparse.Namespace, *, profiler: Callable[[Callable], dict] | None = None,
+) -> dict:
     import torch
     import va_model_builder as builder
 
@@ -320,10 +336,13 @@ def train_arm(args: argparse.Namespace) -> dict:
         },
     )
 
-    def backward() -> torch.Tensor:
+    def forward() -> torch.Tensor:
         mark_model_w36b_step_begin()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = torch.nn.functional.cross_entropy(compiled(inputs)[0], labels)
+            return torch.nn.functional.cross_entropy(compiled(inputs)[0], labels)
+
+    def backward() -> torch.Tensor:
+        loss = forward()
         loss.backward()
         return loss.detach()
 
@@ -347,9 +366,17 @@ def train_arm(args: argparse.Namespace) -> dict:
         running_ms_finite=bool(rms.running_ms.isfinite().all()),
     )
     if "cuda_graphs" in features:
-        with count_cudagraph_replays() as replays:
-            backward()
-        result["cudagraph_replays_per_forward_backward"] = len(replays)
+        with count_cudagraph_replays() as forward_replays:
+            diagnostic_loss = forward()
+        with count_cudagraph_replays() as backward_replays:
+            diagnostic_loss.backward()
+        result["cudagraph_replays_per_forward_backward"] = (
+            len(forward_replays) + len(backward_replays)
+        )
+        result["cudagraph_replays_by_phase"] = {
+            "forward": len(forward_replays), "backward": len(backward_replays),
+        }
+        del diagnostic_loss
     else:
         backward()
     gradients = [p.grad for p in model.parameters() if p.grad is not None]
@@ -366,7 +393,10 @@ def train_arm(args: argparse.Namespace) -> dict:
     optimizer.zero_grad(set_to_none=True)
     if args.profile:
         write_json(args.out, {**result, "status": "profiling"})
-        result["profiler"] = profile_step(step)
+        try:
+            result["profiler"] = (profiler or profile_step)(step)
+        except Exception:  # noqa: BLE001 - preserve timing after a profiler failure
+            result["profiler_error"] = traceback.format_exc()
     return result
 
 
@@ -408,6 +438,8 @@ def infer_fold(args: argparse.Namespace) -> dict:
     from lnet.image_layers import fold_terminal_rms_for_inference
 
     inputs = setup(args.batch)
+    torch.set_float32_matmul_precision(getattr(args, "precision", "high"))
+    torch.backends.cudnn.benchmark = False
     model = build_model(args.variant)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         # Initialize evaluation scales from a clean synthetic batch.
@@ -467,6 +499,7 @@ def infer_fold(args: argparse.Namespace) -> dict:
             guard = False
     diff = float((expected - actual).abs().max())
     return {
+        "precision": precision,
         "unfolded": unfolded,
         "folded": folded,
         "max_abs_logit_diff": diff,
@@ -749,6 +782,8 @@ def main() -> None:
         if name in {"train-arm", "infer-fold"}:
             sub.add_argument("--variant", required=True, choices=VARIANTS)
             sub.add_argument("--batch", required=True, type=int)
+        if name == "infer-fold":
+            sub.add_argument("--precision", choices=("high", "highest"), default="high")
         if name == "train-arm":
             sub.add_argument("--profile", action="store_true")
         if name == "dynamo":

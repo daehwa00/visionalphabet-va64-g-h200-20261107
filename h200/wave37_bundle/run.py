@@ -1,0 +1,246 @@
+"""Run the isolated arm and verification subprocesses and emit JSON results."""
+# ruff: noqa: S603, T201, BLE001
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tarfile
+import time
+import traceback
+from pathlib import Path
+
+from h200.liverms_v2_opt import bench_h200 as bench
+from h200.wave37_bundle.metrics import ARMS, BASE, COMBO, OFF, nograph_preset, select
+
+BENCH = "h200.liverms_v2_opt.bench_h200"
+VARIANT = "17-p1-nr4-1024d-v3"
+VERIFY_PRESET = ("cta_acc_k2", "capture_safe_ortho,max_autotune_gemm")
+TESTS = {
+    "scan": ("tests/test_general_cuda_scans.py", "-k", "wave37a"),
+    "model": ("tests/test_model_w36b.py",),
+    "reader": ("tests/test_factorized_reader_kernels.py", "-k", "not slow"),
+}
+METRICS = (
+    "median_ms", "mean_ms", "min_ms", "max_ms", "p95_ms", "img_per_sec", "compile_time_s",
+    "peak_allocated_gib", "peak_reserved_gib", "loss_finite", "grad_finite", "loss_value",
+    "total_self_cuda_ms", "wall_minus_cuda_ms", "buckets", "subkernels", "top_kernels", "finite",
+    "error", "cudagraph_replays", "cudagraph_log_notes",
+)
+
+
+def run(  # noqa: C901, PLR0912, PLR0915 - contain all subprocess and parse failures
+    root: Path, name: str, presets: tuple[str, str], args: list[str], limit: int, *,
+    pytest_mode: bool = False,
+) -> dict:
+    target = root / "json" / f"{name}.json"
+    log = root / f"{name}.log"
+    env = {
+        **os.environ,
+        "LNET_SCAN_W37A": presets[0],
+        "LNET_MODEL_W36B": presets[1],
+        "TORCHINDUCTOR_CACHE_DIR": str(root / "inductor" / name),
+        "TRITON_CACHE_DIR": str(root / "triton" / name),
+        "CUDA_CACHE_PATH": str(root / "cuda" / name),
+    }
+    if "cuda_graphs" in presets[1].split(",") or name == "pytest_model":
+        env["TORCH_LOGS"] = "cudagraphs"
+    if not pytest_mode:
+        args = [*args, "--out", str(target)]
+    start = time.monotonic()
+    error = {}
+    rc = None
+    try:
+        with log.open("wb") as stream, subprocess.Popen(
+            [sys.executable, *args], env=env, stdout=stream, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        ) as proc:
+            try:
+                rc = proc.wait(timeout=limit)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                error = {"status": "timeout", "error": f"Exceeded {limit} seconds"}
+    except Exception:
+        error = {"status": "error", "error": traceback.format_exc()}
+    elapsed = time.monotonic() - start
+    output = log.read_text(errors="replace") if log.exists() else ""
+    try:
+        if pytest_mode:
+            row = bench.wrap_pytest(argparse.Namespace(log=log, exit_code=rc, elapsed=elapsed))
+            for key in ("tail", "scan_plan_tests", "dynamo_tests", "by_file"):
+                row.pop(key, None)
+            cases = selected_cases(output, name)
+            row["selected_passes"] = len(cases)
+            if name != "pytest_scan":
+                row["passed_cases"] = cases
+        else:
+            row = json.loads(target.read_text()) if target.exists() else {}
+    except Exception:
+        row = {}
+        error.setdefault("error", traceback.format_exc())
+    if (rc != 0 or not row or error) and not error.get("status"):
+        error.update(status="error", error=error.get("error", f"Child exit code {rc}"))
+    row.update(error, presets=presets, duration_seconds=round(elapsed, 3), returncode=rc)
+    if row.get("status") != "ok":
+        row["log_tail"] = output[-2600:]
+    if "TORCH_LOGS" in env:
+        notes = []
+        for line in output.splitlines():
+            lower = line.lower()
+            is_graph = "cudagraph" in lower or "cuda graph" in lower
+            if is_graph and ("skip" in lower or "replay" in lower):
+                note = line.split("] ", 1)[-1].strip()[:480]
+                if note not in notes:
+                    notes.append(note)
+        row["cudagraph_log_notes"] = notes[:20]
+    bench.write_json(target, row)
+    print(f"{name}: {row.get('status')} ({elapsed:.1f}s)", file=sys.stderr, flush=True)
+    return row
+
+
+def selected_cases(output: str, name: str) -> list[str]:
+    patterns = {
+        "pytest_reader": ("test_singleton_strict_fp32", "shape0-1-1-1-dtype0",
+                          "shape2-64-6-True"),
+        "pytest_model": ("replay", "autotune", "parity"),
+        "pytest_scan": ("test_cuda_wave37a_parity",),
+    }
+    cases = re.findall(
+        r"^tests/[^:\n]+::([^\s]+)[ \t]+(?:(?!^tests/).)*?\bPASSED\b",
+        output, flags=re.MULTILINE | re.DOTALL,
+    )
+    return [case for case in cases if any(key in case for key in patterns.get(name, ()))]
+
+
+def arm(root: Path, name: str, presets: tuple[str, str]) -> dict:
+    autotune = any(feature.startswith("max_autotune_gemm") for feature in presets[1].split(","))
+    limit = 600 if autotune else 300
+    row = run(root, name, presets, ["-m", "h200.wave37_bundle.arm"], limit)
+    losses = row.get("losses", {})
+    row.setdefault("loss_value", losses.get("last"))
+    row.setdefault("loss_finite", row.get("finite_losses"))
+    row.setdefault("grad_finite", row.get("finite_gradients"))
+    row.setdefault("img_per_sec", row.get("images_per_second"))
+    if row["loss_finite"] is not None and row["grad_finite"] is not None:
+        row.setdefault("finite", row["loss_finite"] and row["grad_finite"])
+    if row.get("cudagraph_replays") is None:
+        row["cudagraph_replays"] = row.get("cudagraph_replays_per_forward_backward")
+    for field in METRICS:
+        row.setdefault(field, None)
+    bench.write_json(root / "json" / f"{name}.json", row)
+    return row
+
+
+def fold_passed(row: dict) -> bool:
+    return (
+        row.get("status") == "ok" and row.get("strict_reload_max_abs_logit_diff") == 0.0
+        and row.get("folded_train_guard") is True
+    )
+
+
+def verification(root: Path, presets: tuple[str, str]) -> dict:
+    tests = {
+        name: run(root, f"pytest_{name}", OFF,
+                  ["-m", "pytest", "-q", "-vv", *(["-s"] if name == "model" else []), *args],
+                  600 if name == "model" else 300,
+                  pytest_mode=True)
+        for name, args in TESTS.items()
+    }
+    dynamo = run(root, "dynamo", presets, ["-m", BENCH, "dynamo"], 240)
+    graphs = [count for modes in dynamo.get("graphs", {}).values() for count in modes.values()]
+    folds = {}
+    for name, spec in (("base", OFF), ("combo", presets)):
+        folds[name] = run(
+            root, f"fold_{name}", spec,
+            ["-m", BENCH, "infer-fold", "--variant", VARIANT, "--batch", "2",
+             "--precision", "highest"], 300,
+        )
+    return {
+        "pytest_scan": tests["scan"].get("status") == "ok"
+        and tests["scan"].get("selected_passes") == 80,
+        "pytest_model": tests["model"].get("status") == "ok"
+        and (tests["model"].get("counts") or {}).get("skipped", 0) == 0
+        and any("replay" in case for case in tests["model"]["passed_cases"]),
+        "pytest_reader": tests["reader"].get("status") == "ok"
+        and (tests["reader"].get("counts") or {}).get("passed", 0) >= 167
+        and any("shape2-64-6-True" in case for case in tests["reader"]["passed_cases"])
+        and any("shape0-1-1-1-dtype0" in case for case in tests["reader"]["passed_cases"]),
+        "dynamo": len(graphs) == 18 and all(count == [1, 0] for count in graphs),
+        **{f"fold_{name}": fold_passed(row) for name, row in folds.items()},
+    }
+
+
+def benchmark(root: Path) -> None:
+    device = run(root, "device", OFF, ["-m", BENCH, "probe"], 60)
+    if not (
+        device.get("status") == "ok" and "H200" in device["gpu"]
+        and device["vram_gib"] >= 139 and device["sm_count"] == 132
+        and device["capability"] == [9, 0]
+    ):
+        bench.write_json(root / "json" / "summary.json",
+                         {"status": "error", "error": "Expected a Whole H200"})
+        return
+    rows = {name: arm(root, name, presets) for name, presets in ARMS.items()}
+    selection = select(rows)
+    presets = tuple(selection["presets"])
+    if selection["winners"]:
+        arm(root, COMBO, presets)
+        arm(root, f"{COMBO}_rev", presets)
+    arm(root, f"{BASE}_rev", OFF)
+    if presets[0] != "off" and "cuda_graphs" in presets[1].split(","):
+        arm(root, f"{COMBO}_nograph", nograph_preset(presets))
+    gates = verification(root, presets if selection["winners"] else VERIFY_PRESET)
+    bench.write_json(root / "json" / "summary.json", {
+        "status": "ok" if all(gates.values()) else "verification_failed",
+        "selection": selection,
+        "verification": gates,
+        "commit": env_commit(),
+        "compile_time_s_definition": "First training step including lazy compilation and execution",
+        "workload": {"model": VARIANT, "batch": 1024, "dtype": "BF16", "warmup": 3, "iters": 8},
+    })
+
+
+def env_commit() -> str:
+    return os.environ.get("VA_BUNDLE_COMMIT", "unknown")
+
+
+def transport(root: Path) -> None:
+    archive = root / "task134.tar.xz"
+    with tarfile.open(archive, "w:xz", preset=9) as stream:
+        for path in sorted((root / "json").glob("*.json")):
+            stream.add(path, arcname=path.name)
+    raw = archive.read_bytes()
+    encoded = base64.b64encode(raw).decode("ascii")
+    print(f"VA_T134_SHA256 {hashlib.sha256(raw).hexdigest()}")
+    print(f"VA_T134_BASE64_CHARS {len(encoded)}")
+    if len(encoded) >= 45_000:
+        raise RuntimeError(f"Archive exceeded cap; compact JSON retained in {root}")
+    print("VA_T134_BEGIN")
+    for start in range(0, len(encoded), 240):
+        print(f"VA_T134_XZ {encoded[start:start + 240]}")
+    print("VA_T134_END", flush=True)
+
+
+def main() -> None:
+    root = Path(sys.argv[1])
+    (root / "json").mkdir()
+    try:
+        benchmark(root)
+    except Exception:
+        bench.write_json(root / "json" / "summary.json",
+                         {"status": "runner_error", "error": traceback.format_exc()})
+    finally:
+        transport(root)
+    summary = json.loads((root / "json" / "summary.json").read_text())
+    if summary["status"] != "ok":
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
