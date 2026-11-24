@@ -176,7 +176,10 @@ def _residual_rmsnorm_backward(
 def _save_rmsnorm_w34c(ctx, inputs, keyword_only_inputs, output) -> None:  # noqa: ARG001
     x, residual, weight, epsilon = inputs
     _, added, inverse = output
-    ctx.mark_non_differentiable(inverse)
+    if residual is None:
+        ctx.mark_non_differentiable(added, inverse)
+    else:
+        ctx.mark_non_differentiable(inverse)
     ctx.set_materialize_grads(False)
     ctx.epsilon = epsilon
     ctx.save_for_backward(x if residual is None else added, weight, inverse)

@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
+from lnet import model_w29c, model_w34c
 from lnet.memory_backbone import ChannelRMSNorm, SwiGLU
 from lnet.model_w29c import model_w29c_enabled, model_w34c_mode
 from lnet.model_w34c import rmsnorm_w34c
@@ -45,6 +46,36 @@ def test_full_policy(capability: tuple[int, int], monkeypatch: pytest.MonkeyPatc
 def _assert_parity(actual: Tensor, expected: Tensor, dtype: torch.dtype) -> None:
     error = (actual.float() - expected.float()).norm()
     assert error <= 4 * torch.finfo(dtype).eps * expected.float().norm() + 1e-6
+
+
+def test_compiled_standalone_rmsnorm_has_no_residual_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def wrap(_kernel):
+        def launch(x, weight, y, inverse, *_args: object, **_kwargs: object) -> None:
+            inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
+            inverse.copy_(inv)
+            y.copy_(x * inv * weight)
+
+        return {(1,): launch}
+
+    monkeypatch.setattr(model_w34c, "wrap_triton", wrap)
+    monkeypatch.setattr(model_w34c, "_sm_count", lambda _: 1)
+    monkeypatch.setattr(model_w29c, "rmsnorm_eligible", lambda *_: False)
+    x = torch.randn(2, 8, requires_grad=True)
+    weight = torch.randn(8, requires_grad=True)
+
+    def run(x: Tensor, weight: Tensor) -> tuple[Tensor, Tensor]:
+        y, added, _ = rmsnorm_w34c(x, None, weight, 1e-6, save_inverse=True)
+        return y, added
+
+    y, added = torch.compile(run, backend="aot_eager", fullgraph=True)(x, weight)
+    assert added.shape == (0,)
+    assert not added.requires_grad
+    expected = functional.rms_norm(x, (8,), weight, 1e-6)
+    actual_grads = torch.autograd.grad(y.sum(), (x, weight))
+    expected_grads = torch.autograd.grad(expected.sum(), (x, weight))
+    torch.testing.assert_close(actual_grads, expected_grads)
 
 
 @CUDA
