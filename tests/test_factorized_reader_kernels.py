@@ -812,3 +812,84 @@ def test_wave29b_full_hopper_parity(monkeypatch, height, dtype) -> None:
     torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-4)
     torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
     torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize(
+    ("preset", "arch", "expected"),
+    [
+        (None, (9, 0), "off"),
+        ("off", (9, 0), "off"),
+        ("unknown", (9, 0), "off"),
+        ("auto", (9, 0), "full_w30b"),
+        ("auto", (8, 6), "off"),
+        ("dweight_low_traffic", (8, 9), "off"),
+        *((preset, (9, 0), preset) for preset in kernels._WAVE30B_PRESETS),
+    ],
+)
+def test_wave30b_preset_gate(monkeypatch, preset, arch, expected) -> None:
+    if preset is None:
+        monkeypatch.delenv("LNET_READER_W30B", raising=False)
+    else:
+        monkeypatch.setenv("LNET_READER_W30B", preset)
+    monkeypatch.setenv("LNET_READER_VEC", "auto")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: arch)
+    projected = torch.empty((1024, 7, 7, 512), device="meta", dtype=torch.float16)
+    real = projected.new_empty((128, 4, 3, 3))
+    assert kernels._wave30b_preset(projected, real, None, strict=False) == expected
+    assert kernels._wave30b_preset(projected, real, None, strict=True) == "off"
+    assert kernels._wave30b_preset(projected[:, :, :6], real, None, strict=False) == "off"
+    wrong_grad = projected.new_empty((1024, 7, 7, 256), dtype=torch.bfloat16)
+    assert kernels._wave30b_preset(projected, real, wrong_grad, strict=False) == "off"
+    monkeypatch.setenv("LNET_READER_VEC", "1")
+    assert kernels._wave30b_preset(projected, real, None, strict=False) == "off"
+
+
+@pytest.mark.parametrize("height", [7, 14, 28, 56])
+def test_wave30b_spatial_arm_composition(height) -> None:
+    geometry = kernels._wave30b_spatial_geometry
+    for op in ("forward", "dinput"):
+        wide = geometry(height, op, "wide_col_spatial")
+        assert geometry(height, op, "full_w30b") == wide
+        assert geometry(height, op, "dweight_low_traffic") == kernels._wave29b_spatial_geometry(
+            height, op, "hiocc_dinput_v2",
+        )
+        scalar = geometry(height, op, "fwd_scalar_wide")
+        if op == "forward":
+            assert scalar == (1, height, 4, 1)
+        else:
+            assert scalar == wide
+        if height >= 28:
+            assert wide.columns == height
+
+
+@requires_cuda
+@pytest.mark.parametrize("height", [7, 14, 28, 56])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("preset", ["full_w30b", "fwd_scalar_wide"])
+def test_wave30b_hopper_parity(monkeypatch, height, dtype, preset) -> None:
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Hopper SM 9.0 is required")
+    torch.manual_seed(103)
+    modes = 128 if height == 7 else 160
+    batch = kernels._ceildiv(kernels._SPECIALIZE_MIN_PIXELS, height**2)
+    kwargs = {"device": "cuda", "dtype": dtype}
+    projected = torch.randn(batch, height, height, 4 * modes, **kwargs) * 0.125
+    grad = torch.randn(batch, height, height, 2 * modes, **kwargs) * 0.125
+    real, imag = (torch.randn(2, modes, 4, 3, 3, **kwargs) * 0.125).unbind()
+    monkeypatch.setenv("LNET_READER_VEC", "auto")
+    monkeypatch.setenv("LNET_READER_W25B", "auto")
+    monkeypatch.setenv("LNET_READER_W27B", "off")
+    monkeypatch.setenv("LNET_READER_W28B", "bwd_hiocc_v2")
+    monkeypatch.setenv("LNET_READER_W29B", "hiocc_dinput_v2")
+    monkeypatch.setenv("LNET_READER_W30B", "off")
+    expected = kernels._packed_spatial(projected, real, imag, strict_complex=False)
+    expected_dx, expected_dw = kernels._packed_spatial_backward(
+        grad, projected, real, imag, strict_complex=False,
+    )
+    monkeypatch.setenv("LNET_READER_W30B", preset)
+    assert kernels._wave30b_preset(projected, real, grad, strict=False) == preset
+    actual = kernels._packed_spatial(projected, real, imag, strict_complex=False)
+    dx, dw = kernels._packed_spatial_backward(grad, projected, real, imag, strict_complex=False)
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-4)
+    torch.testing.assert_close(dx, expected_dx, rtol=0.008, atol=2e-4)
+    torch.testing.assert_close(dw, expected_dw, rtol=2e-5, atol=2e-5)

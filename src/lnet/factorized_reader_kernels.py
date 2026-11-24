@@ -1504,16 +1504,56 @@ def _wave29b_spatial_geometry(height: int, op: str, preset: str) -> _VectorLaunc
     return _VectorLaunch(vec, _reader_vector_columns(height, vec), rows, warps)
 
 
+_WAVE30B_PRESETS = ("wide_col_spatial", "fwd_scalar_wide", "dweight_low_traffic", "full_w30b")
+_WAVE30B_WIDE_FORWARD = {56: _VectorLaunch(2, 56, 8, 1), 28: _VectorLaunch(2, 28, 7, 1)}
+_WAVE30B_SCALAR_FORWARD = {
+    height: _VectorLaunch(1, height, 4, 1) for height in (7, 14, 28, 56)
+}
+_WAVE30B_WIDE_DINPUT = {56: _VectorLaunch(1, 56, 7, 2), 28: _VectorLaunch(1, 28, 4, 2)}
+
+
+def _wave30b_preset(
+    projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
+) -> str:
+    preset = os.environ.get("LNET_READER_W30B", "off")
+    if preset not in (*_WAVE30B_PRESETS, "auto") or not _hopper_reader_eligible(
+        projected, real, grad, strict=strict, include_compact=True,
+    ):
+        return "off"
+    if torch.cuda.get_device_capability(projected.device) != (9, 0):
+        return "off"
+    return "full_w30b" if preset == "auto" else preset
+
+
+def _wave30b_spatial_geometry(height: int, op: str, preset: str) -> _VectorLaunch | None:
+    if preset != "dweight_low_traffic":
+        if op == "forward":
+            if preset == "fwd_scalar_wide":
+                return _WAVE30B_SCALAR_FORWARD[height]
+            if height in _WAVE30B_WIDE_FORWARD:
+                return _WAVE30B_WIDE_FORWARD[height]
+        if op == "dinput" and height in _WAVE30B_WIDE_DINPUT:
+            return _WAVE30B_WIDE_DINPUT[height]
+    return _wave29b_spatial_geometry(height, op, "hiocc_dinput_v2")
+
+
 def _hopper_reader_spatial(
     projected: Tensor, real: Tensor, grad: Tensor | None, op: str, *, strict: bool,
 ) -> tuple[_VectorLaunch, _CudaModule] | None:
-    wave29b = _wave29b_preset(projected, real, grad, strict=strict)
+    wave30b = _wave30b_preset(projected, real, grad, strict=strict)
+    wave29b = (
+        _wave29b_preset(projected, real, grad, strict=strict)
+        if wave30b == "off" else "hiocc_dinput_v2"
+    )
     batch, height, width, _ = projected.shape
     modes, rank, kernel, _ = real.shape
     columns = None
     stream_forward = op == "forward" and wave29b in ("fwd_stream_vec2", "full_w29b")
     if wave29b != "off":
-        launch = _wave29b_spatial_geometry(height, op, wave29b)
+        launch = (
+            _wave29b_spatial_geometry(height, op, wave29b) if wave30b == "off"
+            else _wave30b_spatial_geometry(height, op, wave30b)
+        )
         if launch is None:
             return None
         vec, columns, rows, warps = launch
@@ -1560,17 +1600,28 @@ _HOPPER_WEIGHT_OVERRIDES = {
 _WAVE29B_WEIGHT = {56: (2, 1, 8, 3), 28: (1, 2, 7, 2), 7: (1, 2, 7, 2)}
 
 
+# Full-rank scalar gradients read each gradient window once per spatial tile.
+_WAVE30B_WEIGHT = {56: (1, 4, 8, 2), 28: (1, 4, 7, 2), 7: (1, 4, 2, 1)}
+
+
 def _hopper_reader_weight(
     projected: Tensor, real: Tensor, grad: Tensor, *, strict: bool, sms: int,
 ) -> tuple[int, tuple[int, int, int], _CudaModule, int] | None:
-    wave29b = _wave29b_preset(projected, real, grad, strict=strict)
+    wave30b = _wave30b_preset(projected, real, grad, strict=strict)
+    wave29b = (
+        _wave29b_preset(projected, real, grad, strict=strict)
+        if wave30b == "off" else "hiocc_dinput_v2"
+    )
     _, height, _, _ = projected.shape
+    low_traffic = wave30b in ("dweight_low_traffic", "full_w30b") and height in _WAVE30B_WEIGHT
     tuned = wave29b in ("hiocc_dweight", "full_w29b") and height in _WAVE29B_WEIGHT
     wave28b = (
         "bwd_hiocc_v2" if wave29b != "off"
         else _wave28b_preset(projected, real, grad, strict=strict)
     )
-    if tuned:
+    if low_traffic:
+        config = _WAVE30B_WEIGHT[height]
+    elif tuned:
         config = _WAVE29B_WEIGHT[height]
     elif wave28b != "off":
         if height == 7:
@@ -1597,6 +1648,7 @@ def _hopper_reader_weight(
         resident = _reader_resident(module, "dweight", geometry[2])
     if not resident:
         return None
+    tuned = tuned or low_traffic
     cta_budget = ctas_per_sm * sms * (resident if tuned else 1)
     if tuned or (height == 14 and wave28b == "bwd_hiocc_v2"):
         # Avoid starting another wave with a single extra worker.
