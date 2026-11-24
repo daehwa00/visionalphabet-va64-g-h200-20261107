@@ -216,7 +216,8 @@ def _channel_rmsnorm_backward(
     partial = x.new_empty((ctas, width) if need_dw else (0,), dtype=torch.float32)
     wrap_triton(_rmsnorm_backward_kernel)[(ctas,)](
         x, weight, inverse, grad, dx, partial, rows, width, _row_pitch(x), _row_pitch(grad),
-        block_rows, triton.next_power_of_2(width), need_dx, need_dw, enable_fp_fusion=False,
+        block_rows, triton.next_power_of_2(width), need_dx, need_dw,
+        reduce_in_loop=False, enable_fp_fusion=False,
     )
     dw = partial.sum(0).to(weight.dtype) if need_dw else weight.new_empty((0,))
     return dx, dw

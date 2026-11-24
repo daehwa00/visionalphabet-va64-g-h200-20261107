@@ -19,6 +19,7 @@ def model_opt_mode(legacy_env: str) -> str:
     return "off" if policy == "off" else os.environ.get(legacy_env, "auto")
 
 
+@torch.compiler.assume_constant_result
 def model_cuda_supported(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.get_device_capability(device) >= (8, 0)
 
