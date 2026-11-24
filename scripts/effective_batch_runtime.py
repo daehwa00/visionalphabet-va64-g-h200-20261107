@@ -22,6 +22,8 @@ from effective_batch_search import baseline_microbatches, measure, valid_receipt
 from effective_batch_update import run_update
 from imagenet100_checkpoint_runtime import atomic_json
 
+from lnet.model_w36b import compile_model_w36b_update
+
 Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor, float | torch.Tensor]
 
 
@@ -30,6 +32,7 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
         super().__init__(*args, **kwargs)
         self.decisions = {}
         self.fallbacks = {}
+        self.compiled_update = compile_model_w36b_update(self.model, self.optimizer)
 
     def saved(self, key: str) -> dict[str, Any] | None:
         doc = read_json(self.base / (key + ".json"))
@@ -174,6 +177,7 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
             microbatch = min(
                 count, min((d["microbatch"] for d in self.decisions.values()), default=32)
             )
+        options = {"compiled_update": self.compiled_update} if self.compiled_update else {}
         return run_update(
             self.model,
             self.runtime_for(microbatch),
@@ -182,4 +186,5 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
             microbatch,
             self.recipe["precision"],
             metrics=True,
+            **options,
         )

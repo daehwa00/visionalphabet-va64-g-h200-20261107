@@ -11,31 +11,38 @@ from __future__ import annotations
 
 import math
 import os
-from typing import TYPE_CHECKING, Final
+from typing import Final
 
 import torch
 from torch import Tensor, nn
-
-if TYPE_CHECKING:
-    from torch.autograd.function import FunctionCtx
 
 DEFAULT_TAYLOR_DEGREE: Final = 14
 DEFAULT_SCALING_STEPS: Final = 2
 
 
-class _AutocastIsolatedMatmul(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: FunctionCtx, left: Tensor, right: Tensor) -> Tensor:
-        ctx.save_for_backward(left, right)
-        return left @ right
+@torch.library.custom_op("lnet::ortho_mm", mutates_args=())
+def _ortho_mm(left: Tensor, right: Tensor) -> Tensor:
+    # Keep the polynomial opaque to Inductor's GEMM template epilogue fusion.
+    with torch.amp.autocast(device_type=left.device.type, enabled=False):
+        return torch.mm(left, right)
 
-    @staticmethod
-    def backward(ctx: FunctionCtx, gradient: Tensor) -> tuple[Tensor, Tensor]:
-        left, right = ctx.saved_tensors
-        # AOTAutograd may trace this backward under the ambient forward
-        # autocast policy. Keep the polynomial VJP at its forward dtype.
-        with torch.amp.autocast(device_type=left.device.type, enabled=False):
-            return gradient @ right.mT, left.mT @ gradient
+
+@_ortho_mm.register_fake
+def _ortho_mm_fake(left: Tensor, right: Tensor) -> Tensor:
+    return left.new_empty((left.shape[0], right.shape[1]))
+
+
+def _save_ortho_mm_inputs(ctx, inputs, output) -> None:  # noqa: ANN001, ARG001
+    ctx.save_for_backward(*inputs)
+
+
+def _backward_ortho_mm(ctx, gradient: Tensor) -> tuple[Tensor, Tensor]:  # noqa: ANN001
+    left, right = ctx.saved_tensors
+    with torch.amp.autocast(device_type=left.device.type, enabled=False):
+        return _ortho_mm(gradient, right.mT), _ortho_mm(left.mT, gradient)
+
+
+_ortho_mm.register_autograd(_backward_ortho_mm, setup_context=_save_ortho_mm_inputs)
 
 
 def fixed_taylor_matrix_exp(
@@ -76,16 +83,16 @@ def fixed_taylor_matrix_exp(
             return _paterson_stockmeyer_14(scaled, identity, scaling_steps).to(matrix.dtype)
         result = identity
         for denominator in range(taylor_degree, 0, -1):
-            result = identity + _AutocastIsolatedMatmul.apply(scaled, result) / denominator
+            result = identity + _ortho_mm(scaled, result) / denominator
         for _ in range(scaling_steps):
-            result = _AutocastIsolatedMatmul.apply(result, result)
+            result = _ortho_mm(result, result)
         return result.to(dtype=matrix.dtype)
 
 
 def _paterson_stockmeyer_14(scaled: Tensor, identity: Tensor, scaling_steps: int) -> Tensor:
-    squared = _AutocastIsolatedMatmul.apply(scaled, scaled)
-    cubed = _AutocastIsolatedMatmul.apply(squared, scaled)
-    fourth = _AutocastIsolatedMatmul.apply(squared, squared)
+    squared = _ortho_mm(scaled, scaled)
+    cubed = _ortho_mm(squared, scaled)
+    fourth = _ortho_mm(squared, squared)
     powers = (identity, scaled, squared, cubed)
 
     def block(start: int, count: int) -> Tensor:
@@ -96,11 +103,11 @@ def _paterson_stockmeyer_14(scaled: Tensor, identity: Tensor, scaling_steps: int
 
     result = block(12, 3)
     for start in (8, 4):
-        result = _AutocastIsolatedMatmul.apply(result, fourth) + block(start, 4)
-    residual = _AutocastIsolatedMatmul.apply(result, fourth) + (scaled + squared / 2 + cubed / 6)
+        result = _ortho_mm(result, fourth) + block(start, 4)
+    residual = _ortho_mm(result, fourth) + (scaled + squared / 2 + cubed / 6)
     # Square I + R while keeping unit diagonal entries out of the matmuls.
     for _ in range(scaling_steps):
-        residual = 2 * residual + _AutocastIsolatedMatmul.apply(residual, residual)
+        residual = 2 * residual + _ortho_mm(residual, residual)
     return identity + residual
 
 
@@ -218,18 +225,19 @@ def prepare_capture_safe_orthogonal_(
     scaling_steps: int = DEFAULT_SCALING_STEPS,
     compute_dtype: torch.dtype | None = None,
     auto: bool = True,
+    respect_env: bool = True,
 ) -> tuple[str, ...]:
     """Replace every existing matrix-exp orthogonal parametrization in ``model``.
 
     Returns the qualified tensor paths that were changed.  Calling the
     function again is idempotent and returns an empty tuple.
 
-    The environment can force preparation on or off. In auto mode, callers
-    opt in via ``auto``, which defaults to True for explicit preparation.
+    With ``respect_env``, the environment can force preparation on or off.
+    In auto mode, callers opt in via ``auto``, which defaults to True.
     The polynomial uses ordinary PyTorch operations on CUDA and CPU and
     derives its matrix dimensions from each original parametrization.
     """
-    policy = os.environ.get("LNET_CAPTURE_SAFE_ORTHOGONAL", "auto")
+    policy = os.environ.get("LNET_CAPTURE_SAFE_ORTHOGONAL", "auto") if respect_env else "on"
     if policy not in {"auto", "on", "off"}:
         raise ValueError(f"invalid LNET_CAPTURE_SAFE_ORTHOGONAL: {policy!r}")
     if policy == "off" or (policy == "auto" and not auto):
