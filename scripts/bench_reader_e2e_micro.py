@@ -301,6 +301,8 @@ def main() -> int:
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
     parser.add_argument("--modes", help="Comma-separated mode names")
     parser.add_argument("--dtypes", default="bf16,fp16")
+    parser.add_argument("--timing-dtype", choices=DTYPES, help="Time only this dtype; check parity for all requested dtypes")
+    parser.add_argument("--model-shapes-only", action="store_true", help="Skip timing for zero-weight edge shapes")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--json-out", type=Path)
@@ -355,7 +357,10 @@ def main() -> int:
                 for metric in comparison.values()
             )
             timings = {}
-            if not args.cpu_smoke:
+            if (
+                not args.cpu_smoke and (args.timing_dtype in (None, name))
+                and (shape.calls or not args.model_shapes_only)
+            ):
                 for mode in modes:
                     torch.cuda.empty_cache()
                     timings[mode] = measure(shape, dtype, device, mode, args, flush)
@@ -368,10 +373,10 @@ def main() -> int:
             })
 
         totals = {}
-        if not args.cpu_smoke:
+        if not args.cpu_smoke and args.timing_dtype in (None, name):
             for mode in modes:
                 totals[mode] = {
-                    key: sum(row["shape"]["calls"] * row["timings"][mode][key] for row in rows)
+                    key: sum(row["shape"]["calls"] * row["timings"][mode][key] for row in rows if row["timings"])
                     for key in ("fwd_ms", "bwd_ms", "total_ms")
                 }
             for values in totals.values():
@@ -382,6 +387,7 @@ def main() -> int:
                             for key in ("fwd_ms", "bwd_ms", "total_ms")
                         }
         report["dtypes"][name] = {"shapes": rows, "weighted_calls": sum(s.calls for s in shapes), "weighted": totals}
+    report["cudnn_benchmark_by_mode"] = {mode: MODES[mode][2] for mode in modes}
     report["parity_summary"] = {"passed": failures == 0, "failed_checks": failures}
     payload = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.json_out:

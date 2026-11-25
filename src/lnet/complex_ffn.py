@@ -7,12 +7,13 @@ delegating projection, activation, residual, and synthesis semantics here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Protocol, cast, override, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, cast, runtime_checkable
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional
 from torch.nn.modules import module as nn_module
+from typing_extensions import override  # noqa: UP035 - Python 3.10 on H200
 
 from .complex_layers import (
     WidelyLinear,

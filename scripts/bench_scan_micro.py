@@ -87,9 +87,14 @@ def best_mode(totals: dict[str, float], parity: dict[str, bool], threshold: floa
     return min(eligible, key=totals.__getitem__, default="off")
 
 
-def _time(run: Callable, warmup: int, iters: int, flush_buffer: Tensor | None = None) -> float:
+def _time(run: Callable, warmup: int, iters: int, flush_buffer: Tensor | None = None, *, graph: bool = False) -> float:
     for _ in range(warmup):
         run()
+    if graph:
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            output = run()
+        run = capture.replay
     events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(iters)]
     # Initialize lazy event handles before the first measured call.
     for start, stop in events:
@@ -103,6 +108,8 @@ def _time(run: Callable, warmup: int, iters: int, flush_buffer: Tensor | None = 
         run()
         stop.record()
     events[-1][1].synchronize()
+    if graph:
+        del output
     return statistics.median(start.elapsed_time(stop) for start, stop in events)
 
 
@@ -356,17 +363,17 @@ def _e2e_sample(
 ) -> dict:
     forward, backward = _e2e_case(data, coarse, mode)
 
-    def full_step() -> None:
+    def full_step() -> list[Tensor]:
         _, _, saved = forward()
-        backward(saved)
+        return backward(saved)
 
     torch.cuda.reset_peak_memory_stats()
-    total_ms = _time(full_step, args.warmup, args.iters, flush)
+    total_ms = _time(full_step, args.warmup, args.iters, flush, graph=True)
     peak = torch.cuda.max_memory_allocated() / 1024**3
     _, _, trajectory = forward()
     return {
-        "fwd_ms": _time(forward, args.warmup, args.iters, flush),
-        "bwd_ms": _time(lambda: backward(trajectory), args.warmup, args.iters, flush),
+        "fwd_ms": _time(forward, args.warmup, args.iters, flush, graph=True),
+        "bwd_ms": _time(lambda: backward(trajectory), args.warmup, args.iters, flush, graph=True),
         "total_ms": total_ms, "peak_vram_gib": peak,
         "selected_saved_path": trajectory is not None,
     }
@@ -480,11 +487,12 @@ def main() -> None:
     with torch.inference_mode():
         flush_buffer = torch.empty(flush_bytes, device="cuda", dtype=torch.uint8) if flush_bytes else None
         for op in ops:
-            for env, _ in OPS.values():
-                os.environ[env] = "off"
             if op == "vscan_e2e":
+                report["scan_flags"] = {env: os.environ.get(env, "off") for env, _ in OPS.values()}
                 report[op] = _screen_e2e(args, e2e_modes, flush_buffer)
                 continue
+            for env, _ in OPS.values():
+                os.environ[env] = "off"
             modes = OPS[op][1]
             if op == "vscan_bwd" and args.modes:
                 modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
