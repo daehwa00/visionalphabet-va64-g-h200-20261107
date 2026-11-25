@@ -138,6 +138,9 @@ class Kernel:
     odd_coarse_backward: bool = False
     odd_coarse_forward: bool = False
     odd_compact_width: bool = False
+    forward_readonly: bool = False
+    horizontal_readonly: bool = False
+    horizontal_unroll: int = 0
 
 
 class Launch(NamedTuple):
@@ -1460,10 +1463,13 @@ def _kernel_name(key: Kernel) -> str:
         return "reduce_path_mlp_partials"
     if key.reduction:
         return "reduce_vscan_partials" if key.vertical else "reduce_hscan_partials"
-    return "general_vscan" if key.vertical else "general_hscan"
+    if key.forward_readonly or key.backward_reduce_warps or key.horizontal_readonly:
+        return "general_vscan" if key.vertical else "general_hscan"
+    # Wave 33A used one symbol for the default vertical and horizontal kernels.
+    return "scan"
 
 
-def _kernel_source(key: Kernel) -> str:  # noqa: C901
+def _kernel_source(key: Kernel) -> str:  # noqa: C901, PLR0912
     """Instantiate a single entry point without modifying the device source."""
     if key.reduction:
         return _CUDA_SOURCE + f"""
@@ -1545,7 +1551,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
 """
     else:
         transposed = f"{str(key.real_transposed).lower()}, {str(key.imag_transposed).lower()}"
-        unroll = ", 8" if key.horizontal_unroll8 else ""
+        factor = key.horizontal_unroll or (8 if key.horizontal_unroll8 else 0)
+        unroll = f", {factor}" if factor else ""
         wrapper = f"""
 {bounds}(
     const float* __restrict__ dr, const float* __restrict__ di,
@@ -1567,13 +1574,15 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = "#define BACKWARD_BATCH2\n" + source
         if key.backward_batch_tail:
             source = "#define BACKWARD_BATCH_TAIL\n" + source
-    if key.backward_readonly and key.vertical:
+    if key.vertical and (key.backward_readonly or key.forward_readonly):
         source = (
             source.replace("states[ia]", "__ldg(states + ia)")
             .replace("states[ia + source_plane]", "__ldg(states + ia + source_plane)")
             .replace("states[ib]", "__ldg(states + ib)")
             .replace("states[ib + source_plane]", "__ldg(states + ib + source_plane)")
         )
+    if not key.vertical and (key.horizontal_readonly or key.horizontal_unroll):
+        source = _horizontal_candidate_source(source, key)
     if key.odd_coarse_forward:
         source = source.replace("int remaining = H;", r"""int remaining = H;
                 if (H & 1) {
@@ -1590,6 +1599,29 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     if key.backward_reduce_warps:
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
     return source + wrapper
+
+
+def _horizontal_candidate_source(source: str, key: Kernel) -> str:
+    body = source.index("void horizontal(")
+    start = source.rindex("template<", 0, body)
+    end = source.index("template<bool PRECISE>", body)
+    kernel = source[start:end]
+    if key.horizontal_readonly:
+        for name, index in (("sr", "base_r + I(x) * step_r"), ("si", "base_i + I(x) * step_i")):
+            kernel = kernel.replace(f"{name}[{index}]", f"__ldg({name} + {index})")
+        for name in ("grad", "states"):
+            kernel = kernel.replace(f"load_complex({name},", f"load_complex_readonly({name},")
+        helper = """template<class T, class I>
+__device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
+    return {read(__ldg(p + offset)), read(__ldg(p + offset + stride))};
+}
+"""
+        kernel = helper + kernel
+    if key.horizontal_unroll and not key.backward:
+        for loop in ("for (int x = 0;", "for (int x = W - 1;"):
+            pragma = "#pragma unroll BACKWARD_UNROLL\n                "
+            kernel = kernel.replace(loop, pragma + loop, 1)
+    return source[:start] + kernel + source[end:]
 
 
 _SGS_ADJOINT = r"""
@@ -1692,7 +1724,7 @@ def _grouped_vscan_source(source: str, reduce_warps: int) -> str:
     source = source[:start] + reduction + source[end:]
     return source.replace(
         "row += I(reduce ? group : worker) * fields * M + m;",
-        f"row += I(worker / {reduce_warps}) * fields * M + m;",
+        f"if (active) row += I(worker / {reduce_warps}) * fields * M + m;",
         1,
     ).replace(
         "row, nullptr, da, dg, m, M);", "row, nullptr, da, dg, m, M, active);",
@@ -1715,7 +1747,7 @@ def _odd_compact_source(source: str) -> str:
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
     if capability >= (9, 0) and key.warps == 1 and (key.real_interleaved or key.imag_interleaved):
         # Task 92 observed inexact forced unrolls on this Hopper layout.
-        key = replace(key, horizontal_unroll8=False)
+        key = replace(key, horizontal_unroll8=False, horizontal_unroll=0)
     nvrtc = _nvrtc()
     program = ct.c_void_p()
     source = _kernel_source(key).encode()
@@ -1833,6 +1865,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
         if (
             key.sgs or key.batch_path or key.register_path or key.horizontal_unroll8
             or key.backward_batch2 or key.backward_readonly
+            or key.forward_readonly or key.horizontal_readonly or key.horizontal_unroll
             or (key.vertical and key.backward and key.chunk and key.cache_source)
         ):
             local = ct.c_int()
@@ -2385,7 +2418,9 @@ def _plan_scan_auto(
     return launch
 
 
-SGS_MODES = ("off", "strict", "strict_ro")
+SGS_MODES = ("off", "strict", "strict_ro_only", "strict_ro", "strict_w8")
+VFWD_MODES = ("off", "ro", "reg_coarse", "batch4")
+HSCAN_MODES = ("off", "ro", "unroll_tune", "wide_cta")
 
 
 @cache
@@ -2423,7 +2458,7 @@ def _sgs_cap(block_limit: int, shared: int, reserved: int, resident: int) -> int
 
 def _wider_readonly_layout(
     launch: Launch, shape: tuple[int, int, int, int], active_warps: int, sms: int,
-    block_limit: int, shared: int, reserved: int,
+    block_limit: int, shared: int, reserved: int, *, max_warps: int = 4,
 ) -> tuple[Kernel, int, int] | None:
     _, key, workers, _ = launch
     _, height, _, modes = shape
@@ -2436,8 +2471,8 @@ def _wider_readonly_layout(
         return None
     best = None
     best_span = key.chunk
-    for warps in _SCAN_WARPS:
-        if warps <= key.warps or warps % key.warps or active_warps % warps:
+    for warps in (8, *_SCAN_WARPS):
+        if not key.warps < warps <= max_warps or warps % key.warps or active_warps % warps:
             continue
         resident = active_warps // warps
         if _ceil(workers, warps) * _ceil(modes, _WARP_SIZE) < 2 * sms * resident:
@@ -2458,7 +2493,7 @@ def _wider_readonly_layout(
 
 
 @lru_cache(maxsize=512)
-def _plan_sgs(
+def _plan_sgs(  # noqa: C901, PLR0911
     device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
 ) -> Launch:
     plan, key, _, _ = launch
@@ -2468,10 +2503,10 @@ def _plan_sgs(
         or key.dtype.itemsize != 2 or key.pure_vertical
     ):
         return launch
-    strict = _plan_sgs(device, launch, shape, "strict") if mode == "strict_ro" else launch
+    strict = _plan_sgs(device, launch, shape, "strict") if mode != "strict" else launch
     full = not key.chunk and key.cache_source
-    chunked = key.chunk and not key.coarse and key.cache_source and not key.global_checkpoints
-    eligible = full if mode == "strict" else strict.key.sgs or chunked
+    chunked = key.chunk and key.cache_source and not key.global_checkpoints
+    eligible = full or (mode != "strict" and chunked)
     if not eligible:
         return launch
     target = _resident(device, key, plan.smem)
@@ -2494,8 +2529,15 @@ def _plan_sgs(
     readonly = replace(strict.key, backward_readonly=True)
     if not strict.key.backward_readonly and _resident(device, readonly, strict.plan.smem) == target:
         strict = strict._replace(key=readonly)
-    wider = _wider_readonly_layout(launch, shape, active_warps, sms, block_limit, shared, reserved)
-    if wider is not None:
+    if mode == "strict_ro_only":
+        return strict
+    limits = (8, 4) if mode == "strict_w8" else (4,)
+    for limit in limits:
+        wider = _wider_readonly_layout(
+            launch, shape, active_warps, sms, block_limit, shared, reserved, max_warps=limit,
+        )
+        if wider is None:
+            break
         candidate, smem, resident = wider
         if _resident(device, candidate, smem) == resident:
             return launch._replace(
@@ -2505,7 +2547,98 @@ def _plan_sgs(
     return strict
 
 
-def _plan_launch(
+def _probe_scan_candidate(device: int, baseline: Launch, candidate: Launch) -> int:
+    target = baseline.key.warps * _resident(device, baseline.key, baseline.plan.smem)
+    resident = _resident(device, candidate.key, candidate.plan.smem)
+    return resident if target and resident * candidate.key.warps >= target else 0
+
+
+@lru_cache(maxsize=512)
+def _plan_vfwd(device: int, launch: Launch, height: int, mode: str) -> Launch:
+    key = launch.key
+    if key.dtype.itemsize != 2 or not key.hidden8 or key.pure_vertical:
+        return launch
+    readonly = launch._replace(key=replace(key, forward_readonly=True))
+    best = readonly if _probe_scan_candidate(device, launch, readonly) else launch
+    rows = height // (1 + key.coarse)
+    if mode == "ro" or rows < 2:
+        return best
+    weights = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (4 if key.vector_weights else key.dtype.itemsize)
+    plan = best.plan._replace(
+        cache_weights=False, smem=best.plan.smem - weights * key.cache_weights,
+    )
+    widths = (4, 2) if mode == "batch4" else (2,)
+    for width in widths:
+        if rows < width:
+            continue
+        candidate = best._replace(
+            plan=plan,
+            key=replace(best.key, cache_weights=False, register_path=True,
+                        batch_path=True, register_batch2=width == 2),
+        )
+        if _probe_scan_candidate(device, launch, candidate):
+            return candidate
+        if width == 4 and key.cache_weights:
+            candidate = best._replace(key=replace(best.key, batch_path=True))
+            if _probe_scan_candidate(device, launch, candidate):
+                return candidate
+    return best
+
+
+@lru_cache(maxsize=512)
+def _plan_hscan(  # noqa: C901, PLR0911
+    device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
+) -> Launch:
+    plan, key, workers, _ = launch
+    if key.dtype.itemsize != 2:
+        return launch
+    readonly = launch._replace(key=replace(key, horizontal_readonly=True))
+    best = readonly if _probe_scan_candidate(device, launch, readonly) else launch
+    if mode == "ro":
+        return best
+    batch, height, width, modes = shape
+    sms, limit, _ = device_limits(device)
+    if mode == "unroll_tune":
+        interleaved = key.real_interleaved or key.imag_interleaved
+        if modes % _WARP_SIZE or width < 4 or (
+            interleaved and key.warps == 1 and torch.cuda.get_device_capability(device) >= (9, 0)
+        ):
+            return best
+        for factor in (8, 4):
+            if width < factor:
+                continue
+            candidate = best._replace(key=replace(best.key, horizontal_unroll=factor))
+            if _probe_scan_candidate(device, launch, candidate):
+                return candidate
+        return best
+
+    tiles = _ceil(modes, _WARP_SIZE)
+    lines = batch * height
+    if width < _LONG_SCAN:
+        return best
+    for warps in (8, *_SCAN_WARPS):
+        if warps <= key.warps:
+            continue
+        threads = warps * _WARP_SIZE
+        stored = width // (1 + (key.backward and key.compact))
+        smem = max(threads * 16 if key.backward else 0, (
+            stored * threads * (8 if key.backward else 2 * key.dtype.itemsize)
+            if plan.cache_line else 0
+        ))
+        if smem > limit or _ceil(workers, warps) * tiles < 2 * sms:
+            continue
+        candidate = Launch(
+            plan._replace(warps=warps, smem=smem),
+            replace(best.key, warps=warps, horizontal_unroll=4), workers,
+            _ceil(workers, warps) if key.backward else workers,
+        )
+        resident = _probe_scan_candidate(device, launch, candidate)
+        if resident and _ceil(workers, warps) * tiles >= 2 * sms * resident:
+            return _align_workers(candidate, lines, tiles, sms * resident)
+    return best
+
+
+def _plan_launch(  # noqa: C901
     source: Tensor,
     shape: tuple[int, int, int, int],
     *,
@@ -2551,6 +2684,14 @@ def _plan_launch(
     mode = os.environ.get("LNET_SCAN_SGS", "off")
     if vertical and backward and mode in SGS_MODES[1:]:
         return _plan_sgs(device, launch, shape, mode)
+    if vertical and not backward:
+        mode = os.environ.get("LNET_SCAN_VFWD", "off")
+        if mode in VFWD_MODES[1:]:
+            return _plan_vfwd(device, launch, height, mode)
+    if not vertical:
+        mode = os.environ.get("LNET_SCAN_HSCAN", "off")
+        if mode in HSCAN_MODES[1:]:
+            return _plan_hscan(device, launch, shape, mode)
     return launch
 
 

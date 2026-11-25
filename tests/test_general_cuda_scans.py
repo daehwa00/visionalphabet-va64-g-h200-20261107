@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from bench_scan_micro import EDGE_SHAPES, MODEL_SHAPES, best_mode, make_inputs
+from bench_scan_micro import EDGE_SHAPES, MODEL_SHAPES, best_mode, make_inputs, parity_stats
 from torch import Tensor
 from torch._inductor import config as inductor_config
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -1426,5 +1426,85 @@ def test_cuda_sgs_parity(
         for mode in scans.SGS_MODES[1:]:
             monkeypatch.setenv("LNET_SCAN_SGS", mode)
             actual = scans.vertical_backward(*inputs, coarse, compact=compact)
-            for value, reference in zip(actual, expected, strict=True):
-                torch.testing.assert_close(value, reference, atol=0, rtol=0, msg=mode)
+            for index, (value, reference) in enumerate(zip(actual, expected, strict=True)):
+                stats = parity_stats(value, reference)
+                field = "exact_match" if mode == "strict" else "tol_pass"
+                assert stats[field], (mode, index, stats)
+
+
+def test_scan_micro_parity_diagnostics() -> None:
+    expected = torch.tensor([0.0, 1.0, 2.0], dtype=torch.bfloat16)
+    actual = expected.clone()
+    actual[2] = torch.nextafter(expected[2], torch.tensor(3.0, dtype=expected.dtype))
+    assert parity_stats(actual, expected) == {
+        "max_abs": 0.015625, "max_rel": 0.0078125, "mismatch_count": 1,
+        "exact_match": False, "tol_pass": True,
+    }
+    actual = torch.tensor([0.0, 1.0, 2.01])
+    assert not parity_stats(actual, expected.float())["tol_pass"]
+    assert not parity_stats(torch.tensor([float("inf")]), torch.tensor([float("inf")]))["tol_pass"]
+
+
+def test_vfwd_batch4_resource_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = scans.Kernel(torch.bfloat16, 4, backward=False, vertical=True, coarse=True, hidden8=True,
+                       cache_weights=True, cache_line=True)
+    plan = scans.ScanPlan(4, 34304, cache_weights=True, cache_line=True)
+    baseline = scans.Launch(plan, key, 100, 100)
+
+    def resident(_, candidate, _smem):
+        return 0 if candidate.batch_path and not candidate.register_batch2 else 3
+
+    monkeypatch.setattr(scans, "_resident", resident)
+    scans._plan_vfwd.cache_clear()
+    try:
+        result = scans._plan_vfwd(0, baseline, 56, "batch4")
+        assert result.key.forward_readonly
+        assert result.key.register_path
+        assert result.key.register_batch2
+        assert not result.key.cache_weights
+        assert result.plan.smem == baseline.plan.smem - 5632
+        assert result[2:] == baseline[2:]
+    finally:
+        scans._plan_vfwd.cache_clear()
+
+
+def test_hscan_hopper_interleaved_unroll_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = scans.Kernel(
+        torch.bfloat16, 1, backward=False, real_interleaved=True, imag_interleaved=True,
+    )
+    baseline = scans.Launch(scans.ScanPlan(1, 0), key, 100, 100)
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 16)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    scans._plan_hscan.cache_clear()
+    try:
+        result = scans._plan_hscan(0, baseline, (2, 56, 56, 160), "unroll_tune")
+        assert result.key == replace(key, horizontal_readonly=True)
+        assert result.plan == baseline.plan
+        source = scans._kernel_source(result.key)
+        assert "__ldg(sr + base_r + I(x) * step_r)" in source
+        assert "load_complex_readonly(grad," in source
+    finally:
+        scans._plan_hscan.cache_clear()
+
+
+def test_hscan_wide_cta_layout_and_two_waves(monkeypatch: pytest.MonkeyPatch) -> None:
+    key = scans.Kernel(torch.float16, 4, backward=True, compact=True,
+                       real_interleaved=True, imag_transposed=True, cache_line=True)
+    plan = scans.ScanPlan(4, 28672, cache_line=True)
+    baseline = scans.Launch(plan, key, 4096, 1024)
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_resident", lambda _, key, _smem: 32 // key.warps)
+    scans._plan_hscan.cache_clear()
+    try:
+        result = scans._plan_hscan(0, baseline, (1024, 56, 56, 160), "wide_cta")
+        assert result.key == replace(key, warps=8, horizontal_readonly=True, horizontal_unroll=4)
+        assert result.plan.smem == 57344
+        assert result.workers == baseline.workers
+        assert result.partials == 512
+        short = baseline._replace(workers=112, partials=28)
+        result = scans._plan_hscan(0, short, (2, 56, 56, 160), "wide_cta")
+        assert result.key == replace(key, horizontal_readonly=True)
+        assert result[2:] == short[2:]
+    finally:
+        scans._plan_hscan.cache_clear()

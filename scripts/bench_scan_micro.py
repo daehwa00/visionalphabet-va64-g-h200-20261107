@@ -1,4 +1,4 @@
-"""Screen eager VScan backward policies with CUDA events and exact parity."""
+"""Screen eager CUDA scan policies with CUDA events and per-tensor parity."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from __future__ import annotations
 # ruff: noqa: FBT001
 import argparse
 import json
+import math
 import os
 import statistics
 import sys
@@ -21,6 +22,8 @@ if __package__ in {None, ""}:
 from lnet import general_cuda_scans as scans
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch import Tensor
 
 MODEL_SHAPES = (
@@ -37,6 +40,19 @@ EDGE_SHAPES = (
 )
 EDGE_LABELS = {shape[0] for shape in EDGE_SHAPES}
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+OPS = {
+    "vscan_bwd": ("LNET_SCAN_SGS", scans.SGS_MODES),
+    "vscan_fwd": ("LNET_SCAN_VFWD", scans.VFWD_MODES),
+    "hscan_fwd": ("LNET_SCAN_HSCAN", scans.HSCAN_MODES),
+    "hscan_bwd": ("LNET_SCAN_HSCAN", scans.HSCAN_MODES),
+}
+POLE_NAMES = ("decay_real", "decay_imag", "gain_real", "gain_imag")
+TENSOR_NAMES = {
+    "vscan_bwd": (*POLE_NAMES, "states", "path_wi", "path_bi", "path_wo", "path_bo"),
+    "vscan_fwd": ("output",),
+    "hscan_fwd": ("states",),
+    "hscan_bwd": (*POLE_NAMES, "source"),
+}
 
 
 class Inputs(NamedTuple):
@@ -68,125 +84,255 @@ def best_mode(totals: dict[str, float], parity: dict[str, bool], threshold: floa
     return min(eligible, key=totals.__getitem__, default="off")
 
 
-def _time(inputs: Inputs, coarse: bool, warmup: int, iters: int) -> float:
+def _time(run: Callable, warmup: int, iters: int) -> float:
     for _ in range(warmup):
-        scans.vertical_backward(*inputs, coarse, compact=coarse)
+        run()
     events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(iters)]
     for start, stop in events:
         start.record()
-        scans.vertical_backward(*inputs, coarse, compact=coarse)
+        run()
         stop.record()
     events[-1][1].synchronize()
     return statistics.median(start.elapsed_time(stop) for start, stop in events)
 
 
-def _plan(inputs: Inputs, coarse: bool, *, compact: bool) -> scans.Launch:
-    launch = scans._plan_launch(
-        inputs.states, tuple(inputs.states.shape[1:]), backward=True, vertical=True,
-        coarse=coarse, hidden=8, precise=False, compact=compact, interleaved=(True, True),
-    )
-    if launch is None:
-        raise RuntimeError("No fused vertical backward plan")
-    return launch
+def _case(op: str, shape: tuple, batch: int, dtype: torch.dtype, *, compact: bool) -> tuple:
+    _, h, w, m, coarse, _ = shape
+    backward = op.endswith("_bwd")
+    vertical = op.startswith("vscan")
+    metadata = {"interleaved": (True, True)}
+    if vertical:
+        inputs = make_inputs(batch, h, w, m, coarse, dtype)
+        source = inputs.states
+    if op == "vscan_bwd":
+        def run() -> list[Tensor]:
+            return scans.vertical_backward(*inputs, coarse, compact=compact)
+    elif op == "vscan_fwd":
+        def run() -> list[Tensor]:
+            packed = scans.vertical_forward_packed(
+                *inputs[:4], coarse, 1e-6, planar=False,
+            )
+            return [packed]
+    else:
+        # Real and imaginary channels share storage as in the packed model.
+        pair = torch.randn(batch, h, w, 2 * m, device="cuda", dtype=dtype).mul_(0.1)
+        real, imag = pair.split(m, dim=-1)
+        source = real
+        metadata = scans._horizontal_layout(real, imag)
+        pole = [torch.full((m,), value, device="cuda") for value in (0.73, 0.13, 0.21, 0.09)]
+        if backward:
+            # The forward output is needed only for backward and is generated once.
+            states = scans.horizontal_forward(pole, real, imag)
+            adjoints = torch.randn(
+                4, batch, h, w // (1 + compact), m, device="cuda", dtype=dtype,
+            ).mul_(0.05)
+
+            def run() -> list[Tensor]:
+                return scans.horizontal_backward(pole, [real, imag], states, adjoints, compact=compact)
+        else:
+            def run() -> list[Tensor]:
+                return [scans.horizontal_forward(pole, real, imag)]
+
+    def plan() -> scans.Launch:
+        launch = scans._plan_launch(
+            source, (batch, h, w, m), backward=backward, vertical=vertical,
+            coarse=vertical and coarse, hidden=8 if vertical else 0,
+            precise=op == "vscan_fwd", compact=backward and compact, **metadata,
+        )
+        if launch is None:
+            raise RuntimeError(f"No fused {op} plan")
+        return launch
+
+    return run, plan
 
 
-def _describe(launch: scans.Launch, device: int) -> dict[str, int | bool]:
-    plan, key, _, _ = launch
+def _describe(launch: scans.Launch) -> dict[str, int | bool]:
+    plan, key, workers, partials = launch
     return {
-        "warps": key.warps, "chunk": key.chunk, "csrc": key.cache_source,
-        "ro": key.backward_readonly, "vecw": key.vector_weights, "sgs_rows": plan.sgs_rows, "smem": plan.smem,
-        "occupancy": key.warps * scans._resident(device, key, plan.smem),
+        "warps": key.warps, "chunk": key.chunk, "cache_source": key.cache_source,
+        "readonly": key.backward_readonly or key.forward_readonly or key.horizontal_readonly,
+        "cache_line": key.cache_line, "cache_weights": key.cache_weights,
+        "vector_weights": key.vector_weights, "register_path": key.register_path,
+        "batch_path": key.batch_path, "register_batch2": key.register_batch2,
+        "unroll": key.horizontal_unroll or (8 if key.horizontal_unroll8 else 0),
+        "sgs_rows": plan.sgs_rows, "smem": plan.smem, "workers": workers, "partials": partials,
+        "occupancy": key.warps * scans._resident(torch.cuda.current_device(), key, plan.smem),
     }
 
 
-def _equal(actual: list[Tensor], expected: list[Tensor]) -> bool:
-    return all(torch.equal(x, y) for x, y in zip(actual, expected, strict=True))
+def parity_stats(actual: Tensor, expected: Tensor) -> dict[str, int | float | bool | None]:
+    if not actual.numel():
+        return {"max_abs": 0.0, "max_rel": 0.0, "mismatch_count": 0, "exact_match": True, "tol_pass": True}
+    actual32, expected32 = actual.float(), expected.float()
+    error = (actual32 - expected32).abs()
+    relative = error / expected32.abs().clamp_min(1e-12)
+    if actual.dtype == torch.float32:
+        close = error <= 1e-4
+    else:
+        close = (error <= 1e-2) | (actual == torch.nextafter(expected, actual))
+    max_abs, max_rel, mismatch_count, passed = torch.stack((
+        error.amax().double(), relative.amax().double(), (actual != expected).sum().double(),
+        (close & actual.isfinite() & expected.isfinite()).all().double(),
+    )).tolist()
+    return {
+        "max_abs": max_abs if math.isfinite(max_abs) else None,
+        "max_rel": max_rel if math.isfinite(max_rel) else None,
+        "mismatch_count": int(mismatch_count),
+        "exact_match": mismatch_count == 0, "tol_pass": bool(passed),
+    }
 
 
 def _parity(
-    modes: tuple[str, ...], timing_dtype: str, mismatches: dict[str, list[str]],
-) -> None:
+    op: str, modes: tuple[str, ...], args: argparse.Namespace,
+    timed_keys: dict[str, dict[str, scans.Kernel]],
+) -> dict:
+    env = OPS[op][0]
+    report = {}
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
     for dtype_name, dtype in DTYPES.items():
-        shapes = EDGE_SHAPES if dtype_name == timing_dtype else (*MODEL_SHAPES, *EDGE_SHAPES)
-        for label, h, w, m, coarse, _ in shapes:
-            inputs = make_inputs(2, h, w, m, coarse, dtype)
-            for compact in (False, True) if coarse and label in EDGE_LABELS else (coarse,):
-                os.environ["LNET_SCAN_SGS"] = "off"
-                expected = scans.vertical_backward(*inputs, coarse, compact=compact)
-                samples = {_plan(inputs, coarse, compact=compact): True}
-                for mode in modes[1:]:
-                    os.environ["LNET_SCAN_SGS"] = mode
-                    launch = _plan(inputs, coarse, compact=compact)
+        for shape in (*MODEL_SHAPES, *EDGE_SHAPES):
+            label, _, w, m, coarse, _ = shape
+            batch = 2 if label in EDGE_LABELS else min(args.batch, 64)
+            if label == "56d" and op == "vscan_bwd":
+                # Exercise the two-wave grouping even when timing a small batch.
+                batch = max(batch, 8, scans._ceil(16 * sms, w * scans._ceil(m, 32)))
+            for compact in _layouts(op, label, coarse, w):
+                os.environ[env] = "off"
+                run, plan = _case(op, shape, batch, dtype, compact=compact)
+                expected = run()
+                samples = {}
+                record = report[f"{dtype_name}/{label}/compact={compact}"] = {"batch": batch, "modes": {}}
+                for mode in modes:
+                    os.environ[env] = mode
+                    launch = plan()
                     if launch not in samples:
-                        actual = scans.vertical_backward(*inputs, coarse, compact=compact)
-                        samples[launch] = _equal(actual, expected)
-                    if not samples[launch]:
-                        mismatches[mode].append(f"{dtype_name}/{label}/compact={compact}")
+                        actual = expected if mode == "off" else run()
+                        samples[launch] = {
+                            "plan": _describe(launch),
+                            "tensors": {
+                                name: parity_stats(value, reference)
+                                for name, value, reference in zip(
+                                    TENSOR_NAMES[op], actual, expected, strict=True,
+                                )
+                            },
+                        }
+                    timed_key = timed_keys.get(label, {}).get(mode) if dtype_name == args.dtype else None
+                    record["modes"][mode] = {
+                        **samples[launch],
+                        "timing_kernel_match": None if timed_key is None else launch.key == timed_key,
+                    }
+    return report
+
+
+def _layouts(op: str, label: str, coarse: bool, width: int) -> tuple[bool, ...]:
+    if not coarse or not op.endswith("_bwd"):
+        return (False,)
+    if op == "hscan_bwd" and width % 2:
+        return (False,)
+    return (False, True) if label in EDGE_LABELS else (True,)
+
+
+def _screen(op: str, args: argparse.Namespace, modes: tuple[str, ...]) -> dict:
+    env = OPS[op][0]
+    results = {mode: {} for mode in modes}
+    totals = dict.fromkeys(modes, 0.0)
+    timed_keys = {}
+    for shape in MODEL_SHAPES:
+        label, _, width, _, coarse, calls = shape
+        if label == "7d" and op.startswith("hscan"):
+            calls = 3
+        os.environ[env] = "off"
+        compact, = _layouts(op, label, coarse, width)
+        run, plan = _case(op, shape, args.batch, DTYPES[args.dtype], compact=compact)
+        samples = {}
+        timed_keys[label] = {}
+        for mode in modes:
+            os.environ[env] = mode
+            launch = plan()
+            timed_keys[label][mode] = launch.key
+            if launch not in samples:
+                samples[launch] = _time(run, args.warmup, args.iters), _describe(launch)
+            ms, details = samples[launch]
+            totals[mode] += calls * ms
+            results[mode][label] = {"median_ms": ms, "calls": calls, "plan": details}
+        del run, plan
+    diagnostics = _parity(op, modes, args, timed_keys) if args.parity else {}
+    passes = {
+        field: {
+            mode: all(
+                stats[field] for case in diagnostics.values()
+                for stats in case["modes"][mode]["tensors"].values()
+            )
+            for mode in modes
+        } if diagnostics else {}
+        for field in ("exact_match", "tol_pass")
+    }
+    covered = {
+        mode: all(case["modes"][mode]["timing_kernel_match"] is not False
+                  for case in diagnostics.values())
+        for mode in modes
+    } if diagnostics else {}
+    exact = {
+        mode: passed and covered["off"] and covered[mode]
+        for mode, passed in passes["exact_match"].items()
+    }
+    tolerated = {
+        mode: passed and covered["off"] and covered[mode]
+        for mode, passed in passes["tol_pass"].items()
+    }
+    return {
+        "best_mode": best_mode(totals, exact),
+        "best_tolerated_mode": best_mode(totals, tolerated),
+        "timing_kernel_covered": covered,
+        "weighted_ms": totals,
+        "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
+        "parity_pass": passes["exact_match"],
+        "parity_mismatches": {
+            mode: [
+                label for label, case in diagnostics.items()
+                if not all(stats["exact_match"] for stats in case["modes"][mode]["tensors"].values())
+            ] for mode in passes["exact_match"]
+        },
+        "tolerance_pass": passes["tol_pass"], "parity": diagnostics, "shapes": results,
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--modes", default=",".join(scans.SGS_MODES))
+    parser.add_argument("--modes", help="Comma-separated policies for VScan backward.")
+    parser.add_argument("--ops", default="vscan_bwd", help="Comma-separated operation names.")
+    parser.add_argument("--all-ops", action="store_true", help="Screen all four scan operations.")
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--parity", action="store_true", help="Require exact BF16 and FP16 parity to qualify.")
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--parity", action="store_true", help="Collect BF16 and FP16 parity diagnostics.")
     parser.add_argument("--out", type=Path, help="Write JSON to this path instead of stdout.")
     args = parser.parse_args()
-    requested = tuple(token.strip() for token in args.modes.split(","))
+    ops = tuple(OPS) if args.all_ops else tuple(dict.fromkeys(token.strip() for token in args.ops.split(",")))
+    if set(ops).difference(OPS):
+        parser.error(f"--ops must contain names from {', '.join(OPS)}")
+    requested = tuple(token.strip() for token in args.modes.split(",")) if args.modes else scans.SGS_MODES
     if set(requested).difference(scans.SGS_MODES):
         parser.error("--modes must contain valid LNET_SCAN_SGS tokens")
     if args.batch < 1 or args.iters < 1 or args.warmup < 0:
         parser.error("--batch and --iters must be positive and --warmup cannot be negative")
     if not torch.cuda.is_available():
         parser.error("CUDA is required")
-    modes = tuple(dict.fromkeys(("off", *requested)))
     os.environ["LNET_VSCAN_DECOUPLED"] = "off"
     started = perf_counter()
     torch.manual_seed(141)
-    results = {mode: {} for mode in modes}
-    totals = dict.fromkeys(modes, 0.0)
-    mismatches = {mode: [] for mode in modes} if args.parity else {}
+    report = {"batch": args.batch, "dtype": args.dtype, "warmup": args.warmup, "iters": args.iters}
     with torch.inference_mode():
-        for label, h, w, m, coarse, calls in MODEL_SHAPES:
-            inputs = make_inputs(args.batch, h, w, m, coarse, DTYPES[args.dtype])
-            expected = None
-            samples = {}
-            for mode in modes:
-                os.environ["LNET_SCAN_SGS"] = mode
-                launch = _plan(inputs, coarse, compact=coarse)
-                if launch not in samples:
-                    ms = _time(inputs, coarse, args.warmup, args.iters)
-                    passed = True
-                    if args.parity:
-                        actual = scans.vertical_backward(*inputs, coarse, compact=coarse)
-                        if expected is None:
-                            expected = actual
-                        else:
-                            passed = _equal(actual, expected)
-                        del actual
-                    samples[launch] = ms, passed
-                ms, passed = samples[launch]
-                if not passed:
-                    mismatches[mode].append(f"{args.dtype}/{label}")
-                totals[mode] += calls * ms
-                results[mode][label] = {
-                    "median_ms": ms, "calls": calls,
-                    "plan": _describe(launch, inputs.states.device.index or 0),
-                }
-            del inputs, expected
-        if args.parity:
-            _parity(modes, args.dtype, mismatches)
-    parity = {mode: not failures for mode, failures in mismatches.items()}
-    report = {
-        "batch": args.batch, "dtype": args.dtype, "warmup": args.warmup, "iters": args.iters,
-        "best_mode": best_mode(totals, parity), "weighted_ms": totals,
-        "elapsed_seconds": perf_counter() - started,
-        "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
-        "parity_pass": parity, "parity_mismatches": mismatches, "shapes": results,
-    }
-    output = json.dumps(report, indent=2) + "\n"
+        for op in ops:
+            for env, _ in OPS.values():
+                os.environ[env] = "off"
+            modes = tuple(dict.fromkeys(("off", *requested))) if op == "vscan_bwd" else OPS[op][1]
+            report[op] = _screen(op, args, modes)
+    if ops == ("vscan_bwd",):
+        report.update(report["vscan_bwd"])
+    report["elapsed_seconds"] = perf_counter() - started
+    output = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.out is None:
         print(output, end="")
     else:
