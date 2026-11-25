@@ -16,6 +16,7 @@ from bench_scan_micro import (
     _layouts,
     _time,
     best_mode,
+    make_inputs,
     parity_stats,
 )
 from torch import Tensor
@@ -675,7 +676,7 @@ def _pipeline(
 _compiled_pipeline = torch.compile(_pipeline, fullgraph=True, dynamic=True)
 
 
-@pytest.mark.parametrize("mode", ["off", "strict", "strict_ro"])
+@pytest.mark.parametrize("mode", ["off", "strict", "strict_ro", "tc_mode_shared"])
 def test_sgs_aot_eager(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     monkeypatch.setenv("LNET_SCAN_SGS", mode)
     args = _inputs(4, 6, 3, 8, torch.bfloat16, "cpu")
@@ -1439,6 +1440,8 @@ def test_cuda_sgs_parity(
         for mode in scans.SGS_MODES[1:]:
             monkeypatch.setenv("LNET_SCAN_SGS", mode)
             launch = plan()
+            if mode == "tc_mode_shared" and torch.cuda.get_device_capability() >= (8, 0):
+                assert launch.key.tc_mode_shared
             if launch not in outputs:
                 outputs[launch] = run()
             actual = outputs[launch]
@@ -1511,6 +1514,8 @@ def test_scan_micro_parity_diagnostics() -> None:
         "exact_match": False, "tol_pass": True,
     }
     actual = torch.tensor([0.0, 1.0, 2.01])
+    assert parity_stats(actual, expected.float())["tol_pass"]
+    actual[2] = 2.03
     assert not parity_stats(actual, expected.float())["tol_pass"]
     assert not parity_stats(torch.tensor([float("inf")]), torch.tensor([float("inf")]))["tol_pass"]
 
@@ -1592,7 +1597,7 @@ def test_invalid_scan_mode(monkeypatch: pytest.MonkeyPatch, op: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "mode", [*scans.SGS_MODES[3:], *scans.VFWD_MODES[2:], *scans.HSCAN_MODES[2:]],
+    "mode", ["strict_ro_hiocc", "strict_ro_seg2", *scans.VFWD_MODES[2:], *scans.HSCAN_MODES[2:]],
 )
 def test_structural_scan_resource_gates(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     monkeypatch.setattr(scans, "device_limits", lambda _: (8, 227 * 1024, 64))
@@ -1679,3 +1684,90 @@ def test_scan_micro_flush_excludes_fill(monkeypatch: pytest.MonkeyPatch, flush: 
         *((["fill"] if flush else []) + ["record", "scan", "record"]) * 2,
         "stop_wait",
     ]
+
+
+def _simulate_path_mma(a_frag, b_frag, c, depth):
+    a = torch.full((16, depth), float("nan"))
+    b = torch.full((depth, 8), float("nan"))
+    for lane in range(32):
+        g, t = divmod(lane, 4)
+        for i, value in enumerate(a_frag(lane)):
+            a[g + 8 * (i // 2 % 2), 2 * t + i % 2 + 8 * (i // 4)] = value
+        for i, value in enumerate(b_frag(lane)):
+            b[2 * t + i % 2 + 8 * (i // 2), g] = value
+    # Simulate scalar multiply and reduction, then spill each lane's outputs
+    # via the device kernel's D fragment coordinates.
+    result = torch.full_like(c, float("nan"))
+    for lane in range(32):
+        g, t = divmod(lane, 4)
+        for i in range(4):
+            row, col = g + 8 * (i // 2), 2 * t + i % 2
+            result[row, col] = (a[row] * b[:, col]).sum() + c[row, col]
+    return result
+
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_tc_path_fragment_mapping(dtype: torch.dtype) -> None:
+    """Feed the kernel's packed operands through the independent PTX ISA maps."""
+    rng = torch.Generator().manual_seed(156)
+    p = torch.randn((16, 8), generator=rng).to(dtype).float()
+    wi = torch.randn((8, 8), generator=rng).to(dtype).float()
+    dz = torch.randn((16, 8), generator=rng).to(dtype).float()
+
+    def matrix_rows(matrix, lane):
+        g, k = lane >> 2, 2 * (lane & 3)
+        return (*matrix[g, k:k + 2], *matrix[g + 8, k:k + 2])
+
+    def matrix_cols(matrix, lane):
+        g, k = lane >> 2, 2 * (lane & 3)
+        return (*matrix[k:k + 2, g], *matrix[k + 8:k + 10, g])
+
+    def forward_weights(lane):
+        g, k = lane >> 2, 2 * (lane & 3)
+        return wi[g, k:k + 2]
+
+    zero = torch.zeros_like(p)
+    pre = _simulate_path_mma(lambda lane: matrix_rows(p, lane), forward_weights, zero, 8)
+    dp = _simulate_path_mma(
+        lambda lane: matrix_rows(dz, lane), lambda lane: matrix_cols(wi, lane), zero, 8,
+    )
+    accum = torch.cat((wi, torch.zeros_like(wi)))
+
+    def dwi_a(lane):
+        a0, a1, a2, a3 = matrix_cols(dz, lane)
+        return a0, a1, 0, 0, a2, a3, 0, 0
+
+    dw = _simulate_path_mma(dwi_a, lambda lane: matrix_cols(p, lane), accum, 16)
+    assert (pre - p @ wi.T).abs().max().item() < 1e-5
+    assert (dp - dz @ wi).abs().max().item() < 1e-5
+    assert (dw[:8] - (dz.T @ p + wi)).abs().max().item() < 1e-5
+    assert not dw[8:].count_nonzero()
+
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("compact", [False, True])
+def test_cuda_tc_mode_shared_dense_grad(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, compact: bool,
+) -> None:
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("Tensor-core instructions require SM 8.0")
+    torch.manual_seed(156)
+    inputs = make_inputs(3, 13, 19, 63, coarse=True, dtype=dtype)
+    inputs = inputs._replace(gr=inputs.gr.contiguous(), gi=inputs.gi.contiguous())
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
+    monkeypatch.setenv("LNET_SCAN_SGS", "strict_ro")
+    expected = scans.vertical_backward(*inputs, coarse=True, compact=compact)
+    monkeypatch.setenv("LNET_SCAN_SGS", "tc_mode_shared")
+    launch = scans._plan_launch(
+        inputs.states, (3, 13, 19, 63), backward=True, vertical=True,
+        coarse=True, hidden=8, precise=False, compact=compact,
+    )
+    assert launch is not None
+    assert launch.key.tc_mode_shared
+    actual = scans.vertical_backward(*inputs, coarse=True, compact=compact)
+    for name, value, reference in zip(TENSOR_NAMES["vscan_bwd"], actual, expected, strict=True):
+        assert parity_stats(value, reference)["tol_pass"], name

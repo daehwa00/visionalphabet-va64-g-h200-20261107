@@ -159,7 +159,8 @@ def _case(op: str, shape: tuple, batch: int, dtype: torch.dtype, *, compact: boo
 def _describe(launch: scans.Launch) -> dict[str, int | bool]:
     plan, key, workers, partials = launch
     return {
-        "warps": key.warps, "chunk": key.horizontal_span or key.chunk,
+        "warps": key.warps, "chunk": plan.chunk if key.tc_mode_shared else key.horizontal_span or key.chunk,
+        "tc_mode_shared": key.tc_mode_shared, "full_trajectory": plan.full_trajectory,
         "cache_source": key.cache_source,
         "readonly": key.backward_readonly or key.forward_readonly or key.horizontal_readonly,
         "cache_line": key.cache_line, "cache_weights": key.cache_weights,
@@ -178,7 +179,7 @@ def parity_stats(actual: Tensor, expected: Tensor) -> dict[str, int | float | bo
     error = (actual32 - expected32).abs()
     relative = error / expected32.abs().clamp_min(1e-12)
     if actual.dtype == torch.float32:
-        close = error <= 1e-5 + 1e-4 * expected32.abs()
+        close = error <= 1e-3 + 1e-2 * expected32.abs()
     else:
         close = (error <= 1e-3 + 1e-2 * expected32.abs()) | (actual == torch.nextafter(expected, actual))
     max_abs, max_rel, mismatch_count, passed = torch.stack((

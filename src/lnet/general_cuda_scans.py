@@ -33,6 +33,7 @@ from .product_scan_reference import (
     bidirectional_product_scan_reference,
     d4_grouped_path_collapse_packed_reference,
 )
+from .vscan_tc_bwd import SOURCE as _VSCAN_TC_SOURCE
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -144,6 +145,7 @@ class Kernel:
     min_blocks: int = 0
     horizontal_span: int = 0
     backward_segment_source: bool = False
+    tc_mode_shared: bool = False
 
 
 class Launch(NamedTuple):
@@ -1458,8 +1460,8 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 # NVRTC compilation and driver launch
 
 def _kernel_name(key: Kernel) -> str:
-    if key.sgs:
-        return "vscan_sgs"
+    if key.tc_mode_shared or key.sgs:
+        return "vscan_tc_mode_shared" if key.tc_mode_shared else "vscan_sgs"
     if key.projection:
         return "path_mlp_backward" if key.backward else "path_mlp_forward"
     if key.projection_reduction:
@@ -1573,6 +1575,16 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         B, H, W, M, workers);
 }}
 """
+    if key.tc_mode_shared:
+        signature = wrapper[:wrapper.index("    vertical<")]
+        args = f"{io}, {index}, {key.warps}, {coarse}, {compact}, {layout}"
+        body = f"""
+    vscan_tc<{args}>(dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo, gr, gi,
+                     gs, partials, B, H, W, M, workers, types, eps, hidden);
+}}
+"""
+        source = _odd_compact_source(_CUDA_SOURCE) if key.odd_compact_width else _CUDA_SOURCE
+        return source + _VSCAN_TC_SOURCE + signature + body
     source = _CUDA_SOURCE
     if key.backward_batch2:
         source = "#define BACKWARD_BATCH2\n" + source
@@ -1932,8 +1944,8 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     with torch.cuda.device(device):
         _ensure_context(driver, device)
         if (
-            key.sgs or key.batch_path or key.register_path or key.horizontal_unroll8
-            or key.backward_batch2 or key.backward_readonly
+            key.tc_mode_shared or key.sgs or key.batch_path or key.register_path
+            or key.horizontal_unroll8 or key.backward_batch2 or key.backward_readonly
             or key.forward_readonly or key.horizontal_readonly or key.horizontal_unroll
             or (key.vertical and key.backward and key.chunk and key.cache_source)
         ):
@@ -1960,7 +1972,10 @@ def _dispatch(source: Tensor, launch: Launch | None, args: tuple) -> None:
     if launch is None:
         raise RuntimeError("CUDA scan is ineligible on this device")
     plan, key, workers, _ = launch
-    grid = _ceil(source.shape[-1], _WARP_SIZE) * _ceil(workers, plan.warps)
+    grid = (
+        _ceil(source.shape[-1], key.warps) * workers if key.tc_mode_shared
+        else _ceil(source.shape[-1], _WARP_SIZE) * _ceil(workers, plan.warps)
+    )
     _launch_kernel(source, key, grid, plan.smem, args)
 
 
@@ -2487,7 +2502,7 @@ def _plan_scan_auto(
     return launch
 
 
-SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
+SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2", "tc_mode_shared")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2")
 
@@ -2568,6 +2583,61 @@ def _wider_readonly_layout(
                 best, best_span = (candidate, smem, resident), span
                 break
     return best
+
+
+@lru_cache(maxsize=512)
+def _plan_tc_vscan(device: int, launch: Launch, shape: tuple[int, int, int, int]) -> Launch:
+    key = launch.key
+    if (
+        not key.hidden8 or key.pure_vertical or key.dtype.itemsize != 2
+        or torch.cuda.get_device_capability(device) < (8, 0)
+    ):
+        return _plan_sgs(device, launch, shape, "strict_ro")
+    b, height, width, modes = shape
+    if not modes or not height // (1 + key.coarse) or not width // (1 + key.coarse):
+        return _plan_sgs(device, launch, shape, "strict_ro")
+    sms, block_limit, max_warps = device_limits(device)
+    columns = _ceil(b * (width // (1 + key.coarse)), 16)
+    row_step = 1 + key.coarse
+    # The checkpoint footprint is minimized near sqrt(H). Full storage skips replay.
+    root = _ceil(int(height**0.5), row_step) * row_step
+    spans = {height, min(height, root), min(height, 2 * root), min(height, 4 * root)}
+    best, best_score = launch, None
+    for warps in (4, 8, 16, 2, 1):
+        if warps > max_warps or (warps > 4 and warps > modes):
+            continue
+        candidate = Kernel(
+            key.dtype, warps, backward=True, vertical=True, coarse=key.coarse, hidden8=True,
+            compact=key.compact, index32=key.index32, real_interleaved=key.real_interleaved,
+            imag_interleaved=key.imag_interleaved, odd_compact_width=key.odd_compact_width,
+            tc_mode_shared=True,
+        )
+        tiles = _ceil(modes, warps)
+        for span in sorted(spans):
+            slots = span + _ceil(height, span) - 1
+            # float4 trajectory, packed injection, padded I/O stage and MMA tile.
+            smem = warps * (16 * (16 * slots + 8 * (height // row_step)) + 1344)
+            smem += 16 * (warps + 1) * 8
+            if smem > block_limit:
+                continue
+            try:
+                resident = _resident(device, candidate, smem)
+            except RuntimeError:
+                continue
+            if not resident:
+                continue
+            groups = min(columns, _ceil(4 * sms * resident, tiles), (2**31 - 1) // tiles)
+            active = min(sms * resident, groups * tiles) * warps
+            # Replay adds almost two source reads. Narrow mode groups also
+            # underfill the 32-byte sectors of the 16-bit row I/O.
+            passes = 3 if span == height else 5 - span / height
+            score = (active / (passes + 16 / warps), warps, span)
+            if best_score is None or score > best_score:
+                plan = ScanPlan(
+                    warps, smem, chunk=span, cache_line=True, full_trajectory=span == height,
+                )
+                best, best_score = Launch(plan, candidate, groups, groups), score
+    return best if best_score is not None else _plan_sgs(device, launch, shape, "strict_ro")
 
 
 @lru_cache(maxsize=512)
@@ -2905,6 +2975,8 @@ def _plan_launch(  # noqa: C901, PLR0911, PLR0912
             odd_compact_width=backward and compact and bool(width % 2),
             backward_batch2=False, backward_batch_tail=False,
         ))
+    if mode == "tc_mode_shared":
+        return _plan_tc_vscan(device, launch, shape)
     if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
         return _plan_structural(device, launch, shape, mode)
     if mode != "off":
@@ -3299,7 +3371,8 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         (
             *map(_ptr, (*inputs, gr, gi, outr, outi, gs, partial, scratch, checkpoints)),
             *map(ct.c_int, (
-                *shape, launch.workers, hidden, _scalar_types(path),
+                *shape, launch.workers,
+                launch.plan.chunk if launch.key.tc_mode_shared else hidden, _scalar_types(path),
             )),
             ct.c_float(epsilon),
             ct.c_longlong(states.stride(0) if pure else 0),
