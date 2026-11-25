@@ -24,6 +24,7 @@ from .model_w29c import (
     packed_swiglu_vec2d,
     rmsnorm_eligible,
 )
+from .model_w36b import inductor_norms_enabled
 from .phase_gated_transition import PathOnlyCollapse
 from .product_scan_reference import d4_grouped_path_collapse_packed_reference
 
@@ -56,6 +57,8 @@ class ChannelRMSNorm(nn.Module):
         self.epsilon = epsilon
 
     def forward(self, x: Tensor) -> Tensor:
+        if inductor_norms_enabled():
+            return functional.rms_norm(x, (x.shape[-1],), self.weight.to(x.dtype), self.epsilon)
         if x.is_cuda and (
             _fused_factorized_reader_enabled()
             or os.environ.get(_GENERAL_SCANS_ENV) != "0"

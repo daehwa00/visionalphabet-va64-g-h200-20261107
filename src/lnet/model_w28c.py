@@ -11,6 +11,8 @@ import triton.language as tl
 from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
+from .model_w36b import inductor_norms_enabled
+
 
 def model_opt_mode(legacy_env: str) -> str:
     policy = os.environ.get("LNET_MODEL_OPT", "auto")
@@ -25,6 +27,8 @@ def model_cuda_supported(device: torch.device) -> bool:
 
 
 def model_w28c_enabled(device: torch.device, preset: str) -> bool:
+    if preset == "swiglu" and inductor_norms_enabled():
+        return False
     mode = model_opt_mode("LNET_MODEL_W28C")
     selected = preset == "nr4" if mode == "auto" else mode in (preset, "combined")
     return selected and model_cuda_supported(device)

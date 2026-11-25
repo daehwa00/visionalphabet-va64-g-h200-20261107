@@ -10,6 +10,7 @@ from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
 from .model_w28c import _differentiate_swiglu, _save_joint, model_cuda_supported, model_opt_mode
+from .model_w36b import inductor_norms_enabled
 
 
 def model_w29c_enabled(device: torch.device, feature: str) -> bool:
@@ -26,6 +27,8 @@ def model_w29c_enabled(device: torch.device, feature: str) -> bool:
         "rmsnorm_full": ("rmsnorm_full", "combined_full"),
         "nr4": ("combined_bwd", "combined_full"),
     }[feature]
+    if selected and feature in ("swiglu_vec2d", "rmsnorm_bwd", "rmsnorm_full"):
+        selected = not inductor_norms_enabled()
     return selected and model_cuda_supported(device)
 
 
