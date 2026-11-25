@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
+from . import reader_vec128_kernels as vec128
 from .cuda_nvrtc import _check_cu, _check_nvrtc, _CudaModule, _ensure_context, _include_dirs, _nvrtc
 
 _CUDA_TYPES = {torch.float32: "float", torch.float16: "__half", torch.bfloat16: "__nv_bfloat16"}
@@ -1108,7 +1109,13 @@ def _reader_cuda_module(
     if not normalize and convert_weight:
         source = source.replace("R <= 2 && sizeof(G) == 2 && READER_WIDTH > 2 * READER_COLUMNS",
                                 "sizeof(G) == 2")
-    if operation is not None:
+    if operation == "vec128":
+        start = source.index('extern "C" __global__ void reader_dweight_reduce(')
+        source = "constexpr int Kernel = 3;\n" + vec128.source() + source[start:]
+        operations = (
+            "forward", "dinput", "dweight", "dweight_reduce", "dweight_reduce_parallel",
+        )
+    elif operation is not None:
         source, operations = _reader_variant_source(source, operation)
     # Reuse the CUDA launch interface with Reader-specific PTX and entry points.
     nvrtc = _nvrtc()
@@ -1146,15 +1153,23 @@ def _ceildiv(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
-_W44_MODES = (
-    "off", "dw_fullrank", "dw_fullrank_cvt", "fwd_vec1_r8", "fwd_vec1_r4", "dinput_wide", "all_opt",
+_W44_MODES = ("off", "dw_fullrank", "dw_fullrank_cvt", "dinput_wide")
+_READER_MODES = (
+    "off", "proven_floor", "fwd_vec128", "dinput_vec128", "dw_smem_vec128", "vec128_all",
 )
+
+
+def _reader_mode() -> str:
+    mode = os.environ.get("LNET_READER_OPT", "off")
+    if mode == "auto":
+        return "off"
+    if mode not in _READER_MODES:
+        raise ValueError(f"Invalid LNET_READER_OPT={mode!r}; expected one of {_READER_MODES}")
+    return mode
 
 
 def _reader_w44() -> str:
     mode = os.environ.get("LNET_READER_W44", "off")
-    if mode == "fwd_lane_opt":
-        return "fwd_vec1_r8"
     if mode not in _W44_MODES:
         raise ValueError(f"Invalid LNET_READER_W44={mode!r}; expected one of {_W44_MODES}")
     return mode
@@ -1364,8 +1379,7 @@ def _reader_auto(
     _, rank, kernel, _ = real.shape
     batch, height, width, _ = projected.shape
     return (
-        os.environ.get("LNET_READER_OPT", "auto") == "auto"
-        and not strict and 1 <= rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL
+        not strict and 1 <= rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL
         and projected.dtype == real.dtype and projected.dtype in (torch.float16, torch.bfloat16)
         and (grad is None or grad.dtype == projected.dtype)
         and (force_search or batch * height * width >= _SPECIALIZE_MIN_PIXELS
@@ -1397,7 +1411,7 @@ def _wide_spatial_plan(
     launch = _VectorLaunch(1, width, rows, 1)
     module = _reader_module_for(
         projected, real, grad, strict=False, launch=launch, updated=True,
-        operation="forward" if rows == 4 and grad is None else "spatial",
+        operation="spatial",
     )
     return (launch, module) if _reader_resident(module, op, launch.warps) else None
 
@@ -1425,6 +1439,61 @@ def _spatial_tile_candidates(
     return tuple(_VectorLaunch(vec, columns, row, 1) for row in rows)
 
 
+def _reader_vec128_module(
+    projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool, op: str,
+) -> _CudaModule | None:
+    if _reader_mode() not in ("vec128_all", {
+        "forward": "fwd_vec128", "dinput": "dinput_vec128", "dweight": "dw_smem_vec128",
+    }[op]):
+        return None
+    if not _reader_auto(projected, real, grad, strict=strict, force_search=True):
+        return None
+    modes, rank, _, _ = real.shape
+    _, height, width, _ = projected.shape
+    if (
+        modes % 8 or not projected.is_contiguous() or not real.is_contiguous()
+        or projected.data_ptr() % 16
+        or (grad is not None and (not grad.is_contiguous() or grad.data_ptr() % 16))
+        or _ceildiv(height, vec128.TILE_H) * _ceildiv(width, vec128.TILE_W) > _MAX_CUDA_GRID_DIM
+    ):
+        return None
+    props = torch.cuda.get_device_properties(projected.device)
+    halo = (vec128.TILE_H + 2) * (vec128.TILE_W + 2)
+    center = vec128.TILE_H * vec128.TILE_W
+    inputs, outputs = (2, rank) if op == "dinput" else (rank, 2)
+    filters = 0 if op == "dweight" else 2 * rank * 9 * 4
+    if vec128.MODE_TILE * (2 * (halo * inputs + center * outputs) + filters) > (
+        props.shared_memory_per_block
+    ):
+        return None
+    # Runtime dimensions are ABI arguments. All three passes share one program per rank/dtype.
+    types = (_CUDA_TYPES[projected.dtype],) * 3
+    module = _reader_cuda_module(
+        projected.device.index or 0, (0, 0, 0, 0), vec128.TILE_W, rank, 3, types,
+        strict=False, operation="vec128", spatial_vec=8, weight_vec=8,
+        spatial_geometry=(vec128.TILE_H, vec128.WARPS),
+        weight_geometry=(rank, vec128.TILE_H, vec128.WARPS),
+    )
+    return module if _reader_resident(module, op, vec128.WARPS) else None
+
+
+def _reader_floor_dinput(
+    projected: Tensor, real: Tensor, grad: Tensor, baseline: _VectorLaunch,
+) -> tuple[_VectorLaunch, _CudaModule] | None:
+    height, width = projected.shape[1:3]
+    kernel = real.shape[-1]
+    rows = _reader_tall_rows(height)
+    traffic = _halo_extent(height, baseline.rows, kernel) * _halo_extent(
+        width, baseline.columns * baseline.warps, kernel,
+    )
+    if width > _WARP_SIZE or _halo_extent(height, rows, kernel) * width >= traffic:
+        return None
+    candidate = _wide_spatial_plan(projected, real, grad, rows=rows)
+    if candidate is not None and _reader_resident(candidate[1], "dinput", 1) >= 20:
+        return candidate
+    return None
+
+
 def _reader_spatial_plan(
     projected: Tensor, real: Tensor, grad: Tensor | None, *, strict: bool,
 ) -> tuple[_VectorLaunch, _CudaModule]:
@@ -1433,15 +1502,13 @@ def _reader_spatial_plan(
     props = torch.cuda.get_device_properties(projected.device)
     backward = grad is not None
     op = "dinput" if backward else "forward"
-    w44 = _reader_w44()
-    wide_modes = ("all_opt", "dinput_wide") if backward else (
-        "all_opt", "fwd_vec1_r8", "fwd_vec1_r4",
-    )
-    if w44 in wide_modes and _reader_auto(
+    module = _reader_vec128_module(projected, real, grad, strict=strict, op=op)
+    if module is not None:
+        return _VectorLaunch(8, vec128.TILE_W, vec128.TILE_H, vec128.WARPS), module
+    if backward and _reader_w44() == "dinput_wide" and _reader_auto(
         projected, real, grad, strict=strict, force_search=True,
     ):
-        rows = min(height, 4) if w44 == "fwd_vec1_r4" else _reader_tall_rows(height)
-        candidate = _wide_spatial_plan(projected, real, grad, rows=rows)
+        candidate = _wide_spatial_plan(projected, real, grad, rows=_reader_tall_rows(height))
         if candidate is not None:
             return candidate
     if _reader_auto(projected, real, grad, strict=strict):
@@ -1475,7 +1542,11 @@ def _reader_spatial_plan(
             if score > best_score:
                 best, best_score = (launch, module), score
         if best is not None:
-            return best
+            wide = (
+                _reader_floor_dinput(projected, real, grad, best[0])
+                if backward and _reader_mode() == "proven_floor" else None
+            )
+            return wide or best
     rows, warps = _spatial_geometry(width, rank, kernel, projected.dtype, strict=strict)
     launch = _VectorLaunch(1, _reader_columns(width), rows, warps)
     return launch, _reader_module_for(projected, real, grad, strict=strict, launch=launch)
@@ -1529,11 +1600,63 @@ def _fullrank_weight_candidate(
         projected, real, grad, strict=False, launch=spatial,
         weight_geometry=geometry, weight_vec=vec, operation="dweight",
     )
-    for operation in ("dweight_cvt", "dweight") if convert else ("dweight",):
-        resident = _reader_resident(module, operation, geometry[2])
-        if resident:
-            return geometry, vec, module, resident, operation
-    return None
+    raw = _reader_resident(module, "dweight", geometry[2])
+    cvt = _reader_resident(module, "dweight_cvt", geometry[2]) if convert else 0
+    if cvt and cvt >= raw:
+        return geometry, vec, module, cvt, "dweight_cvt"
+    return (geometry, vec, module, raw, "dweight") if raw else None
+
+
+def _reader_weight_variant(
+    projected: Tensor, real: Tensor, grad: Tensor, spatial: _VectorLaunch, *, compact: bool,
+) -> tuple[tuple[int, int, int], int, _CudaModule, int, str] | None:
+    w44 = _reader_w44()
+    if w44 in ("dw_fullrank", "dw_fullrank_cvt"):
+        candidate = _fullrank_weight_candidate(
+            projected, real, grad, spatial, convert=w44 == "dw_fullrank_cvt",
+        )
+        if candidate is not None:
+            return candidate
+    baseline = _reader_weight_candidate(projected, real, grad, spatial, compact=compact)
+    if baseline is None:
+        return None
+    geometry, vec, _, _ = baseline
+    height, rank = projected.shape[1], real.shape[1]
+    if (
+        _reader_mode() == "proven_floor" and vec == 1
+        and (geometry[0] < rank or geometry[1] < height)
+        and _reader_tall_rows(height) >= geometry[1]
+    ):
+        # Short windows have little reuse of the converted gradient patch.
+        candidate = _fullrank_weight_candidate(
+            projected, real, grad, spatial, convert=projected.shape[2] > spatial.columns,
+        )
+        if candidate is not None:
+            return candidate
+    return (*baseline, "dweight")
+
+
+def _reader_vec128_weight_plan(
+    projected: Tensor, real: Tensor, grad: Tensor, *, strict: bool,
+) -> _WeightLaunch | None:
+    module = _reader_vec128_module(projected, real, grad, strict=strict, op="dweight")
+    if module is None:
+        return None
+    batch, height, width, _ = projected.shape
+    modes, rank, kernel, _ = real.shape
+    props = torch.cuda.get_device_properties(projected.device)
+    sms = props.multi_processor_count
+    resident = _reader_resident(module, "dweight", vec128.WARPS)
+    mode_tiles = _ceildiv(modes, vec128.MODE_TILE)
+    spatial_tiles = _ceildiv(height, vec128.TILE_H) * _ceildiv(width, vec128.TILE_W)
+    workers = min(
+        batch * spatial_tiles,
+        _ceildiv(2 * sms * resident, mode_tiles),
+        _weight_partial_limit(props.total_memory, sms, 2 * modes * rank * kernel**2,
+                              resident * vec128.WARPS * _WARP_SIZE),
+    )
+    return _WeightLaunch((mode_tiles, workers, 1), vec128.WARPS, "dweight_reduce_parallel",
+                         _WARP_SIZE, module, "dweight")
 
 
 def _reader_weight_plan(
@@ -1544,6 +1667,9 @@ def _reader_weight_plan(
     device = projected.device
     props = torch.cuda.get_device_properties(device)
     sms = props.multi_processor_count
+    vector = _reader_vec128_weight_plan(projected, real, grad, strict=strict)
+    if vector is not None:
+        return vector
     static = not strict and rank <= _STATIC_RANK_LIMIT and kernel == _STATIC_SPATIAL_KERNEL
     baseline = _weight_geometry(projected, modes, rank, grad.dtype) if static else None
     columns = _reader_columns(width)
@@ -1556,17 +1682,11 @@ def _reader_weight_plan(
     operation = "dweight"
     compact = width <= columns and height <= 2 * columns
     w44 = _reader_w44()
-    structural = w44 in ("dw_fullrank", "dw_fullrank_cvt", "all_opt")
+    structural = w44 in ("dw_fullrank", "dw_fullrank_cvt")
     if _reader_auto(projected, real, grad, strict=strict, force_search=structural):
-        candidate = _fullrank_weight_candidate(
-            projected, real, grad, spatial, convert=w44 != "dw_fullrank",
-        ) if structural else None
+        candidate = _reader_weight_variant(projected, real, grad, spatial, compact=compact)
         if candidate is not None:
             geometry, weight_vec, module, resident, operation = candidate
-        else:
-            legacy = _reader_weight_candidate(projected, real, grad, spatial, compact=compact)
-            if legacy is not None:
-                geometry, weight_vec, module, resident = legacy
         if module is not None:
             # Longer row tiles have fewer bands. Keep their workers spread
             # over additional resident waves before reducing the partials.
@@ -1762,6 +1882,9 @@ def _reader_spatial_grid(
     batch: int, height: int, width: int, modes: int, rows: int, warps: int, vec: int = 1,
     columns: int | None = None,
 ) -> tuple[int, int, int]:
+    if vec == 8:
+        return (_ceildiv(modes, vec128.MODE_TILE),
+                _ceildiv(height, rows) * _ceildiv(width, columns or vec128.TILE_W), batch)
     tiles = _ceildiv(height, rows) * _ceildiv(width, warps * (
         columns or _reader_vector_columns(width, vec)
     ))
@@ -1905,6 +2028,7 @@ _packed_spatial.register_autograd(_backward_spatial, setup_context=_save_spatial
 
 def packed_spatial(projected: Tensor, real: Tensor, imag: Tensor) -> Tensor:
     """Filter packed (component, rank, mode) projections with FP32 accumulation."""
+    _reader_mode()
     _reader_w44()
     _validate_packed_spatial_shape(projected, real, strict_complex=True)
     if projected.is_cuda and projected.numel() != 0:
@@ -1916,6 +2040,7 @@ def real_packed_spatial(
     projected: Tensor, weights: Tensor, *, component_first: bool = False,
 ) -> Tensor:
     """Apply two independent filters per mode to a shared real projection."""
+    _reader_mode()
     _reader_w44()
     real, imag = weights.unbind(dim=0 if component_first else 1)
     _validate_packed_spatial_shape(projected, real, strict_complex=False)

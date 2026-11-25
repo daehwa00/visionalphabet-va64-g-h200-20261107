@@ -1,4 +1,4 @@
-"""Screen Wave 45B reader policies with eager CUDA launches and cold caches."""
+"""Screen Wave 47 reader policies with eager CUDA launches and cold caches."""
 
 from __future__ import annotations
 
@@ -190,7 +190,7 @@ def timing_pass(
         inputs = make_inputs(args.batch, shape, DTYPES["bf16"])
         for op in OPS:
             for mode in args.modes:
-                os.environ["LNET_READER_W44"] = mode
+                os.environ["LNET_READER_OPT"] = mode
                 compile_before = compilation["seconds"]
                 run, output, plan = prepare(op, inputs, module_plans)
                 compile_s = compilation["seconds"] - compile_before
@@ -230,7 +230,7 @@ def parity_pass(
         for dtype, torch_dtype in DTYPES.items():
             inputs = make_inputs(batch, shape, torch_dtype)
             for op in OPS:
-                os.environ["LNET_READER_W44"] = "off"
+                os.environ["LNET_READER_OPT"] = "off"
                 compile_before = compilation["seconds"]
                 baseline, expected, _ = prepare(op, inputs, module_plans)
                 baseline_compile = compilation["seconds"] - compile_before
@@ -241,7 +241,7 @@ def parity_pass(
                 progress("off", name, op, baseline_compile, parity_s=time.perf_counter() - started)
                 del baseline
                 for mode in args.modes:
-                    os.environ["LNET_READER_W44"] = mode
+                    os.environ["LNET_READER_OPT"] = mode
                     compile_before = compilation["seconds"]
                     run, output, plan = prepare(op, inputs, module_plans)
                     compile_s = compilation["seconds"] - compile_before
@@ -262,7 +262,7 @@ def parity_pass(
 def screen(args: argparse.Namespace) -> dict:
     flush = l2_buffer() if args.flush_l2 else None
     capture, module_plans, compilation = record_module_plans()
-    with capture:
+    with capture, patch.dict(os.environ, {"LNET_READER_W44": "off"}):
         result = timing_pass(args, flush, module_plans, compilation)
         timing_plans = result.pop("timing_plans")
         rows = parity_pass(args, timing_plans, module_plans, compilation) if args.parity else []
@@ -278,7 +278,7 @@ def main() -> None:
     parser.add_argument("--flush-l2", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--parity", action="store_true")
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--modes", choices=reader._W44_MODES, nargs="+", default=reader._W44_MODES)
+    parser.add_argument("--modes", choices=reader._READER_MODES, nargs="+", default=reader._READER_MODES)
     args = parser.parse_args()
     if args.batch < 1 or args.warmup < 0 or args.iters < 1:
         parser.error("batch and iters must be positive and warmup must be nonnegative")
