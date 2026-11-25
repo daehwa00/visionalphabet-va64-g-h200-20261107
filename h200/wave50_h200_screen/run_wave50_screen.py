@@ -80,6 +80,76 @@ def stage(
     }
 
 
+TARGETED = ("stem_stage0", "vscan_e2e", "reader_8fix_smoke")
+
+
+def targeted_screen(out: Path, env: dict[str, str], stages: tuple[str, ...]) -> dict:
+    scan_flags = {
+        "LNET_SCAN_STRICT_RO": "1",
+        "LNET_SCAN_BATCH4_W2": "1",
+        "LNET_SCAN_BWD_OPT": "1",
+        "LNET_SCAN_SGS": "strict_ro",
+        "LNET_SCAN_VFWD": "batch4_w2",
+        "LNET_SCAN_HSCAN": "bwd_opt",
+    }
+    commands = {
+        "stem_stage0": (
+            [
+                "scripts/bench_stem_micro.py",
+                "--modes",
+                "off,cuda_tiled",
+                "--batch",
+                "1024",
+                "--warmup",
+                "3",
+                "--iters",
+                "10",
+                "--flush-l2",
+                "--parity",
+            ],
+            90,
+            env,
+        ),
+        "vscan_e2e": (
+            [
+                "scripts/bench_scan_micro.py",
+                "--ops",
+                "vscan_e2e",
+                "--modes",
+                "off,saved_fused,saved_split,auto_vram",
+                "--batch",
+                "1024",
+                "--dtype",
+                "bf16",
+                "--warmup",
+                "2",
+                "--iters",
+                "5",
+                "--flush-l2",
+                "--parity",
+                "--parity-batch",
+                "4",
+            ],
+            240,
+            {**env, **scan_flags},
+        ),
+        "reader_8fix_smoke": (
+            ["-m", "h200.wave50_h200_screen.reader_8fix_smoke"],
+            60,
+            env,
+        ),
+    }
+    results = {}
+    for name in stages:
+        print(f"starting {name}", flush=True)  # noqa: T201
+        results[name] = stage(out, name, *commands[name], json_flag="--json-out")
+        log = (out / f"{name}.log").read_text(errors="replace")
+        if not (out / f"{name}.json").exists():
+            write_json(out / f"{name}.json", {**results[name], "log_tail": log[-3000:]})
+        print(f"{name}: {results[name]}", flush=True)  # noqa: T201
+    return results
+
+
 def screen(out: Path, env: dict[str, str]) -> dict:
     scan_flags = {
         "LNET_SCAN_SGS": "strict_ro",
@@ -267,7 +337,7 @@ def lockin(out: Path, env: dict[str, str]) -> dict:
     return results
 
 
-def archive(out: Path, results: dict) -> None:
+def archive(out: Path, results: dict, prefix: str = "VA_T177") -> None:
     files = [
         out / f"{name}.{suffix}"
         for name in results
@@ -294,24 +364,30 @@ def archive(out: Path, results: dict) -> None:
             tar.add(file, arcname=file.name)
     raw = bundle.read_bytes()
     encoded = base64.b64encode(raw).decode("ascii")
-    print(f"VA_T177_SHA256 {hashlib.sha256(raw).hexdigest()}")  # noqa: T201
+    print(f"{prefix}_SHA256 {hashlib.sha256(raw).hexdigest()}")  # noqa: T201
     for file in [manifest, *files]:
         if file.suffix == ".json":
             print(  # noqa: T201
-                f"VA_T177_JSON_SHA256 {file.name} {hashlib.sha256(file.read_bytes()).hexdigest()}"
+                f"{prefix}_JSON_SHA256 {file.name} {hashlib.sha256(file.read_bytes()).hexdigest()}"
             )
-    print("VA_T177_BEGIN")  # noqa: T201
+    print(f"{prefix}_BEGIN")  # noqa: T201
     for start in range(0, len(encoded), 240):
-        print(f"VA_T177_GZ {encoded[start : start + 240]}")  # noqa: T201
-    print("VA_T177_END", flush=True)  # noqa: T201
+        print(f"{prefix}_GZ {encoded[start : start + 240]}")  # noqa: T201
+    print(f"{prefix}_END", flush=True)  # noqa: T201
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=Path("wave50_results"))
     parser.add_argument("--run", choices=("screen", "lockin"), default="screen")
+    parser.add_argument(
+        "--stages", help="Run a comma-separated subset of the targeted screen stages."
+    )
     parser.add_argument("--arm", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    stages = tuple(dict.fromkeys(args.stages.split(","))) if args.stages else ()
+    if stages and (set(stages).difference(TARGETED) or args.run != "screen" or args.arm):
+        parser.error(f"--stages requires screen mode and names from {', '.join(TARGETED)}")
     out = args.out.resolve()
     if args.arm:
         return compiled_arm(out)
@@ -334,7 +410,11 @@ def main() -> int:
         torch.backends.cudnn.version(),
         flush=True,
     )
-    results = (screen if args.run == "screen" else lockin)(out, env)
+    results = (
+        targeted_screen(out, env, stages)
+        if stages
+        else (screen if args.run == "screen" else lockin)(out, env)
+    )
     props = torch.cuda.get_device_properties(0)
     write_json(
         out / "meta.json",
@@ -350,7 +430,7 @@ def main() -> int:
             "screen_wall_s": monotonic() - started,
         },
     )
-    archive(out, results)
+    archive(out, results, "VA_T178" if stages else "VA_T177")
     print(json.dumps(results, indent=2))  # noqa: T201
     return int(any(row["status"] == "error" for row in results.values()))
 
