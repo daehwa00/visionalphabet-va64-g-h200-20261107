@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import os
 import re
 import statistics
 import sys
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 
 GIB = 1024**3
 VARIANTS = ("17-p1-nr4-1024d-v3", "17-live-complex-rms-s03", "17-e2-multiscale-s3s4-live-rms-v2")
+LOCKIN_FOLD_ALIAS = "VA-Ablation-17-factorized-terminal-rmsnorm"
 COUNTS = ("passed", "skipped", "failed", "errors", "xfailed", "xpassed", "deselected")
 
 
@@ -115,7 +117,7 @@ def setup(batch: int) -> torch.Tensor:
 
     torch.manual_seed(501)
     torch.set_float32_matmul_precision("high")
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = os.getenv("LNET_CUDNN_BENCHMARK", "1") != "0"
     return torch.randn(batch, 3, 224, 224, device="cuda").contiguous(
         memory_format=torch.channels_last
     )
@@ -127,6 +129,7 @@ def build_model(variant: str) -> torch.nn.Module:
 
     from lnet.model_w36b import prepare_model_w36b_
 
+    variant = VARIANTS[0] if variant == LOCKIN_FOLD_ALIAS else variant
     model = build_variant(variant).to(device="cuda", memory_format=torch.channels_last)
     return prepare_model_w36b_(model)
 
@@ -830,7 +833,8 @@ def main() -> None:
         sub = subs.add_parser(name)
         sub.add_argument("--out", required=True, type=Path)
         if name in {"train-arm", "infer-fold"}:
-            sub.add_argument("--variant", required=True, choices=VARIANTS)
+            choices = (*VARIANTS, LOCKIN_FOLD_ALIAS) if name == "infer-fold" else VARIANTS
+            sub.add_argument("--variant", required=True, choices=choices)
             sub.add_argument("--batch", required=True, type=int)
         if name == "infer-fold":
             sub.add_argument("--precision", choices=("high", "highest"), default="high")
