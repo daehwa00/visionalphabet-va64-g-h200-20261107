@@ -3,7 +3,6 @@
 import re
 import subprocess
 import sys
-from functools import partial
 
 import bench_wave53b_stem_type1 as bench
 import pytest
@@ -44,7 +43,6 @@ def test_cpu_check_case_has_no_grad_fn_at_capture(monkeypatch) -> None:
     assert all(t.grad_fn is None for t in reference_gradients(x, conv, norm, dy))
     monkeypatch.setattr(bench, "stem_case", lambda *args, **kwargs: (x, conv, norm, dy))
     monkeypatch.setattr(bench, "stem_forward", lambda *_: lambda v: _fused_stem_block(v, conv, norm))
-    monkeypatch.setattr(torch, "compile", partial(torch.compile, backend="aot_eager"))
     captures = []
 
     def capture_probe(step):
@@ -59,6 +57,51 @@ def test_cpu_check_case_has_no_grad_fn_at_capture(monkeypatch) -> None:
     monkeypatch.setattr(bench, "graph_finite", capture_probe)
     check_case(torch.contiguous_format, torch.float32, needs_dx=True, bias=True)
     assert captures == [True]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("scenario", ["pass", "aot", "expected", "eager"])
+def test_cpu_check_case_compile_parity(dtype, scenario, monkeypatch):
+    x = torch.ones(1, 3, 5, 7)
+    conv = torch.nn.Conv2d(3, 32, 3, stride=2, padding=1)
+    norm = LayerNorm2d(32)
+    dy = torch.ones(1, 32, 3, 4)
+    monkeypatch.setattr(bench, "stem_case", lambda *args, **kwargs: (x, conv, norm, dy))
+    # Exercise the CUDA-only decision with CPU operators and controlled FP32 dw differences.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda tensor: tensor is x))
+    monkeypatch.setattr(bench, "stem_forward", lambda *_: lambda v: _fused_stem_block(v, conv, norm))
+    backends = []
+    eager_limit = 0.015 if dtype == torch.bfloat16 else 0.005
+    ref_limit = 0.04 if dtype == torch.bfloat16 else 0.008
+
+    def compile_probe(forward, *, fullgraph, backend="inductor"):
+        assert fullgraph
+        backends.append(backend)
+        return (forward, backend)
+
+    def step(forward, *args):
+        backend = "eager"
+        if isinstance(forward, tuple):
+            forward, backend = forward
+        y, dw, *rest = run_step(forward, *args)
+        shift = ref_limit - eager_limit / 4 if scenario == "expected" else 0
+        if backend == "aot_eager" and scenario == "aot":
+            shift += eager_limit / 2
+        if backend == "inductor":
+            shift += eager_limit * (1.25 if scenario == "eager" else 0.5)
+        return (y, dw * (1 + shift), *rest)
+
+    run_step = bench.run_step
+    monkeypatch.setattr(torch, "compile", compile_probe)
+    monkeypatch.setattr(bench, "run_step", step)
+    monkeypatch.setattr(bench, "graph_finite", lambda _: True)
+    if scenario == "pass":
+        check_case(torch.contiguous_format, dtype, needs_dx=False, bias=True)
+    else:
+        message = {"aot": "not close", "expected": "Inductor vs FP32", "eager": "Inductor vs eager"}
+        with pytest.raises(AssertionError, match=message[scenario]):
+            check_case(torch.contiguous_format, dtype, needs_dx=False, bias=True)
+    assert backends == (["aot_eager"] if scenario == "aot" else ["aot_eager", "inductor"])
 
 
 def _compile(kernel, pointers, constants, warps, stages, tmp_path, spill_limit=(0, 0)):
