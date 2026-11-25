@@ -167,9 +167,9 @@ def parity_stats(actual: Tensor, expected: Tensor) -> dict[str, int | float | bo
     error = (actual32 - expected32).abs()
     relative = error / expected32.abs().clamp_min(1e-12)
     if actual.dtype == torch.float32:
-        close = error <= 1e-4
+        close = error <= 1e-5 + 1e-4 * expected32.abs()
     else:
-        close = (error <= 1e-2) | (actual == torch.nextafter(expected, actual))
+        close = (error <= 1e-3 + 1e-2 * expected32.abs()) | (actual == torch.nextafter(expected, actual))
     max_abs, max_rel, mismatch_count, passed = torch.stack((
         error.amax().double(), relative.amax().double(), (actual != expected).sum().double(),
         (close & actual.isfinite() & expected.isfinite()).all().double(),
@@ -284,7 +284,7 @@ def _screen(op: str, args: argparse.Namespace, modes: tuple[str, ...]) -> dict:
     }
     return {
         "best_mode": best_mode(totals, exact),
-        "best_tolerated_mode": best_mode(totals, tolerated),
+        "best_tolerated_mode": best_mode(totals, tolerated if op == "vscan_bwd" else exact),
         "timing_kernel_covered": covered,
         "weighted_ms": totals,
         "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
@@ -297,6 +297,15 @@ def _screen(op: str, args: argparse.Namespace, modes: tuple[str, ...]) -> dict:
         },
         "tolerance_pass": passes["tol_pass"], "parity": diagnostics, "shapes": results,
     }
+
+
+def _combined_projection(report: dict) -> dict[str, float]:
+    winners = {"vscan_bwd": "strict_ro", "vscan_fwd": "batch4", "hscan_fwd": "bwd_opt", "hscan_bwd": "bwd_opt"}
+    totals = {op: report[op]["weighted_ms"] for op in winners}
+    projected = sum(totals[op][mode] for op, mode in winners.items())
+    off = sum(times["off"] for times in totals.values())
+    strict = off - totals["vscan_bwd"]["off"] + totals["vscan_bwd"]["strict"]
+    return {"weighted_ms": projected, "delta_vs_off_ms": projected - off, "delta_vs_strict_ms": projected - strict}
 
 
 def main() -> None:
@@ -333,6 +342,9 @@ def main() -> None:
             report[op] = _screen(op, args, modes)
     if ops == ("vscan_bwd",):
         report.update(report["vscan_bwd"])
+    if all(op in report and set(modes) <= report[op]["weighted_ms"].keys()
+           for op, (_, modes) in OPS.items()):
+        report["combined_projection"] = _combined_projection(report)
     report["elapsed_seconds"] = perf_counter() - started
     output = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.out is None:

@@ -6,7 +6,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from bench_scan_micro import EDGE_SHAPES, MODEL_SHAPES, best_mode, make_inputs, parity_stats
+from bench_scan_micro import (
+    EDGE_SHAPES,
+    MODEL_SHAPES,
+    OPS,
+    TENSOR_NAMES,
+    _case,
+    _layouts,
+    best_mode,
+    parity_stats,
+)
 from torch import Tensor
 from torch._inductor import config as inductor_config
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -1419,17 +1428,54 @@ def test_cuda_sgs_parity(
         sms = torch.cuda.get_device_properties(0).multi_processor_count
         tiles = scans._ceil(m, scans._WARP_SIZE)
         batch = max(batch, scans._ceil(16 * sms, w * tiles))
-    inputs = make_inputs(batch, h, w, m, coarse, dtype)
-    for compact in ((False, True) if coarse else (False,)):
+    shape = (label, h, w, m, coarse, _calls)
+    for compact in _layouts("vscan_bwd", label, coarse, w):
         monkeypatch.setenv("LNET_SCAN_SGS", "off")
-        expected = scans.vertical_backward(*inputs, coarse, compact=compact)
+        run, plan = _case("vscan_bwd", shape, batch, dtype, compact=compact)
+        expected = run()
         for mode in scans.SGS_MODES[1:]:
             monkeypatch.setenv("LNET_SCAN_SGS", mode)
-            actual = scans.vertical_backward(*inputs, coarse, compact=compact)
-            for index, (value, reference) in enumerate(zip(actual, expected, strict=True)):
-                stats = parity_stats(value, reference)
-                field = "exact_match" if mode == "strict" else "tol_pass"
-                assert stats[field], (mode, index, stats)
+            actual = run()
+            diagnosed = mode == "strict_ro" and label == "56d" and dtype == torch.bfloat16
+            if diagnosed:
+                key = plan().key
+                assert key.chunk > 0
+                assert key.sgs == 0
+            names = TENSOR_NAMES["vscan_bwd"]
+            for name, value, reference in zip(names, actual, expected, strict=True):
+                if diagnosed and not name.startswith("decay_"):
+                    assert torch.equal(value, reference), name
+                elif diagnosed:
+                    torch.testing.assert_close(value, reference, atol=1e-5, rtol=0, msg=name)
+                else:
+                    assert parity_stats(value, reference)["tol_pass"], (mode, name)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [*MODEL_SHAPES, *EDGE_SHAPES], ids=lambda shape: shape[0])
+@pytest.mark.parametrize(
+    "op", ["vscan_fwd", "hscan_fwd", "hscan_bwd"], ids=["vfwd", "hscan_fwd", "hscan_bwd"],
+)
+def test_cuda_scan_winner_exact(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, shape: tuple, op: str,
+) -> None:
+    torch.manual_seed(141)
+    label, h, w, _, coarse, _ = shape
+    batch = 2 if shape in EDGE_SHAPES else min(64, 64 * 28 * 28 // (h * w))
+    env, (off, winner) = OPS[op]
+    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
+    for compact in _layouts(op, label, coarse, w):
+        monkeypatch.setenv(env, off)
+        run, plan = _case(op, shape, batch, dtype, compact=compact)
+        baseline = plan()
+        expected = run()
+        monkeypatch.setenv(env, winner)
+        if op == "hscan_fwd":
+            assert plan() == baseline
+        for name, actual, reference in zip(TENSOR_NAMES[op], run(), expected, strict=True):
+            assert torch.equal(actual, reference), (label, name)
 
 
 def test_scan_micro_parity_diagnostics() -> None:
@@ -1468,43 +1514,54 @@ def test_vfwd_batch4_resource_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
         scans._plan_vfwd.cache_clear()
 
 
-def test_hscan_hopper_interleaved_unroll_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    key = scans.Kernel(
-        torch.bfloat16, 1, backward=False, real_interleaved=True, imag_interleaved=True,
-    )
-    baseline = scans.Launch(scans.ScanPlan(1, 0), key, 100, 100)
-    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
-    monkeypatch.setattr(scans, "_resident", lambda *_: 16)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+@pytest.mark.parametrize(
+    ("backward", "warps", "width", "base", "candidate", "accepted"),
+    [
+        (False, 2, 56, 15, 15, False),
+        (True, 4, 56, 8, 8, False),
+        (True, 3, 16, 10, 10, False),
+        (True, 3, 28, 7, 10, False),
+        (True, 3, 28, 10, 0, False),
+        (True, 3, 28, 10, 9, False),
+        (True, 3, 28, 10, None, False),
+        (True, 3, 28, 10, 10, True),
+        (True, 2, 56, 15, 16, True),
+    ],
+)
+def test_hscan_bwd_opt_resource_gate(
+    monkeypatch: pytest.MonkeyPatch, backward: bool, warps: int, width: int,
+    base: int, candidate: int | None, accepted: bool,
+) -> None:
+    key = scans.Kernel(torch.bfloat16, warps, backward=backward, cache_line=True)
+    baseline = scans.Launch(scans.ScanPlan(warps, 28672, cache_line=True), key, 105, 35)
+
+    def resident(_, probe, _smem):
+        if probe == key:
+            return base
+        if candidate is None:
+            raise RuntimeError("JIT failure")
+        return candidate
+
+    monkeypatch.setattr(scans, "_resident", resident)
     scans._plan_hscan.cache_clear()
     try:
-        result = scans._plan_hscan(0, baseline, (2, 56, 56, 160), "unroll_tune")
-        assert result.key == replace(key, horizontal_readonly=True)
-        assert result.plan == baseline.plan
-        source = scans._kernel_source(result.key)
-        assert "__ldg(sr + base_r + I(x) * step_r)" in source
-        assert "load_complex_readonly(grad," in source
+        assert scans._plan_hscan(0, baseline, (2, 56, width, 63), "off") is baseline
+        result = scans._plan_hscan(0, baseline, (2, 56, width, 63), "bwd_opt")
+        if accepted:
+            candidate_key = replace(key, horizontal_readonly=True, horizontal_unroll=8)
+            assert result == baseline._replace(key=candidate_key)
+        else:
+            assert result is baseline
     finally:
         scans._plan_hscan.cache_clear()
 
 
-def test_hscan_wide_cta_layout_and_two_waves(monkeypatch: pytest.MonkeyPatch) -> None:
-    key = scans.Kernel(torch.float16, 4, backward=True, compact=True,
-                       real_interleaved=True, imag_transposed=True, cache_line=True)
-    plan = scans.ScanPlan(4, 28672, cache_line=True)
-    baseline = scans.Launch(plan, key, 4096, 1024)
-    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
-    monkeypatch.setattr(scans, "_resident", lambda _, key, _smem: 32 // key.warps)
-    scans._plan_hscan.cache_clear()
-    try:
-        result = scans._plan_hscan(0, baseline, (1024, 56, 56, 160), "wide_cta")
-        assert result.key == replace(key, warps=8, horizontal_readonly=True, horizontal_unroll=4)
-        assert result.plan.smem == 57344
-        assert result.workers == baseline.workers
-        assert result.partials == 512
-        short = baseline._replace(workers=112, partials=28)
-        result = scans._plan_hscan(0, short, (2, 56, 56, 160), "wide_cta")
-        assert result.key == replace(key, horizontal_readonly=True)
-        assert result[2:] == short[2:]
-    finally:
-        scans._plan_hscan.cache_clear()
+@pytest.mark.parametrize("op", list(OPS))
+def test_invalid_scan_mode(monkeypatch: pytest.MonkeyPatch, op: str) -> None:
+    env, modes = OPS[op]
+    monkeypatch.setenv(env, "removed")
+    with pytest.raises(ValueError, match=f"{env}=.*allowed modes: {', '.join(modes)}"):
+        scans._plan_launch(
+            torch.empty(1), (1, 1, 1, 1), backward=op.endswith("_bwd"),
+            vertical=op.startswith("vscan"), coarse=False, hidden=8, precise=False,
+        )

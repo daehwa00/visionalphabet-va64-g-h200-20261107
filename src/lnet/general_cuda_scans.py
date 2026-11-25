@@ -2418,9 +2418,16 @@ def _plan_scan_auto(
     return launch
 
 
-SGS_MODES = ("off", "strict", "strict_ro_only", "strict_ro", "strict_w8")
-VFWD_MODES = ("off", "ro", "reg_coarse", "batch4")
-HSCAN_MODES = ("off", "ro", "unroll_tune", "wide_cta")
+SGS_MODES = ("off", "strict", "strict_ro")
+VFWD_MODES = ("off", "batch4")
+HSCAN_MODES = ("off", "bwd_opt")
+
+
+def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
+    mode = os.environ.get(env, "off")
+    if mode not in allowed:
+        raise ValueError(f"{env}={mode!r}; allowed modes: {', '.join(allowed)}")
+    return mode
 
 
 @cache
@@ -2458,7 +2465,7 @@ def _sgs_cap(block_limit: int, shared: int, reserved: int, resident: int) -> int
 
 def _wider_readonly_layout(
     launch: Launch, shape: tuple[int, int, int, int], active_warps: int, sms: int,
-    block_limit: int, shared: int, reserved: int, *, max_warps: int = 4,
+    block_limit: int, shared: int, reserved: int,
 ) -> tuple[Kernel, int, int] | None:
     _, key, workers, _ = launch
     _, height, _, modes = shape
@@ -2471,8 +2478,8 @@ def _wider_readonly_layout(
         return None
     best = None
     best_span = key.chunk
-    for warps in (8, *_SCAN_WARPS):
-        if not key.warps < warps <= max_warps or warps % key.warps or active_warps % warps:
+    for warps in _SCAN_WARPS:
+        if warps <= key.warps or warps % key.warps or active_warps % warps:
             continue
         resident = active_warps // warps
         if _ceil(workers, warps) * _ceil(modes, _WARP_SIZE) < 2 * sms * resident:
@@ -2493,7 +2500,7 @@ def _wider_readonly_layout(
 
 
 @lru_cache(maxsize=512)
-def _plan_sgs(  # noqa: C901, PLR0911
+def _plan_sgs(
     device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
 ) -> Launch:
     plan, key, _, _ = launch
@@ -2529,15 +2536,8 @@ def _plan_sgs(  # noqa: C901, PLR0911
     readonly = replace(strict.key, backward_readonly=True)
     if not strict.key.backward_readonly and _resident(device, readonly, strict.plan.smem) == target:
         strict = strict._replace(key=readonly)
-    if mode == "strict_ro_only":
-        return strict
-    limits = (8, 4) if mode == "strict_w8" else (4,)
-    for limit in limits:
-        wider = _wider_readonly_layout(
-            launch, shape, active_warps, sms, block_limit, shared, reserved, max_warps=limit,
-        )
-        if wider is None:
-            break
+    wider = _wider_readonly_layout(launch, shape, active_warps, sms, block_limit, shared, reserved)
+    if wider is not None:
         candidate, smem, resident = wider
         if _resident(device, candidate, smem) == resident:
             return launch._replace(
@@ -2556,19 +2556,18 @@ def _probe_scan_candidate(device: int, baseline: Launch, candidate: Launch) -> i
 @lru_cache(maxsize=512)
 def _plan_vfwd(device: int, launch: Launch, height: int, mode: str) -> Launch:
     key = launch.key
-    if key.dtype.itemsize != 2 or not key.hidden8 or key.pure_vertical:
+    if mode == "off" or key.dtype.itemsize != 2 or not key.hidden8 or key.pure_vertical:
         return launch
     readonly = launch._replace(key=replace(key, forward_readonly=True))
     best = readonly if _probe_scan_candidate(device, launch, readonly) else launch
     rows = height // (1 + key.coarse)
-    if mode == "ro" or rows < 2:
+    if rows < 2:
         return best
     weights = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (4 if key.vector_weights else key.dtype.itemsize)
     plan = best.plan._replace(
         cache_weights=False, smem=best.plan.smem - weights * key.cache_weights,
     )
-    widths = (4, 2) if mode == "batch4" else (2,)
-    for width in widths:
+    for width in (4, 2):
         if rows < width:
             continue
         candidate = best._replace(
@@ -2586,56 +2585,24 @@ def _plan_vfwd(device: int, launch: Launch, height: int, mode: str) -> Launch:
 
 
 @lru_cache(maxsize=512)
-def _plan_hscan(  # noqa: C901, PLR0911
+def _plan_hscan(
     device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
 ) -> Launch:
-    plan, key, workers, _ = launch
-    if key.dtype.itemsize != 2:
+    plan, key, _, _ = launch
+    width = shape[2]
+    if mode == "off" or not key.backward or key.warps > 3 or width <= 2 * plan.chunk:
         return launch
-    readonly = launch._replace(key=replace(key, horizontal_readonly=True))
-    best = readonly if _probe_scan_candidate(device, launch, readonly) else launch
-    if mode == "ro":
-        return best
-    batch, height, width, modes = shape
-    sms, limit, _ = device_limits(device)
-    if mode == "unroll_tune":
-        interleaved = key.real_interleaved or key.imag_interleaved
-        if modes % _WARP_SIZE or width < 4 or (
-            interleaved and key.warps == 1 and torch.cuda.get_device_capability(device) >= (9, 0)
-        ):
-            return best
-        for factor in (8, 4):
-            if width < factor:
-                continue
-            candidate = best._replace(key=replace(best.key, horizontal_unroll=factor))
-            if _probe_scan_candidate(device, launch, candidate):
-                return candidate
-        return best
-
-    tiles = _ceil(modes, _WARP_SIZE)
-    lines = batch * height
-    if width < _LONG_SCAN:
-        return best
-    for warps in (8, *_SCAN_WARPS):
-        if warps <= key.warps:
-            continue
-        threads = warps * _WARP_SIZE
-        stored = width // (1 + (key.backward and key.compact))
-        smem = max(threads * 16 if key.backward else 0, (
-            stored * threads * (8 if key.backward else 2 * key.dtype.itemsize)
-            if plan.cache_line else 0
-        ))
-        if smem > limit or _ceil(workers, warps) * tiles < 2 * sms:
-            continue
-        candidate = Launch(
-            plan._replace(warps=warps, smem=smem),
-            replace(best.key, warps=warps, horizontal_unroll=4), workers,
-            _ceil(workers, warps) if key.backward else workers,
-        )
-        resident = _probe_scan_candidate(device, launch, candidate)
-        if resident and _ceil(workers, warps) * tiles >= 2 * sms * resident:
-            return _align_workers(candidate, lines, tiles, sms * resident)
-    return best
+    base_occupancy = key.warps * _resident(device, key, plan.smem)
+    if base_occupancy < 24:
+        return launch
+    candidate = replace(key, horizontal_readonly=True, horizontal_unroll=8)
+    try:
+        # The driver JIT assembles NVRTC PTX. _resident rejects local memory,
+        # including stack slots used for register spills.
+        occupancy = key.warps * _resident(device, candidate, plan.smem)
+    except RuntimeError:
+        return launch
+    return launch._replace(key=candidate) if occupancy >= base_occupancy else launch
 
 
 def _plan_launch(  # noqa: C901
@@ -2652,6 +2619,12 @@ def _plan_launch(  # noqa: C901
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
 ) -> Launch | None:
+    if vertical and backward:
+        mode = _scan_mode("LNET_SCAN_SGS", SGS_MODES)
+    elif vertical:
+        mode = _scan_mode("LNET_SCAN_VFWD", VFWD_MODES)
+    else:
+        mode = _scan_mode("LNET_SCAN_HSCAN", HSCAN_MODES)
     if not source.is_cuda or source.dtype not in _DTYPES:
         return None
     # Vertical input already includes every plane. Horizontal forward takes
@@ -2681,17 +2654,12 @@ def _plan_launch(  # noqa: C901
             odd_compact_width=backward and compact and bool(width % 2),
             backward_batch2=False, backward_batch_tail=False,
         ))
-    mode = os.environ.get("LNET_SCAN_SGS", "off")
-    if vertical and backward and mode in SGS_MODES[1:]:
-        return _plan_sgs(device, launch, shape, mode)
-    if vertical and not backward:
-        mode = os.environ.get("LNET_SCAN_VFWD", "off")
-        if mode in VFWD_MODES[1:]:
-            return _plan_vfwd(device, launch, height, mode)
-    if not vertical:
-        mode = os.environ.get("LNET_SCAN_HSCAN", "off")
-        if mode in HSCAN_MODES[1:]:
+    if mode != "off":
+        if not vertical:
             return _plan_hscan(device, launch, shape, mode)
+        if backward:
+            return _plan_sgs(device, launch, shape, mode)
+        return _plan_vfwd(device, launch, height, mode)
     return launch
 
 
@@ -2972,6 +2940,9 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     b, h, w, m = shape
     hidden = 0 if pure else path[0].shape[1]
     backward = grad is not None or features is not None
+    mode = _scan_mode("LNET_SCAN_SGS", SGS_MODES) if backward else _scan_mode(
+        "LNET_SCAN_VFWD", VFWD_MODES,
+    )
     oh, ow = (h // 2, w // 2) if coarse else (h, w)
     out_shape = (b, oh, ow, m)
     checkpoints = None
@@ -3001,7 +2972,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     if not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None
-            and os.environ.get("LNET_SCAN_SGS") in SGS_MODES[1:])
+            and mode != "off")
     ):
         chunk = (
             _saved_backward_chunk(states, coarse)
