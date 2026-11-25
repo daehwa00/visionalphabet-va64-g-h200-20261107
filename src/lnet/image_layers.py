@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional
 
-from .fused_stem_ops import fused_conv_stem, fused_nhwc_layernorm_gelu
+from .fused_stem_ops import fused_conv_stem, fused_nhwc_layernorm_gelu, tiled_stem_enabled
 from .model_w28c import model_cuda_supported
 
 _FUSED_FACTORIZED_READER_ENV = "LNET_FUSED_FACTORIZED_READER"
@@ -126,7 +126,9 @@ def _fused_stem_large_enough(inputs: Tensor, first: nn.Conv2d, second: nn.Conv2d
     return inputs.shape[0] * second.out_channels * h2 * w2 >= _FUSED_STEM_MIN_ELEMENTS
 
 
-def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d) -> bool:
+def _fused_conv_stem_supported(
+    inputs: Tensor, conv: nn.Conv2d, *, tiled: bool = False,
+) -> bool:
     mode = os.environ.get("LNET_FUSED_STEM_CONV", "auto")
     if mode not in ("auto", "off", "on"):
         raise ValueError("LNET_FUSED_STEM_CONV must be auto, off, or on")
@@ -140,11 +142,14 @@ def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d) -> bool:
         and inputs.dtype in eligible_types
         and conv.weight.dtype in eligible_types
         and inputs.shape[1] == conv.in_channels
-        and 1 <= conv.in_channels <= 4
+        and 1 <= conv.in_channels <= (8 if tiled else 4)
         and conv.out_channels in (32, 64)
         and conv.kernel_size == (3, 3)
-        and conv.stride == (2, 2)
-        and conv.padding == (1, 1)
+        and (tiled or conv.stride == (2, 2))
+        and (
+            isinstance(conv.padding, tuple) if tiled else conv.padding == (1, 1)
+        )
+        and conv.padding_mode == "zeros"
         and conv.dilation == (1, 1)
         and conv.groups == 1
         and (inputs.is_contiguous() or inputs.is_contiguous(memory_format=torch.channels_last))
@@ -159,12 +164,17 @@ def _fused_stem_block(
     *,
     nhwc_output: bool = False,
 ) -> Tensor:
-    if not nhwc_output and _fused_conv_stem_supported(inputs, conv):
+    tiled = (
+        not nhwc_output and inputs.is_cuda and conv.out_channels == 32 and tiled_stem_enabled()
+    )
+    use_tiled = tiled and _fused_conv_stem_supported(inputs, conv, tiled=True)
+    if not nhwc_output and (use_tiled or _fused_conv_stem_supported(inputs, conv)):
         dtype = (
             torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else inputs.dtype
         )
         return fused_conv_stem(
-            inputs, conv.weight, conv.bias, norm.norm.weight, norm.norm.bias, norm.norm.eps, dtype
+            inputs, conv.weight, conv.bias, norm.norm.weight, norm.norm.bias, norm.norm.eps, dtype,
+            tiled_geometry=(*conv.stride, *conv.padding) if use_tiled else None,
         )
     hidden = functional.conv2d(
         inputs, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups

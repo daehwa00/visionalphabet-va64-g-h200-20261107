@@ -3,17 +3,25 @@
 # ruff: noqa: ANN001
 from __future__ import annotations
 
+import ctypes as ct
+import os
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
+from .cuda_nvrtc import _CudaModule, _ensure_context
+from .fused_stem_ops import _TYPES, _compile_source, _launch
 from .model_w28c import _differentiate_swiglu, _save_joint, model_cuda_supported, model_opt_mode
 from .model_w36b import inductor_norms_enabled
 
 
 def model_w29c_enabled(device: torch.device, feature: str) -> bool:
+    if feature in ("rmsnorm_bwd", "rmsnorm_full") and _fast_rmsnorm_enabled():
+        return model_cuda_supported(device)
     mode = model_opt_mode("LNET_MODEL_W29C")
     if mode == "auto":
         if feature == "swiglu_vec2d" and model_opt_mode("LNET_MODEL_W28C") in (
@@ -183,8 +191,18 @@ def _rmsnorm_backward_kernel(
         tl.store(partial + pid * width + col, result, col < width)
 
 
+def channel_rmsnorm(
+    x: Tensor, weight: Tensor, epsilon: float, save_inverse: bool,  # noqa: FBT001
+) -> tuple[Tensor, Tensor]:
+    if _fast_rmsnorm_enabled():
+        return _fast_rmsnorm(x, weight, epsilon, save_inverse)
+    return _triton_rmsnorm(x, weight, epsilon, save_inverse)
+
+
 @triton_op("lnet::w29c_rmsnorm_forward", mutates_args=())
-def channel_rmsnorm(x: Tensor, weight: Tensor, epsilon: float, save_inverse: bool) -> tuple[Tensor, Tensor]:  # noqa: E501, FBT001
+def _triton_rmsnorm(
+    x: Tensor, weight: Tensor, epsilon: float, save_inverse: bool,  # noqa: FBT001
+) -> tuple[Tensor, Tensor]:
     width = x.shape[-1]
     rows = x.numel() // width
     output = x.new_empty(x.shape)
@@ -272,7 +290,7 @@ def _differentiate_rmsnorm(ctx, grad: Tensor, inverse_grad: Tensor | None) -> tu
     return dx, dw, None, None
 
 
-channel_rmsnorm.register_autograd(_differentiate_rmsnorm, setup_context=_save_rmsnorm)
+_triton_rmsnorm.register_autograd(_differentiate_rmsnorm, setup_context=_save_rmsnorm)
 
 
 class _CompiledChannelRMSNorm(torch.autograd.Function):
@@ -309,3 +327,151 @@ class _CompiledChannelRMSNorm(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             dw = (grad * normalized).reshape(-1, x.shape[-1]).sum(0).to(weight.dtype)
         return dx, dw, None, None
+
+
+_FAST_RMS_CUDA = r"""
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+using T = SCALAR;
+constexpr int elements = 16 / sizeof(T);
+
+union Pack {
+    uint4 vector;
+    T values[elements];
+    __device__ Pack() {}
+};
+
+template<bool Vector, bool Wide = false>
+__device__ __forceinline__ void rms(
+    const T* x, const T* w, T* y, float* inverse,
+    int rows, int width, int pitch, float eps
+) {
+    const int lane = threadIdx.x % 32, row = blockIdx.x * 4 + threadIdx.x / 32;
+    if (row >= rows) return;
+    x += row * pitch;
+    y += row * width;
+    float sum = 0.f;
+    if constexpr (Vector) {
+        auto vx = reinterpret_cast<const uint4*>(x);
+        auto vw = reinterpret_cast<const uint4*>(w);
+        auto vy = reinterpret_cast<uint4*>(y);
+        const int packs = width / elements;
+        Pack input;
+        for (int p = lane; p < packs; p += 32) {
+            input.vector = vx[p];
+            #pragma unroll
+            for (int i = 0; i < elements; ++i) {
+                const float v = float(input.values[i]);
+                sum += v * v;
+            }
+            if constexpr (!Wide) break;
+        }
+        #pragma unroll
+        for (int offset = 16; offset; offset /= 2)
+            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        const float inv = rsqrtf(sum / width + eps);
+        if (lane == 0 && inverse) inverse[row] = inv;
+        for (int p = lane; p < packs; p += 32) {
+            Pack scale, output;
+            if constexpr (Wide) input.vector = vx[p];
+            scale.vector = vw[p];
+            #pragma unroll
+            for (int i = 0; i < elements; ++i)
+                output.values[i] = T(float(input.values[i]) * inv * float(scale.values[i]));
+            vy[p] = output.vector;
+            if constexpr (!Wide) break;
+        }
+    } else {
+        for (int c = lane; c < width; c += 32) {
+            const float v = float(x[c]);
+            sum += v * v;
+        }
+        #pragma unroll
+        for (int offset = 16; offset; offset /= 2)
+            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        const float inv = rsqrtf(sum / width + eps);
+        if (lane == 0 && inverse) inverse[row] = inv;
+        for (int c = lane; c < width; c += 32)
+            y[c] = T(float(x[c]) * inv * float(w[c]));
+    }
+}
+
+extern "C" __global__ void rms_vector(
+    const T* x, const T* w, T* y, float* inverse, int rows, int width, int pitch, float eps
+) {
+    rms<true>(x, w, y, inverse, rows, width, pitch, eps);
+}
+
+extern "C" __global__ void rms_vector_wide(
+    const T* x, const T* w, T* y, float* inverse, int rows, int width, int pitch, float eps
+) {
+    rms<true, true>(x, w, y, inverse, rows, width, pitch, eps);
+}
+
+extern "C" __global__ void rms_scalar(
+    const T* x, const T* w, T* y, float* inverse, int rows, int width, int pitch, float eps
+) {
+    rms<false>(x, w, y, inverse, rows, width, pitch, eps);
+}
+"""
+
+
+def _fast_rmsnorm_enabled() -> bool:
+    mode = os.environ.get("LNET_NORM_W50_MODE", "off")
+    if mode not in ("off", "fast_fwd"):
+        raise ValueError("LNET_NORM_W50_MODE must be off or fast_fwd")
+    return mode == "fast_fwd"
+
+
+def _compile_fast_rms_ptx(capability, dtype: torch.dtype) -> ct.Array:
+    return _compile_source(capability, f"#define SCALAR {_TYPES[dtype]}\n" + _FAST_RMS_CUDA)
+
+
+@cache
+def _fast_rms_module(device: int, dtype: torch.dtype) -> _CudaModule:
+    image = _compile_fast_rms_ptx(torch.cuda.get_device_capability(device), dtype)
+    module = _CudaModule(image, device)
+    for name in ("rms_vector", "rms_vector_wide", "rms_scalar"):
+        module.load_function(name, 0)
+    return module
+
+
+@torch.library.custom_op("lnet::w50_rmsnorm_forward", mutates_args=(), device_types="cuda")
+def _fast_rmsnorm(
+    x: Tensor, weight: Tensor, epsilon: float, save_inverse: bool,  # noqa: FBT001
+) -> tuple[Tensor, Tensor]:
+    output, inverse = _fast_rmsnorm_fake(x, weight, epsilon, save_inverse)
+    width = x.shape[-1]
+    rows = x.numel() // width
+    pitch = _row_pitch(x)
+    elements = 16 // x.element_size()
+    vector = (
+        width % elements == 0 and pitch % elements == 0
+        and x.data_ptr() % 16 == 0 and weight.data_ptr() % 16 == 0
+    )
+    name = "rms_scalar"
+    if vector:
+        name = "rms_vector" if width <= elements * 32 else "rms_vector_wide"
+    device = x.device.index or 0
+    with torch.cuda.device(x.device):
+        module = _fast_rms_module(device, x.dtype)
+        _ensure_context(module.driver, device)
+        _launch(
+            module, torch.cuda.current_stream(x.device).cuda_stream,
+            name, triton.cdiv(rows, 4),
+            (x, weight, output, inverse if save_inverse else None),
+            ct.c_int(rows), ct.c_int(width), ct.c_int(pitch), ct.c_float(epsilon),
+        )
+    return output, inverse
+
+
+@_fast_rmsnorm.register_fake
+def _fast_rmsnorm_fake(
+    x: Tensor, weight: Tensor, epsilon: float, save_inverse: bool,  # noqa: ARG001, FBT001
+) -> tuple[Tensor, Tensor]:
+    return x.new_empty(x.shape), x.new_empty(
+        (*x.shape[:-1], 1) if save_inverse else (0,), dtype=torch.float32
+    )
+
+
+_fast_rmsnorm.register_autograd(_differentiate_rmsnorm, setup_context=_save_rmsnorm)
