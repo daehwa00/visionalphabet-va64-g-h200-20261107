@@ -116,7 +116,7 @@ def test_cuda_stage0_parity_compile_and_graph(
     x, conv, norm, dy = stem_case((4, 3, 33, 63), layout, dtype, needs_dx=needs_dx)
     forward = stem_forward(conv, norm, dtype)
     params = stem_parameters(x, conv, norm)
-    with torch.backends.cudnn.flags(allow_tf32=False):
+    with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
         expected = reference_gradients(x, conv, norm, dy)
         actual = run_step(forward, x, params, dy)
         errors = parity_errors(actual, expected)

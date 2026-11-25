@@ -3141,8 +3141,8 @@ W52A_MODES = (
 )
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
-W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4")
-H53_MODES = ("h53_ro_all", "h53_compact2", "h53_bf16_buf", "h53_l2_scratch")
+W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin")
+H53_MODES = ("h53_ro_all", "h53_compact2", "h53_bf16_buf", "h53_l2_scratch", "h53_lockin")
 HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2") + H53_MODES
 
 
@@ -3600,6 +3600,11 @@ def _plan_w53a(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
     )
     smemw = not key.backward and not key.coarse and 24 <= height < 48
     winner = "combo_sw" if floor else "tanh_gain_smemw" if smemw else "tanh_gain"
+    if mode == "w53_lockin" and key.backward:
+        if (not key.coarse and height >= 48) or (key.coarse and height <= 16):
+            winner = "fp32"
+        elif 24 <= height < 48:
+            mode = "w52_best_swpipe"
     launch = _plan_w52a(device, launch, shape, winner)
     if key.backward_batch2 and key.hidden8 and key.backward:
         pipe = {"w52_best_swpipe": 1, "w52_best_pipe4": 2}.get(mode, 0)
@@ -3614,6 +3619,14 @@ def _plan_h53(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
         return launch
     b, h, width, modes = shape
     long_dense = width >= 48 and not key.compact
+    if mode == "h53_lockin":
+        if long_dense:
+            # Reuse the measured dense pointer-stepping loop for both dtypes.
+            mode = "h53_bf16_buf"
+        elif (key.compact and width >= 48) or (not key.compact and 24 <= width < 48):
+            return _plan_hscan(device, launch, shape, "bwd_opt")
+        else:
+            mode = "h53_ro_all"
     scratch = long_dense and mode == "h53_l2_scratch"
     bf16 = long_dense and key.cache_line and mode == "h53_bf16_buf" and key.dtype == torch.bfloat16
     half = long_dense and key.cache_line and not (scratch or bf16)

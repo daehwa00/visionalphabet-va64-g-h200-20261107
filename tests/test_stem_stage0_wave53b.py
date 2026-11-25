@@ -34,7 +34,6 @@ def test_config(mode, monkeypatch) -> None:
 def _compile(kernel, pointers, constants, warps, stages, tmp_path, spill_limit=(0, 0)):
     triton = pytest.importorskip("triton")
     from triton.backends.compiler import GPUTarget  # noqa: PLC0415
-    from triton.backends.nvidia.compiler import get_ptxas  # noqa: PLC0415
     from triton.compiler import ASTSource  # noqa: PLC0415
 
     signature = dict(zip(kernel.arg_names, pointers + ["constexpr"] * len(constants), strict=True))
@@ -52,7 +51,7 @@ def _compile(kernel, pointers, constants, warps, stages, tmp_path, spill_limit=(
     ptx.write_text(compiled.asm["ptx"])
     result = subprocess.run(
         [
-            get_ptxas().path,
+            triton.knobs.nvidia.ptxas.path,
             "-lineinfo",
             "-v",
             "--gpu-name=sm_90a",
@@ -136,5 +135,5 @@ def test_large_reductions() -> None:
 def test_cuda(mode, layout, dtype, dx, bias, monkeypatch) -> None:
     monkeypatch.setenv("LNET_FUSED_STEM_CONV", "on")
     monkeypatch.setenv("LNET_STEM_STAGE0_MODE", mode)
-    with torch.backends.cudnn.flags(allow_tf32=False):
+    with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
         check_case(layout, dtype, needs_dx=dx, bias=bias)

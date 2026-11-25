@@ -85,14 +85,14 @@ def check_case(
     if not bias:
         conv.bias = None
     forward = stem_forward(conv, norm, dtype)
-    params = tuple(p for p in stem_parameters(x, conv, norm) if p is not None)
+    params = stem_parameters(x, conv, norm)
     x_ref = x.detach().float().requires_grad_(needs_dx)
     z = functional.conv2d(x_ref, conv.weight, conv.bias, stride=2, padding=1)
     z = functional.layer_norm(
         z.permute(0, 2, 3, 1), (32,), norm.norm.weight, norm.norm.bias, norm.norm.eps
     )
     y = functional.gelu(z).permute(0, 3, 1, 2)
-    ref_params = tuple(p for p in stem_parameters(x_ref, conv, norm) if p is not None)
+    ref_params = stem_parameters(x_ref, conv, norm)
     expected = (y, *torch.autograd.grad(y, ref_params, dy.float()))
     eager = run_step(forward, x, params, dy)
     names = ["y", "dw", "dg", "db"] + (["dc"] if bias else []) + (["dx"] if needs_dx else [])

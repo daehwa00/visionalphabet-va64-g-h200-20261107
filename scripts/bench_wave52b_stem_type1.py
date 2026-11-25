@@ -50,7 +50,10 @@ def stem_forward(conv: nn.Conv2d, norm: LayerNorm2d, dtype: torch.dtype) -> Call
 def stem_parameters(
     x: Tensor, conv: nn.Conv2d, norm: LayerNorm2d,
 ) -> tuple[Tensor, ...]:
-    return (conv.weight, norm.norm.weight, norm.norm.bias, conv.bias, *((x,) if x.requires_grad else ()))
+    params = (conv.weight, norm.norm.weight, norm.norm.bias)
+    if conv.bias is not None:
+        params += (conv.bias,)
+    return (*params, x) if x.requires_grad else params
 
 
 def reference_gradients(
@@ -82,16 +85,17 @@ def parity_errors(actual: tuple[Tensor, ...], ref: tuple[Tensor, ...]) -> dict[s
 
 
 def graph_finite(fn: Callable[[], tuple[Tensor, ...]]) -> bool:
+    torch.cuda.synchronize()
     warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup):
         for _ in range(3):
             fn()
-    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=warmup):
         result = fn()
     graph.replay()
+    torch.cuda.synchronize()
     return all(bool(t.isfinite().all()) for t in result)
 
 

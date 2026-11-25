@@ -25,14 +25,17 @@ def isolated_environment() -> Iterator[None]:
         yield
 
 
-@pytest.fixture(scope="module")
-def previous() -> ModuleType:
+@pytest.fixture(scope="module", params=[BASE, "fb7759865e9e6b66a8ef8952a97008a1c3062a84"])
+def previous(request) -> ModuleType:
     module = ModuleType("lnet._wave53_base")
     module.__package__ = "lnet"
     root = Path(scans.__file__).resolve().parents[2]
-    src = subprocess.check_output(
-        ["git", "show", f"{BASE}:src/lnet/general_cuda_scans.py"], cwd=root
-    )
+    try:
+        src = subprocess.check_output(
+            ["git", "show", f"{request.param}:src/lnet/general_cuda_scans.py"], cwd=root
+        )
+    except subprocess.CalledProcessError:
+        pytest.skip("Shallow clone does not contain base commit for PTX diff")
     sys.modules[module.__name__] = module
     try:
         src = src.split(b"# Custom ops and public API", 1)[0]
@@ -127,7 +130,7 @@ def test_h53(monkeypatch, mode, width) -> None:
         assert (
             not key.cache_line and key.warps == 2 and width * launch.workers * 160 * 8 <= 32 << 20
         )
-    elif mode == "h53_bf16_buf":
+    elif mode in ("h53_bf16_buf", "h53_lockin"):
         assert key.horizontal_bf16_buf and "Pair<__nv_bfloat16>::pack(right)" in code
     else:
         assert key.horizontal_half_replay and "descend(half, 0)" in code
@@ -158,7 +161,7 @@ def test_compact_source() -> None:
     assert "consume(2*k+1, a*even)" in source and "consume(2*k, even)" in source
 
 
-@pytest.mark.parametrize("mode", scans.W53A_MODES[1:])
+@pytest.mark.parametrize("mode", ("w52_best", "w52_best_swpipe", "w52_best_pipe4"))
 def test_winners(monkeypatch, mode) -> None:
     limits(monkeypatch, scans)
     for height, coarse, floor in ((56, False, False), (56, True, True), (28, False, True)):
@@ -180,6 +183,43 @@ def test_winners(monkeypatch, mode) -> None:
         if out.key.path_bwd_pipe:
             source = scans._kernel_source(out.key)
             assert "preactivate(j+1" in source if mode.endswith("swpipe") else "jb += 4" in source
+
+
+@pytest.mark.parametrize("height,coarse,backward", [
+    (56, False, True), (14, True, True), (28, False, True), (28, True, True),
+    (56, False, False), (56, True, True),
+])
+def test_vertical_lockin(monkeypatch, height, coarse, backward):
+    limits(monkeypatch, scans)
+    key = scans.Kernel(torch.bfloat16, 4, backward, vertical=True, hidden8=True,
+                       coarse=coarse, vector_weights=True, backward_batch2=backward)
+    base = scans.Launch(scans.ScanPlan(4, 8192), key, 16384, 4096)
+    shape = (1024, height, height, 160)
+    out = scans._plan_w53a(0, base, shape, "w53_lockin")
+    best = scans._plan_w53a(0, base, shape, "w52_best")
+    assert (out.plan, out.workers, out.partials) == (best.plan, best.workers, best.partials)
+    assert out.key.l2_single_write == best.key.l2_single_write
+    assert out.key.tanh_gain == (not backward or (height, coarse) not in ((56, False), (14, True)))
+    assert out.key.path_bwd_pipe == int(backward and height == 28)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("width,compact,expected", [
+    (56, False, "h53_bf16_buf"), (56, True, "bwd_opt"), (28, False, "bwd_opt"),
+    (28, True, "h53_ro_all"), (14, False, "h53_ro_all"), (14, True, "h53_ro_all"),
+    (7, False, "h53_ro_all"),
+])
+def test_horizontal_lockin(monkeypatch, dtype, width, compact, expected):
+    limits(monkeypatch, scans)
+    key = scans.Kernel(dtype, 4, True, compact=compact, cache_line=True)
+    base = scans.Launch(scans.ScanPlan(4, width * 1024, cache_line=True), key, 32000, 8000)
+    shape = (1024, width, width, 160)
+    out = scans._plan_h53(0, base, shape, "h53_lockin")
+    planner = scans._plan_hscan if expected == "bwd_opt" else scans._plan_h53
+    assert out == planner(0, base, shape, expected)
+    if expected == "h53_bf16_buf":
+        assert out.key.horizontal_bf16_buf == (dtype == torch.bfloat16)
+        assert out.key.horizontal_half_replay == (dtype == torch.float16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
