@@ -179,6 +179,8 @@ def test_sm90(monkeypatch, resources, dtype):
                         assert shape[0] in ("7d", "14c")
                 else:
                     assert key.horizontal_stream
+                    if shape[0] == "56c" and mode in ("h54_bwd_bf16_all", "h54_bwd_bf16_half"):
+                        assert aw >= 32
                     if "vec2" in mode:
                         assert key.horizontal_vec2
 

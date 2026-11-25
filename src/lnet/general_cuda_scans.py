@@ -4003,7 +4003,7 @@ def _plan_h54(device: int, launch: Launch, shape: tuple, mode: str, aligned: boo
         horizontal_vec2=vec,
         horizontal_wave53=key.backward,
         horizontal_readonly=True,
-        horizontal_unroll=4,
+        horizontal_unroll=1 if narrow and key.compact and not vec else 4,
         horizontal_compact2=narrow and not vec,
         horizontal_half_replay=half,
         horizontal_bf16_buf=narrow,
