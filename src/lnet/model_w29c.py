@@ -19,6 +19,13 @@ from .model_w28c import _differentiate_swiglu, _save_joint, model_cuda_supported
 from .model_w36b import inductor_norms_enabled
 
 
+def _wave56b_mode() -> str:
+    mode = os.environ.get("LNET_MODEL_W56B", "off")
+    if mode not in ("off", "triton_hiocc", "cuda_vec8", "cuda_vec8_tanh"):
+        raise ValueError(f"invalid LNET_MODEL_W56B={mode!r}")
+    return mode
+
+
 def model_w29c_enabled(device: torch.device, feature: str) -> bool:
     if feature in ("rmsnorm_bwd", "rmsnorm_full") and _fast_rmsnorm_enabled():
         return model_cuda_supported(device)
@@ -44,7 +51,7 @@ def model_w29c_enabled(device: torch.device, feature: str) -> bool:
 def _swiglu_vec2d_kernel(
     joint, gradient, output, rows, hidden: tl.constexpr,
     block_rows: tl.constexpr, block_cols: tl.constexpr, backward: tl.constexpr,
-    divisor_tiled: tl.constexpr = False,  # noqa: FBT002
+    divisor_tiled: tl.constexpr = False, hiocc: tl.constexpr = False,  # noqa: FBT002
 ) -> None:
     row_tile = tl.program_id(0)
     col_tile = tl.program_id(1)
@@ -62,7 +69,7 @@ def _swiglu_vec2d_kernel(
     dtype: tl.constexpr = joint.dtype.element_ty
     value = tl.load(joint + packed, active, 0).to(tl.float32)
     gate = tl.load(joint + packed + hidden, active, 0).to(tl.float32)
-    sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+    sigmoid = tl.sigmoid(gate) if hiocc else 1.0 / (1.0 + tl.exp(-gate))
     activated = (gate * sigmoid).to(dtype).to(tl.float32)
     if backward:
         grad = tl.load(gradient + dense, active, 0).to(tl.float32)
@@ -74,40 +81,97 @@ def _swiglu_vec2d_kernel(
         tl.store(output + dense, value * activated, active)
 
 
-def _launch_swiglu(joint: Tensor, grad: Tensor, output: Tensor, *, backward: bool) -> None:
+def _launch_swiglu(joint: Tensor, grad: Tensor, output: Tensor, *, backward: bool, hiocc: bool = False) -> None:
     hidden = joint.shape[-1] // 2
     rows = joint.numel() // (2 * hidden)
     block_cols = min(512, triton.next_power_of_2(hidden))
     block_rows = 8
+    if hiocc:
+        block_cols = min(256, hidden & -hidden)
+        tiles = triton.cdiv(hidden, block_cols)
+        divisible = hidden % block_cols == 0
+        row_tiles = triton.cdiv(rows, block_rows)
+        grid = (row_tiles * tiles,) if divisible else (row_tiles, tiles)
+        wrap_triton(_swiglu_vec2d_kernel)[grid](
+            joint, grad, output, rows, hidden, block_rows, block_cols, backward,
+            hiocc=True, divisor_tiled=divisible, num_warps=8, enable_fp_fusion=True,
+        )
+        return
     wrap_triton(_swiglu_vec2d_kernel)[
         (triton.cdiv(rows, block_rows), triton.cdiv(hidden, block_cols))
     ](
         joint, grad, output, rows, hidden, block_rows, block_cols, backward,
-        divisor_tiled=False, enable_fp_fusion=False,
+        hiocc=False, divisor_tiled=False, enable_fp_fusion=False,
     )
 
 
-@triton_op("lnet::w29c_swiglu", mutates_args=())
 def packed_swiglu_vec2d(joint: Tensor) -> Tensor:
+    mode = _wave56b_mode()
+    if mode == "off":
+        return _off_swiglu(joint)
+    return _tuned_swiglu(joint, mode)
+
+
+@triton_op("lnet::w29c_swiglu", mutates_args=())
+def _off_swiglu(joint: Tensor) -> Tensor:
     output = joint.new_empty((*joint.shape[:-1], joint.shape[-1] // 2))
     _launch_swiglu(joint, joint, output, backward=False)
     return output
 
 
-@triton_op("lnet::w29c_swiglu_backward", mutates_args=())
+@triton_op("lnet::w56b_swiglu_forward", mutates_args=())
+def _tuned_swiglu(joint: Tensor, mode: str) -> Tensor:
+    if mode.startswith("cuda_vec8"):
+        return _vec_swiglu(joint, joint, False, mode == "cuda_vec8_tanh")
+    output = joint.new_empty((*joint.shape[:-1], joint.shape[-1] // 2))
+    _launch_swiglu(joint, joint, output, backward=False, hiocc=True)
+    return output
+
+
 def _swiglu_vec2d_backward(joint: Tensor, grad: Tensor) -> Tensor:
+    mode = _wave56b_mode()
+    if mode == "off":
+        return _off_swiglu_backward(joint, grad)
+    return _tuned_swiglu_backward(joint, grad, mode)
+
+
+@triton_op("lnet::w29c_swiglu_backward", mutates_args=())
+def _off_swiglu_backward(joint: Tensor, grad: Tensor) -> Tensor:
     output = torch.empty_like(joint)
     _launch_swiglu(joint, grad, output, backward=True)
     return output
 
 
+@triton_op("lnet::w56b_swiglu_backward", mutates_args=())
+def _tuned_swiglu_backward(joint: Tensor, grad: Tensor, mode: str) -> Tensor:
+    if mode.startswith("cuda_vec8"):
+        return _vec_swiglu(joint, grad, True, mode == "cuda_vec8_tanh")
+    output = torch.empty_like(joint)
+    _launch_swiglu(joint, grad, output, backward=True, hiocc=True)
+    return output
+
+
 def _differentiate_swiglu_vec2d(ctx, grad: Tensor) -> Tensor:
     if grad.is_contiguous() and not torch.is_grad_enabled():
-        return _swiglu_vec2d_backward(ctx.saved_tensors[0], grad)
+        return _off_swiglu_backward(ctx.saved_tensors[0], grad)
     return _differentiate_swiglu(ctx, grad)
 
 
-packed_swiglu_vec2d.register_autograd(_differentiate_swiglu_vec2d, setup_context=_save_joint)
+_off_swiglu.register_autograd(_differentiate_swiglu_vec2d, setup_context=_save_joint)
+
+
+def _save_tuned_joint(ctx, inputs, output):
+    joint, ctx.mode = inputs
+    ctx.save_for_backward(joint)
+
+
+def _differentiate_tuned_swiglu(ctx, grad):
+    if grad.is_contiguous() and not torch.is_grad_enabled():
+        return _tuned_swiglu_backward(ctx.saved_tensors[0], grad, ctx.mode), None
+    return _differentiate_swiglu(ctx, grad), None
+
+
+_tuned_swiglu.register_autograd(_differentiate_tuned_swiglu, setup_context=_save_tuned_joint)
 
 
 def _row_pitch(tensor: Tensor) -> int:
@@ -222,23 +286,43 @@ def _rmsnorm_backward_rows(width: int, *, v2: bool = False) -> int:
     return min(max_rows if width % 16 == 0 else 8, max_elements // triton.next_power_of_2(width))
 
 
-@triton_op("lnet::w29c_rmsnorm_backward", mutates_args=())
 def _channel_rmsnorm_backward(
     x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *,
     need_dx: bool, need_dw: bool,
 ) -> tuple[Tensor, Tensor]:
+    mode = _wave56b_mode()
+    if mode.startswith("cuda_vec8"):
+        return _vec_rms(x, weight, inverse, grad, need_dx, need_dw, mode == "cuda_vec8_tanh")
+    op = _hiocc_rms_bwd if mode == "triton_hiocc" else _off_rms_bwd
+    return op(x, weight, inverse, grad, need_dx=need_dx, need_dw=need_dw)
+
+
+@triton_op("lnet::w29c_rmsnorm_backward", mutates_args=())
+def _off_rms_bwd(x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *,
+                 need_dx: bool, need_dw: bool) -> tuple[Tensor, Tensor]:
+    return _launch_rms_bwd(x, weight, inverse, grad, need_dx, need_dw, False)
+
+
+@triton_op("lnet::w56b_rms_hiocc", mutates_args=())
+def _hiocc_rms_bwd(x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *,
+                   need_dx: bool, need_dw: bool) -> tuple[Tensor, Tensor]:
+    return _launch_rms_bwd(x, weight, inverse, grad, need_dx, need_dw, True)
+
+
+def _launch_rms_bwd(x, weight, inverse, grad, need_dx, need_dw, hiocc):
     width = x.shape[-1]
     rows = x.numel() // width
     dx = x.new_empty(x.shape if need_dx else (0,))
-    block_rows = _rmsnorm_backward_rows(width)
+    block_rows = 8 if hiocc else _rmsnorm_backward_rows(width)
     # Two CTAs per SM preserve the H200 launch geometry and bound the reduction.
-    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-    ctas = min(2 * sms, triton.cdiv(rows, block_rows))
+    sms = (_vec_sms(x.device.index) if x.is_cuda and (hiocc or _wave56b_mode() != "off")
+           else torch.cuda.get_device_properties(x.device).multi_processor_count)
+    ctas = min((6 if hiocc else 2) * sms, triton.cdiv(rows, block_rows))
     partial = x.new_empty((ctas, width) if need_dw else (0,), dtype=torch.float32)
     wrap_triton(_rmsnorm_backward_kernel)[(ctas,)](
         x, weight, inverse, grad, dx, partial, rows, width, _row_pitch(x), _row_pitch(grad),
         block_rows, triton.next_power_of_2(width), need_dx, need_dw,
-        reduce_in_loop=False, enable_fp_fusion=False,
+        reduce_in_loop=hiocc, enable_fp_fusion=hiocc,
     )
     dw = partial.sum(0).to(weight.dtype) if need_dw else weight.new_empty((0,))
     return dx, dw
@@ -475,3 +559,233 @@ def _fast_rmsnorm_fake(
 
 
 _fast_rmsnorm.register_autograd(_differentiate_rmsnorm, setup_context=_save_rmsnorm)
+
+
+_VEC_SOURCE = r"""
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+using T = SCALAR;
+union Pack {
+    uint4 bits;
+    T v[8];
+    __device__ Pack() {}
+};
+
+#if !RMS_KERNEL
+extern "C" __global__ void swiglu_vec8_kernel(
+    const uint4* joint, const uint4* grad, uint4* out, int rows
+) {
+    constexpr int packs = WIDTH / 8;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * packs) return;
+    int j = idx + (idx / packs) * packs;
+    Pack a, b, d, u, v;
+    a.bits = joint[j];
+    b.bits = joint[j + packs];
+    if (BACKWARD) d.bits = grad[idx];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float x = float(a.v[i]), g = float(b.v[i]), sig;
+        if (TANH_MODE) {
+            float t;
+            asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f*g));
+            sig = 0.5f*t + 0.5f;
+        } else sig = __fdividef(1.f, 1.f + __expf(-g));
+        float act = float(T(g*sig));
+        if (BACKWARD) {
+            float dy = float(d.v[i]);
+            u.v[i] = T(dy * act);
+            v.v[i] = T(float(T(dy*x)) * (sig * (1.f + g*(1.f-sig))));
+        } else u.v[i] = T(x*act);
+    }
+    out[BACKWARD ? j : idx] = u.bits;
+    if (BACKWARD) out[j+packs] = v.bits;
+}
+
+#else
+#if __CUDA_ARCH__ >= 900
+#define RMS_BOUNDS __launch_bounds__(256,6)
+#else
+#define RMS_BOUNDS
+#endif
+extern "C" __global__ void RMS_BOUNDS rmsnorm_bwd_vec8_kernel(
+    const uint4* x, const uint4* w, const float* inverse, const uint4* dy,
+    uint4* dx, float* partial, int rows, int xp, int yp
+) {
+    constexpr int packs = WIDTH/8;
+    constexpr int lanes = WIDTH <= 256 ? 32 : WIDTH <= 512 ? 64 : 128;
+    constexpr int groups = 256/lanes;
+    int t = threadIdx.x, g = t / lanes, p = t % lanes;
+    __shared__ float scratch[256*8];
+    float dw[8] = {};
+    Pack weight;
+    for (int base = blockIdx.x*groups; (DX || WIDTH>256) && base < rows; base += gridDim.x*groups) {
+        int row = base+g;
+        bool active = row < rows && p < packs;
+        Pack a,b,d;
+        float proj = 0.f;
+        float inv = row < rows ? inverse[row] : 0.f;
+        if (active) {
+            if (DX) weight.bits = w[p];
+            a.bits = x[row*xp+p];
+            b.bits = dy[row*yp+p];
+            #pragma unroll
+            for (int i=0;i<8;++i) {
+                float n = float(a.v[i])*inv;
+                float grad = float(b.v[i]);
+                if (DW && WIDTH > 256) dw[i] += n*grad;
+                if (DX) {
+                    float scaled = grad*float(weight.v[i]);
+                    proj += n*scaled;
+                }
+            }
+        }
+        if (DX) {
+            #pragma unroll
+            for (int k=(lanes<32 ? lanes/2 : 16);k;k/=2) proj += __shfl_xor_sync(0xffffffff,proj,k);
+            if constexpr (lanes > 32) {
+                if (!(t%32)) scratch[t/32] = proj;
+                __syncthreads();
+                proj = 0.f;
+                #pragma unroll
+                for(int k=0;k<lanes/32;++k) proj += scratch[g*(lanes/32)+k];
+                __syncthreads();
+            }
+            if (active) {
+                #pragma unroll
+                for(int i=0;i<8;++i) {
+                    float n = float(a.v[i])*inv;
+                    float scaled = float(b.v[i])*float(weight.v[i]);
+                    d.v[i] = T((scaled-(n/WIDTH)*proj)*inv);
+                }
+                dx[row*packs+p] = d.bits;
+            }
+        }
+    }
+    if (DW && WIDTH <= 256) {
+        // Each warp owns four adjacent packs. Eight lane groups reduce rows
+        // independently, so writing the CTA subtotal needs no shared barrier.
+        int col = (t/32)*4 + t%4;
+        unsigned mask = __ballot_sync(0xffffffff, col < packs);
+        if (col < packs) {
+            for (int row = blockIdx.x*8 + (t%32)/4; row < rows; row += gridDim.x*8) {
+                Pack a,b;
+                a.bits = x[row*xp+col];
+                b.bits = dy[row*yp+col];
+                float inv = inverse[row];
+                #pragma unroll
+                for(int i=0;i<8;++i) dw[i] += (float(a.v[i])*inv)*float(b.v[i]);
+            }
+            #pragma unroll
+            for(int i=0;i<8;++i) {
+                for(int offset=16;offset>=4;offset/=2)
+                    dw[i] += __shfl_xor_sync(mask,dw[i],offset);
+            }
+            if ((t%32)<4) {
+                float* dst = partial+blockIdx.x*WIDTH+col*8;
+                reinterpret_cast<float4*>(dst)[0] = make_float4(dw[0],dw[1],dw[2],dw[3]);
+                reinterpret_cast<float4*>(dst)[1] = make_float4(dw[4],dw[5],dw[6],dw[7]);
+            }
+        }
+    } else if (DW) {
+        #pragma unroll
+        for(int i=0;i<8;++i) if(p<packs) scratch[t*8+i] = dw[i];
+        __syncthreads();
+        for(int c=t;c<WIDTH;c+=256) {
+            float sum=0.f;
+            #pragma unroll
+            for(int k=0;k<groups;++k) sum += scratch[k*lanes*8+c];
+            partial[blockIdx.x*WIDTH+c] = sum;
+        }
+    }
+}
+#endif
+"""
+
+
+def _vec_source(dtype, width, backward, tanh, dx, dw):
+    flags = dict(SCALAR=_TYPES[dtype], RMS_KERNEL=int(dx or dw), WIDTH=width, BACKWARD=int(backward),
+                 TANH_MODE=int(tanh), DX=int(dx), DW=int(dw))
+    return "".join(f"#define {key} {value}\n" for key, value in flags.items()) + _VEC_SOURCE
+
+
+@cache
+def _vec_module(device, dtype, width, backward, tanh, dx, dw):
+    source = _vec_source(dtype, width, backward, tanh, dx, dw)
+    if torch.cuda.is_current_stream_capturing():
+        # An uncached capture uses portable PTX without querying device properties.
+        capability = (7, 5)
+    else:
+        capability = torch.cuda.get_device_capability(device)
+        if capability == (9, 0):
+            # _compile_source concatenates the two architecture components.
+            capability = (9, "0a")
+    image = _compile_source(capability, source)
+    module = _CudaModule(image, device)
+    name = "rmsnorm_bwd_vec8_kernel" if dx or dw else "swiglu_vec8_kernel"
+    module.load_function(name, 0)
+    return module, name
+
+
+def _run_vec(tensors, sizes, blocks, key):
+    x = tensors[0]
+    with torch.cuda.device(x.device):
+        module, name = _vec_module(x.device.index, x.dtype, *key)
+        _ensure_context(module.driver, x.device.index)
+        args = [ct.c_void_p(t.data_ptr()) for t in tensors] + [ct.c_int(n) for n in sizes]
+        module.launch(name, (blocks, 1, 1), (256, 1, 1), 0,
+                      torch.cuda.current_stream(x.device).cuda_stream, args)
+
+
+@torch.library.custom_op("lnet::w56b_swiglu", mutates_args=(), device_types="cuda")
+def _vec_swiglu(joint: Tensor, grad: Tensor, backward: bool, tanh: bool) -> Tensor:
+    width = joint.shape[-1] // 2
+    out = _vec_swiglu_fake(joint, grad, backward, tanh)
+    if (width % 8 or joint.dtype not in (torch.float16, torch.bfloat16)
+            or not all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (joint, grad))):
+        _launch_swiglu(joint.contiguous(), grad.contiguous(), out, backward=backward)
+        return out
+    rows = joint.numel() // (2 * width)
+    _run_vec((joint, grad, out), (rows,), triton.cdiv(rows * (width // 8), 256),
+             (width, backward, tanh, False, False))
+    return out
+
+
+@_vec_swiglu.register_fake
+def _vec_swiglu_fake(joint, grad, backward, tanh):
+    return joint.new_empty(joint.shape if backward else (*joint.shape[:-1], joint.shape[-1] // 2))
+
+
+@torch.library.custom_op("lnet::w56b_rms_bwd", mutates_args=(), device_types="cuda")
+def _vec_rms(x: Tensor, w: Tensor, inv: Tensor, dy: Tensor, dx: bool,
+             dw: bool, tanh: bool) -> tuple[Tensor, Tensor]:
+    width = x.shape[-1]
+    xp, yp = _row_pitch(x), _row_pitch(dy)
+    if (not (0 < width <= 1024 and width % 8 == 0 and xp and yp)
+            or xp % 8 or yp % 8 or x.dtype not in (torch.bfloat16, torch.float16)
+            or not w.is_contiguous() or not inv.is_contiguous()
+            or w.dtype != x.dtype or dy.dtype != x.dtype or inv.dtype != torch.float32
+            or any(t.data_ptr() % 16 for t in (x, w, dy))):
+        return _launch_rms_bwd(x if xp else x.contiguous(), w.contiguous(), inv.contiguous(),
+                               dy if yp else dy.contiguous(), dx, dw, False)
+    rows = x.numel() // width
+    groups = 8 if width <= 256 else 4 if width <= 512 else 2
+    sms = _vec_sms(x.device.index)
+    blocks = min((4 if tanh else 8) * sms, triton.cdiv(rows, groups))
+    out = x.new_empty(x.shape if dx else (0,))
+    partial = inv.new_empty((blocks, width) if dw else (0,))
+    _run_vec((x, w, inv, dy, out, partial), (rows, xp // 8, yp // 8), blocks,
+             (width, False, False, dx, dw))
+    return out, partial.sum(0).to(w.dtype) if dw else w.new_empty((0,))
+
+
+@cache
+def _vec_sms(device):
+    if torch.cuda.is_current_stream_capturing():
+        return 132
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@_vec_rms.register_fake
+def _vec_rms_fake(x, w, inv, dy, dx, dw, tanh):
+    return x.new_empty(x.shape if dx else (0,)), w.new_empty(w.shape if dw else (0,))
