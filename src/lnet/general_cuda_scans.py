@@ -3393,9 +3393,16 @@ def _plan_w52a(device: int, launch: Launch, shape: tuple[int, int, int, int], mo
         candidate = replace(
             key, register_path=False, cache_weights=True, vector_weights=True, cache_line=False,
         )
-        if _resident(device, candidate, smem):
+        # Moving a line out of SMEM must also respect the global workspace budget.
+        workers = old_workers
+        if plan.cache_line:
+            bytes_per_worker = rows * m * 4 * key.dtype.itemsize
+            workers = min(workers, _scan_workspace_budget(device) // bytes_per_worker)
+        if workers and _resident(device, candidate, smem):
             key = candidate
             plan = plan._replace(cache_weights=True, cache_line=False, smem=smem)
+            old_workers = workers
+            launch = launch._replace(workers=workers, partials=workers)
     launch = launch._replace(plan=plan, key=key)
     if not mode.startswith(("l2_floor", "combo")) or plan.cache_line:
         return launch

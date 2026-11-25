@@ -79,6 +79,7 @@ def test_persistent_workers_floor(resident: int, workers: int, grid: int) -> Non
     assert grid <= 132 * resident
     assert scans._persistent_workers_floor(*args, 56 * workers * 160 * 8 - 1) == (0, False)
     assert scans._persistent_workers_floor(*args, 56 * workers * 160 * 8) == (workers, False)
+    assert scans._persistent_workers_floor(1, 56, 0, 160, 2, 4, 1, 1, 45 * 2**20) == (0, False)
 
 
 @pytest.mark.parametrize("single_residency", [1, 2])
@@ -133,15 +134,19 @@ def test_nvcc_offline(
     if nvcc is None or cuobjdump is None:
         pytest.skip("Offline SASS check requires nvcc and cuobjdump")
     monkeypatch.setattr(scans, "_resident", lambda *_: 1)
+    monkeypatch.setattr(scans, "_scan_workspace_budget", lambda _: 64 * 2**20)
     register_key = replace(
         key56fwd, register_path=True, cache_weights=False, vector_weights=False, cache_line=True,
     )
     plan28 = scans.ScanPlan(4, 28672, 8, cache_line=True)
     launch28 = scans.Launch(plan28, register_key, 4116, 4116)
     try:
-        key28 = scans._plan_w52a(0, launch28, (1024, 28, 28, 160), "tanh_gain_smemw").key
+        smem_launch = scans._plan_w52a(0, launch28, (1024, 28, 28, 160), "tanh_gain_smemw")
     finally:
         scans._plan_w52a.cache_clear()
+    key28 = smem_launch.key
+    assert smem_launch.workers == (64 * 2**20) // (28 * 160 * 8)
+    assert smem_launch.partials == smem_launch.workers
     assert key28.cache_weights
     assert key28.vector_weights
     assert not key28.register_path
