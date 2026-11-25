@@ -1,4 +1,4 @@
-"""Screen Wave 44 reader policies with eager CUDA launches and cold caches."""
+"""Screen Wave 45B reader policies with eager CUDA launches and cold caches."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import os
 import statistics
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -32,20 +33,35 @@ PARITY_BATCHES = {56: 32, 28: 64, 14: 128, 7: 256}
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
-def record_module_plans() -> tuple[AbstractContextManager, dict]:
+def record_module_plans() -> tuple[AbstractContextManager, dict, dict]:
     compile_module = reader._reader_cuda_module
     signature = inspect.signature(compile_module)
     plans = {}
+    compilation = {"count": 0, "seconds": 0.0}
 
     def record(*args: object, **kwargs: object) -> reader._CudaModule:
+        misses = compile_module.cache_info().misses
+        started = time.perf_counter()
         module = compile_module(*args, **kwargs)
+        if compile_module.cache_info().misses > misses:
+            compilation["count"] += 1
+            compilation["seconds"] += time.perf_counter() - started
         if module not in plans:
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
             plans[module] = bound.arguments
         return module
 
-    return patch.object(reader, "_reader_cuda_module", record), plans
+    return patch.object(reader, "_reader_cuda_module", record), plans, compilation
+
+
+def progress(mode: str, shape: str, op: str, compile_s: float, *,
+             timing_s: float = 0.0, parity_s: float = 0.0) -> None:
+    print(
+        f"[{mode}] {shape} {op} compile={compile_s:.3f}s "
+        f"timing={timing_s:.3f}s parity={parity_s:.3f}s",
+        file=sys.stderr, flush=True,
+    )
 
 
 def make_inputs(batch: int, shape: tuple[int, ...], dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
@@ -73,7 +89,7 @@ def prepare(
 
         def weight() -> None:
             reader._launch_reader_cuda(
-                plan.module, op, plan.grid, (projected, grad, partial),
+                plan.module, plan.operation, plan.grid, (projected, grad, partial),
                 (height, width, modes, batch, rank), stream=stream, threads=plan.warps * 32,
             )
             reader._launch_reader_cuda(
@@ -87,7 +103,7 @@ def prepare(
             "vec": config["weight_vec"], "rank_tile": tile, "rows": rows,
             "columns": config["columns"], "warps": plan.warps, "grid": plan.grid,
             "reduce": plan.reduce, "reduce_grid": reduce_grid,
-            "convert": config["convert_weight"], "specialized_batch": config["shape"][0],
+            "convert": plan.operation == "dweight_cvt", "specialized_batch": config["shape"][0],
         }
 
     backward = op == "dinput"
@@ -160,7 +176,9 @@ def comparable_plan(plan: dict, op: str) -> dict:
     return result
 
 
-def timing_pass(args: argparse.Namespace, flush: torch.Tensor | None, module_plans: dict) -> dict:
+def timing_pass(
+    args: argparse.Namespace, flush: torch.Tensor | None, module_plans: dict, compilation: dict,
+) -> dict:
     rows = []
     plans = {}
     totals = {mode: dict.fromkeys(OPS, 0.0) for mode in args.modes}
@@ -173,8 +191,12 @@ def timing_pass(args: argparse.Namespace, flush: torch.Tensor | None, module_pla
         for op in OPS:
             for mode in args.modes:
                 os.environ["LNET_READER_W44"] = mode
+                compile_before = compilation["seconds"]
                 run, output, plan = prepare(op, inputs, module_plans)
+                compile_s = compilation["seconds"] - compile_before
+                started = time.perf_counter()
                 ms = measure(run, args.warmup, args.iters, flush)
+                progress(mode, name, op, compile_s, timing_s=time.perf_counter() - started)
                 plans[shape, op, mode] = plan
                 rows.append({"shape": [args.batch, h, w, modes, rank], "calls": calls,
                              "dtype": "bf16", "op": op, "mode": mode, "ms": ms, "plan": plan})
@@ -197,7 +219,9 @@ def with_deltas(timings: dict) -> dict:
     return timings
 
 
-def parity_pass(args: argparse.Namespace, timing_plans: dict, module_plans: dict) -> list[dict]:
+def parity_pass(
+    args: argparse.Namespace, timing_plans: dict, module_plans: dict, compilation: dict,
+) -> list[dict]:
     rows = []
     for shape in (*MODEL, *EDGE):
         h, w, modes, rank, calls = shape
@@ -207,18 +231,28 @@ def parity_pass(args: argparse.Namespace, timing_plans: dict, module_plans: dict
             inputs = make_inputs(batch, shape, torch_dtype)
             for op in OPS:
                 os.environ["LNET_READER_W44"] = "off"
+                compile_before = compilation["seconds"]
                 baseline, expected, _ = prepare(op, inputs, module_plans)
+                baseline_compile = compilation["seconds"] - compile_before
+                started = time.perf_counter()
                 baseline()
+                torch.cuda.synchronize()
+                name = f"{h}x{w}x{modes}x{rank}/{dtype}"
+                progress("off", name, op, baseline_compile, parity_s=time.perf_counter() - started)
                 del baseline
                 for mode in args.modes:
                     os.environ["LNET_READER_W44"] = mode
+                    compile_before = compilation["seconds"]
                     run, output, plan = prepare(op, inputs, module_plans)
+                    compile_s = compilation["seconds"] - compile_before
+                    started = time.perf_counter()
                     run()
                     timing = timing_plans.get((shape, op, mode))
                     match = None if timing is None else comparable_plan(plan, op) == comparable_plan(timing, op)
                     rows.append({"shape": [batch, h, w, modes, rank], "calls": calls, "dtype": dtype,
                                  "op": op, "mode": mode, "plan": plan, "timing_plan_match": match,
                                  **metrics(output, expected)})
+                    progress(mode, name, op, compile_s, parity_s=time.perf_counter() - started)
                     del run, output
                 del expected
             del inputs
@@ -227,13 +261,13 @@ def parity_pass(args: argparse.Namespace, timing_plans: dict, module_plans: dict
 
 def screen(args: argparse.Namespace) -> dict:
     flush = l2_buffer() if args.flush_l2 else None
-    capture, module_plans = record_module_plans()
+    capture, module_plans, compilation = record_module_plans()
     with capture:
-        result = timing_pass(args, flush, module_plans)
+        result = timing_pass(args, flush, module_plans, compilation)
         timing_plans = result.pop("timing_plans")
-        rows = parity_pass(args, timing_plans, module_plans) if args.parity else []
+        rows = parity_pass(args, timing_plans, module_plans, compilation) if args.parity else []
     return {"flush_l2": args.flush_l2, "flush_bytes": flush.numel() if flush is not None else 0,
-            **result, "rows": rows}
+            **result, "rows": rows, "compilation": compilation}
 
 
 def main() -> None:

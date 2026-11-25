@@ -43,35 +43,49 @@ def test_w44_options(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("mode", kernels._W44_MODES[1:])
-def test_w44_plans_reject_local_memory(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+@pytest.mark.parametrize(("height", "modes"), [(56, 160), (7, 128)])
+def test_w44_plans_reject_local_memory(
+    monkeypatch: pytest.MonkeyPatch, mode: str, height: int, modes: int,
+) -> None:
     monkeypatch.setenv("LNET_READER_W44", mode)
     props = SimpleNamespace(major=9, multi_processor_count=132, shared_memory_per_block=49152,
                             max_threads_per_multi_processor=2048, total_memory=140 * 2**30)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
-    monkeypatch.setattr(kernels, "_reader_module_for", lambda *_a, **kw: kw)
+    compilations = []
+
+    def compile_module(*_args: object, **kwargs: object) -> dict:
+        compilations.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(kernels, "_reader_module_for", compile_module)
 
     def resident(module, op, warps) -> int:
-        if op == "dweight" and module.get("convert_weight"):
+        if op == "dweight_cvt":
             return 0
         if op != "dweight" and module["launch"].vec == 2:
             return 0
         return 16 // warps
 
     monkeypatch.setattr(kernels, "_reader_resident", resident)
-    p = torch.empty((1024, 56, 56, 640), device="meta", dtype=torch.bfloat16)
-    w = torch.empty((160, 4, 3, 3), device="meta", dtype=p.dtype)
-    g = torch.empty((1024, 56, 56, 320), device="meta", dtype=p.dtype)
+    p = torch.empty((1024, height, height, modes * 4), device="meta", dtype=torch.bfloat16)
+    w = torch.empty((modes, 4, 3, 3), device="meta", dtype=p.dtype)
+    g = torch.empty((1024, height, height, modes * 2), device="meta", dtype=p.dtype)
     if mode in ("dw_fullrank", "dw_fullrank_cvt", "all_opt"):
         launch = kernels._reader_weight_plan(p, w, g, strict=False)
         assert launch.module["weight_geometry"][0] == 4
         assert launch.module["weight_vec"] == 1
-        assert not launch.module.get("convert_weight")
-    for backward, spatial_mode in ((False, "fwd_lane_opt"), (True, "dinput_wide")):
-        if mode in (spatial_mode, "all_opt"):
+        assert launch.operation == "dweight"
+        assert len(compilations) == 1
+    for backward, spatial_modes in (
+        (False, ("fwd_vec1_r8", "fwd_vec1_r4")), (True, ("dinput_wide",)),
+    ):
+        if mode in (*spatial_modes, "all_opt"):
             launch, module = kernels._reader_spatial_plan(
                 p, w, g if backward else None, strict=False,
             )
             assert launch.vec == 1
+            assert launch.columns == height
+            assert launch.rows == (4 if mode == "fwd_vec1_r4" else min(height, 8))
             assert module["updated"]
 
 
