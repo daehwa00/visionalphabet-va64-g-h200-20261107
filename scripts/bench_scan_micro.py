@@ -298,7 +298,8 @@ def _screen(
     winner = W43_MODES[op]
     for shapes in results.values():
         for label, sample in shapes.items():
-            sample["delta_vs_off_ms"] = sample["median_ms"] - results["off"][label]["median_ms"]
+            if "off" in results:
+                sample["delta_vs_off_ms"] = sample["median_ms"] - results["off"][label]["median_ms"]
             sample["delta_vs_w43_ms"] = sample["median_ms"] - results[winner][label]["median_ms"]
     diagnostics = _parity(op, modes, args, timed_keys) if args.parity else {}
     passes = {
@@ -317,19 +318,20 @@ def _screen(
         for mode in modes
     } if diagnostics else {}
     exact = {
-        mode: passed and covered["off"] and covered[mode]
+        mode: passed and covered.get("off", True) and covered[mode]
         for mode, passed in passes["exact_match"].items()
     }
     tolerated = {
-        mode: passed and covered["off"] and covered[mode]
+        mode: passed and covered.get("off", True) and covered[mode]
         for mode, passed in passes["tol_pass"].items()
     }
     return {
-        "best_mode": best_mode(totals, exact),
-        "best_tolerated_mode": best_mode(totals, tolerated if op in ("vscan_bwd", "hscan_bwd") else exact),
+        "best_mode": best_mode(totals, exact) if "off" in totals else None,
+        "best_tolerated_mode": best_mode(totals, tolerated if op in ("vscan_bwd", "hscan_bwd") else exact)
+        if "off" in totals else None,
         "timing_kernel_covered": covered,
         "weighted_ms": totals,
-        "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
+        "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()} if "off" in totals else {},
         "delta_vs_w43_ms": {mode: ms - totals[winner] for mode, ms in totals.items()},
         "parity_pass": passes["exact_match"],
         "parity_mismatches": {
@@ -354,6 +356,7 @@ def _combined_projection(report: dict) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--modes", help="Comma-separated policies for VScan backward.")
+    parser.add_argument("--op-modes", help="Comma-separated exact policy list for a single operation.")
     parser.add_argument("--ops", default="vscan_bwd", help="Comma-separated operation names.")
     parser.add_argument("--all-ops", action="store_true", help="Screen all four scan operations.")
     parser.add_argument("--state-layouts", help="Comma-separated scan state layouts (default: planar).")
@@ -377,6 +380,12 @@ def main() -> None:
     requested = tuple(token.strip() for token in args.modes.split(",")) if args.modes else scans.SGS_MODES
     if set(requested).difference(scans.SGS_MODES):
         parser.error("--modes must contain valid LNET_SCAN_SGS tokens")
+    exact_modes = tuple(dict.fromkeys(token.strip() for token in args.op_modes.split(","))) if args.op_modes else ()
+    if exact_modes and (
+        len(ops) != 1 or args.modes or set(exact_modes).difference(OPS[ops[0]][1])
+        or W43_MODES[ops[0]] not in exact_modes
+    ):
+        parser.error("--op-modes requires one op and valid policies including the Wave 43 baseline")
     if args.batch < 1 or args.iters < 1 or args.warmup < 0:
         parser.error("--batch and --iters must be positive and --warmup cannot be negative")
     if not torch.cuda.is_available():
@@ -419,7 +428,7 @@ def main() -> None:
                         modes = tuple(mode for mode in modes if mode != "batch4_w2_cs")
                     if op == "vscan_bwd" and args.modes:
                         modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
-                    results[op] = _screen(op, args, modes, flush_buffer)
+                    results[op] = _screen(op, args, exact_modes or modes, flush_buffer)
                 results["nvrtc"] = {name: value - before[name] for name, value in compile_stats.items()}
         finally:
             scans._compile_ptx = compile_ptx
@@ -431,6 +440,7 @@ def main() -> None:
     if (
         all(op in report and W43_MODES[op] in report[op]["weighted_ms"] for op in OPS)
         and "strict" in report["vscan_bwd"]["weighted_ms"]
+        and all("off" in report[op]["weighted_ms"] for op in OPS)
     ):
         report["combined_projection"] = _combined_projection(report)
     report["elapsed_seconds"] = perf_counter() - started
