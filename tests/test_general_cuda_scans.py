@@ -1837,7 +1837,7 @@ def test_wave39a_empty_coarse_edge(
 
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("policy", ["wmma_bwd", "wmma_fwd", "legacy_sgs"])
+@pytest.mark.parametrize("policy", ["wmma_bwd", "wmma_fwd", "wmma_both", "legacy_sgs"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("interleaved", [False, True])
@@ -1878,6 +1878,8 @@ def test_cuda_wave39a_parity(
     actual = scans.vertical_backward(py, states, aux, path, gr, gi, coarse, compact=compact)
     if policy in {"wmma_bwd", "wmma_fwd"}:
         assert policy in recorded
+    elif policy == "wmma_both":
+        assert {"wmma_bwd", "wmma_fwd"} <= set(recorded)
     monkeypatch.setenv("LNET_SCAN_W39A", "off")
     padded, padded_aux = _even_vscan_inputs(states, aux, coarse)
     expected_out = scans._vscan(py, padded, padded_aux, path, coarse, 1e-6, precise=True)
