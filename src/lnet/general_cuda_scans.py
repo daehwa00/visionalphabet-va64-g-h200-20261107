@@ -108,6 +108,7 @@ class _Wave53Options:
     backward_reload_source: bool = False
     partial_shared_acc: bool = False
     horizontal_stream: bool = False
+    vertical_w56: str = "off"
     vertical_w55: str = "off"
     horizontal_nocs: bool = False
     horizontal_vec2: bool = False
@@ -2311,7 +2312,16 @@ template<class T> struct NativeWeights {
             )
             .replace("VECTOR_WEIGHTS ? sizeof(float) : sizeof(T)", "sizeof(T)")
         )
-    if key.vertical_w55 == W55A_MODES[3] and key.backward:
+    if key.vertical_w56 != "off":
+        for name in ("path_mlp_batch", "path_adjoint_pair"):
+            begin = source.index("void " + name + "(")
+            end = source.index("\n}", begin)
+            source = source[:begin] + source[begin:end].replace("rounded<T>(", "(") + source[end:]
+    if key.vertical_w56 == "v56_bwd_quad_hfma2":
+        source = _w56_quad_source(source)
+    if key.vertical_w56 == "v56_bwd_hfma2_dw_l2":
+        source = _w56_partial_source(source)
+    if (key.vertical_w55 == W55A_MODES[3] or key.vertical_w56 == "v56_bwd_hfma2_dw_l2") and key.backward:
         marker = "float* acc, float* tail, I stride, float (&dp)"
         source = source.replace(marker, "Pair<T>* dw_chunk, " + marker)
         source = source.replace(
@@ -2349,6 +2359,135 @@ template<class T> struct NativeWeights {
             + source[off:]
         )
     return source
+
+
+def _w56_partial_source(source: str) -> str:
+    source = source.replace(
+        "constexpr bool reduce = (PURE || SHARED_ACC || register_acc) && WARPS > 1;",
+        "constexpr bool reduce = false;",
+    )
+    source = source.replace(
+        "float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};", "float local_tail[26]{};"
+    )
+    source = source.replace(
+        "acc = local_acc;",
+        """acc = row + 4 * I(M);
+            if (active) {
+                #pragma unroll 1
+                for (int k=0;k<64;++k) acc[I(k)*M]=0;
+            }""",
+        1,
+    )
+    source = source.replace("register_acc ? 1 : SHARED_ACC ? threads : M", "M")
+    source = source.replace("row, local_acc, da", "row, local_tail, da")
+    source = source.replace(
+        "j < 11 * HIDDEN + 2; ++j) row[(4 + I(j)) * M] = local_acc[j]",
+        "j < 26; ++j) row[(68 + I(j)) * M] = local_tail[j]",
+    )
+    source = source.replace(
+        "T* gs, float* acc, I acc_stride,", "T* gs, float* acc, float* tail, I acc_stride,"
+    )
+    source = source.replace("acc, acc_stride, (seg", "acc, local_tail, acc_stride, (seg")
+    source = source.replace(
+        "float* acc, I stride, float (&dp)", "float* acc, float* tail, I stride, float (&dp)"
+    )
+    source = source.replace("path, acc, acc_stride, dp);", "path, acc, tail, acc_stride, dp);")
+    for offset in (64, 72, 80):
+        source = source.replace(f"acc[({offset} + j) * stride]", f"tail[{offset - 64}+j]")
+    source = source.replace("acc[88 * stride]", "tail[24]").replace("acc[89 * stride]", "tail[25]")
+    return source.replace(
+        "else path_mlp<T, I, HIDDEN, false, true>(", "else path_mlp<T, I, HIDDEN, false, true, 8>("
+    ).replace("                acc, acc_stride, dp);", "                tail, I(1), dp, acc, c.M);")
+
+
+_W56_QUAD = r"""
+#if __CUDA_ARCH__ >= 800
+template<class T, class I, class Weights>
+__device__ __forceinline__ void path_adjoint_quad(
+    const float (&p)[4][8], const float2 (&dy)[4], Weights path,
+    float* acc, I stride, float (&dp)[4][8]
+) {
+    using P = Half2<T>;
+    typename P::V packed[2][8], grad[2][8];
+    #pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            packed[pair][k] = P::pack(p[2 * pair][k], p[2 * pair + 1][k]);
+            grad[pair][k] = P::splat(0);
+        }
+    }
+    #pragma unroll
+    for (int cell = 0; cell < 4; ++cell) {
+        acc[88 * stride] += dy[cell].x;
+        acc[89 * stride] += dy[cell].y;
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        uint4 row = reinterpret_cast<const uint4*>(path.cache)[32 * j + path.lane];
+        typename P::V weights[8], a = P::splat(0), b = P::splat(0);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            T w = reinterpret_cast<const T*>(&row)[k];
+            weights[k] = Pair<T>::from(w, w).value;
+            a = P::fma(weights[k], packed[0][k], a);
+            b = P::fma(weights[k], packed[1][k], b);
+        }
+        float pre[4] = {P::unpack_lo(a), P::unpack_hi(a), P::unpack_lo(b), P::unpack_hi(b)};
+        float dz[4];
+        float bias = path.bias(j), wr = path.output(j), wi = path.output(8 + j);
+        #pragma unroll
+        for (int cell = 0; cell < 4; ++cell) {
+            float z = pre[cell] + bias;
+            float sig = fast_sigmoid_tanh(z), act = z * sig;
+            dz[cell] = (dy[cell].x * wr + dy[cell].y * wi) * __fmaf_rn(-act, sig, sig + act);
+            acc[(64 + j) * stride] += dz[cell];
+            acc[(72 + j) * stride] += dy[cell].x * act;
+            acc[(80 + j) * stride] += dy[cell].y * act;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k)
+                acc[(8 * j + k) * stride] += dz[cell] * p[cell][k];
+        }
+        auto da = P::pack(dz[0], dz[1]), db = P::pack(dz[2], dz[3]);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            grad[0][k] = P::fma(da, weights[k], grad[0][k]);
+            grad[1][k] = P::fma(db, weights[k], grad[1][k]);
+        }
+    }
+    #pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            dp[2 * pair][k] = P::unpack_lo(grad[pair][k]);
+            dp[2 * pair + 1][k] = P::unpack_hi(grad[pair][k]);
+        }
+    }
+}
+#endif
+"""
+
+
+def _w56_quad_source(source: str) -> str:
+    start = source.index("void path_adjoint_pair(")
+    end = source.index("\n}\n#endif", start) + 2
+    source = source[:end] + _W56_QUAD + source[end:]
+    a = source.index("        for (; end >= 2 * step")
+    body = source.index("            float p[2][8]", a)
+    b = source.index("\n#endif\n#if !defined(BACKWARD_BATCH2)", body)
+    declarations, iteration = source[body:b].split("            #pragma unroll", 1)
+    loop = (
+        declarations.replace("[2]", "[4]")
+        + "            #pragma unroll"
+        + iteration.replace("i < 2", "i < 4").replace("path_adjoint_pair", "path_adjoint_quad")
+    )
+    return (
+        source[:a]
+        + "        for (; end >= 4 * step - 1; end -= 4 * step) {\n"
+        + loop
+        + "\n"
+        + source[a:]
+    )
 
 
 def _horizontal_vec2_source(kernel: str) -> str:
@@ -3619,6 +3758,7 @@ W52A_MODES = (
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin", "w55_lockin")
+W56A_MODES = ("off", "v56_noround", "v56_bwd_hfma2_dw_l2", "v56_bwd_quad_hfma2", "v56_fwd_hiworker")
 W55A_MODES = ("off", "v55_bf16x2_predp", "v55_bf16x2_bf16w", "v55_bf16x2_chunkacc")
 H55_MODES = ("off", "h55_fwd_vec2_cached", "h55_bwd_vec2_nocs", "h55_bwd_vec2_half", "h55_bwd_bf16_nocs")
 W54A_MODES = ("off", "v54_sacc_aw12", "v54_psacc_aw12", "v54_gacc_aw12", "v54_sacc_b4")
@@ -4376,6 +4516,113 @@ def _plan_w55(device: int, launch: Launch, shape: tuple, w55: str) -> Launch:
     return launch._replace(key=key, plan=plan)
 
 
+def _w56_mode(dtype: torch.dtype, hidden: int, device: int) -> str:
+    mode = _scan_mode("LNET_SCAN_W56A", W56A_MODES)
+    if (
+        mode != "off"
+        and hidden == 8
+        and dtype in (torch.bfloat16, torch.float16)
+        and torch.cuda.get_device_capability(device) >= (8, 0)
+    ):
+        return mode
+    return "off"
+
+
+def _plan_w56(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+    b, h, w, m = shape
+    key = launch.key
+    if key.odd_coarse_backward:
+        return launch
+    key = replace(key, vertical_w56="v56_noround")
+    model_shape = h == w and h in (56, 28, 14, 7) and m == (128 if h == 7 else 160)
+    if model_shape and not key.backward:
+        smem = launch.plan.smem + (0 if key.cache_weights and not key.register_path else 5632)
+        if smem <= device_limits(device)[1]:
+            key = replace(key, register_path=False, cache_weights=True, vector_weights=True,
+                          batch_path=True, register_batch2=h // (1 + key.coarse) == 7)
+            launch = launch._replace(plan=launch.plan._replace(cache_weights=True, smem=smem))
+    if mode == "v56_fwd_hiworker" and not key.backward and not key.coarse and h == 56:
+        resident = _resident(device, key, launch.plan.smem)
+        tiles = _ceil(m, 32)
+        workers = min(b * w, _ceil(device_limits(device)[0] * resident, tiles) * key.warps)
+        launch = launch._replace(workers=max(workers, launch.workers))
+    packed_dw = mode == "v56_bwd_hfma2_dw_l2" and key.dtype == torch.bfloat16
+    quad = mode == "v56_bwd_quad_hfma2"
+    if not key.backward or not (packed_dw or quad):
+        return launch._replace(key=key)
+
+    # Lock the tested chunk/cache layout independently of the baseline
+    # planner's device-specific choice of warp count and checkpoint span.
+    if model_shape:
+        chunk = (20 if quad or key.coarse else 22) if h == 56 else 0
+        cache_line = h <= 14 or (h == 28 and key.coarse)
+        persistent = (h == 56 and key.coarse) or (h == 28 and not key.coarse)
+        key = replace(
+            key,
+            warps=4,
+            chunk=chunk,
+            cache_source=True,
+            cache_weights=True,
+            cache_line=cache_line,
+            vector_weights=True,
+            global_checkpoints=False,
+            shared_acc=False,
+            backward_batch2=True,
+            backward_reduce_warps=0,
+            backward_batch_tail=bool((chunk or h) % (2 * (1 + key.coarse))),
+            backward_segment_source=False,
+            sgs=int(h <= 14),
+            l2_single_write=persistent,
+            min_blocks=0,
+            fp32_path=True,
+            register_path=False,
+        )
+        smem = _sgs_smem(key, h) - 5632 + key.sgs * h * 128 * 8
+        if smem + (94 * 4 * 128 if quad else 0) > device_limits(device)[1]:
+            return launch._replace(key=replace(launch.key, vertical_w56="v56_noround"))
+        workers = launch.workers
+        if not cache_line:
+            scratch_per_worker = (h // (1 + key.coarse) + h * persistent) * m * 8
+            workers = min(workers, max(1, _scan_workspace_budget(device) // scratch_per_worker))
+        launch = launch._replace(
+            plan=ScanPlan(
+                4,
+                smem,
+                chunk or h,
+                cache_weights=True,
+                cache_line=cache_line,
+                full_trajectory=not chunk,
+                cache_source=True,
+                sgs_rows=h * key.sgs,
+            ),
+            workers=workers,
+            partials=_ceil(workers, 4),
+        )
+    if key.backward_batch2 and key.cache_source and not key.shared_acc:
+        if packed_dw:
+            # Each warp owns a row. Keep the full 94-field workspace within 44 MiB.
+            workers = min(launch.workers, (44 << 20) // (94 * m * 4))
+            if workers:
+                launch = launch._replace(workers=workers, partials=workers)
+                key = replace(key, vertical_w56=mode, backward_reduce_warps=0)
+        elif key.cache_weights and key.vector_weights:
+            # Shared FP32 accumulators leave registers for both adjoint chains.
+            smem = launch.plan.smem + 94 * 4 * 32 * key.warps
+            if smem <= device_limits(device)[1]:
+                key = replace(
+                    key,
+                    vertical_w56=mode,
+                    backward_batch_tail=True,
+                    shared_acc=True,
+                    backward_reduce_warps=0,
+                )
+                launch = launch._replace(
+                    plan=launch.plan._replace(shared_acc=True, smem=smem),
+                    partials=_ceil(launch.workers, key.warps),
+                )
+    return launch._replace(key=key)
+
+
 def _fp32_hiocc(
     device: int, launch: Launch, shape: tuple[int, int, int, int], budget: int,
 ) -> Launch:
@@ -4581,12 +4828,15 @@ def _plan_launch(  # noqa: C901, PLR0912
     )
     w54 = _scan_mode("LNET_SCAN_W54A", W54A_MODES) if vertical else "off"
     w55 = _scan_mode("LNET_SCAN_W55A", W55A_MODES) if vertical else "off"
+    w56 = _w56_mode(source.dtype, hidden, device) if vertical else "off"
     if wave53a == "w55_lockin":
         wave53a = "w53_lockin"
         if backward:
             w55 = "v55_bf16x2_predp" if not coarse and height <= 8 else "v55_bf16x2_bf16w"
         elif (coarse and height >= 48) or (not coarse and 24 <= height < 48):
             w55 = "v55_bf16x2_bf16w"
+    if w56 != "off" and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
+        w55 = "v55_bf16x2_bf16w"
     if (w54 != "off" or w55 != "off") and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
         wave53a = "w53_lockin"
     if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
@@ -4630,7 +4880,10 @@ def _plan_launch(  # noqa: C901, PLR0912
         if (w55 != "off" and launch.key.hidden8 and launch.key.index32
                 and not (pure_vertical or saved_trajectory)
                 and torch.cuda.get_device_capability(device) >= (8, 0)):
-            return _plan_w55(device, launch, shape, w55)
+            launch = _plan_w55(device, launch, shape, w55)
+            if w56 != "off":
+                return _plan_w56(device, launch, shape, w56)
+            return launch
         return launch if w54 == "off" else _plan_w54(device, launch, shape, w54)
     if wave52a != "off":
         # Both waves tune the same fused kernel and scratch allocation.
@@ -4954,7 +5207,8 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         raise ValueError("Invalid saved vertical features")
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES)
     wave52a = "off" if pure else _wave52a_mode(states.element_size())
-    if _scan_mode("LNET_SCAN_W55A", W55A_MODES) == _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
+    w56 = _w56_mode(states.dtype, hidden, states.device.index or 0)
+    if w56 == _scan_mode("LNET_SCAN_W55A", W55A_MODES) == _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None and (
             mode != "off"
