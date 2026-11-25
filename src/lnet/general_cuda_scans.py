@@ -104,6 +104,10 @@ class ScanPlan(NamedTuple):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Wave53Options:
     # Keep the legacy positional constructor and vars(key) snapshot compatible.
+    backward_reload_source: bool = False
+    partial_shared_acc: bool = False
+    horizontal_stream: bool = False
+    horizontal_vec2: bool = False
     path_bwd_pipe: int = 0
     horizontal_half_replay: bool = False
     horizontal_compact2: bool = False
@@ -1846,6 +1850,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _with_saved_quads(_saved_forward_source(source))
     if key.dw1_tile:
         source = _tiled_dw1_source(source, key)
+    if key.backward_reload_source:
+        source = _vertical_wave54_source(source, key)
     return source + wrapper
 
 
@@ -2039,6 +2045,205 @@ def _saved_backward_source(key: Kernel, io: str, index: str, bounds: str) -> str
 """
 
 
+def _vertical_wave54_source(source: str, key: Kernel) -> str:
+    source = source.replace("static_assert(!full || CACHE_SOURCE);", "").replace(
+        "#define CACHED_SOURCE_AT(j) source_cache[(j) * THREADS].unpack()",
+        "#define CACHED_SOURCE_AT(j) c.source(y0 + (j))",
+    ).replace("I(CACHE_SOURCE ? H : span) * threads", "0")
+    source = "\n".join(line for line in source.split("\n") if "seg_src[j * THREADS] =" not in line)
+    start = source.index("    __device__ float4 source(int y) const {")
+    end = source.index("    __device__ float2 gain", start)
+    source = source[:start] + """    __device__ float4 source(int y) const {
+        return packed_source(y).unpack();
+    }
+
+""" + source[end:]
+    if not key.shared_acc:
+        return source.replace("BACKWARD && HIDDEN && !SHARED_ACC;", "false;")
+    head = 64 if key.partial_shared_acc else 90
+    source = source.replace("SHARED_ACC ? fields * threads", f"SHARED_ACC ? {head} * threads")
+    start = source.index("            for (I j = 4; j < fields;")
+    end = source.index("\n        }", start)
+    source = source[:start] + f"            for (int j=0; j<{head}; ++j) acc[j*threads]=0;" + source[end:]
+    start = source.index("            acc -= 4 * threads;")
+    end = source.index("        } else if (active)", start)
+    # The weight tile is dead once every warp finishes its last line.
+    reduction = """
+            __syncthreads();
+            float* poles = reinterpret_cast<float*>(shared) + threadIdx.x;
+            poles[0]=da.r; poles[threads]=da.i; poles[2*threads]=dg.r; poles[3*threads]=dg.i;
+            __syncthreads();
+            if (warp == 0 && m < M) {
+                for (int j=0; j<4+HEAD; ++j) {
+                    float* field = j<4 ? poles+j*threads : acc+(j-4)*threads;
+                    float sum = field[0];
+                    for (int k=1; k<WARPS; ++k) sum += field[k*32];
+                    row[I(j)*M] = sum;
+                }
+            }
+"""
+    if key.partial_shared_acc:
+        reduction += """
+            #pragma unroll
+            for (int j=0; j<26; ++j) {
+                __syncthreads();
+                poles[0]=local_tail[j];
+                __syncthreads();
+                if (warp==0 && m<M) {
+                    float sum=poles[0];
+                    for (int k=1; k<WARPS; ++k) sum+=poles[k*32];
+                    row[I(68+j)*M]=sum;
+                }
+            }
+"""
+    source = source[:start] + reduction.replace("HEAD", str(head)) + source[end:]
+    if key.partial_shared_acc:
+        source = source.replace("float* acc = acc_base", "float local_tail[26]{}; float* acc = acc_base")
+        source = source.replace("T* gs, float* acc, I acc_stride,", "T* gs, float* acc, float* tail, I acc_stride,")
+        source = source.replace("acc, acc_stride, (seg", "acc, local_tail, acc_stride, (seg")
+        source = source.replace("float* acc, I stride, float (&dp)", "float* acc, float* tail, I stride, float (&dp)")
+        source = source.replace("path, acc, acc_stride, dp);", "path, acc, tail, acc_stride, dp);")
+        for offset in (64,72,80):
+            source = source.replace(f"acc[({offset} + j) * stride]", f"tail[{offset-64}+j]")
+        source = source.replace("acc[88 * stride]", "tail[24]").replace("acc[89 * stride]", "tail[25]")
+        source = source.replace("else path_mlp<T, I, HIDDEN, false, true>(",
+                                "else path_mlp<T, I, HIDDEN, false, true, 8>(")
+        source = source.replace("                acc, acc_stride, dp);", "                tail, I(1), dp, acc, THREADS);")
+    return source
+
+
+_STREAM_STORES = r"""
+template<class V> __device__ void stream_store(V* dst, V value) {
+#if __CUDA_ARCH__ >= 700
+    if constexpr (sizeof(V)==2)
+        asm volatile("st.global.cs.b16 [%0], %1;" :: "l"(dst), "h"(__builtin_bit_cast(unsigned short,value)) : "memory");
+    else
+        asm volatile("st.global.cs.b32 [%0], %1;" :: "l"(dst), "r"(__builtin_bit_cast(unsigned,value)) : "memory");
+#else
+    *dst=value;
+#endif
+}
+template<class T, class I>
+__device__ void store_complex_cs(T* dst, I off, I plane, Complex z) {
+    stream_store(dst+off,write<T>(z.r));
+    stream_store(dst+off+plane,write<T>(z.i));
+}
+"""
+
+
+def _horizontal_vec2_source(kernel: str) -> str:
+    start = kernel.index("template<class T, class I, int WARPS")
+    body = kernel.index("    const I stride_r", start)
+    return _STREAM_STORES + kernel[start:body] + r"""
+    constexpr int threads=32*WARPS;
+    extern __shared__ float4 shared[];
+    const int warp=threadIdx.x/32, lane=threadIdx.x%32, tiles=(M+63)/64;
+    const int m=(blockIdx.x%tiles)*64+2*lane, group=blockIdx.x/tiles;
+    const int worker=group*WARPS+warp;
+    const I plane=I(B)*H*W*M, gp=plane/(1+COMPACT);
+    float4 sums[2]{};
+    using V=Complex;
+    auto read2=[](const T* src) {
+        unsigned bits=__ldg(reinterpret_cast<const unsigned*>(src));
+        return reinterpret_cast<Pair<T>*>(&bits)->unpack();
+    };
+    auto store2=[](T* dst, float x, float y) {
+        auto value=Pair<T>::pack({x,y});
+        stream_store(reinterpret_cast<unsigned*>(dst),*reinterpret_cast<const unsigned*>(&value));
+    };
+    if (m<M && worker<workers) {
+        Complex a[2]={{dr[m],di[m]},{dr[m+1],di[m+1]}};
+        Complex g[2]={{decay_gr[m],decay_gi[m]},{decay_gr[m+1],decay_gi[m+1]}};
+        for (I line=worker; line<I(B)*H; line+=workers) {
+            const I base=line*W*M+m, gb=line*(W/(1+COMPACT))*M+m;
+            auto inputs=[&](int x,V& r,V& i) {
+                I tr=((line/H)*W+x)*H+line%H, ord=line*W+x;
+                r=read2(sr+(REAL_TRANSPOSED?tr:ord)*M*(1+REAL_INTERLEAVED)+m);
+                i=read2(si+(IMAG_TRANSPOSED?tr:ord)*M*(1+IMAG_INTERLEAVED)+m);
+            };
+            Complex right[2]{},left[2]{};
+            #pragma unroll
+            for (int pass=0;pass<2;++pass) {
+                #pragma unroll 4
+                for (int t=0;t<W;++t) {
+                    int x=pass?W-1-t:t;
+                    I off=base+I(x)*M, gi=gb+I(x/(1+COMPACT))*M;
+                    V r{},i{},gr{},gim{},pr{},pi{},nr{},ni{};
+                    if (!BACKWARD || pass) inputs(x,r,i);
+                    if constexpr (BACKWARD) {
+                        if (!COMPACT || ((x&1)==pass)) {
+                            gr=read2(grad+(pass?0:2*gp)+gi);
+                            gim=read2(grad+(pass?gp:3*gp)+gi);
+                        }
+                        if (pass && x) { pr=read2(states+off-M); pi=read2(states+plane+off-M); }
+                        if (pass && x+1<W) {
+                            nr=read2(states+2*plane+off+M); ni=read2(states+3*plane+off+M);
+                        }
+                    }
+                    Complex output[2];
+                    uint2 packed{};
+                    auto* buf=reinterpret_cast<uint2*>(shared)+threadIdx.x+I(x/(1+COMPACT))*threads;
+                    if constexpr (BACKWARD) { if (pass) packed=*buf; }
+                    #pragma unroll
+                    for (int q=0;q<2;++q) {
+                        Complex s{read(q?r.i:r.r),read(q?i.i:i.r)};
+                        if constexpr (!BACKWARD) {
+                            auto& z=pass?left[q]:right[q];
+                            z=(pass?a[q].conj():a[q])*z+(pass?g[q].conj():g[q])*s;
+                            output[q]=z;
+                        } else {
+                            Complex adj{read(q?gr.i:gr.r),read(q?gim.i:gim.r)};
+                            if (!pass) {
+                                right[q]=a[q]*right[q]+adj;
+                                auto stored=Pair<__nv_bfloat16>::pack(right[q]);
+                                unsigned bits=*reinterpret_cast<unsigned*>(&stored);
+                                if (q) packed.y=bits; else packed.x=bits;
+                            } else {
+                                left[q]=a[q].conj()*left[q]+adj;
+                                unsigned bits=q?packed.y:packed.x;
+                                auto ra=reinterpret_cast<Pair<__nv_bfloat16>*>(&bits)->unpack();
+                                if (COMPACT && (x&1)) ra=a[q]*ra;
+                                Complex prev{read(q?pr.i:pr.r),read(q?pi.i:pi.r)};
+                                Complex next{read(q?nr.i:nr.r),read(q?ni.i:ni.r)};
+                                Complex sum=left[q]+ra,diff{left[q].r-ra.r,left[q].i-ra.i};
+                                sums[q].x+=left[q].r*prev.r+left[q].i*prev.i+ra.r*next.r+ra.i*next.i;
+                                sums[q].y+=left[q].i*prev.r-left[q].r*prev.i+ra.r*next.i-ra.i*next.r;
+                                sums[q].z+=sum.r*s.r+sum.i*s.i;
+                                sums[q].w+=diff.i*s.r-diff.r*s.i;
+                                output[q]={sum.r*g[q].r+diff.i*g[q].i,sum.i*g[q].r-diff.r*g[q].i};
+                            }
+                        }
+                    }
+                    if constexpr (BACKWARD) {
+                        if (!pass && (!COMPACT || !(x&1))) *buf=packed;
+                    }
+                    if (!BACKWARD || pass) {
+                        I dst=BACKWARD?2*(off-m)+m:off+2*pass*plane;
+                        store2(out+dst,output[0].r,output[1].r);
+                        store2(out+dst+(BACKWARD?I(M):plane),output[0].i,output[1].i);
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (BACKWARD) {
+        #pragma unroll
+        for (int q=0;q<2;++q) {
+            __syncthreads(); shared[threadIdx.x]=sums[q]; __syncthreads();
+            if (warp==0 && m<M) {
+                float4 z=shared[lane];
+                for (int k=1;k<WARPS;++k) {
+                    float4 t=shared[32*k+lane]; z.x+=t.x; z.y+=t.y; z.z+=t.z; z.w+=t.w;
+                }
+                float* row=partial+I(4)*group*M+m+q;
+                row[0]=z.x;row[M]=z.y;row[2*I(M)]=z.z;row[3*I(M)]=z.w;
+            }
+        }
+    }
+}
+"""
+
+
 def _horizontal_candidate_source(source: str, key: Kernel) -> str:
     body = source.index("void horizontal(")
     start = source.rindex("template<", 0, body)
@@ -2059,6 +2264,12 @@ __device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
         kernel = _horizontal_wave53_source(kernel, key)
     if key.horizontal_span:
         kernel = _horizontal_chunk_source(kernel, key.horizontal_span)
+    if key.horizontal_stream:
+        if key.horizontal_vec2:
+            return source[:start] + _horizontal_vec2_source(kernel) + source[end:]
+        kernel = _STREAM_STORES + kernel.replace("store_complex(out,", "store_complex_cs(out,")
+        if key.horizontal_bf16_buf:
+            kernel = kernel.replace("Pair<float>::pack(right)", "Pair<__nv_bfloat16>::pack(right)")
     if key.horizontal_unroll and not key.backward:
         for loop in ("for (int x = 0;", "for (int x = W - 1;"):
             pragma = "#pragma unroll BACKWARD_UNROLL\n                "
@@ -2607,7 +2818,7 @@ def _dispatch(source: Tensor, launch: Launch | None, args: tuple) -> None:
     if launch is None:
         raise RuntimeError("CUDA scan is ineligible on this device")
     plan, key, workers, _ = launch
-    grid = _ceil(source.shape[-1], _WARP_SIZE) * _ceil(workers, plan.warps)
+    grid = _ceil(source.shape[-1], _WARP_SIZE * (1 + key.horizontal_vec2)) * _ceil(workers, plan.warps)
     _launch_kernel(source, key, grid, plan.smem, args)
 
 
@@ -2727,6 +2938,10 @@ def _shape_supported(shape: tuple[int, ...]) -> bool:
     return max(b * h, b * w) * _ceil(m, _WARP_SIZE) < 2**31
 
 
+def _checkpoint_rows(height: int, chunk: int) -> int:
+    return (height - 1) // (chunk or height)
+
+
 def _scratch_per_worker(plan: ScanPlan, length: int, *, vertical: bool, coarse: bool,
                         backward: bool, itemsize: int, compact: bool = False) -> int:
     """Return global scratch storage per worker and mode, in bytes."""
@@ -2734,7 +2949,7 @@ def _scratch_per_worker(plan: ScanPlan, length: int, *, vertical: bool, coarse: 
         return length // (1 + int(compact)) * 8 if backward and not plan.cache_line else 0
     outputs = length // (1 + int(coarse))
     line = 0 if plan.cache_line else outputs * 4 * itemsize
-    checkpoints = (length - 1) // plan.chunk * 16 if plan.global_checkpoints else 0
+    checkpoints = _checkpoint_rows(length, plan.chunk) * 16 if plan.global_checkpoints else 0
     return line + checkpoints
 
 
@@ -3142,6 +3357,9 @@ W52A_MODES = (
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin")
+W54A_MODES = ("off", "v54_sacc_aw12", "v54_psacc_aw12", "v54_gacc_aw12")
+H54_MODES = ("off", "h54_fwd_nocache", "h54_fwd_vec2", "h54_bwd_bf16_all",
+             "h54_bwd_bf16_half", "h54_bwd_vec2", "h54_combo_vec2")
 H53_MODES = ("h53_ro_all", "h53_compact2", "h53_bf16_buf", "h53_l2_scratch", "h53_lockin")
 HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2") + H53_MODES
 
@@ -3670,6 +3888,112 @@ def _plan_h53(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
     return trial._replace(workers=workers, partials=_ceil(workers, warps))
 
 
+@lru_cache(maxsize=512)
+def _plan_w54(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+    key = launch.key
+    b, h, w, m = shape
+    if (
+        not (key.backward and key.hidden8 and key.index32)
+        or key.pure_vertical
+        or key.odd_coarse_backward
+    ):
+        return launch
+    shared = mode != "v54_gacc_aw12"
+    partial = mode == "v54_psacc_aw12"
+    step = 1 + key.coarse
+    # The scalar tail of global accumulation exceeded the SM90 register budget.
+    if not shared and h % (2 * step):
+        return launch
+    candidates = []
+    for warps in (4, 3):
+        spans = set(range(2 * step, min(h, 20) + 1, 2 * step))
+        if h <= 14:
+            spans.add(h)
+        for span in spans:
+            chunk = 0 if span == h else span
+            fields = (64 if partial else 90) if shared else 0
+            smem = 11264 + warps * 32 * (16 * span + 4 * fields)
+            if smem > (76458 if warps == 4 else 57088):
+                continue
+            k = replace(
+                key,
+                warps=warps,
+                chunk=chunk,
+                backward_reduce_warps=0,
+                shared_acc=shared,
+                partial_shared_acc=partial,
+                backward_reload_source=True,
+                backward_segment_source=False,
+                global_checkpoints=True,
+                cache_source=False,
+                cache_line=False,
+                cache_weights=True,
+                vector_weights=True,
+                backward_readonly=True,
+                fp32_path=True,
+                tanh_gain=True,
+                backward_batch2=True,
+                path_bwd_pipe=0,
+                backward_batch_tail=bool(h % (2 * step)),
+                sgs=0,
+                l2_single_write=False,
+                min_blocks=0,
+            )
+            plan = ScanPlan(warps, smem, chunk, True, True, False, shared, chunk == 0)
+            candidates.append((span, warps, k, plan))
+    for _, warps, k, plan in sorted(candidates, reverse=True):
+        resident = _resident(device, k, plan.smem)
+        if resident * warps < 12:
+            continue
+        wave = max(1, device_limits(device)[0] * resident // _ceil(m, 32)) * warps
+        workers = min(b * (w // step), 2 * wave, launch.workers)
+        if not shared:
+            workers = min(workers, (36 << 20) // (94 * m * 4))
+        if workers:
+            return Launch(plan, k, workers, _ceil(workers, warps) if shared else workers)
+    return launch
+
+
+@lru_cache(maxsize=512)
+def _plan_h54(device: int, launch: Launch, shape: tuple, mode: str, aligned: bool) -> Launch:
+    base = _plan_h53(device, launch, shape, "h53_lockin")
+    key = base.key
+    if (
+        key.backward
+        and mode.startswith("h54_fwd")
+        or not key.backward
+        and mode.startswith("h54_bwd")
+    ):
+        return base
+    _, _, width, m = shape
+    vec = "vec2" in mode and aligned and m % 2 == 0
+    half = key.backward and mode.endswith("half") and width >= 48 and not key.compact
+    narrow = key.backward and (vec or width >= (48 if key.compact else 24))
+    saved = (width + 1) // 2 if half else width // (1 + key.compact)
+    smem = 128 * max(16, saved * (8 if vec or not narrow else 4)) if key.backward else 0
+    k = replace(
+        key,
+        warps=4,
+        horizontal_stream=True,
+        horizontal_vec2=vec,
+        horizontal_wave53=key.backward,
+        horizontal_readonly=True,
+        horizontal_unroll=4,
+        horizontal_compact2=narrow and not vec,
+        horizontal_half_replay=half,
+        horizontal_bf16_buf=narrow,
+        cache_line=key.backward,
+    )
+    if smem > device_limits(device)[1] or not _resident(device, k, smem):
+        return base
+    return Launch(
+        base.plan._replace(warps=4, smem=smem, cache_line=key.backward),
+        k,
+        base.workers,
+        _ceil(base.workers, 4),
+    )
+
+
 def _fp32_hiocc(
     device: int, launch: Launch, shape: tuple[int, int, int, int], budget: int,
 ) -> Launch:
@@ -3826,6 +4150,7 @@ def _plan_launch(  # noqa: C901, PLR0912
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
     saved_trajectory: bool = False,
+    aligned: bool = True,
 ) -> Launch | None:
     if vertical and backward:
         mode = _scan_mode("LNET_SCAN_SGS", SGS_MODES)
@@ -3872,6 +4197,9 @@ def _plan_launch(  # noqa: C901, PLR0912
         _wave52a_mode(source.dtype.itemsize)
         if vertical and not (pure_vertical or saved_trajectory) else "off"
     )
+    w54 = _scan_mode("LNET_SCAN_W54A", W54A_MODES) if vertical else "off"
+    if w54 != "off" and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
+        wave53a = "w53_lockin"
     if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
         "off", "strict_ro",
     ) and wave52a == wave53a == "off":
@@ -3882,6 +4210,10 @@ def _plan_launch(  # noqa: C901, PLR0912
                 return candidate
             if wave51a == "fp32_hiocc":
                 wave51a = "fp32"
+    if not vertical and source.dtype.itemsize == 2:
+        h54 = _scan_mode("LNET_SCAN_H54", H54_MODES)
+        if h54 != "off":
+            return _plan_h54(device, launch, shape, h54, aligned)
     if mode in H53_MODES:
         return _plan_h53(device, launch, shape, mode)
     if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
@@ -3894,7 +4226,8 @@ def _plan_launch(  # noqa: C901, PLR0912
         else:
             launch = _plan_vfwd(device, launch, height, mode)
     if wave53a != "off":
-        return _plan_w53a(device, launch, shape, wave53a)
+        launch = _plan_w53a(device, launch, shape, wave53a)
+        return launch if w54 == "off" else _plan_w54(device, launch, shape, w54)
     if wave52a != "off":
         # Both waves tune the same fused kernel and scratch allocation.
         return _plan_w52a(device, launch, shape, wave52a)
@@ -4061,6 +4394,11 @@ def _horizontal_layout(real: Tensor, imag: Tensor) -> dict[str, tuple[bool, bool
     }
 
 
+def _vec2_aligned(*values: Tensor | None) -> bool:
+    return all(value.data_ptr() % 4 == 0 and all(step % 2 == 0 for step in value.stride()[:-1])
+               for value in values if value is not None)
+
+
 def _hscan(
     pole: list[Tensor],
     real: Tensor,
@@ -4103,6 +4441,8 @@ def _hscan(
     launch = _plan_launch(
         real, shape, backward=backward, vertical=False, coarse=False, hidden=0, precise=False,
         compact=compact,
+        aligned=_vec2_aligned(real, imag, states, adjoints)
+                if os.getenv("LNET_SCAN_H54", "off") != "off" else True,
         **layout,
     )
     if launch is None:
@@ -4210,7 +4550,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         raise ValueError("Invalid saved vertical features")
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES)
     wave52a = "off" if pure else _wave52a_mode(states.element_size())
-    if wave51a == wave52a == "off" and trajectory is None and not pure and not (
+    if _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None and (
             mode != "off"
@@ -4266,7 +4606,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         )
         fields = 4 if pure else 11 * hidden + 6
         partial = states.new_empty((launch.partials, fields, m), dtype=torch.float32)
-        checkpoint_rows = _ceil(h, launch.plan.chunk) - 1
+        checkpoint_rows = _checkpoint_rows(h, launch.plan.chunk)
         if launch.plan.global_checkpoints and checkpoint_rows:
             checkpoints = states.new_empty(
                 (checkpoint_rows, launch.workers, m, 4), dtype=torch.float32
