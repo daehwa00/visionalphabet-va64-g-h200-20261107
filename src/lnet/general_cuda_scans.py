@@ -4534,35 +4534,90 @@ def _plan_w56(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
     if key.odd_coarse_backward:
         return launch
     key = replace(key, vertical_w56="v56_noround")
+    model_shape = h == w and h in (56, 28, 14, 7) and m == (128 if h == 7 else 160)
+    if model_shape and not key.backward:
+        smem = launch.plan.smem + (0 if key.cache_weights and not key.register_path else 5632)
+        if smem <= device_limits(device)[1]:
+            key = replace(key, register_path=False, cache_weights=True, vector_weights=True,
+                          batch_path=True, register_batch2=h // (1 + key.coarse) == 7)
+            launch = launch._replace(plan=launch.plan._replace(cache_weights=True, smem=smem))
     if mode == "v56_fwd_hiworker" and not key.backward and not key.coarse and h == 56:
         resident = _resident(device, key, launch.plan.smem)
         tiles = _ceil(m, 32)
         workers = min(b * w, _ceil(device_limits(device)[0] * resident, tiles) * key.warps)
         launch = launch._replace(workers=max(workers, launch.workers))
-    if key.backward and key.backward_batch2 and key.cache_source and not key.shared_acc:
-        if mode == "v56_bwd_hfma2_dw_l2" and key.dtype == torch.bfloat16:
+    packed_dw = mode == "v56_bwd_hfma2_dw_l2" and key.dtype == torch.bfloat16
+    quad = mode == "v56_bwd_quad_hfma2"
+    if not key.backward or not (packed_dw or quad):
+        return launch._replace(key=key)
+
+    # Lock the tested chunk/cache layout independently of the baseline
+    # planner's device-specific choice of warp count and checkpoint span.
+    if model_shape:
+        chunk = (20 if quad or key.coarse else 22) if h == 56 else 0
+        cache_line = h <= 14 or (h == 28 and key.coarse)
+        persistent = (h == 56 and key.coarse) or (h == 28 and not key.coarse)
+        key = replace(
+            key,
+            warps=4,
+            chunk=chunk,
+            cache_source=True,
+            cache_weights=True,
+            cache_line=cache_line,
+            vector_weights=True,
+            global_checkpoints=False,
+            shared_acc=False,
+            backward_batch2=True,
+            backward_reduce_warps=0,
+            backward_batch_tail=bool((chunk or h) % (2 * (1 + key.coarse))),
+            backward_segment_source=False,
+            sgs=int(h <= 14),
+            l2_single_write=persistent,
+            min_blocks=0,
+            fp32_path=True,
+            register_path=False,
+        )
+        smem = _sgs_smem(key, h) - 5632 + key.sgs * h * 128 * 8
+        if smem + (94 * 4 * 128 if quad else 0) > device_limits(device)[1]:
+            return launch._replace(key=replace(launch.key, vertical_w56="v56_noround"))
+        workers = launch.workers
+        if not cache_line:
+            scratch_per_worker = (h // (1 + key.coarse) + h * persistent) * m * 8
+            workers = min(workers, max(1, _scan_workspace_budget(device) // scratch_per_worker))
+        launch = launch._replace(
+            plan=ScanPlan(
+                4,
+                smem,
+                chunk or h,
+                cache_weights=True,
+                cache_line=cache_line,
+                full_trajectory=not chunk,
+                cache_source=True,
+                sgs_rows=h * key.sgs,
+            ),
+            workers=workers,
+            partials=_ceil(workers, 4),
+        )
+    if key.backward_batch2 and key.cache_source and not key.shared_acc:
+        if packed_dw:
             # Each warp owns a row. Keep the full 94-field workspace within 44 MiB.
             workers = min(launch.workers, (44 << 20) // (94 * m * 4))
             if workers:
                 launch = launch._replace(workers=workers, partials=workers)
                 key = replace(key, vertical_w56=mode, backward_reduce_warps=0)
-        elif mode == "v56_bwd_quad_hfma2" and key.cache_weights and key.vector_weights:
-            # Stage the FP32 accumulators in shared memory so both packed
-            # adjoint chains can remain live across a hidden-unit iteration.
-            chunk = 20 if h == 56 and key.chunk >= 20 else key.chunk
-            extra = _sgs_smem(replace(key, chunk=chunk), h) - _sgs_smem(key, h)
-            smem = launch.plan.smem + extra + 94 * 4 * 32 * key.warps
+        elif key.cache_weights and key.vector_weights:
+            # Shared FP32 accumulators leave registers for both adjoint chains.
+            smem = launch.plan.smem + 94 * 4 * 32 * key.warps
             if smem <= device_limits(device)[1]:
                 key = replace(
                     key,
                     vertical_w56=mode,
                     backward_batch_tail=True,
-                    chunk=chunk,
                     shared_acc=True,
                     backward_reduce_warps=0,
                 )
                 launch = launch._replace(
-                    plan=launch.plan._replace(shared_acc=True, smem=smem, chunk=chunk or h),
+                    plan=launch.plan._replace(shared_acc=True, smem=smem),
                     partials=_ceil(launch.workers, key.warps),
                 )
     return launch._replace(key=key)

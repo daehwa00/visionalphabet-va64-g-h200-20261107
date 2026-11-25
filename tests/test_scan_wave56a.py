@@ -190,10 +190,15 @@ def test_resources(offline, compiler, monkeypatch):
                         assert {int(k) for k in re.findall(r"p\[i\]\[(\d)\] =", quad)} == set(
                             range(8)
                         )
+                    if mode != "w55_lockin":
+                        assert ops[0] >= 64 and ops[2] > 0
                     if any(mem):
                         failures.append((mode, shape[0], dtype, backward, mem))
                     if backward and mode == "v56_bwd_hfma2_dw_l2" and dtype == torch.bfloat16:
                         assert key.cache_source and key.vertical_w56 == mode
+                        assert key.chunk == (
+                            22 if shape[0] == "56d" else 20 if shape[0] == "56c" else 0
+                        )
                         assert launch.partials == launch.workers
                         assert launch.partials * 94 * shape[3] * 4 <= 44 << 20
                     if mode == "v56_fwd_hiworker" and shape[0] == "56d" and not backward:
