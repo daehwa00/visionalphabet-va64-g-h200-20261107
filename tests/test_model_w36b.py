@@ -10,7 +10,7 @@ import torch
 from run_va_eight_ablations import build_variant
 from torch import nn
 
-from lnet import capture_safe_orthogonal
+from lnet import capture_safe_orthogonal, memory_backbone, model_w28c, model_w29c
 from lnet.capture_safe_orthogonal import fixed_taylor_matrix_exp
 from lnet.model_w36b import (
     _clip_static_grads,
@@ -81,6 +81,97 @@ def test_autotune_features(monkeypatch: pytest.MonkeyPatch, features, expected) 
     options = compile_model_w36b(nn.Linear(4, 4))
     assert options["options"] == expected
     assert options["fullgraph"] == ("cuda_graphs" in features)
+
+
+@pytest.mark.parametrize("extra", [
+    "",
+    ",inductor_norms",
+    ",inductor_norms,aggressive_epilogue",
+    ",inductor_norms,aggressive_epilogue,multi_kernel",
+])
+def test_inductor_fusion_options(monkeypatch: pytest.MonkeyPatch, extra: str) -> None:
+    monkeypatch.setenv("LNET_MODEL_W36B", f"cuda_graphs,tma_gemm,max_autotune_pointwise{extra}")
+    monkeypatch.setattr(torch, "compile", lambda _, **kwargs: kwargs)
+    triton = torch._inductor.config.triton
+    expected = {
+        "triton.cudagraphs": True,
+        "max_autotune_gemm": True,
+        "max_autotune_gemm_backends": "ATEN,TRITON",
+        "max_autotune_gemm_search_space": "DEFAULT",
+        "aggressive_fusion": "aggressive_epilogue" in extra,
+        "max_autotune_pointwise": True,
+        "epilogue_fusion": True,
+    }
+    if hasattr(triton, "enable_persistent_tma_matmul"):
+        expected["triton.enable_persistent_tma_matmul"] = True
+    if "aggressive_epilogue" in extra:
+        for name in ("tiling_prevents_pointwise_fusion", "tiling_prevents_reduction_fusion"):
+            if hasattr(triton, name):
+                expected[f"triton.{name}"] = False
+    if "multi_kernel" in extra and hasattr(triton, "multi_kernel"):
+        expected["triton.multi_kernel"] = 1
+    assert compile_model_w36b(nn.Linear(4, 4)) == {
+        "options": expected, "fullgraph": True, "dynamic": False,
+    }
+
+
+def test_gemm_respects_explicit_aggressive_fusion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_MODEL_W36B", "tma_gemm")
+    monkeypatch.setattr(torch, "compile", lambda _, **kwargs: kwargs)
+    compiled = compile_model_w36b(nn.Linear(4, 4), options={"aggressive_fusion": True})
+    assert compiled["options"]["aggressive_fusion"] is True
+
+
+@pytest.mark.parametrize("policy", ["off", "cuda_graphs,tma_gemm,max_autotune_pointwise"])
+def test_inductor_norms_dispatch(monkeypatch: pytest.MonkeyPatch, policy: str) -> None:
+    device = torch.device("cuda")
+    monkeypatch.setenv("LNET_MODEL_OPT", "auto")
+    monkeypatch.setenv("LNET_MODEL_W28C", "combined")
+    monkeypatch.setenv("LNET_MODEL_W29C", "combined_full")
+    monkeypatch.setattr(model_w28c, "model_cuda_supported", lambda _: True)
+    monkeypatch.setattr(model_w29c, "model_cuda_supported", lambda _: True)
+    monkeypatch.setenv("LNET_MODEL_W36B", policy)
+
+    def selections() -> tuple[bool, ...]:
+        return (
+            model_w28c.model_w28c_enabled(device, "swiglu"),
+            model_w29c.model_w29c_enabled(device, "swiglu_vec2d"),
+            model_w29c.model_w29c_enabled(device, "rmsnorm_bwd"),
+            model_w29c.model_w29c_enabled(device, "rmsnorm_full"),
+            model_w28c.model_w28c_enabled(device, "nr4"),
+            model_w29c.model_w29c_enabled(device, "nr4"),
+        )
+
+    assert selections() == (True, True, True, True, True, True)
+    monkeypatch.setenv("LNET_MODEL_W36B", "cuda_graphs, inductor_norms")
+    assert selections() == (False, False, False, False, True, True)
+
+
+def test_inductor_norms_native_rmsnorm_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    norm = memory_backbone.ChannelRMSNorm(4)
+    inputs = torch.randn(2, 4, dtype=torch.bfloat16, requires_grad=True)
+    graphs = []
+
+    def record(graph: torch.fx.GraphModule, _inputs: list[torch.Tensor]):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(norm, backend=record, fullgraph=True)
+    monkeypatch.setenv("LNET_MODEL_W36B", "off")
+    compiled(inputs)
+    monkeypatch.setenv("LNET_MODEL_W36B", "inductor_norms")
+    actual = compiled(inputs)
+    actual.sum().backward()
+
+    assert len(graphs) == 2
+    assert not any(node.target is torch.rms_norm for node in graphs[0].graph.nodes)
+    assert any(node.target is torch.rms_norm for node in graphs[1].graph.nodes)
+    expected = torch.nn.functional.rms_norm(
+        inputs, (4,), norm.weight.to(inputs.dtype), norm.epsilon,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert inputs.grad is not None
+    assert inputs.grad.isfinite().all()
 
 
 @pytest.mark.parametrize("features", [

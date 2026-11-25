@@ -20,8 +20,17 @@ if TYPE_CHECKING:
 _GEMM_FEATURES = frozenset({"max_autotune_gemm", "max_autotune_gemm_aten", "tma_gemm"})
 AUTOTUNE_FEATURES = _GEMM_FEATURES | {
     "max_autotune_pointwise", "coord_descent", "aggressive_fusion", "shape_padding",
+    "aggressive_epilogue", "multi_kernel",
 }
-_FEATURES = AUTOTUNE_FEATURES | {"capture_safe_ortho", "cuda_graphs", "compiled_update"}
+_FEATURES = AUTOTUNE_FEATURES | {
+    "capture_safe_ortho", "cuda_graphs", "compiled_update", "inductor_norms",
+}
+
+
+def inductor_norms_enabled() -> bool:
+    """Use native norm and activation ops with a Dynamo-guarded policy read."""
+    policy = os.environ.get("LNET_MODEL_W36B", "off")
+    return "inductor_norms" in [part.strip() for part in policy.split(",")]
 
 
 def model_w36b_features() -> frozenset[str]:
@@ -45,6 +54,18 @@ def prepare_model_w36b_(model: nn.Module) -> nn.Module:
     return model
 
 
+def _set_fusion_options(settings: dict[str, Any], features: frozenset[str]) -> None:
+    if "aggressive_fusion" in features:
+        settings["aggressive_fusion"] = True
+    if "aggressive_epilogue" in features:
+        settings.update(aggressive_fusion=True, epilogue_fusion=True)
+        for name in ("tiling_prevents_pointwise_fusion", "tiling_prevents_reduction_fusion"):
+            if hasattr(inductor_config.triton, name):
+                settings[f"triton.{name}"] = False
+    if "multi_kernel" in features and hasattr(inductor_config.triton, "multi_kernel"):
+        settings["triton.multi_kernel"] = 1
+
+
 def compile_model_w36b(
     model: nn.Module, *, options: dict[str, Any] | None = None,
 ) -> nn.Module:
@@ -65,8 +86,8 @@ def compile_model_w36b(
             max_autotune_gemm_backends=(
                 "ATEN" if "max_autotune_gemm_aten" in features else "ATEN,TRITON"
             ),
-            aggressive_fusion=False,
         )
+        settings.setdefault("aggressive_fusion", False)
     if "tma_gemm" in features:
         settings["max_autotune_gemm_search_space"] = "DEFAULT"
         if hasattr(inductor_config.triton, "enable_persistent_tma_matmul"):
@@ -75,8 +96,7 @@ def compile_model_w36b(
         settings.update(max_autotune_pointwise=True, epilogue_fusion=True)
     if "coord_descent" in features:
         settings["coordinate_descent_tuning"] = True
-    if "aggressive_fusion" in features:
-        settings["aggressive_fusion"] = True
+    _set_fusion_options(settings, features)
     if "shape_padding" in features:
         settings["shape_padding"] = True
     fullgraph = graphs or (autotune and "capture_safe_ortho" in features)
