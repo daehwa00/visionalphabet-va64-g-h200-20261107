@@ -45,7 +45,7 @@ def measure_arm(out: Path, *, profile: bool) -> int:
     bench_h200.kernel_bucket = kernel_bucket
 
     result = bench_h200.train_arm(
-        argparse.Namespace(variant=VARIANT, batch=1024, profile=profile),
+        argparse.Namespace(variant=VARIANT, batch=1024, profile=profile, out=out),
         profiler=lambda step, _diagnostic: profile_step(step),
     )
     replays = result.get("cudagraph_replays_by_phase", {})
