@@ -2586,7 +2586,7 @@ def _wider_readonly_layout(
 
 
 @lru_cache(maxsize=512)
-def _plan_tc_vscan(device: int, launch: Launch, shape: tuple[int, int, int, int]) -> Launch:
+def _plan_tc_vscan(device: int, launch: Launch, shape: tuple[int, int, int, int]) -> Launch:  # noqa: C901
     key = launch.key
     if (
         not key.hidden8 or key.pure_vertical or key.dtype.itemsize != 2
@@ -2602,10 +2602,21 @@ def _plan_tc_vscan(device: int, launch: Launch, shape: tuple[int, int, int, int]
     # The checkpoint footprint is minimized near sqrt(H). Full storage skips replay.
     root = _ceil(int(height**0.5), row_step) * row_step
     spans = {height, min(height, root), min(height, 2 * root), min(height, 4 * root)}
+    warp_counts = tuple(
+        warps for warps in (16, 8, 4, 2, 1)
+        if warps <= max_warps and (warps <= 4 or warps <= modes)
+    )
+    # With a tighter warp budget, narrower CTAs can win on residency even if
+    # the widest CTA fits. Preserve the occupancy search on those devices.
+    shortlist = bool(warp_counts) and max_warps >= 4 * warp_counts[0]
     best, best_score = launch, None
-    for warps in (4, 8, 16, 2, 1):
-        if warps > max_warps or (warps > 4 and warps > modes):
-            continue
+    for warps in warp_counts:
+        if shortlist and best_score is not None:
+            if best.plan.full_trajectory or warps != best.key.warps // 2:
+                break
+            trial_spans = (height,)
+        else:
+            trial_spans = sorted(spans)
         candidate = Kernel(
             key.dtype, warps, backward=True, vertical=True, coarse=key.coarse, hidden8=True,
             compact=key.compact, index32=key.index32, real_interleaved=key.real_interleaved,
@@ -2613,7 +2624,7 @@ def _plan_tc_vscan(device: int, launch: Launch, shape: tuple[int, int, int, int]
             tc_mode_shared=True,
         )
         tiles = _ceil(modes, warps)
-        for span in sorted(spans):
+        for span in trial_spans:
             slots = span + _ceil(height, span) - 1
             # float4 trajectory, packed injection, padded I/O stage and MMA tile.
             smem = warps * (16 * (16 * slots + 8 * (height // row_step)) + 1344)

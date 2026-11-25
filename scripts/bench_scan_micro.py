@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, NamedTuple
+from unittest.mock import patch
 
 import torch
 
@@ -65,6 +66,28 @@ class Inputs(NamedTuple):
     path: list[Tensor]
     gr: Tensor
     gi: Tensor
+
+
+class JitStats:
+    def __init__(self) -> None:
+        self.count = 0
+        self.seconds = 0.0
+        self.compile_ptx = scans._compile_ptx
+
+    def compile(self, key: scans.Kernel, capability: tuple[int, int]) -> object:
+        start = perf_counter()
+        self.count += 1
+        try:
+            return self.compile_ptx(key, capability)
+        finally:
+            self.seconds += perf_counter() - start
+
+    def snapshot(self) -> dict[str, int | float]:
+        return {"count": self.count, "seconds": self.seconds}
+
+
+def _progress(message: str) -> None:
+    print(f"[scan] {message}", file=sys.stderr, flush=True)
 
 
 def make_inputs(batch: int, height: int, width: int, modes: int, coarse: bool, dtype: torch.dtype) -> Inputs:
@@ -211,11 +234,13 @@ def _parity(
                 # Exercise the two-wave grouping even when timing a small batch.
                 batch = max(batch, 8, scans._ceil(16 * sms, w * scans._ceil(m, 32)))
             for compact in _layouts(op, label, coarse, w):
+                label_key = f"{dtype_name}/{label}/compact={compact}"
+                _progress(f"parity {op} {label_key}")
                 os.environ[env] = "off"
                 run, plan = _case(op, shape, batch, dtype, compact=compact)
                 expected = run()
                 samples = {}
-                record = report[f"{dtype_name}/{label}/compact={compact}"] = {"batch": batch, "modes": {}}
+                record = report[label_key] = {"batch": batch, "modes": {}}
                 for mode in modes:
                     os.environ[env] = mode
                     launch = plan()
@@ -246,9 +271,10 @@ def _layouts(op: str, label: str, coarse: bool, width: int) -> tuple[bool, ...]:
     return (False, True) if label in EDGE_LABELS else (True,)
 
 
-def _screen(
+def _timing(
     op: str, args: argparse.Namespace, modes: tuple[str, ...], flush_buffer: Tensor | None,
-) -> dict:
+    jit: JitStats,
+) -> tuple[dict, dict[str, dict[str, scans.Kernel]]]:
     env = OPS[op][0]
     results = {mode: {} for mode in modes}
     totals = dict.fromkeys(modes, 0.0)
@@ -263,6 +289,9 @@ def _screen(
         samples = {}
         timed_keys[label] = {}
         for mode in modes:
+            message = f"timing {op} {label} mode={mode}"
+            _progress(f"{message} ...")
+            count, seconds = jit.count, jit.seconds
             os.environ[env] = mode
             launch = plan()
             timed_keys[label][mode] = launch.key
@@ -272,13 +301,26 @@ def _screen(
             ms, details = samples[launch]
             totals[mode] += calls * ms
             results[mode][label] = {"median_ms": ms, "calls": calls, "plan": details}
+            _progress(
+                f"{message} done {ms:.4f} ms (jit={jit.count - count}, "
+                f"{jit.seconds - seconds:.2f}s)",
+            )
         del run, plan
     winner = W43_MODES[op]
     for shapes in results.values():
         for label, sample in shapes.items():
             sample["delta_vs_off_ms"] = sample["median_ms"] - results["off"][label]["median_ms"]
             sample["delta_vs_w43_ms"] = sample["median_ms"] - results[winner][label]["median_ms"]
-    diagnostics = _parity(op, modes, args, timed_keys) if args.parity else {}
+    return {
+        "weighted_ms": totals,
+        "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
+        "delta_vs_w43_ms": {mode: ms - totals[winner] for mode, ms in totals.items()},
+        "shapes": results,
+    }, timed_keys
+
+
+def _summarize_parity(op: str, totals: dict, diagnostics: dict) -> dict:
+    modes = tuple(totals)
     passes = {
         field: {
             mode: all(
@@ -306,9 +348,6 @@ def _screen(
         "best_mode": best_mode(totals, exact),
         "best_tolerated_mode": best_mode(totals, tolerated if op in ("vscan_bwd", "hscan_bwd") else exact),
         "timing_kernel_covered": covered,
-        "weighted_ms": totals,
-        "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
-        "delta_vs_w43_ms": {mode: ms - totals[winner] for mode, ms in totals.items()},
         "parity_pass": passes["exact_match"],
         "parity_mismatches": {
             mode: [
@@ -316,7 +355,7 @@ def _screen(
                 if not all(stats["exact_match"] for stats in case["modes"][mode]["tensors"].values())
             ] for mode in passes["exact_match"]
         },
-        "tolerance_pass": passes["tol_pass"], "parity": diagnostics, "shapes": results,
+        "tolerance_pass": passes["tol_pass"], "parity": diagnostics,
     }
 
 
@@ -327,6 +366,12 @@ def _combined_projection(report: dict) -> dict[str, float]:
     off = sum(times["off"] for times in totals.values())
     strict = off - totals["vscan_bwd"]["off"] + totals["vscan_bwd"]["strict"]
     return {"weighted_ms": projected, "delta_vs_off_ms": projected - off, "delta_vs_strict_ms": projected - strict}
+
+
+def _write_report(report: dict, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def main() -> None:
@@ -363,7 +408,9 @@ def main() -> None:
     if args.flush_l2:
         flush_bytes = max(64 * 1024**2, 2 * scans._l2_size(torch.cuda.current_device()))
     report.update(flush_l2=args.flush_l2, flush_bytes=flush_bytes)
-    with torch.inference_mode():
+    jit = JitStats()
+    timing_keys = {}
+    with torch.inference_mode(), patch.object(scans, "_compile_ptx", jit.compile):
         flush_buffer = torch.empty(flush_bytes, device="cuda", dtype=torch.uint8) if flush_bytes else None
         for op in ops:
             for env, _ in OPS.values():
@@ -371,18 +418,32 @@ def main() -> None:
             modes = OPS[op][1]
             if op == "vscan_bwd" and args.modes:
                 modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
-            report[op] = _screen(op, args, modes, flush_buffer)
+            report[op], timing_keys[op] = _timing(op, args, modes, flush_buffer, jit)
+        report["jit"] = jit.snapshot()
+        report["parity_complete"] = False
+        if ops == ("vscan_bwd",):
+            report.update(report["vscan_bwd"])
+        if args.out is not None:
+            _write_report(report, args.out)
+        _progress(f"timing complete (jit={jit.count}, {jit.seconds:.2f}s)")
+        for op in ops:
+            for env, _ in OPS.values():
+                os.environ[env] = "off"
+            totals = report[op]["weighted_ms"]
+            diagnostics = _parity(op, tuple(totals), args, timing_keys[op]) if args.parity else {}
+            report[op].update(_summarize_parity(op, totals, diagnostics))
+    report["parity_complete"] = args.parity
+    report["jit"] = jit.snapshot()
     if ops == ("vscan_bwd",):
         report.update(report["vscan_bwd"])
     if all(op in report and set(modes) <= report[op]["weighted_ms"].keys()
            for op, (_, modes) in OPS.items()):
         report["combined_projection"] = _combined_projection(report)
     report["elapsed_seconds"] = perf_counter() - started
-    output = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.out is None:
-        print(output, end="")
+        print(json.dumps(report, indent=2, allow_nan=False), flush=True)
     else:
-        args.out.write_text(output, encoding="utf-8")
+        _write_report(report, args.out)
 
 
 if __name__ == "__main__":
