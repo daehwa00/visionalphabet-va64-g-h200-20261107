@@ -109,31 +109,35 @@ def test_w44_cuda_parity(monkeypatch, mode, dtype, h, w, modes, rank) -> None:
 
 
 @pytest.mark.parametrize("mode", kernels._READER_MODES)
-@pytest.mark.parametrize("modes", [24, 34, 40])
-def test_vec128_alignment_and_pass_selection(monkeypatch, mode, modes) -> None:
+@pytest.mark.parametrize("modes", [23, 34, 40])
+@pytest.mark.parametrize("resident", [0, 16])
+def test_regslide_alignment_and_pass_selection(monkeypatch, mode, modes, resident) -> None:
     monkeypatch.setenv("LNET_READER_OPT", mode)
-    props = SimpleNamespace(major=9, shared_memory_per_block=49152)
+    props = SimpleNamespace(major=9, max_threads_per_multi_processor=2048)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
     monkeypatch.setattr(kernels, "_reader_cuda_module", lambda *args, **kw: (args, kw))
-    monkeypatch.setattr(kernels, "_reader_resident", lambda *_: 4)
+    monkeypatch.setattr(kernels, "_reader_resident", lambda *_: resident)
     projected = torch.empty((1, 9, 11, 4 * modes), device="meta", dtype=torch.float16)
     real = torch.empty((modes, 4, 3, 3), device="meta", dtype=projected.dtype)
     grad = torch.empty((1, 9, 11, 2 * modes), device="meta", dtype=projected.dtype)
-    selected = {}
-    for op, value in (("forward", None), ("dinput", grad), ("dweight", grad)):
-        selected[op] = kernels._reader_vec128_module(
-            projected, real, value, strict=False, op=op,
-        )
-    modes_to_ops = {
-        "off": set(), "proven_floor": set(),
-        "fwd_vec128": {"forward"}, "dinput_vec128": {"dinput"},
-        "dw_smem_vec128": {"dweight"}, "vec128_all": set(selected),
+    vectors = {
+        "dinput_vec2": {"dinput": 2}, "dinput_vec4": {"dinput": 4},
+        "fwd_vec2_r4": {"forward": 2}, "fwd_vec4": {"forward": 4},
+        "dw_vec2_fullrank": {"dweight": 2},
+        "regslide_all": {"forward": 2, "dinput": 2, "dweight": 2},
     }
-    assert {op for op, module in selected.items() if module is not None} == (
-        set() if modes == 34 else modes_to_ops[mode]
-    )
-    modules = [module for module in selected.values() if module is not None]
-    assert all(module == modules[0] for module in modules)
+    for op, value in (("forward", None), ("dinput", grad), ("dweight", grad)):
+        candidate = kernels._regslide_candidate(projected, real, value, strict=False, op=op)
+        vec = vectors.get(mode, {}).get(op)
+        if not resident or vec is None or modes % vec:
+            assert candidate is None
+        else:
+            launch, (_, kwargs) = candidate
+            assert launch.vec == vec
+            assert launch.warps == 1
+            assert kwargs["operation"] == f"regslide{vec}"
+            if op == "dweight":
+                assert kwargs["weight_geometry"] == (4, 4, 1)
 
 
 @requires_cuda
@@ -142,7 +146,7 @@ def test_vec128_alignment_and_pass_selection(monkeypatch, mode, modes) -> None:
 @pytest.mark.parametrize(("batch", "h", "w", "modes", "rank"), [
     (1, 9, 11, 40, 4), (2, 13, 19, 63, 4), (1, 7, 5, 8, 2),
 ])
-def test_wave47_cuda_parity(monkeypatch, mode, dtype, batch, h, w, modes, rank) -> None:
+def test_regslide_cuda_parity(monkeypatch, mode, dtype, batch, h, w, modes, rank) -> None:
     torch.manual_seed(47)
     options = {"device": "cuda", "dtype": dtype}
     projected = torch.randn(batch, h, w, modes * rank, **options).mul_(0.125)

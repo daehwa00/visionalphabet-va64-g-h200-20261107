@@ -1,4 +1,4 @@
-"""Screen Wave 47 reader policies with eager CUDA launches and cold caches."""
+"""Screen Wave 48B reader policies with eager CUDA launches and cold caches."""
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ MODEL = ((56, 56, 160, 4, 2), (28, 28, 160, 4, 2), (14, 14, 160, 4, 6), (7, 7, 1
 EDGE = ((13, 19, 63, 4, 0), (9, 11, 34, 4, 0), (7, 7, 128, 2, 0),
         (1, 1, 1, 1, 0), (37, 17, 97, 4, 0))
 OPS = ("fwd", "dinput", "dweight")
-PARITY_BATCHES = {56: 32, 28: 64, 14: 128, 7: 256}
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
@@ -103,7 +102,7 @@ def prepare(
             "vec": config["weight_vec"], "rank_tile": tile, "rows": rows,
             "columns": config["columns"], "warps": plan.warps, "grid": plan.grid,
             "reduce": plan.reduce, "reduce_grid": reduce_grid,
-            "convert": plan.operation == "dweight_cvt", "specialized_batch": config["shape"][0],
+            "convert": plan.operation == "dweight_cvt", "kernel": config,
         }
 
     backward = op == "dinput"
@@ -126,7 +125,7 @@ def prepare(
         "vec": launch.vec, "rank_tile": rank, "rows": launch.rows, "columns": launch.columns,
         "warps": launch.warps, "grid": grid, "reduce": None,
         "convert": config["convert_spatial"], "updated": config["updated_spatial"],
-        "specialized_batch": config["shape"][0],
+        "kernel": config,
     }
 
 
@@ -156,24 +155,22 @@ def measure(run: Callable[[], None], warmup: int, iters: int, flush: torch.Tenso
 
 
 def metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float | bool]:
-    a, b = actual.float(), expected.float()
-    delta = (a - b).abs()
     atol, rtol = (0.005, 0.02) if actual.dtype == torch.bfloat16 else (0.0005, 0.003)
-    return {
-        "max_abs": delta.amax().item(),
-        "max_rel": (delta / b.abs().clamp_min(1e-8)).amax().item(),
-        "exact_match": torch.equal(a, b),
-        "tol_pass": torch.isclose(a, b, atol=atol, rtol=rtol).all().item(),
-    }
-
-
-def comparable_plan(plan: dict, op: str) -> dict:
-    # Ignore the changed batch extent, but compare reduction partitions and geometry.
-    result = {key: value for key, value in plan.items() if key != "specialized_batch"}
-    result["batch_specialized"] = bool(plan["specialized_batch"])
-    if op != "dweight":
-        result["grid"] = plan["grid"][:2]
-    return result
+    maxima = torch.zeros(2, device=actual.device)
+    exact = close = torch.ones((), dtype=torch.bool, device=actual.device)
+    for observed, reference in zip(
+        actual.flatten().split(1 << 20), expected.flatten().split(1 << 20), strict=True,
+    ):
+        a, b = observed.float(), reference.float()
+        delta = (a - b).abs()
+        maxima = torch.maximum(maxima, torch.stack(
+            (delta.amax(), (delta / b.abs().clamp_min(1e-8)).amax()),
+        ))
+        exact = exact & (a == b).all()
+        close = close & torch.isclose(a, b, atol=atol, rtol=rtol).all()
+    max_abs, max_rel = maxima.tolist()
+    return {"max_abs": max_abs, "max_rel": max_rel,
+            "exact_match": exact.item(), "tol_pass": close.item()}
 
 
 def timing_pass(
@@ -225,8 +222,9 @@ def parity_pass(
     rows = []
     for shape in (*MODEL, *EDGE):
         h, w, modes, rank, calls = shape
-        limit = PARITY_BATCHES[h] if calls else 16
-        batch = 1 if h == w == modes == rank == 1 else min(args.batch, limit)
+        # Model parity uses the timing batch to preserve the exact specialization
+        # and worker partition. Edge shapes only exercise correctness.
+        batch = args.batch if calls else (1 if h == w == modes == rank == 1 else min(args.batch, 16))
         for dtype, torch_dtype in DTYPES.items():
             inputs = make_inputs(batch, shape, torch_dtype)
             for op in OPS:
@@ -248,9 +246,14 @@ def parity_pass(
                     started = time.perf_counter()
                     run()
                     timing = timing_plans.get((shape, op, mode))
-                    match = None if timing is None else comparable_plan(plan, op) == comparable_plan(timing, op)
+                    match = None if timing is None else plan == timing
+                    same_geometry = None if timing is None else (
+                        {**plan, "kernel": {**plan["kernel"], "types": timing["kernel"]["types"]}}
+                        == timing
+                    )
                     rows.append({"shape": [batch, h, w, modes, rank], "calls": calls, "dtype": dtype,
-                                 "op": op, "mode": mode, "plan": plan, "timing_plan_match": match,
+                                 "op": op, "mode": mode, "plan": plan, "timing_plan_match": match if dtype == "bf16" else None,
+                                 "bf16_timing_geometry_match": same_geometry,
                                  **metrics(output, expected)})
                     progress(mode, name, op, compile_s, parity_s=time.perf_counter() - started)
                     del run, output
@@ -289,7 +292,7 @@ def main() -> None:
     if args.out is not None:
         args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: result[key] for key in ("weighted_ms", "per_shape_ms")}, indent=2))
-    if any(not row.get("tol_pass", True) for row in result["rows"]):
+    if any(not row["tol_pass"] or row["timing_plan_match"] is False for row in result["rows"]):
         raise SystemExit(1)
 
 
