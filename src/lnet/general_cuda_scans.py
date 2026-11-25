@@ -101,8 +101,18 @@ class ScanPlan(NamedTuple):
     sgs_rows: int = 0
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Wave53Options:
+    # Keep the legacy positional constructor and vars(key) snapshot compatible.
+    path_bwd_pipe: int = 0
+    horizontal_half_replay: bool = False
+    horizontal_compact2: bool = False
+    horizontal_bf16_buf: bool = False
+    horizontal_wave53: bool = False
+
+
 @dataclass(frozen=True)
-class Kernel:
+class Kernel(_Wave53Options):
     dtype: torch.dtype
     warps: int
     backward: bool
@@ -151,6 +161,7 @@ class Kernel:
     l2_single_write: bool = False
     dw1_tile: int = 0
     dw1_fp32: bool = False
+
 
 
 class Launch(NamedTuple):
@@ -1759,6 +1770,14 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         transposed = f"{str(key.real_transposed).lower()}, {str(key.imag_transposed).lower()}"
         factor = key.horizontal_unroll or (8 if key.horizontal_unroll8 else 0)
         unroll = f", {factor}" if factor else ""
+        if key.horizontal_wave53 and factor:
+            # Ampere/Ada spill on some unrolled strided layouts.
+            transposed_scalar = (
+                (key.real_transposed and not key.real_interleaved)
+                or (key.imag_transposed and not key.imag_interleaved)
+            )
+            older = 1 if transposed_scalar else 4
+            unroll = f", (__CUDA_ARCH__ >= 900 ? {factor} : {older})"
         wrapper = f"""
 {bounds}(
     const float* __restrict__ dr, const float* __restrict__ di,
@@ -1815,6 +1834,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _odd_compact_source(source)
     if key.sgs or key.l2_single_write:
         source = _sgs_source(source, persistent=key.l2_single_write)
+    if key.path_bwd_pipe and key.fp32_path and key.tanh_gain and key.backward_batch2 and key.hidden8:
+        source = _pipelined_adjoint(source, key.path_bwd_pipe)
     if key.fp32_path:
         source = _fp32_path_source(source)
     if key.tanh_gain:
@@ -2034,6 +2055,8 @@ __device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
 }
 """
         kernel = helper + kernel
+    if key.horizontal_half_replay or key.horizontal_compact2:
+        kernel = _horizontal_wave53_source(kernel, key)
     if key.horizontal_span:
         kernel = _horizontal_chunk_source(kernel, key.horizontal_span)
     if key.horizontal_unroll and not key.backward:
@@ -2041,6 +2064,78 @@ __device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
             pragma = "#pragma unroll BACKWARD_UNROLL\n                "
             kernel = kernel.replace(loop, pragma + loop, 1)
     return source[:start] + kernel + source[end:]
+
+
+def _horizontal_wave53_source(kernel: str, key: Kernel) -> str:
+    start = kernel.index("                #pragma unroll BACKWARD_UNROLL")
+    end = kernel.index("\n            }\n        }", start)
+    middle = kernel.index("                    const auto prev", start)
+    body = kernel[middle:end].rsplit("\n                }", 1)[0]
+    body = body.replace("source(x)", "Complex{read(__ldg(sr + ir)), read(__ldg(si + ii))}")
+    body = body.replace("2 * (i - m) + m", "oi")
+    consume = """
+                I i = base + I(W-1) * M, oi = 2 * (i-m) + m;
+                I ir = base_r + I(W-1) * step_r, ii = base_i + I(W-1) * step_i;
+                auto consume = [&](int x, Complex right_adj) {
+""" + body + """
+                    i -= M; oi -= 2*M; ir -= step_r; ii -= step_i;
+                };
+"""
+    if key.compact:
+        # Compact adjoints are defined on even-width input pairs.
+        loop = """
+                #pragma unroll BACKWARD_UNROLL
+                for (int k = 0; k < W/2; ++k) {
+                    right = a * right + load_complex_readonly(grad,
+                        2 * grad_plane + grad_base + I(k)*M, grad_plane);
+                    buf[I(k)*stride] = Pair<float>::pack(right);
+                    right = a * right;
+                }
+                I gi = grad_base + I(W/2-1)*M;
+                #pragma unroll BACKWARD_UNROLL
+                for (int k = W/2-1; k >= 0; --k, gi -= M) {
+                    const auto even = buf[I(k)*stride].unpack();
+                    left = a.conj() * left + load_complex_readonly(grad, gi, grad_plane);
+                    consume(2*k+1, a*even);
+                    left = a.conj()*left;
+                    consume(2*k, even);
+                }"""
+    else:
+        loop = """
+                const int half = HALF_REPLAY ? W/2 : 0;
+                #pragma unroll BACKWARD_UNROLL
+                for (int x = 0; x < W; ++x) {
+                    right = a * right + load_complex_readonly(grad,
+                        2 * plane + base + I(x)*M, plane);
+                    if (x >= half) buf[I(x-half)*stride] = Pair<BUF_TYPE>::pack(right);
+                }
+                auto descend = [&](int hi, int lo) {
+                    #pragma unroll BACKWARD_UNROLL
+                    for (int x = hi-1; x >= lo; --x) {
+                        left = a.conj()*left + load_complex_readonly(grad, i, plane);
+                        consume(x, buf[I(x-lo)*stride].unpack());
+                    }
+                };
+                descend(W, half);
+                if constexpr (HALF_REPLAY) {
+                    right = {};
+                    #pragma unroll BACKWARD_UNROLL
+                    for (int x = 0; x < half; ++x) {
+                        right = a*right + load_complex_readonly(grad,
+                            2*plane + base + I(x)*M, plane);
+                        buf[I(x)*stride] = Pair<BUF_TYPE>::pack(right);
+                    }
+                    descend(half, 0);
+                }""".replace("HALF_REPLAY", str(key.horizontal_half_replay).lower())
+    kernel = kernel[:start] + consume + loop + kernel[end:]
+    dtype = "__nv_bfloat16" if key.horizontal_bf16_buf else "float"
+    if key.horizontal_bf16_buf:
+        begin = kernel.index("                Pair<float>* buf =")
+        finish = kernel.index("                const I stride", begin)
+        kernel = (kernel[:begin] + "                auto* buf = "
+                  "reinterpret_cast<Pair<__nv_bfloat16>*>(shared) + threadIdx.x;\n"
+                  + kernel[finish:])
+    return kernel.replace("BUF_TYPE", dtype)
 
 
 def _horizontal_chunk_source(kernel: str, span: int) -> str:
@@ -2143,6 +2238,74 @@ def _odd_coarse_backward_source(source: str) -> str:
         }
 """ + reverse + source[after:]
     return _odd_coarse_negative(source)
+
+
+def _pipelined_adjoint(source: str, pipe: int) -> str:
+    start = source.index("    #pragma unroll\n    for (int j", source.index("void path_adjoint_pair("))
+    end = source.index("\n}\n#endif", start)
+    original = source[start:end]
+    load = original[original.index("        if constexpr"):original.index("        #pragma unroll\n        for (int k = 0; k < 8; ++k)")]
+    update = original[original.index("            const float act"):original.rindex("    }")]
+    helpers = """
+    auto load_w = [&](int j, float (&weights)[8]) {
+""" + load + """
+    };
+    auto preactivate = [&](int j, const float (&w)[8], float (&z)[2]) {
+        #pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            float t[4];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+                t[k] = __fmaf_rn(w[k+4], p[c][k+4], w[k] * p[c][k]);
+            z[c] = ((t[0] + t[1]) + (t[2] + t[3])) + path.bias(j);
+        }
+    };
+    auto apply = [&](int j, const float (&weights)[8], const float (&zs)[2], const float (&ss)[2]) {
+        const float wr = path.output(j), wi = path.output(8+j);
+        #pragma unroll
+        for (int cell = 0; cell < 2; ++cell) {
+            const float z = zs[cell], sig = ss[cell];
+""" + update + "    };"
+    if pipe == 1:
+        loop = """
+    float w[2][8], z[2][2], sig[2][2];
+    load_w(0, w[0]);
+    preactivate(0, w[0], z[0]);
+    sig[0][0] = fast_sigmoid_tanh(z[0][0]);
+    sig[0][1] = fast_sigmoid_tanh(z[0][1]);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int cur = j % 2, next = 1 - cur;
+        if (j + 1 < 8) {
+            load_w(j+1, w[next]);
+            preactivate(j+1, w[next], z[next]);
+            #pragma unroll
+            for (int c = 0; c < 2; ++c) sig[next][c] = fast_sigmoid_tanh(z[next][c]);
+        }
+        apply(j, w[cur], z[cur], sig[cur]);
+    }"""
+    else:
+        loop = """
+    #pragma unroll
+    for (int jb = 0; jb < 8; jb += 4) {
+        float z[4][2], sig[4][2], w[8];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            load_w(jb+i, w);
+            preactivate(jb+i, w, z[i]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll
+            for (int c = 0; c < 2; ++c) sig[i][c] = fast_sigmoid_tanh(z[i][c]);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            load_w(jb+i, w);
+            apply(jb+i, w, z[i], sig[i]);
+        }
+    }"""
+    return source[:start] + helpers + loop + source[end:]
 
 
 def _fp32_path_source(source: str) -> str:
@@ -2978,7 +3141,9 @@ W52A_MODES = (
 )
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
-HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2")
+W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4")
+H53_MODES = ("h53_ro_all", "h53_compact2", "h53_bf16_buf", "h53_l2_scratch")
+HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2") + H53_MODES
 
 
 def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
@@ -3425,6 +3590,73 @@ def _plan_w52a(device: int, launch: Launch, shape: tuple[int, int, int, int], mo
     return Launch(plan, key, workers, workers // group if reduce else workers)
 
 
+def _plan_w53a(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+    key = launch.key
+    height = shape[1]
+    floor = (
+        (not key.backward and not key.coarse and height >= 48)
+        or (key.backward and key.coarse and height >= 48)
+        or (key.backward and not key.coarse and 24 <= height < 48)
+    )
+    smemw = not key.backward and not key.coarse and 24 <= height < 48
+    winner = "combo_sw" if floor else "tanh_gain_smemw" if smemw else "tanh_gain"
+    launch = _plan_w52a(device, launch, shape, winner)
+    if key.backward_batch2 and key.hidden8 and key.backward:
+        pipe = {"w52_best_swpipe": 1, "w52_best_pipe4": 2}.get(mode, 0)
+        launch = launch._replace(key=replace(launch.key, path_bwd_pipe=pipe))
+    return launch
+
+
+@lru_cache(maxsize=512)
+def _plan_h53(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+    plan, key, old_workers, _ = launch
+    if not key.backward:
+        return launch
+    b, h, width, modes = shape
+    long_dense = width >= 48 and not key.compact
+    scratch = long_dense and mode == "h53_l2_scratch"
+    bf16 = long_dense and key.cache_line and mode == "h53_bf16_buf" and key.dtype == torch.bfloat16
+    half = long_dense and key.cache_line and not (scratch or bf16)
+    warps = 2 if scratch else key.warps
+    smem = plan.smem
+    if scratch:
+        smem = warps * 32 * 16
+    elif half or bf16:
+        smem = max(16, width * 4 if bf16 else (width - width // 2) * 8) * warps * 32
+    candidate = replace(key, warps=warps, cache_line=key.cache_line and not scratch,
+                        horizontal_wave53=True, horizontal_readonly=True, horizontal_half_replay=half,
+                        horizontal_bf16_buf=bf16, horizontal_compact2=mode != "h53_ro_all")
+    baseline = _active_warps(device, launch)
+    for unroll in (8, 4):
+        candidate = replace(candidate, horizontal_unroll=unroll)
+        trial = launch._replace(key=candidate, plan=plan._replace(
+            warps=warps, smem=smem, cache_line=candidate.cache_line))
+        active = _active_warps(device, trial)
+        if active and active >= baseline:
+            break
+    else:
+        trial, active = launch, baseline
+    if not active:
+        return launch
+    warps = trial.key.warps
+    tiles = _ceil(modes, 32)
+    lines = b * h
+    wave = max(1, device_limits(device)[0] * (active // warps) // tiles) * warps
+    limit = min(old_workers, lines, 2 * wave)
+    if scratch and not trial.key.cache_line:
+        limit = min(limit, (32 << 20) // (width * modes * 8))
+    if limit <= 0:
+        return launch
+    if lines <= 2 * limit:
+        workers = max(1, lines // _ceil(lines, limit) // warps) * warps
+    elif limit >= wave:
+        workers = limit // wave * wave
+    else:
+        workers = max(1, limit // warps) * warps
+    workers = min(workers, limit)
+    return trial._replace(workers=workers, partials=_ceil(workers, warps))
+
+
 def _fp32_hiocc(
     device: int, launch: Launch, shape: tuple[int, int, int, int], budget: int,
 ) -> Launch:
@@ -3618,13 +3850,18 @@ def _plan_launch(  # noqa: C901, PLR0912
             backward_batch2=False, backward_batch_tail=False,
         ))
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES) if vertical else "off"
+    wave53a = (
+        _scan_mode("LNET_SCAN_W53A", W53A_MODES)
+        if vertical and source.dtype.itemsize == 2 and not (pure_vertical or saved_trajectory)
+        else "off"
+    )
     wave52a = (
         _wave52a_mode(source.dtype.itemsize)
         if vertical and not (pure_vertical or saved_trajectory) else "off"
     )
     if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
         "off", "strict_ro",
-    ) and wave52a == "off":
+    ) and wave52a == wave53a == "off":
         wave51b = _scan_mode("LNET_SCAN_W51B", W51B_MODES)
         if wave51b != "off":
             candidate = _plan_w51b(device, launch, shape, wave51b)
@@ -3632,6 +3869,8 @@ def _plan_launch(  # noqa: C901, PLR0912
                 return candidate
             if wave51a == "fp32_hiocc":
                 wave51a = "fp32"
+    if mode in H53_MODES:
+        return _plan_h53(device, launch, shape, mode)
     if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
         launch = _plan_structural(device, launch, shape, mode)
     elif mode != "off":
@@ -3641,6 +3880,8 @@ def _plan_launch(  # noqa: C901, PLR0912
             launch = _plan_sgs(device, launch, shape, mode)
         else:
             launch = _plan_vfwd(device, launch, height, mode)
+    if wave53a != "off":
+        return _plan_w53a(device, launch, shape, wave53a)
     if wave52a != "off":
         # Both waves tune the same fused kernel and scratch allocation.
         return _plan_w52a(device, launch, shape, wave52a)
