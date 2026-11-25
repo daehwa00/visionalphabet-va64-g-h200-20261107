@@ -9,11 +9,13 @@ import math
 import os
 import statistics
 import sys
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import cast
 
 import torch
+from torch._functorch import config as aot_config
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -51,6 +53,13 @@ MODES = {
     "dense_nhwc_bmm_bench": ("dense_nhwc_bmm", "off", True),
     "auto_roofline_bench": ("auto_roofline", "off", True),
 }
+DEFAULT_MODES = tuple(MODES)
+MODES.update({
+    "dense_nhwc_inductor": ("dense_nhwc_inductor", "off", False),
+    "dense_nhwc_inductor_bench": ("dense_nhwc_inductor", "off", True),
+    "off_bench": ("off", "off", True),
+})
+COMPILED_MODES = ("off_bench", "dense_nhwc_inductor_bench", "dense_nhwc_bench")
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 SIGNALS = ("output", "grad_source", "grad_point_weight", "grad_spatial_weight", "grad_input_norm")
 MIB = 1024**2
@@ -189,12 +198,16 @@ def measure(
     set_mode(mode)
     reader = make_reader(shape, device)
     x, dy = make_inputs(shape, dtype, device)
+    run = reader
+    if args.compiled:
+        torch._dynamo.reset()
+        run = torch.compile(reader, backend="inductor", fullgraph=True, options={"triton.cudagraphs": False})
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
     def forward() -> torch.Tensor:
         with torch.autocast("cuda", dtype=dtype):
-            return reader(x)
+            return run(x)
 
     def backward(y: torch.Tensor) -> None:
         (y * dy).sum(dtype=torch.float32).backward()
@@ -203,7 +216,8 @@ def measure(
         reader.zero_grad(set_to_none=True)
         x.grad = None
 
-    with torch.cuda.stream(stream):
+    autocast = aot_config.patch("backward_pass_autocast", "off") if args.compiled else nullcontext()
+    with torch.cuda.stream(stream), autocast:
         for _ in range(args.warmup):
             reset()
             backward(forward())
@@ -282,15 +296,18 @@ def measure(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compiled", action="store_true", help="Time Inductor-compiled forward/backward")
     parser.add_argument("--cpu-smoke", action="store_true")
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
-    parser.add_argument("--modes", default=",".join(MODES))
+    parser.add_argument("--modes", help="Comma-separated mode names")
     parser.add_argument("--dtypes", default="bf16,fp16")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
-    modes, dtypes = args.modes.split(","), args.dtypes.split(",")
+    defaults = COMPILED_MODES if args.compiled else DEFAULT_MODES
+    modes = args.modes.split(",") if args.modes is not None else list(defaults)
+    dtypes = args.dtypes.split(",")
     if any(mode not in MODES for mode in modes) or any(dtype not in DTYPES for dtype in dtypes):
         parser.error("--modes or --dtypes contains an unknown value")
     if min(args.warmup, args.iterations) < 1:
@@ -316,6 +333,7 @@ def main() -> int:
     flush = None if args.cpu_smoke else torch.zeros(128 * MIB // 4, dtype=torch.float32, device=device)
     report = {
         "device": str(device), "sm": properties[:2], "multiprocessors": properties[2],
+        "compiled": args.compiled and not args.cpu_smoke,
         "mode": "cpu-smoke" if args.cpu_smoke else args.mode,
         "cold_cache_bytes": 0 if args.cpu_smoke else 128 * MIB,
         "dtypes": {},
@@ -357,7 +375,7 @@ def main() -> int:
                     for key in ("fwd_ms", "bwd_ms", "total_ms")
                 }
             for values in totals.values():
-                for baseline in ("off", "proven_floor"):
+                for baseline in ("off", "off_bench", "proven_floor"):
                     if baseline in totals:
                         values[f"delta_vs_{baseline}_ms"] = {
                             key: values[key] - totals[baseline][key]

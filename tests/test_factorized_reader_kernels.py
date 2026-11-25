@@ -31,6 +31,15 @@ def isolate_reader_options(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LNET_READER_W44", raising=False)
 
 
+@pytest.fixture
+def isolated_dynamo() -> Iterator[None]:
+    torch._dynamo.reset()
+    try:
+        yield
+    finally:
+        torch._dynamo.reset()
+
+
 def test_w44_options(monkeypatch: pytest.MonkeyPatch) -> None:
     assert kernels._reader_w44() == "off"
     assert kernels._lane_utilization(160, 1) == 1
@@ -279,6 +288,7 @@ def test_fake_custom_op_and_autograd_metadata(monkeypatch, option) -> None:
 
 
 @pytest.mark.parametrize("option", ["auto", "off"])
+@pytest.mark.usefixtures("isolated_dynamo")
 def test_compile_cpu_dynamic_fullgraph_forward_and_backward(monkeypatch, option) -> None:
     monkeypatch.setenv("LNET_READER_OPT", option)
     torch.manual_seed(37)
@@ -354,6 +364,7 @@ def test_cuda_spatial_matches_fp32_reference(shape, modes, rank, kernel, dtype) 
 @requires_cuda
 @pytest.mark.usefixtures("cudnn_full_precision")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.usefixtures("isolated_dynamo")
 def test_cuda_reader_fullgraph_autocast_and_gradients(dtype: torch.dtype) -> None:
     torch.manual_seed(72)
     reader, reference = _reader_pair(13, 48, 2, 3, rms=True, device="cuda")
@@ -389,6 +400,7 @@ def test_cuda_reader_fullgraph_autocast_and_gradients(dtype: torch.dtype) -> Non
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "inductor"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("fused", [True, False], ids=["default", "opt-out"])
+@pytest.mark.usefixtures("isolated_dynamo")
 def test_free_real_memory_reader_matches_grouped_cuda(
     compiled: bool, dtype: torch.dtype, fused: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

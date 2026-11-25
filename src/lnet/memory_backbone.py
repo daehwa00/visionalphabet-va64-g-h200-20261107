@@ -90,10 +90,103 @@ def reader_roofline_costs(
     return dense, point + spatial
 
 
+def _reader_cuda_device_properties(index: int | None) -> torch.cuda._CudaDeviceProperties:
+    return torch.cuda.get_device_properties(index)
+
+
 @torch.compiler.assume_constant_result
 def _reader_cuda_properties(index: int | None) -> tuple[int, int, int]:
-    props = torch.cuda.get_device_properties(index)
+    props = _reader_cuda_device_properties(index)
     return props.major, props.minor, props.multi_processor_count
+
+
+@torch.library.custom_op(
+    "lnet::dense_nhwc_conv2d", mutates_args=(), tags=(torch.Tag.needs_fixed_stride_order,),
+)
+def dense_nhwc_conv2d(source: Tensor, kernel: Tensor, padding: int) -> Tensor:
+    x = source.contiguous().permute(0, 3, 1, 2)
+    weight = kernel.contiguous(memory_format=torch.channels_last)
+    return functional.conv2d(x, weight, padding=padding).permute(0, 2, 3, 1).contiguous()
+
+
+@dense_nhwc_conv2d.register_fake
+def _fake_dense_nhwc_conv2d(source: Tensor, kernel: Tensor, padding: int) -> Tensor:
+    return source.new_empty((
+        source.shape[0],
+        source.shape[1] + 2 * padding - kernel.shape[2] + 1,
+        source.shape[2] + 2 * padding - kernel.shape[3] + 1,
+        kernel.shape[0],
+    ))
+
+
+@torch.library.custom_op(
+    "lnet::dense_nhwc_conv2d_backward",
+    mutates_args=(),
+    tags=(torch.Tag.needs_fixed_stride_order,),
+    schema=(
+        "(Tensor grad, Tensor source, Tensor kernel, int padding, bool[] mask)"
+        " -> (Tensor?, Tensor?)"
+    ),
+)
+def dense_nhwc_conv2d_backward(
+    grad: Tensor, source: Tensor, kernel: Tensor, padding: int, mask: list[bool],
+) -> tuple[Tensor | None, Tensor | None]:
+    return _dense_nhwc_conv2d_backward_impl(grad, source, kernel, padding, mask)
+
+
+def _dense_nhwc_conv2d_backward_impl(
+    grad: Tensor, source: Tensor, kernel: Tensor, padding: int, mask: list[bool],
+) -> tuple[Tensor | None, Tensor | None]:
+    dy = grad.contiguous().permute(0, 3, 1, 2)
+    x = source.contiguous().permute(0, 3, 1, 2)
+    weight = kernel.contiguous(memory_format=torch.channels_last)
+    dx, dw, _ = torch.ops.aten.convolution_backward.default(
+        dy, x, weight, None, [1, 1], [padding, padding], [1, 1],
+        False,  # noqa: FBT003
+        [0, 0], 1,
+        [*mask, False],
+    )
+    return (
+        dx.permute(0, 2, 3, 1).contiguous() if dx is not None else None,
+        dw.contiguous(memory_format=torch.channels_last) if dw is not None else None,
+    )
+
+
+@dense_nhwc_conv2d_backward.register_fake
+def _fake_dense_nhwc_conv2d_backward(
+    grad: Tensor, source: Tensor, kernel: Tensor, padding: int, mask: list[bool],  # noqa: ARG001
+) -> tuple[Tensor | None, Tensor | None]:
+    return (
+        torch.empty_like(source, memory_format=torch.contiguous_format) if mask[0] else None,
+        torch.empty_like(kernel, memory_format=torch.channels_last) if mask[1] else None,
+    )
+
+
+def _save_dense_nhwc_inputs(
+    ctx: torch.autograd.function.FunctionCtx,
+    inputs: tuple[Tensor, Tensor, int],
+    output: Tensor,  # noqa: ARG001
+) -> None:
+    source, kernel, ctx.padding = inputs
+    ctx.save_for_backward(source, kernel)
+
+
+def _differentiate_dense_nhwc(
+    ctx: torch.autograd.function.FunctionCtx, grad: Tensor,
+) -> tuple[Tensor | None, Tensor | None, None]:
+    source, kernel = ctx.saved_tensors
+    backward = (
+        _dense_nhwc_conv2d_backward_impl if torch.is_grad_enabled() else dense_nhwc_conv2d_backward
+    )
+    dx, dw = backward(
+        grad.contiguous(), source, kernel, ctx.padding, list(ctx.needs_input_grad[:2]),
+    )
+    return dx, dw, None
+
+
+dense_nhwc_conv2d.register_autograd(
+    _differentiate_dense_nhwc, setup_context=_save_dense_nhwc_inputs,
+)
 
 
 def _fused_factorized_reader_enabled() -> bool:
@@ -320,15 +413,31 @@ class FactorizedMemoryReader(nn.Module):
             2 * self.output_modes, self.input_channels, self.kernel_size, self.kernel_size
         )
 
-    def _dense_nhwc(self, source: Tensor, *, bmm: bool) -> Tensor:
+    def _dense_nhwc(self, source: Tensor, *, bmm: bool, opaque: bool) -> Tensor:
         dtype = self._dense_compute_dtype(source)
+        if (
+            opaque and source.device.type == "cpu" and torch.is_autocast_enabled("cpu")
+            and dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            dtype = torch.get_autocast_dtype("cpu")
+        if opaque:
+            source_in = source.to(dtype=dtype).contiguous()
+            full, inverse = self._kernel_and_scale()
+            kernel_cl = (
+                (full * inverse).permute(1, 0, 3, 4, 2)
+                .reshape(-1, self.kernel_size, self.kernel_size, self.input_channels)
+                .to(dtype=dtype).contiguous().movedim(-1, 1)
+            )
+            with torch.autocast(device_type=source.device.type, enabled=False):
+                return dense_nhwc_conv2d(source_in, kernel_cl, self.padding)
         source_in = source.to(dtype=dtype, memory_format=torch.contiguous_format).contiguous()
-        source_cl = source_in.movedim(-1, 1)
         kernel_cl = self._normalized_kernel(bmm=bmm).to(
             dtype=dtype, memory_format=torch.channels_last
         )
         with torch.autocast(device_type="cuda", enabled=False):
-            output = functional.conv2d(source_cl, kernel_cl, padding=self.padding).movedim(1, -1)
+            output = functional.conv2d(
+                source_in.movedim(-1, 1), kernel_cl, padding=self.padding,
+            ).movedim(1, -1)
         return output if output.is_contiguous() else output.contiguous()
 
     def _reader_execution_mode(self, source: Tensor) -> str:
@@ -344,7 +453,7 @@ class FactorizedMemoryReader(nn.Module):
                 *_reader_cuda_properties(source.device.index),
             )
             return "dense_nhwc" if dense < factorized else "factorized_triton"
-        if mode not in {"dense_nhwc", "dense_nhwc_bmm"}:
+        if mode not in {"dense_nhwc", "dense_nhwc_bmm", "dense_nhwc_inductor"}:
             raise ValueError(f"unknown LNET_READER_EXEC_MODE: {mode!r}")
         return mode
 
@@ -354,8 +463,10 @@ class FactorizedMemoryReader(nn.Module):
         if self.input_norm is not None:
             source = self.input_norm(source)
         mode = self._reader_execution_mode(source)
-        if mode in {"dense_nhwc", "dense_nhwc_bmm"}:
-            output = self._dense_nhwc(source, bmm=mode == "dense_nhwc_bmm")
+        if mode in {"dense_nhwc", "dense_nhwc_bmm", "dense_nhwc_inductor"}:
+            output = self._dense_nhwc(
+                source, bmm=mode == "dense_nhwc_bmm", opaque=mode == "dense_nhwc",
+            )
         elif not source.is_cuda or mode == "dense":
             kernel = self._normalized_kernel()
             output = (

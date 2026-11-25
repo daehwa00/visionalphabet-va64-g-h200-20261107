@@ -9,6 +9,7 @@ from torch.nn import functional
 from torch.utils._pytree import tree_leaves
 from va_model_builder import build_dw_terminal_rmsnorm
 
+from lnet import memory_backbone
 from lnet.factorized_reader_kernels import real_packed_spatial
 from lnet.memory_backbone import FactorizedMemoryReader, reader_roofline_costs
 from lnet.memory_training import enable_memory_training_
@@ -20,6 +21,15 @@ def limit_cpu_threads() -> Iterator[None]:
     torch.set_num_threads(2)
     yield
     torch.set_num_threads(threads)
+
+
+@pytest.fixture
+def isolated_dynamo() -> Iterator[None]:
+    torch._dynamo.reset()
+    try:
+        yield
+    finally:
+        torch._dynamo.reset()
 
 
 def reference(reader, x, *, factorized) -> torch.Tensor:
@@ -72,7 +82,7 @@ def test_output_and_all_gradients(shape, normalize, match, dtype, monkeypatch) -
     fp32 = evaluate(reader, x, dy, lambda s: reference(reader, s, factorized=False), torch.float32)
     fact = evaluate(reader, x, dy, lambda s: reference(reader, s, factorized=True), dtype)
     results = {}
-    for mode in ("off", "dense_nhwc", "dense_nhwc_bmm"):
+    for mode in ("off", "dense_nhwc", "dense_nhwc_inductor", "dense_nhwc_bmm"):
         monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
         results[mode] = evaluate(reader, x, dy, reader, dtype)
         assert results[mode][0].is_contiguous()
@@ -123,6 +133,24 @@ def test_channels_last_views(monkeypatch, strided, dtype) -> None:
     assert y.data_ptr() == pointers["output"]
 
 
+@pytest.mark.parametrize(("needs_x", "needs_weight"), [(True, False), (False, True), (True, True)])
+def test_nhwc_backward_gradient_mask(needs_x, needs_weight) -> None:
+    x = torch.randn(2, 3, 5, 7, requires_grad=needs_x)
+    weight = torch.empty(6, 7, 3, 3, memory_format=torch.channels_last).normal_()
+    weight.requires_grad_(needs_weight)
+    inputs = tuple(t for t in (x, weight) if t.requires_grad)
+    output = memory_backbone.dense_nhwc_conv2d(x, weight, 1)
+    reference = functional.conv2d(x.movedim(-1, 1), weight, padding=1).movedim(1, -1)
+    dy = torch.randn(2, 3, 5, 12)[..., ::2]
+    assert output.is_contiguous()
+    torch.testing.assert_close(output, reference, atol=0, rtol=0)
+    gradients = torch.autograd.grad(output, inputs, dy)
+    expected = torch.autograd.grad(reference, inputs, dy)
+    torch.testing.assert_close(gradients, expected)
+    if needs_x:
+        assert gradients[0].is_contiguous()
+
+
 def calculate(shape, dtype, sm) -> tuple[float, float]:
     return reader_roofline_costs(
         shape.batch, shape.height, shape.width, shape.channels, shape.modes, shape.rank,
@@ -159,6 +187,7 @@ def test_roofline_fallbacks(shape, dtype, sm, expected) -> None:
 @pytest.mark.parametrize(
     ("shape", "expected"), [(SHAPES[0], "dense_nhwc"), (SHAPES[-1], "factorized_triton")]
 )
+@pytest.mark.usefixtures("isolated_dynamo")
 def test_auto_roofline_dispatch_uses_runtime_properties(shape, expected, monkeypatch) -> None:
     reader = make_reader(shape, torch.device("cpu"))
     reader.execution_mode = "dense"
@@ -167,11 +196,13 @@ def test_auto_roofline_dispatch_uses_runtime_properties(shape, expected, monkeyp
         shape=(shape.batch, shape.height, shape.width, shape.channels),
     )
 
+    sm = (9, 0, 132)
+
     def properties(index):
         assert index == 1
-        return SimpleNamespace(major=9, minor=0, multi_processor_count=132)
+        return SimpleNamespace(major=sm[0], minor=sm[1], multi_processor_count=sm[2])
 
-    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    monkeypatch.setattr(memory_backbone, "_reader_cuda_device_properties", properties)
     monkeypatch.setenv("LNET_READER_EXEC_MODE", "auto_roofline")
     assert reader._reader_execution_mode(source) == expected
 
@@ -180,12 +211,21 @@ def test_auto_roofline_dispatch_uses_runtime_properties(shape, expected, monkeyp
 
     compiled_dispatch = torch.compile(dispatch, backend="aot_eager", fullgraph=True)
     assert compiled_dispatch(torch.zeros(())) == (1 if expected == "dense_nhwc" else 2)
+    # The compiled graph specializes once. Eager dispatch must still read the
+    # current properties after that specialization has populated Dynamo's cache.
+    sm = (7, 0, 80)
+    assert reader._reader_execution_mode(source) == "factorized_triton"
+    torch._dynamo.reset()
+    assert torch.compile(dispatch, backend="aot_eager", fullgraph=True)(torch.zeros(())) == 2
     monkeypatch.setenv("LNET_READER_EXEC_MODE", "off")
     assert reader._reader_execution_mode(source) == "dense"
 
 
-@pytest.mark.parametrize("mode", ["off", "dense_nhwc", "dense_nhwc_bmm", "auto_roofline"])
+@pytest.mark.parametrize(
+    "mode", ["off", "dense_nhwc", "dense_nhwc_inductor", "dense_nhwc_bmm", "auto_roofline"],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.usefixtures("isolated_dynamo")
 def test_reader_fullgraph(mode, dtype, monkeypatch) -> None:
     monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
     torch.manual_seed(168)
@@ -211,6 +251,7 @@ def test_default_and_off_are_bit_identical(monkeypatch) -> None:
         torch.testing.assert_close(actual, default, rtol=0, atol=0)
 
 
+@pytest.mark.usefixtures("isolated_dynamo")
 def test_ablation17_full_model_aot_eager(monkeypatch) -> None:
     torch.manual_seed(168)
     model = build_dw_terminal_rmsnorm(factorized_reader=True).train()
@@ -224,7 +265,7 @@ def test_ablation17_full_model_aot_eager(monkeypatch) -> None:
     assert len(readers) == 12
     x = torch.randn(1, 3, 224, 224)
     reference = None
-    for mode in ("off", "dense_nhwc", "dense_nhwc_bmm"):
+    for mode in ("off", "dense_nhwc", "dense_nhwc_inductor", "dense_nhwc_bmm"):
         monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
         assert enable_memory_training_(model) == {"readers": len(readers)}
         assert all(reader.execution_mode == "factorized_triton" for reader in readers)
