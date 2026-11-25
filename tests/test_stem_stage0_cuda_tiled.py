@@ -64,13 +64,25 @@ def test_wave50_ablation17_fullgraph_cpu(monkeypatch: pytest.MonkeyPatch) -> Non
     torch.testing.assert_close(*results, rtol=0, atol=0)
 
 
+@pytest.fixture
+def reset_dynamo() -> None:
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("width", range(1, 11))
+def test_wave51a_dynamo_reset_cpu(width: int, reset_dynamo: None) -> None:  # noqa: ARG001
+    with torch._dynamo.config.patch(recompile_limit=1):
+        compiled = torch.compile(lambda x: x + 1, backend="eager", fullgraph=True, dynamic=False)
+        torch.testing.assert_close(compiled(torch.zeros(width)), torch.ones(width))
+
+
 @CUDA
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("input_grad", [False, True])
 @pytest.mark.parametrize(("stride", "padding"), [(2, 1), (3, 2)])
 def test_wave50_cuda_stem_fullgraph(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, input_grad: bool,
-    stride: int, padding: int,
+    stride: int, padding: int, reset_dynamo: None,  # noqa: ARG001
 ) -> None:
     torch.manual_seed(176)
     monkeypatch.setenv("LNET_FUSED_STEM_CONV", "on")
@@ -99,7 +111,9 @@ def test_wave50_cuda_stem_fullgraph(
 @CUDA
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("width", [63, 64, 96, 128, 256, 272])
-def test_wave50_cuda_norm_fullgraph(monkeypatch: pytest.MonkeyPatch, dtype, width: int) -> None:
+def test_wave50_cuda_norm_fullgraph(
+    monkeypatch: pytest.MonkeyPatch, dtype, width: int, reset_dynamo: None,  # noqa: ARG001
+) -> None:
     torch.manual_seed(176)
     monkeypatch.setenv("LNET_NORM_W50_MODE", "fast_fwd")
     monkeypatch.setenv("LNET_MODEL_W36B", "off")

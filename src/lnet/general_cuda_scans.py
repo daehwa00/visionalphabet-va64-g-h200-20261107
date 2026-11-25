@@ -146,6 +146,8 @@ class Kernel:
     min_blocks: int = 0
     horizontal_span: int = 0
     backward_segment_source: bool = False
+    fp32_path: bool = False
+    l2_single_write: bool = False
 
 
 class Launch(NamedTuple):
@@ -1718,7 +1720,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     if key.vertical:
         hidden = _REGISTER_HIDDEN if key.hidden8 else 0
         cache_source = str(key.cache_source).lower()
-        register = ", true, 2" if key.register_batch2 else ", true" if key.register_path else ""
+        register = (
+            f", {str(key.register_path or not key.fp32_path).lower()}, 2" if key.register_batch2
+            else ", true" if key.register_path else ""
+        )
         targs = (
             f"{io}, {index}, {coarse}, {key.warps}, {key.chunk}, {hidden}, "
             f"{backward}, {cache_weights}, {global_ckpt}, {cache_line}, "
@@ -1805,8 +1810,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _odd_coarse_backward_source(source)
     if key.odd_compact_width:
         source = _odd_compact_source(source)
-    if key.sgs:
-        source = _sgs_source(source)
+    if key.sgs or key.l2_single_write:
+        source = _sgs_source(source, persistent=key.l2_single_write)
+    if key.fp32_path:
+        source = _fp32_path_source(source)
     if key.backward_reduce_warps:
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
     if key.saved_trajectory:
@@ -2005,25 +2012,52 @@ def _odd_coarse_backward_source(source: str) -> str:
     return _odd_coarse_negative(source)
 
 
-def _sgs_source(source: str) -> str:
+def _fp32_path_source(source: str) -> str:
+    # Preserve the baseline CUDA source verbatim for all other keys.
+    start = source.index("template<class T>\n__device__ Quad<T> normalize_packed")
+    end = source.index("template<int WARPS, int FIELDS, class I>", start)
+    path = source[start:end].replace(
+        "const auto stored = Quad<T>::pack(v).unpack();",
+        "const auto stored = v;",
+    ).replace(
+        "return normalize_packed<T>(v, gain).unpack();",
+        "return make_float4(v.x * gain.x, v.y * gain.x, v.z * gain.y, v.w * gain.y);",
+    )
+    path = path.replace("rounded<T>(", "(").replace(
+        "weights[slot] = (value);", "weights[slot] = rounded<T>(value);",
+    )
+    return source[:start] + path + source[end:]
+
+
+def _sgs_source(source: str, *, persistent: bool = False) -> str:
+    if persistent:
+        pos_grad = "buf + I(oh) * stride"
+        stride_decl = ", I pos_stride"
+        stride_arg = ", g2_stride"
+        launch_stride = ", stride"
+        adjoint = _SGS_ADJOINT.replace("Quad<T>* pos_grad", "Quad<T>* pos_grad, I pos_stride")
+        adjoint = adjoint.replace("I(y) * THREADS", "I(y) * pos_stride")
+    else:
+        pos_grad = "line_buf + (CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x"
+        stride_decl = stride_arg = launch_stride = ""
+        adjoint = _SGS_ADJOINT
     source = source.replace(
         "int chunks, Complex& da, Complex& dg",
-        "int chunks, Complex& da, Complex& dg, Quad<T>* pos_grad",
+        f"int chunks, Complex& da, Complex& dg, Quad<T>* pos_grad{stride_decl}",
     ).replace(
         "buf, stride, chunks, da, dg",
-        "buf, stride, chunks, da, dg, line_buf + "
-        "(CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x",
+        f"buf, stride, chunks, da, dg, {pos_grad}{launch_stride}",
     )
     start = source.index("void column_backward(")
     end = source.index("#undef CACHED_SOURCE_AT", start)
     column = source[start:end].replace(
         "column_adjoint<false, COMPACT>(", "column_adjoint_positive<T, I, COMPACT, THREADS>(",
-    ).replace("da, dg, gs);", "da, dg, gs, pos_grad);").replace(
+    ).replace("da, dg, gs);", f"da, dg, gs, pos_grad{stride_arg});").replace(
         "column_adjoint<true, COMPACT>(", "column_adjoint_negative<T, I, COMPACT, THREADS>(",
     )
     return (source[:start] + column + source[end:]).replace(
         "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
-        _SGS_ADJOINT
+        adjoint
         + "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
     )
 
@@ -2192,7 +2226,8 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     with torch.cuda.device(device):
         _ensure_context(driver, device)
         if (
-            key.sgs or key.batch_path or key.register_path or key.horizontal_unroll8
+            key.sgs or key.l2_single_write or key.batch_path or key.register_path
+            or key.horizontal_unroll8
             or key.backward_batch2 or key.backward_readonly
             or key.forward_readonly or key.horizontal_readonly or key.horizontal_unroll
             or (key.vertical and key.backward and key.chunk and key.cache_source)
@@ -2747,6 +2782,7 @@ def _plan_scan_auto(
     return launch
 
 
+W51A_MODES = ("off", "fp32", "l2", "fp32_l2", "fp32_hiocc")
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2")
@@ -3116,7 +3152,112 @@ def _plan_structural(device: int, launch: Launch, shape: tuple[int, ...], mode: 
     return _structural_vfwd(device, launch, base, shape, mode)
 
 
-def _plan_launch(  # noqa: C901, PLR0911, PLR0912
+def _persistent_workers(
+    lines: int, rows: int, height: int, modes: int, itemsize: int,
+    warps: int, sms: int, resident: int, budget: int, checkpoint_rows: int = 0,
+) -> tuple[int, bool]:
+    tiles = _ceil(modes, _WARP_SIZE)
+    workers = min(_ceil(lines, warps), _ceil(sms * resident, tiles)) * warps
+    quad_bytes = workers * modes * 4 * itemsize
+    scan_bytes = rows * quad_bytes + checkpoint_rows * workers * modes * 16
+    if scan_bytes > budget:
+        return 0, False
+    return workers, bool(height and scan_bytes + height * quad_bytes <= budget)
+
+
+def _fp32_hiocc(
+    device: int, launch: Launch, shape: tuple[int, int, int, int], budget: int,
+) -> Launch:
+    key = launch.key
+    if key.backward or not key.hidden8 or not key.fp32_path:
+        return launch
+    b, height, width, modes = shape
+    step = 1 + key.coarse
+    rows, lines = height // step, b * (width // step)
+    tiles = _ceil(modes, _WARP_SIZE)
+    sms, block_limit, _ = device_limits(device)
+    shared, _, reserved = _sgs_device_limits(device)
+    best, score = launch, (0, 0, 0)
+    weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * 4
+    for warps in (2, 4):
+        cta_bytes = rows * warps * modes * 4 * key.dtype.itemsize
+        max_groups = budget // cta_bytes if cta_bytes else 0
+        if not max_groups:
+            continue
+        # Reserve dynamic SMEM to bound residency only when all naturally
+        # resident CTAs would overflow the L2 budget. Each resident CTA can
+        # still receive work without oversubscribing scratch.
+        cta_cap = max_groups * tiles // sms
+        smem = weight_bytes
+        if max_groups < _ceil(lines, warps):
+            if not cta_cap:
+                continue
+            smem = max(smem, _ceil(shared // (cta_cap + 1) + 1 - reserved, 256) * 256)
+        if smem > block_limit:
+            continue
+        for width in (2, 4):
+            if rows < width:
+                continue
+            candidate = replace(
+                key, warps=warps, cache_weights=True, cache_line=False,
+                vector_weights=True, batch_path=True, register_path=False,
+                register_batch2=width == 2, min_blocks=0,
+            )
+            plan = launch.plan._replace(
+                warps=warps, smem=smem, cache_line=False, cache_weights=True,
+            )
+            trial = launch._replace(key=candidate, plan=plan)
+            active = _active_warps(device, trial)
+            rank = (active, width, warps)
+            if active and rank > score:
+                best, score = trial, rank
+    return best
+
+
+@lru_cache(maxsize=512)
+def _plan_w51a(
+    device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
+) -> Launch:
+    if mode == "off" or not launch.key.vertical or launch.key.pure_vertical:
+        return launch
+    b, h, w, m = shape
+    key = launch.key
+    if mode.startswith("fp32") and key.dtype.itemsize == 2:
+        launch = launch._replace(key=replace(key, fp32_path=True))
+    if mode == "fp32":
+        return launch
+    budget = _l2_size(device) * 3 // 4
+    fallback = launch
+    if mode == "fp32_hiocc":
+        launch = _fp32_hiocc(device, launch, shape, budget)
+    plan, key, old_workers, _ = launch
+    if plan.cache_line:
+        return launch
+    sms, _, _ = device_limits(device)
+    resident = _resident(device, key, plan.smem)
+    if not resident:
+        return launch
+    step = 1 + key.coarse
+    checkpoint_rows = (h - 1) // plan.chunk if plan.global_checkpoints else 0
+    workers, single = _persistent_workers(
+        b * (w // step), h // step, h if key.backward and not key.sgs else 0,
+        m, key.dtype.itemsize, key.warps, sms, resident, budget, checkpoint_rows,
+    )
+    if single:
+        candidate = replace(key, l2_single_write=True)
+        if _resident(device, candidate, plan.smem) >= resident:
+            key = candidate
+    if not workers or (
+        launch is fallback and workers > _ceil(old_workers, key.warps) * key.warps
+    ):
+        return fallback
+    group = key.backward_reduce_warps or key.warps
+    reduce = key.backward and (key.shared_acc or key.hidden8)
+    partials = workers // group if reduce else workers
+    return Launch(plan, key, workers, partials)
+
+
+def _plan_launch(  # noqa: C901, PLR0912
     source: Tensor,
     shape: tuple[int, int, int, int],
     *,
@@ -3166,14 +3307,16 @@ def _plan_launch(  # noqa: C901, PLR0911, PLR0912
             backward_batch2=False, backward_batch_tail=False,
         ))
     if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
-        return _plan_structural(device, launch, shape, mode)
-    if mode != "off":
+        launch = _plan_structural(device, launch, shape, mode)
+    elif mode != "off":
         if not vertical:
             return _plan_hscan(device, launch, shape, mode)
         if backward:
-            return _plan_sgs(device, launch, shape, mode)
-        return _plan_vfwd(device, launch, height, mode)
-    return launch
+            launch = _plan_sgs(device, launch, shape, mode)
+        else:
+            launch = _plan_vfwd(device, launch, height, mode)
+    wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES) if vertical else "off"
+    return launch if wave51a == "off" else _plan_w51a(device, launch, shape, wave51a)
 
 
 # Custom ops and public API
@@ -3483,7 +3626,8 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or not saved_features.is_contiguous()
     ):
         raise ValueError("Invalid saved vertical features")
-    if trajectory is None and not pure and not (
+    wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES)
+    if wave51a == "off" and trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None
             and mode != "off")
@@ -3519,7 +3663,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         line_bytes = oh * plan.warps * 32 * 4 * states.element_size() if plan.cache_line else 0
         plan = plan._replace(cache_line=False, smem=plan.smem - line_bytes)
         key = replace(
-            base, saved_trajectory=1, cache_line=False,
+            base, saved_trajectory=1, cache_line=False, l2_single_write=False, fp32_path=False,
             index32=base.index32 and trajectory.numel() // 4 < 2**31,
         )
         launch = launch._replace(plan=plan, key=key)
@@ -3554,9 +3698,11 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
             outr, outi = states.new_empty(out_shape), states.new_empty(out_shape)
             output = outr, outi
         gr = gi = gs = partial = None
+    # Keep g2 and the optional positive adjoints in disjoint row ranges of
+    # one workspace. A persistent worker reuses both ranges on its next line.
     scratch = (
         None if launch.plan.cache_line or trajectory is not None else
-        states.new_empty((oh, launch.workers, m, 4))
+        states.new_empty((oh + h * launch.key.l2_single_write, launch.workers, m, 4))
     )
     inputs = (
         *(p.float().contiguous() for p in pole),
@@ -3633,6 +3779,8 @@ def _total_vram(device: torch.device) -> int:
 def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
     if not states.is_cuda or policy not in {"saved", "test_saved"}:
+        return False
+    if _scan_mode("LNET_SCAN_W51A", W51A_MODES) != "off":
         return False
     vram = _total_vram(states.device)
     if policy == "saved" and vram < 48 * 1024**3:
@@ -3978,6 +4126,8 @@ def _vscan_saved_policy(
         mode = _scan_mode("LNET_SCAN_VSCAN_SAVED", VSCAN_SAVED_MODES)
     # #854: saved_fused/saved_split cost +13.03/+16.33 ms on H200 and failed BF16 decay-grad parity.
     if mode in ("off", "auto_vram") or not states.is_cuda or not path or path[0].shape[1] != 8:
+        return "off"
+    if _scan_mode("LNET_SCAN_W51A", W51A_MODES) != "off":
         return "off"
     _, _, h, w, _ = states.shape
     oh, ow = h // (1 + coarse), w // (1 + coarse)

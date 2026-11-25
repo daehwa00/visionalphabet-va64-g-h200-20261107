@@ -67,6 +67,43 @@ def test_general_scans_default_and_opt_out(monkeypatch: pytest.MonkeyPatch) -> N
     assert not general_scans_enabled()
 
 
+def test_wave51a_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = "LNET_SCAN_W51A"
+    monkeypatch.delenv(env, raising=False)
+    assert scans._scan_mode(env, scans.W51A_MODES) == "off"
+    for mode in ("fp32", "l2", "fp32_l2", "fp32_hiocc"):
+        monkeypatch.setenv(env, mode)
+        assert scans._scan_mode(env, scans.W51A_MODES) == mode
+    monkeypatch.setenv(env, "unknown")
+    with pytest.raises(ValueError, match=env):
+        scans._scan_mode(env, scans.W51A_MODES)
+
+
+def test_wave51a_persistent_budget_and_off_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    shape = (1024, 56, 56, 160)
+    key = scans.Kernel(torch.bfloat16, 4, backward=True, vertical=True, hidden8=True)
+    launch = scans.Launch(scans.ScanPlan(4, 113 * 1024), key, 1688, 422)
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 2)
+    monkeypatch.setattr(scans, "_l2_size", lambda _: 60 * 1024**2)
+    assert scans._plan_w51a(0, launch, shape, "off") is launch
+    updated = scans._plan_w51a(0, launch, shape, "l2")
+    assert updated.key == replace(key, l2_single_write=True)
+    assert updated.workers == 212
+    assert updated.partials == 53
+    assert (updated.workers // key.warps) * 5 >= 132 * 2
+    assert 2 * 56 * updated.workers * 160 * 8 <= 45 * 1024**2
+
+    small_gpu = replace(key, compact=True, coarse=True)
+    coarse_launch = launch._replace(key=small_gpu)
+    monkeypatch.setattr(scans, "device_limits", lambda _: (80, 99 * 1024, 48))
+    monkeypatch.setattr(scans, "_l2_size", lambda _: 6 * 1024**2)
+    coarse = scans._plan_w51a(1, coarse_launch, (1024, 57, 57, 159), "l2")
+    assert coarse.key == small_gpu
+    assert coarse.workers == 128
+    assert scans._plan_w51a(1, launch, shape, "l2") is launch
+
+
 @pytest.mark.parametrize("kb", [48, 100, 228])
 @pytest.mark.parametrize("height", [1, 7, 14, 28, 56, 64, 96, 128, 192, 193, 200, 334, 1024])
 def test_smem_budget(kb: int, height: int) -> None:
