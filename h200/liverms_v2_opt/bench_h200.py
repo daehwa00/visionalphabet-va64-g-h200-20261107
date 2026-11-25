@@ -124,7 +124,10 @@ def build_model(variant: str) -> torch.nn.Module:
     import torch
     from run_va_eight_ablations import build_variant
 
-    return build_variant(variant).to(device="cuda", memory_format=torch.channels_last)
+    from lnet.model_w36b import prepare_model_w36b_
+
+    model = build_variant(variant).to(device="cuda", memory_format=torch.channels_last)
+    return prepare_model_w36b_(model)
 
 
 def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dict, list]:
@@ -286,10 +289,27 @@ def train_arm(args: argparse.Namespace) -> dict:
     import torch
     import va_model_builder as builder
 
+    from lnet.model_w36b import (
+        AUTOTUNE_FEATURES,
+        compile_model_w36b,
+        compile_model_w36b_update,
+        count_cudagraph_replays,
+        mark_model_w36b_step_begin,
+        model_w36b_features,
+    )
+
     inputs = setup(args.batch)
     labels = torch.arange(args.batch, device="cuda") % 100
     model = build_model(args.variant)
-    compiled = torch.compile(model, mode="default")
+    features = model_w36b_features()
+    if "cuda_graphs" in features:
+        # The synthetic batch stays at this address for every timed iteration.
+        torch._dynamo.mark_static_address(inputs)
+    compiled = (
+        compile_model_w36b(model)
+        if features & (AUTOTUNE_FEATURES | {"cuda_graphs"})
+        else torch.compile(model, mode="default")
+    )
     optimizer = builder.build_optimizer(
         model,
         {
@@ -302,15 +322,19 @@ def train_arm(args: argparse.Namespace) -> dict:
     )
 
     def backward() -> torch.Tensor:
+        mark_model_w36b_step_begin()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = torch.nn.functional.cross_entropy(compiled(inputs)[0], labels)
         loss.backward()
         return loss.detach()
 
-    def update() -> None:
+    def eager_update() -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
+    compiled_update = compile_model_w36b_update(model, optimizer)
+    update = compiled_update or eager_update
 
     def step() -> torch.Tensor:
         loss = backward()
@@ -326,7 +350,12 @@ def train_arm(args: argparse.Namespace) -> dict:
         ema_weight_after=float(rms.ema_weight),
         running_ms_finite=bool(rms.running_ms.isfinite().all()),
     )
-    backward()
+    if "cuda_graphs" in features:
+        with count_cudagraph_replays() as replays:
+            backward()
+        result["cudagraph_replays_per_forward_backward"] = len(replays)
+    else:
+        backward()
     gradients = [p.grad for p in model.parameters() if p.grad is not None]
     terminal = getattr(model.backbone, "terminal_s3", None)
     result.update(
@@ -338,7 +367,12 @@ def train_arm(args: argparse.Namespace) -> dict:
             else None
         ),
     )
-    optimizer.zero_grad(set_to_none=True)
+    if compiled_update is None:
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        with count_cudagraph_replays() as update_replays:
+            compiled_update()
+        result["cudagraph_replays_per_update"] = len(update_replays)
     if args.profile:
         write_json(args.out, {**result, "status": "profiling"})
         result["profiler"] = profile_step(step)

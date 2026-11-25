@@ -584,6 +584,11 @@ def _fallback_norm(
     return norm
 
 
+@torch.compiler.assume_constant_result
+def _stem_cuda_major(device: torch.device) -> int:
+    return torch.cuda.get_device_capability(device)[0]
+
+
 def fused_nhwc_layernorm_gelu(
     x: Tensor,
     weight: Tensor,
@@ -638,9 +643,8 @@ def fused_nhwc_layernorm_gelu(
             or (conv_bias.dtype in (torch.float32, x.dtype) and conv_bias.is_contiguous())
         )
     ):
-        major, _ = torch.cuda.get_device_capability(x.device)
         needs_bf16 = torch.bfloat16 in (x.dtype, output_dtype)
-        if major >= (8 if needs_bf16 else 7):
+        if _stem_cuda_major(x.device) >= (8 if needs_bf16 else 7):
             result = _forward(pixels, weight, bias, conv_bias, eps, output_dtype, round_affine)
             return result.permute(0, 3, 1, 2) if nchw and not nhwc_output else result
 

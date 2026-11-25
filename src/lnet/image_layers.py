@@ -9,6 +9,7 @@ from torch import Tensor, nn
 from torch.nn import functional
 
 from .fused_stem_ops import fused_conv_stem, fused_nhwc_layernorm_gelu
+from .model_w28c import model_cuda_supported
 
 _FUSED_FACTORIZED_READER_ENV = "LNET_FUSED_FACTORIZED_READER"
 _GENERAL_SCANS_ENV = "LNET_GENERAL_SCANS"
@@ -147,7 +148,7 @@ def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d) -> bool:
         and conv.dilation == (1, 1)
         and conv.groups == 1
         and (inputs.is_contiguous() or inputs.is_contiguous(memory_format=torch.channels_last))
-        and torch.cuda.get_device_capability(inputs.device)[0] >= 8
+        and model_cuda_supported(inputs.device)
     )
 
 
