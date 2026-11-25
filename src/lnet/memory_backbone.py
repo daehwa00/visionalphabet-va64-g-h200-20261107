@@ -30,8 +30,70 @@ from .product_scan_reference import d4_grouped_path_collapse_packed_reference
 
 _FUSED_FACTORIZED_READER_ENV = "LNET_FUSED_FACTORIZED_READER"
 _GENERAL_SCANS_ENV = "LNET_GENERAL_SCANS"
+_READER_EXEC_MODE_ENV = "LNET_READER_EXEC_MODE"
 
 _MAX_FUSED_GRAM_RANK = 8
+
+# Approximate peak tensor-core and scalar FP32 FLOP/byte by SM architecture.
+_READER_RIDGE_POINTS = {
+    (7, 0): (140.0, 17.0),
+    (7, 5): (200.0, 13.0),
+    (8, 0): (156.0, 10.0),
+    (8, 6): (185.0, 45.0),
+    (8, 9): (325.0, 81.0),
+    (9, 0): (206.0, 14.0),
+    (10, 0): (280.0, 10.0),
+}
+
+
+def reader_roofline_costs(
+    batch: int,
+    height: int,
+    width: int,
+    channels: int,
+    modes: int,
+    rank: int,
+    kernel: int,
+    dtype: torch.dtype,
+    major: int,
+    minor: int,
+    multiprocessors: int,
+) -> tuple[float, float]:
+    """Return dense and factorized train costs in equivalent HBM bytes per pixel."""
+    outputs = 2 * modes
+    latent = rank * modes
+    taps = kernel**2
+    dense_flops = 6 * channels * outputs * taps
+    point_flops = 6 * channels * latent
+    spatial_flops = 12 * latent * taps
+    tensor_cores = (dtype == torch.bfloat16 and major >= 8) or (
+        dtype == torch.float16 and major >= 7
+    )
+    if not tensor_cores:
+        factorized_flops = point_flops + spatial_flops
+        if kernel == 1 or dense_flops <= factorized_flops:
+            return float(dense_flops), math.inf
+        return math.inf, float(factorized_flops)
+
+    fallback = (156.0, 14.0) if major >= 9 else (140.0, 17.0)
+    tensor_ridge, scalar_ridge = _READER_RIDGE_POINTS.get((major, minor), fallback)
+    tiles = ((batch * height * width + 63) // 64) * ((outputs + 63) // 64)
+    utilization = min(1.0, max(1, tiles) / max(1, multiprocessors))
+    alignment = 1.0 if channels % 8 == outputs % 8 == 0 else 0.5
+    dense_ridge = tensor_ridge * 0.65 * alignment * utilization
+
+    traffic = 3 * dtype.itemsize
+    dense = max(traffic * (channels + outputs), dense_flops / dense_ridge)
+    point = max(traffic * (channels + latent), point_flops / tensor_ridge)
+    # Neighborhood rereads and partial spatial weight gradients lower effective bandwidth.
+    spatial = max(traffic * (latent + outputs) / 0.18, spatial_flops / scalar_ridge)
+    return dense, point + spatial
+
+
+@torch.compiler.assume_constant_result
+def _reader_cuda_properties(index: int | None) -> tuple[int, int, int]:
+    props = torch.cuda.get_device_properties(index)
+    return props.major, props.minor, props.multi_processor_count
 
 
 def _fused_factorized_reader_enabled() -> bool:
@@ -231,27 +293,71 @@ class FactorizedMemoryReader(nn.Module):
                 self.point_weight.float(),
             )
 
-    def _kernel_and_scale(self) -> tuple[Tensor, Tensor]:
-        full = self.synthesized_kernel()
+    def _synthesized_kernel_bmm(self) -> Tensor:
+        modes, rank, size = self.output_modes, self.rank, self.kernel_size
+        with torch.autocast(device_type=self.point_weight.device.type, enabled=False):
+            spatial = self.spatial_weight.float().reshape(modes, 2, rank, size, size)
+            spatial = spatial.permute(0, 1, 3, 4, 2).reshape(modes, 2 * size**2, rank)
+            full = torch.bmm(spatial, self.point_weight.float())
+            return full.reshape(modes, 2, size, size, self.input_channels).movedim(-1, 2)
+
+    def _kernel_and_scale(self, *, bmm: bool = False) -> tuple[Tensor, Tensor]:
+        full = self._synthesized_kernel_bmm() if bmm else self.synthesized_kernel()
         inverse = torch.rsqrt(
             full.square().sum((2, 3, 4), keepdim=True).clamp_min(self.variance_epsilon)
         )
         return full, inverse
+
+    @staticmethod
+    def _dense_compute_dtype(source: Tensor) -> torch.dtype:
+        if source.is_cuda and source.dtype == torch.float32 and torch.is_autocast_enabled("cuda"):
+            return torch.get_autocast_dtype("cuda")
+        return source.dtype
+
+    def _normalized_kernel(self, *, bmm: bool = False) -> Tensor:
+        full, inverse = self._kernel_and_scale(bmm=bmm)
+        return (full * inverse).permute(1, 0, 2, 3, 4).reshape(
+            2 * self.output_modes, self.input_channels, self.kernel_size, self.kernel_size
+        )
+
+    def _dense_nhwc(self, source: Tensor, *, bmm: bool) -> Tensor:
+        dtype = self._dense_compute_dtype(source)
+        source_in = source.to(dtype=dtype, memory_format=torch.contiguous_format).contiguous()
+        source_cl = source_in.movedim(-1, 1)
+        kernel_cl = self._normalized_kernel(bmm=bmm).to(
+            dtype=dtype, memory_format=torch.channels_last
+        )
+        with torch.autocast(device_type="cuda", enabled=False):
+            output = functional.conv2d(source_cl, kernel_cl, padding=self.padding).movedim(1, -1)
+        return output if output.is_contiguous() else output.contiguous()
+
+    def _reader_execution_mode(self, source: Tensor) -> str:
+        mode = os.environ.get(_READER_EXEC_MODE_ENV, "off")
+        if mode in {"", "off"}:
+            return self.execution_mode
+        if mode == "auto_roofline":
+            if not source.is_cuda:
+                return self.execution_mode
+            dense, factorized = reader_roofline_costs(
+                *source.shape[:3], self.input_channels, self.output_modes, self.rank,
+                self.kernel_size, self._dense_compute_dtype(source),
+                *_reader_cuda_properties(source.device.index),
+            )
+            return "dense_nhwc" if dense < factorized else "factorized_triton"
+        if mode not in {"dense_nhwc", "dense_nhwc_bmm"}:
+            raise ValueError(f"unknown LNET_READER_EXEC_MODE: {mode!r}")
+        return mode
 
     def forward(self, source: Tensor) -> Tensor:
         if source.ndim != 4 or source.shape[-1] != self.input_channels:
             raise ValueError("real Reader requires NHWC features of the configured width")
         if self.input_norm is not None:
             source = self.input_norm(source)
-        if not source.is_cuda or self.execution_mode == "dense":
-            full, inverse = self._kernel_and_scale()
-            kernel = (
-                (full * inverse)
-                .permute(1, 0, 2, 3, 4)
-                .reshape(
-                    2 * self.output_modes, self.input_channels, self.kernel_size, self.kernel_size
-                )
-            )
+        mode = self._reader_execution_mode(source)
+        if mode in {"dense_nhwc", "dense_nhwc_bmm"}:
+            output = self._dense_nhwc(source, bmm=mode == "dense_nhwc_bmm")
+        elif not source.is_cuda or mode == "dense":
+            kernel = self._normalized_kernel()
             output = (
                 functional.conv2d(source.movedim(-1, 1), kernel, padding=self.padding)
                 .movedim(1, -1)
@@ -259,7 +365,7 @@ class FactorizedMemoryReader(nn.Module):
             )
         else:
             fused = (
-                self.execution_mode == "factorized_triton"
+                mode == "factorized_triton"
                 and _fused_factorized_reader_enabled()
             )
             point = self.point_weight.transpose(0, 1) if fused else self.point_weight
@@ -282,7 +388,7 @@ class FactorizedMemoryReader(nn.Module):
                         self.spatial_weight.float().reshape(shape) * inverse[..., None, None, None]
                     ).transpose(0, 1).to(projected.dtype).contiguous()
                 output = real_packed_spatial(projected, spatial, component_first=True)
-            elif self.execution_mode in {"factorized", "factorized_triton"}:
+            elif mode in {"factorized", "factorized_triton"}:
                 _, inverse = self._kernel_and_scale()
                 spatial = self.spatial_weight.float().reshape(
                     self.output_modes, 2, self.rank, self.kernel_size, self.kernel_size
