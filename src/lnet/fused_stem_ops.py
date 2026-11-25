@@ -1009,11 +1009,13 @@ def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
         if TILE_REDUCE:
             dg = tl.full((M, CO), 0, tl.float32)
             db = tl.full((M, CO), 0, tl.float32)
-            dc = tl.full((M, CO), 0, tl.float32)
+            if BIAS:
+                dc = tl.full((M, CO), 0, tl.float32)
         else:
             dg = tl.full((CO,), 0, tl.float32)
             db = tl.full((CO,), 0, tl.float32)
-            dc = tl.full((CO,), 0, tl.float32)
+            if BIAS:
+                dc = tl.full((CO,), 0, tl.float32)
     ow: tl.constexpr = (W + 1) // 2
     end: tl.constexpr = N // ow if ROW else N
     step: tl.constexpr = 1 if ROW else M
@@ -1094,10 +1096,16 @@ def stem_conv_tensor_reduce(  # noqa: ANN201
     k = tl.program_id(0)
     worker = tl.arange(0, R)
     c = tl.arange(0, CO)
-    v = tl.sum(
-        tl.load(P + (worker[:, None] * fields + k) * CO + c[None, :], worker[:, None] < WORKERS, 0),
-        0,
-    )
+    if WORKERS > 1024:
+        v = tl.full((CO,), 0, tl.float32)
+        for base in range(0, WORKERS, R):
+            row = base + worker
+            addr = P + (row[:, None] * fields + k) * CO + c[None, :]
+            partial = tl.load(addr, row[:, None] < WORKERS, 0)
+            v += tl.sum(partial, 0)
+    else:
+        addr = P + (worker[:, None] * fields + k) * CO + c[None, :]
+        v = tl.sum(tl.load(addr, worker[:, None] < WORKERS, 0), 0)
     if k < CI * 9:
         tl.store(DW + k * CO + c, v)
     elif k == CI * 9:
@@ -1156,6 +1164,7 @@ def _launch_tensor_core_stem(
         mode != "off",
         mode == "triton_row_coalesced",
         num_warps=warps,
+        **({"num_stages": 2} if backward and mode in _V3_CONFIG else {}),
     )
 
 
@@ -1165,6 +1174,8 @@ def _tensor_core_tiles(x: Tensor, mode: str, *, backward: bool) -> tuple[int, in
     if mode == "triton_row_coalesced":
         return triton.next_power_of_2(ow), rows
     block = (64 if backward else 32) if mode == "off" else 128
+    if mode in _V3_CONFIG:
+        block = _V3_CONFIG[mode][2 if backward else 0]
     return block, triton.cdiv(rows * ow, block)
 
 
@@ -1186,6 +1197,7 @@ def _conv_forward(
             _launch_tensor_core_stem(
                 x, w, g, b, cb, y, y, stats, stats, eps, workers,
                 backward=False, block=block, mode=mode,
+                warps=_V3_CONFIG[mode][1] if mode in _V3_CONFIG else 4,
             )
         else:
             module, stream, n, sizes = _conv_launch_setup(x, w, cb, eps)
@@ -1236,7 +1248,9 @@ def _tensor_core_conv_backward(
     mode: str,
 ) -> None:
     block, tiles = _tensor_core_tiles(x, mode, backward=True)
-    workers = min(1024 if mode == "off" else 528, tiles)
+    config = _V3_CONFIG.get(mode)
+    limit = config[4] if config else (1024 if mode == "off" else 528)
+    workers = min(limit, tiles)
     ci, co = x.shape[1], g.numel()
     fields = ci * 9 + 2 + int(cb is not None)
     part = g.new_empty((workers, fields, co))
@@ -1254,7 +1268,8 @@ def _tensor_core_conv_backward(
         workers,
         backward=True,
         block=block,
-        tile_reduce=mode == "off",
+        tile_reduce=mode == "off" or config is not None,
+        warps=config[3] if config else 4,
         mode=mode,
     )
     stem_conv_tensor_reduce[(fields,)](
@@ -1267,7 +1282,7 @@ def _tensor_core_conv_backward(
         co,
         cb is not None,
         workers,
-        triton.next_power_of_2(workers),
+        256 if workers > 1024 else triton.next_power_of_2(workers),
     )
 
 
@@ -1629,7 +1644,16 @@ def _tiled_stem_module(
     return module
 
 
-STAGE0_CANDIDATES = ("cudnn_fused", "triton_row_coalesced", "triton_tuned_v2")
+# Forward rows/warps, backward rows/warps, persistent worker limit.
+_V3_CONFIG = {
+    "triton_v3_m64_w4": (128, 4, 64, 4, 1056),
+    "triton_v3_m32_w4": (128, 4, 32, 4, 2112),
+    "triton_v3_m32_w4_4k": (128, 4, 32, 4, 4224),
+    "triton_v3_m64_w8": (128, 4, 64, 8, 1056),
+    "triton_v3_m128_w8": (128, 8, 128, 8, 1056),
+    "triton_v3_m64_2k": (256, 8, 64, 4, 2112),
+}
+STAGE0_CANDIDATES = ("cudnn_fused", "triton_row_coalesced", "triton_tuned_v2", *_V3_CONFIG)
 
 
 def stem_stage0_mode() -> str:
