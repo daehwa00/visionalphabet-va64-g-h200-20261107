@@ -28,6 +28,7 @@ requires_cuda = pytest.mark.skipif(
 def isolate_reader_options(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LNET_READER_OPT", raising=False)
     monkeypatch.delenv("LNET_READER_VEC", raising=False)
+    monkeypatch.delenv("LNET_READER_W42", raising=False)
 
 
 @pytest.mark.parametrize(
@@ -746,3 +747,86 @@ def test_cuda_launcher_buffers_follow_argument_signature() -> None:
             module, "test_signature", (1, 1, 1), (tensor,), (value,), stream=ctypes.c_void_p(),
         )
     assert values == [(tensor.data_ptr(), 7), (tensor.data_ptr(), 0.5)]
+
+
+@pytest.mark.parametrize("mode", [None, "off", " RO ", "fwd_hiocc", "dw_hiocc",
+                                  "dinput_tune", "combo", "invalid"])
+def test_w42_env(monkeypatch, mode) -> None:
+    monkeypatch.delenv("LNET_READER_W42", raising=False)
+    if mode is not None:
+        monkeypatch.setenv("LNET_READER_W42", mode)
+    expected = "off" if mode in (None, "invalid") else mode.strip().lower()
+    assert kernels._reader_w42() == expected
+
+
+def test_w42_tile_geometry() -> None:
+    launch = kernels._VectorLaunch(2, 56, 8, 1)
+    props = SimpleNamespace(regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048,
+                            L2_cache_size=50 << 20, multi_processor_count=132,
+                            shared_memory_per_multiprocessor=228 << 10)
+    tuned = kernels._w42_forward_tile(launch, props, 4, width=56)
+    assert 0 < tuned.rows < launch.rows
+    assert tuned._replace(rows=launch.rows) == launch
+    smaller_smem = SimpleNamespace(**vars(props))
+    smaller_smem.shared_memory_per_multiprocessor = 100 << 10
+    split = kernels._w42_forward_tile(launch, smaller_smem, 4, width=56)
+    assert (split.vec, split.warps, split.columns) == (2, 2, 28)
+    props.regs_per_multiprocessor //= 2
+    assert kernels._w42_forward_tile(launch, props, 4, width=56).rows <= tuned.rows
+    assert kernels._w42_dinput_tile(launch, props, 160, 4, 8, width=56).rows < launch.rows
+    assert kernels._w42_dinput_tile(launch, props, 160, 4, 24, width=56).rows == launch.rows
+
+
+@pytest.mark.parametrize("mode", ["off", "combo"])
+def test_w42_fake_and_aot_eager(monkeypatch, mode) -> None:
+    monkeypatch.setenv("LNET_READER_W42", mode)
+    with FakeTensorMode():
+        projected = torch.empty(2, 3, 7, 20, dtype=torch.bfloat16, device="cuda")
+        real = torch.empty(5, 4, 3, 3, dtype=torch.bfloat16, device="cuda")
+        out = kernels._packed_spatial(projected, real, real, strict_complex=False)
+        assert out.shape == (2, 3, 7, 10)
+        dp, dw = kernels._packed_spatial_backward(out, projected, real, real, strict_complex=False)
+        assert dp.shape == projected.shape
+        assert dp.dtype == projected.dtype
+        assert dw.shape == (2, *real.shape)
+        assert dw.dtype == torch.float32
+
+    def forward(projected, weights):
+        return kernels.real_packed_spatial(projected, weights, component_first=True)
+
+    compiled = torch.compile(forward, backend="aot_eager", fullgraph=True, dynamic=True)
+    weights = torch.randn(2, 5, 4, 3, 3, requires_grad=True)
+    for height, width in ((3, 7), (5, 9)):
+        projected = torch.randn(2, height, width, 20, requires_grad=True)
+        actual, expected = compiled(projected, weights), forward(projected, weights)
+        torch.testing.assert_close(actual, expected)
+        _check_gradients(actual, expected, (projected, weights), (projected, weights),
+                         atol=2e-6, rtol=2e-5)
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(11, 56, 56, 160, 4), (67, 13, 19, 63, 3),
+                                   (40, 37, 13, 160, 1), (40, 13, 37, 128, 6)])
+def test_w42_cuda_parity(monkeypatch, dtype, shape) -> None:
+    batch, h, w, modes, rank = shape
+    torch.manual_seed(42)
+    projected = torch.randn(batch, h, w, modes * rank, dtype=dtype, device="cuda") / 8
+    weights = torch.randn(2, modes, rank, 3, 3, dtype=dtype, device="cuda") / 8
+    real, imag = weights.unbind()
+    grad = torch.randn(batch, h, w, 2 * modes, dtype=dtype, device="cuda") / 8
+
+    def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        out = kernels.real_packed_spatial(projected, weights, component_first=True)
+        dp, dw = kernels._packed_spatial_backward(grad, projected, real, imag, strict_complex=False)
+        return out, dp, dw
+
+    monkeypatch.setenv("LNET_READER_W42", "off")
+    refs = run()
+    for mode in sorted(kernels._READER_W42_MODES - {"off"}):
+        monkeypatch.setenv("LNET_READER_W42", mode)
+        for result, ref in zip(run(), refs, strict=True):
+            if result.dtype == torch.float32:
+                torch.testing.assert_close(result, ref, atol=2e-4, rtol=5e-4)
+            else:
+                torch.testing.assert_close(result, ref, atol=0, rtol=0)
