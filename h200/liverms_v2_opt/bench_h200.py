@@ -492,7 +492,8 @@ def infer_fold(args: argparse.Namespace) -> dict:
 
     inputs = setup(args.batch)
     torch.set_float32_matmul_precision(getattr(args, "precision", "high"))
-    torch.backends.cudnn.benchmark = False
+    if not getattr(args, "use_benchmark_env", False):
+        torch.backends.cudnn.benchmark = False
     model = build_model(args.variant)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         # Initialize evaluation scales from a clean synthetic batch.
@@ -838,6 +839,7 @@ def main() -> None:
             sub.add_argument("--batch", required=True, type=int)
         if name == "infer-fold":
             sub.add_argument("--precision", choices=("high", "highest"), default="high")
+            sub.add_argument("--use-benchmark-env", action="store_true")
         if name == "train-arm":
             sub.add_argument("--profile", action="store_true")
         if name == "dynamo":

@@ -1495,7 +1495,8 @@ def tiled_stem_enabled() -> bool:
     mode = os.environ.get("LNET_STEM_STAGE0_MODE", "off")
     if mode not in ("off", "cuda_tiled", "auto"):
         raise ValueError("LNET_STEM_STAGE0_MODE must be off, cuda_tiled, or auto")
-    return mode != "off"
+    # #854: the tiled stage-0 stem cost +6.31 ms on H200.
+    return mode == "cuda_tiled"
 
 
 def _tiled_stem_shape(x: Tensor, sh: int, sw: int, ph: int, pw: int) -> tuple:

@@ -3971,28 +3971,18 @@ def _trajectory_shape(states: Tensor, coarse: bool, split: bool) -> tuple[int, .
     return (1, *shape) if split else shape
 
 
-@torch.compiler.assume_constant_result
-def _free_vram(device: torch.device) -> int:
-    return torch.cuda.mem_get_info(device)[0]
-
-
 def _vscan_saved_policy(
     states: Tensor, path: list[Tensor], coarse: bool, mode: str | None = None,
 ) -> str:
     if mode is None:
         mode = _scan_mode("LNET_SCAN_VSCAN_SAVED", VSCAN_SAVED_MODES)
-    if mode == "off" or not states.is_cuda or not path or path[0].shape[1] != 8:
+    # #854: saved_fused/saved_split cost +13.03/+16.33 ms on H200 and failed BF16 decay-grad parity.
+    if mode in ("off", "auto_vram") or not states.is_cuda or not path or path[0].shape[1] != 8:
         return "off"
-    _, b, h, w, m = states.shape
+    _, _, h, w, _ = states.shape
     oh, ow = h // (1 + coarse), w // (1 + coarse)
     if not (oh and ow):
         return "off"
-    if mode == "auto_vram":
-        nbytes = 8 * b * h * ow * m * states.element_size()
-        total = _total_vram(states.device)
-        if total < 48 * 1024**3 or 100 * nbytes > 15 * min(total, _free_vram(states.device)):
-            return "off"
-        return "saved_split"
     return mode
 
 

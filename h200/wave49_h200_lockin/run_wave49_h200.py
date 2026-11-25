@@ -77,7 +77,9 @@ def profile_step(step: Callable) -> dict:
     }
 
 
-def measure_arm(out: Path, *, profile: bool) -> int:
+def measure_arm(
+    out: Path, *, profile: bool, arm_env_keys: tuple[str, ...] = tuple(MODES[REF]),
+) -> int:
     from torch._dynamo.utils import counters
 
     from lnet import general_cuda_scans as scans
@@ -121,7 +123,11 @@ def measure_arm(out: Path, *, profile: bool) -> int:
             for group, prefix in (("inductor", "fxgraph"), ("aot_autograd", "autograd"))
             for key in (f"{prefix}_cache_hit", f"{prefix}_cache_miss")
         },
-        "arm_env": {key: os.environ[key] for key in MODES[REF]},
+        "aot_autograd": {
+            key: counters["aot_autograd"].get(f"autograd_cache_{key}", 0)
+            for key in ("hit", "miss", "bypass")
+        },
+        "arm_env": {key: os.environ[key] for key in arm_env_keys},
         "preset": os.environ["LNET_MODEL_W36B"],
         **{key: result[key] for key in ("profiler", "profiler_error") if key in result},
     })
@@ -207,7 +213,7 @@ def run(root: Path, summary: dict) -> None:
         summary["verdict"] = "PASS"
 
 
-def transport(root: Path) -> None:
+def transport(root: Path, *, tag: str = "VA_T173") -> None:
     members = sorted(path for path in root.glob("*.json") if path.name != "manifest.json")
     manifest = root / "manifest.json"
     bench_h200.write_json(manifest, {
@@ -219,15 +225,15 @@ def transport(root: Path) -> None:
             archive.add(path, arcname=path.name)
     raw = buffer.getvalue()
     encoded = base64.b64encode(raw).decode("ascii")
-    print(f"VA_T173_SHA256 {hashlib.sha256(raw).hexdigest()}")
-    print(f"VA_T173_MANIFEST_SHA256 {hashlib.sha256(manifest.read_bytes()).hexdigest()}")
+    print(f"{tag}_SHA256 {hashlib.sha256(raw).hexdigest()}")
+    print(f"{tag}_MANIFEST_SHA256 {hashlib.sha256(manifest.read_bytes()).hexdigest()}")
     for path in (*members, manifest):
-        print(f"VA_T173_JSON_SHA256 {path.name} {hashlib.sha256(path.read_bytes()).hexdigest()}")
-    print(f"VA_T173_BASE64_CHARS {len(encoded)}")
-    print("VA_T173_BEGIN")
+        print(f"{tag}_JSON_SHA256 {path.name} {hashlib.sha256(path.read_bytes()).hexdigest()}")
+    print(f"{tag}_BASE64_CHARS {len(encoded)}")
+    print(f"{tag}_BEGIN")
     for start in range(0, len(encoded), 240):
-        print(f"VA_T173_GZ {encoded[start:start + 240]}")
-    print("VA_T173_END", flush=True)
+        print(f"{tag}_GZ {encoded[start:start + 240]}")
+    print(f"{tag}_END", flush=True)
 
 
 def main() -> int:

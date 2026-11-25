@@ -2,12 +2,20 @@
 set -euo pipefail
 SECONDS=0
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
-out=$(mktemp -d /app/output/va-t173-h200.XXXXXX)
+runner=${VA_LOCKIN_RUNNER:-h200.wave49_h200_lockin.run_wave49_h200}
+transport_tag=${VA_LOCKIN_TRANSPORT_TAG:-VA_T173}
+out=$(mktemp -d "/app/output/${transport_tag,,}-h200.XXXXXX")
+export TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_AUTOGRAD_CACHE=1
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$out/cache/inductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$out/cache/triton}"
+export CUDA_CACHE_PATH="$out/cache/cuda"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"
+
 export LC_ALL=C PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 WANDB_MODE=disabled
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=4
 export PYTHONPATH="$PWD/src:$PWD/scripts:$PWD" VA_BUNDLE_COMMIT
 VA_BUNDLE_COMMIT=$(git rev-parse HEAD)
-for variable in ${!LNET_SCAN_@} ${!LNET_READER_@} ${!LNET_MODEL_@} ${!LNET_STEM_@}; do
+for variable in ${!LNET_SCAN_@} ${!LNET_READER_@} ${!LNET_MODEL_@} ${!LNET_STEM_@} ${!LNET_NORM_@}; do
     unset "$variable"
 done
 unset LNET_GENERAL_SCANS LNET_FUSED_FACTORIZED_READER LNET_GENERAL_SCAN_REF_FWD
@@ -31,7 +39,7 @@ log = root / "environment.log"
     "commit": sys.argv[3],
 }))
 ' "$out" "$rc" "$VA_BUNDLE_COMMIT"
-    python3 -c 'from pathlib import Path; from h200.wave49_h200_lockin.run_wave49_h200 import transport; import sys; transport(Path(sys.argv[1]))' "$out"
+    python3 -c 'from pathlib import Path; from h200.wave49_h200_lockin.run_wave49_h200 import transport; import sys; transport(Path(sys.argv[1]), tag=sys.argv[2])' "$out" "$transport_tag"
     exit "$rc"
 }
 trap bootstrap_failure ERR
@@ -91,12 +99,7 @@ fi > "$out/environment.log" 2>&1
 
 
 "$PYTHON_BIN" -c 'import sys, torch, triton, timm, va_model_builder, lnet.general_cuda_scans; assert sys.version_info >= (3, 13) and torch.cuda.is_available()' >> "$out/environment.log" 2>&1
-export TORCHINDUCTOR_CACHE_DIR="$out/cache/inductor"
-export TRITON_CACHE_DIR="$out/cache/triton"
-export CUDA_CACHE_PATH="$out/cache/cuda"
-export TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_AUTOGRAD_CACHE=1
-mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH"
 export VA_BOOTSTRAP_SECONDS="$SECONDS"
 trap - ERR
 printf 'Python environment ready after %ss\n' "$SECONDS" >&2
-exec "$PYTHON_BIN" h200/wave49_h200_lockin/run_wave49_h200.py "$out"
+exec "$PYTHON_BIN" -m "$runner" "$out"

@@ -100,8 +100,8 @@ def test_trajectory_reference(h: int, w: int, m: int, coarse: bool, dtype: torch
 
 @pytest.mark.parametrize(
     ("total", "free", "batch", "expected"),
-    [(12, 11, 1, "off"), (24, 23, 1, "off"), (80, 70, 1024, "saved_split"),
-     (140, 105, 1024, "saved_split"), (140, 4, 1024, "off"),
+    [(12, 11, 1, "off"), (24, 23, 1, "off"), (80, 70, 1024, "off"),
+     (140, 105, 1024, "off"), (140, 4, 1024, "off"),
      (140, 140, 10_000, "off")],
 )
 def test_auto_vram(

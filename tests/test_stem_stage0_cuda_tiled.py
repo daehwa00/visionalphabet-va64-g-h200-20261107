@@ -9,11 +9,17 @@ import torch
 from torch import nn
 from torch.nn import functional
 
+from lnet.fused_stem_ops import tiled_stem_enabled
 from lnet.image_layers import LayerNorm2d, ModeScaledTwoConvStem, _fused_stem_block
 from lnet.memory_backbone import ChannelRMSNorm
 from lnet.model_w29c import _fast_rmsnorm
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def test_auto_stem_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_STEM_STAGE0_MODE", "auto")
+    assert not tiled_stem_enabled()
 
 
 def _run(forward, inputs: torch.Tensor, parameters: tuple, dy: torch.Tensor) -> tuple:
