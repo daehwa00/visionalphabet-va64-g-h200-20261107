@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from copy import deepcopy
 
 import pytest
@@ -12,6 +13,8 @@ from torch import nn
 from lnet import capture_safe_orthogonal
 from lnet.capture_safe_orthogonal import fixed_taylor_matrix_exp
 from lnet.model_w36b import (
+    _clip_static_grads,
+    _tensor_update,
     compile_model_w36b,
     compile_model_w36b_update,
     count_cudagraph_replays,
@@ -58,6 +61,12 @@ def test_compile_policy(monkeypatch: pytest.MonkeyPatch) -> None:
         "max_autotune_gemm_backends": "ATEN,TRITON", "max_autotune_gemm_search_space": "DEFAULT",
         "aggressive_fusion": False,
     }),
+    ("cuda_graphs,tma_gemm,max_autotune_pointwise,shape_padding,compiled_update", {
+        "triton.cudagraphs": True, "triton.enable_persistent_tma_matmul": True,
+        "max_autotune_gemm": True, "max_autotune_gemm_backends": "ATEN,TRITON",
+        "max_autotune_gemm_search_space": "DEFAULT", "aggressive_fusion": False,
+        "max_autotune_pointwise": True, "epilogue_fusion": True, "shape_padding": True,
+    }),
     ("max_autotune_pointwise", {"max_autotune_pointwise": True, "epilogue_fusion": True}),
     ("cuda_graphs,max_autotune_gemm,coord_descent,aggressive_fusion", {
         "triton.cudagraphs": True, "max_autotune_gemm": True,
@@ -84,35 +93,89 @@ def test_invalid_features(monkeypatch: pytest.MonkeyPatch, features: str) -> Non
         model_w36b_features()
 
 
-@pytest.mark.parametrize("fused", [False, True])
-def test_compiled_update_parity(monkeypatch: pytest.MonkeyPatch, fused: bool) -> None:
+@pytest.mark.parametrize(("fused", "backend"), [
+    (False, "eager"), (True, "eager"), (True, "aot_eager"),
+])
+def test_compiled_update_parity(monkeypatch: pytest.MonkeyPatch, fused: bool, backend: str) -> None:
     torch.manual_seed(52)
     eager = nn.Sequential(nn.Linear(4, 8), nn.Linear(8, 2), nn.Linear(2, 1))
     model = deepcopy(eager)
-    baseline = torch.optim.AdamW(eager.parameters(), fused=fused)
-    optimizer = torch.optim.AdamW(model.parameters(), fused=fused)
+    baseline = torch.optim.AdamW(eager.parameters(), fused=fused, capturable=fused)
+    optimizer = torch.optim.AdamW(model.parameters(), fused=fused, capturable=fused)
     monkeypatch.setenv("LNET_MODEL_W36B", "off")
     assert compile_model_w36b_update(model, optimizer) is None
     monkeypatch.setenv("LNET_MODEL_W36B", "compiled_update")
     assert compile_model_w36b(model) is model
-    update = compile_model_w36b_update(model, optimizer, backend="aot_eager")
+    update = compile_model_w36b_update(model, optimizer, backend=backend)
     assert update is not None
-    for scale in (10.0, 0.1, 50.0):
-        for got, want in zip(model.parameters(), eager.parameters(), strict=True):
-            # The final layer is intentionally unused.
-            if got.numel() > 2:
-                want.grad = torch.randn_like(want) * scale
-                got.grad = want.grad.clone()
-        clipped = [param.grad for param in model.parameters() if param.grad is not None]
+    for index, scale in enumerate((10.0, 0.1, 50.0, 0.25, 1.0)):
+        # The final layer is unused on most iterations. Its stale zero buffer
+        # must not cause a momentum or weight-decay update on the last step.
+        inputs = torch.randn(6, 4) * scale
+        eager[:2 if index != 3 else 3](inputs).sum().backward()
+        model[:2 if index != 3 else 3](inputs).sum().backward()
         expected_norm = nn.utils.clip_grad_norm_(eager.parameters(), 1.0)
-        expected_clipped = [param.grad for param in eager.parameters() if param.grad is not None]
+        expected_clipped = [p.grad for p in eager.parameters() if p.grad is not None]
+        clipped = [p.grad.clone() for p in model.parameters() if p.grad is not None]
+        if index == 4 and fused:
+            clipped = clipped[:len(expected_clipped)]
+        torch.testing.assert_close(_clip_static_grads(clipped), expected_norm, rtol=0, atol=0)
+        torch.testing.assert_close(clipped, expected_clipped, rtol=0, atol=0)
         baseline.step()
         baseline.zero_grad(set_to_none=True)
         torch.testing.assert_close(update(), expected_norm, rtol=0, atol=0)
-        torch.testing.assert_close(clipped, expected_clipped, rtol=0, atol=0)
         torch.testing.assert_close(model.state_dict(), eager.state_dict(), rtol=0, atol=0)
         torch.testing.assert_close(optimizer.state_dict(), baseline.state_dict(), rtol=0, atol=0)
-        assert all(parameter.grad is None for parameter in model.parameters())
+        for parameter in model.parameters():
+            if fused and parameter.grad is not None:
+                assert not parameter.grad.count_nonzero()
+            else:
+                assert parameter.grad is None
+    if fused:
+        assert all(parameter.grad is None for parameter in model[-1].parameters())
+        model[:2](inputs).sum().backward()
+        active = {p: p.grad for p in model.parameters() if p.grad is not None}
+        report = torch._dynamo.explain(_tensor_update)(
+            list(active.values()), update._inputs(active), functional=backend == "aot_eager",
+        )
+        assert (report.graph_count, report.graph_break_count) == (1, 0), report.break_reasons
+
+
+@requires_cuda
+def test_compiled_update_cudagraph_replays(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_MODEL_W36B", "cuda_graphs,compiled_update")
+    torch.manual_seed(52)
+    eager = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4)).cuda()
+    model = deepcopy(eager)
+    forward = compile_model_w36b(model)
+    baseline = torch.optim.AdamW(eager.parameters(), fused=True, capturable=True)
+    optimizer = torch.optim.AdamW(model.parameters(), fused=True, capturable=True)
+    update = compile_model_w36b_update(model, optimizer)
+    inputs = torch.empty(16, 8, device="cuda")
+    torch._dynamo.mark_static_address(inputs)
+    for index in range(5):
+        inputs.normal_().mul_(index + 1)
+        # Both optimizers receive identical gradients while compiled backward
+        # still exercises accumulation into the persistent grad tensors.
+        mark_model_w36b_step_begin()
+        with count_cudagraph_replays() as forwards:
+            loss = forward(inputs).sum()
+        with count_cudagraph_replays() as backwards:
+            loss.backward()
+        for ref, param in zip(eager.parameters(), model.parameters(), strict=True):
+            ref.grad = param.grad.clone()
+        expected = nn.utils.clip_grad_norm_(eager.parameters(), 1.0)
+        baseline.step()
+        baseline.zero_grad(set_to_none=True)
+        with count_cudagraph_replays() as updates:
+            actual = update()
+        if index >= 3:
+            assert min(len(forwards), len(backwards), len(updates)) >= 1
+        torch.testing.assert_close(actual, expected, rtol=0, atol=1e-7)
+        torch.testing.assert_close(model.state_dict(), eager.state_dict(), rtol=0, atol=1e-7)
+        torch.testing.assert_close(optimizer.state_dict(), baseline.state_dict(), rtol=0, atol=1e-7)
+        assert all(p.grad is not None and not p.grad.count_nonzero() for p in model.parameters())
+        del loss
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
@@ -156,27 +219,80 @@ def _cuda_sample():
     )
 
 
-def _assert_training_parity(model, reference, actual, expected, *, atol, rtol) -> None:
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-    grads = [(got.grad, want.grad) for got, want in zip(
-        model.parameters(), reference.parameters(), strict=True,
-    ) if got.grad is not None or want.grad is not None]
-    assert len(grads) == 193
-    for got, want in grads:
-        assert got is not None
-        assert want is not None
-        torch.testing.assert_close(got, want, atol=atol, rtol=rtol)
+def _assert_training_parity(model, reference, actual, expected, *, atol, rtol, label) -> None:
+    pairs = defaultdict(list, {
+        "logits": [(actual[0], expected[0])],
+        "loss": [(actual[1], expected[1])],
+    })
+    pairs["grads"] = [
+        (got.grad, want.grad)
+        for got, want in zip(model.parameters(), reference.parameters(), strict=True)
+        if got.grad is not None or want.grad is not None
+    ]
+    assert len(pairs["grads"]) == 193
+    assert all(got is not None and want is not None for got, want in pairs["grads"])
     buffers = dict(reference.named_buffers())
     for name, buffer in model.named_buffers():
-        if name.endswith("running_ms"):
-            torch.testing.assert_close(buffer, buffers[name], atol=atol, rtol=rtol)
-        elif name.endswith("ema_weight"):
-            # EMA weight depends on step count and momentum, not the BF16 activations.
-            torch.testing.assert_close(buffer, buffers[name], atol=1e-6, rtol=1e-6)
+        suffix = name.rsplit(".", 1)[-1]
+        if suffix in {"running_ms", "ema_weight"}:
+            pairs[suffix].append((buffer, buffers[name]))
+    with torch.no_grad():
+        maxima = {
+            name: torch.stack([(got.float() - want.float()).abs().max() for got, want in values])
+            .max().item()
+            for name, values in pairs.items()
+        }
+    print(f"{label} max_abs = {maxima}")  # noqa: T201
+    for name, values in pairs.items():
+        tolerance = {"atol": 1e-6, "rtol": 1e-6} if name == "ema_weight" else {
+            "atol": atol, "rtol": rtol,
+        }
+        torch.testing.assert_close(*zip(*values, strict=True), **tolerance)
+
+
+def _graph_train_step(compiled, sample, bf16: bool):
+    mark_model_w36b_step_begin()
+    with count_cudagraph_replays() as forward, torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=bf16,
+    ):
+        actual = compiled(sample)[0]
+    loss = actual.float().square().mean()
+    with count_cudagraph_replays() as backward:
+        loss.backward()
+    return (actual, loss), (len(forward), len(backward))
+
+
+def _graph_replay_self_consistency(model, compiled, sample, bf16: bool) -> None:
+    buffers = [(buf, buf.clone()) for buf in model.buffers()]
+    snapshots = []
+    for _ in range(2):
+        model.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            for buffer, initial in buffers:
+                buffer.copy_(initial)
+        (logits, loss), replays = _graph_train_step(compiled, sample, bf16)
+        assert min(replays) >= 1
+        snapshots.append((
+            logits.detach().clone(), loss.detach().clone(),
+            [p.grad.clone() for p in model.parameters() if p.grad is not None],
+            [buf.clone() for buf, _ in buffers],
+        ))
+        del logits, loss
+    torch.testing.assert_close(*snapshots, atol=1e-6, rtol=1e-6)
 
 
 @requires_cuda
-def test_variant_compiled_cudagraph_replay(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+@pytest.mark.parametrize("bf16", [False, True], ids=["fp32", "bf16"])
+def test_variant_compiled_cudagraph_replay(monkeypatch: pytest.MonkeyPatch, caplog, bf16) -> None:
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        _check_variant_compiled_cudagraph_replay(monkeypatch, caplog, bf16)
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+
+
+def _check_variant_compiled_cudagraph_replay(monkeypatch, caplog, bf16) -> None:
     monkeypatch.setenv("LNET_MODEL_W36B", "cuda_graphs")
     skip_logger = torch._logging.getArtifactLogger("torch._inductor.cudagraph_utils", "perf_hints")
     monkeypatch.setattr(skip_logger, "propagate", True)
@@ -187,40 +303,34 @@ def test_variant_compiled_cudagraph_replay(monkeypatch: pytest.MonkeyPatch, capl
     model = deepcopy(eager)
     compiled = compile_model_w36b(model)
     no_graph_model = deepcopy(eager)
-    with monkeypatch.context() as patch:
-        patch.setenv("LNET_MODEL_W36B", "capture_safe_ortho")
-        prepare_model_w36b_(no_graph_model)
-    # Keep the Dynamo graph and lowering options common to both compiled arms.
-    options = dict(torch._inductor.list_mode_options("reduce-overhead"))
-    options["triton.cudagraphs"] = False
-    no_graph = torch.compile(no_graph_model, options=options, fullgraph=True, dynamic=False)
+    no_graph = compile_model_w36b(no_graph_model, options={"triton.cudagraphs": False})
     step_replays = []
-    for _ in range(5):
-        model.zero_grad(set_to_none=True)
-        eager.zero_grad(set_to_none=True)
-        no_graph_model.zero_grad(set_to_none=True)
-        mark_model_w36b_step_begin()
-        with count_cudagraph_replays() as forward, torch.autocast("cuda", dtype=torch.bfloat16):
-            actual = compiled(sample)[0]
-        loss = actual.float().square().mean()
-        with count_cudagraph_replays() as backward:
-            loss.backward()
-        step_replays.append((len(forward), len(backward)))
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            expected = eager(sample)[0]
+    tolerance = 5e-3 if bf16 else 1e-4
+    for index in range(5):
+        sample.mul_(-1)
+        for arm in (model, eager, no_graph_model):
+            arm.zero_grad(set_to_none=True)
+        actual, replays = _graph_train_step(compiled, sample, bf16)
+        step_replays.append(replays)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
             no_graph_logits = no_graph(sample)[0]
-        reference = expected.float().square().mean()
+            expected = eager(sample)[0] if bf16 else None
         no_graph_loss = no_graph_logits.float().square().mean()
-        reference.backward()
         no_graph_loss.backward()
         _assert_training_parity(
-            model, eager, (actual, loss), (expected, reference), atol=2e-2, rtol=2e-2,
+            model, no_graph_model, actual, (no_graph_logits, no_graph_loss),
+            atol=tolerance, rtol=tolerance, label=f"step {index}, graphs vs no graphs",
         )
-        _assert_training_parity(
-            model, no_graph_model, (actual, loss), (no_graph_logits, no_graph_loss),
-            atol=1e-4, rtol=1e-4,
-        )
-        del actual, loss, no_graph_logits, no_graph_loss, expected, reference
+        if expected is not None:
+            reference = expected.float().square().mean()
+            reference.backward()
+            _assert_training_parity(
+                model, eager, actual, (expected, reference),
+                atol=2e-2, rtol=2e-2, label=f"step {index}, graphs vs eager",
+            )
+            del expected, reference
+        del actual, no_graph_logits, no_graph_loss
+    _graph_replay_self_consistency(model, compiled, sample, bf16)
     skips = [m for m in caplog.messages if "skipping cudagraph" in m.lower()]
     print(f"CUDA Graph replays (forward, backward) per step = {step_replays}; skips = {skips}")  # noqa: T201
     assert all(min(counts) >= 1 for counts in step_replays[-2:]), (step_replays, skips)

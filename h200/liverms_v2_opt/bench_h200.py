@@ -333,7 +333,8 @@ def train_arm(args: argparse.Namespace) -> dict:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-    update = compile_model_w36b_update(model, optimizer) or eager_update
+    compiled_update = compile_model_w36b_update(model, optimizer)
+    update = compiled_update or eager_update
 
     def step() -> torch.Tensor:
         loss = backward()
@@ -366,7 +367,12 @@ def train_arm(args: argparse.Namespace) -> dict:
             else None
         ),
     )
-    optimizer.zero_grad(set_to_none=True)
+    if compiled_update is None:
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        with count_cudagraph_replays() as update_replays:
+            compiled_update()
+        result["cudagraph_replays_per_update"] = len(update_replays)
     if args.profile:
         write_json(args.out, {**result, "status": "profiling"})
         result["profiler"] = profile_step(step)

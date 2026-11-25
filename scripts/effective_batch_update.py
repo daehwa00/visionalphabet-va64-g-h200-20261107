@@ -29,7 +29,8 @@ def run_update(
     if torch.is_tensor(mixing) and mixing.shape != targets.shape:
         raise ValueError("Per-example MixUp weights must match the logical batch")
     device = x.device
-    optimizer.zero_grad(set_to_none=True)
+    if capture or compiled_update is None:
+        optimizer.zero_grad(set_to_none=True)
     if capture:
         parameters = {n: p for n, p in model.named_parameters() if p.requires_grad}
         prior = {n: p.detach().cpu().clone() for n, p in parameters.items()}
