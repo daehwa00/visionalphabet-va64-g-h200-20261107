@@ -143,19 +143,25 @@ def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dic
     for _ in range(warmup - 1):
         step()
     torch.cuda.synchronize()
+    compile_warmup_s = time.perf_counter() - start
+    loop_start = time.perf_counter()
     timings, outputs = [], []
     for _ in range(count):
         start = time.perf_counter()
         outputs.append(step())
         torch.cuda.synchronize()
         timings.append((time.perf_counter() - start) * 1000)
+    timed_loop_s = time.perf_counter() - loop_start
     median = statistics.median(timings)
     p25, _, p75 = statistics.quantiles(timings, n=4, method="inclusive")
     return {
         "median_ms": median,
         "mean_ms": statistics.mean(timings),
+        "p90_ms": statistics.quantiles(timings, n=10, method="inclusive")[-1],
         "p95_ms": statistics.quantiles(timings, n=20, method="inclusive")[-1],
         "compile_time_s": first_step_s,
+        "compile_warmup_s": compile_warmup_s,
+        "timed_loop_s": timed_loop_s,
         "min_ms": min(timings),
         "max_ms": max(timings),
         "p25_ms": p25,
@@ -401,9 +407,11 @@ def train_arm(  # noqa: C901, PLR0915 - keep the timing and diagnostic phases to
     else:
         backward()
     gradients = [p.grad for p in model.parameters() if p.grad is not None]
+    finite_grad_count = sum(bool(grad.isfinite().all()) for grad in gradients)
     terminal = getattr(model.backbone, "terminal_s3", None)
     result.update(
-        finite_gradients=bool(gradients) and all(bool(g.isfinite().all()) for g in gradients),
+        finite_gradients=finite_grad_count == len(gradients) and bool(gradients),
+        finite_grad_count=finite_grad_count,
         grad_tensor_count=len(gradients),
         terminal_s3_nonzero_grads=(
             sum(p.grad is not None and bool(p.grad.count_nonzero()) for p in terminal.parameters())
