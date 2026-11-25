@@ -3618,14 +3618,14 @@ W52A_MODES = (
 )
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
-W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin")
+W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin", "w55_lockin")
 W55A_MODES = ("off", "v55_bf16x2_predp", "v55_bf16x2_bf16w", "v55_bf16x2_chunkacc")
 H55_MODES = ("off", "h55_fwd_vec2_cached", "h55_bwd_vec2_nocs", "h55_bwd_vec2_half", "h55_bwd_bf16_nocs")
 W54A_MODES = ("off", "v54_sacc_aw12", "v54_psacc_aw12", "v54_gacc_aw12", "v54_sacc_b4")
 H54_MODES = ("off", "h54_fwd_nocache", "h54_fwd_vec2", "h54_bwd_bf16_all",
              "h54_bwd_bf16_half", "h54_bwd_vec2", "h54_combo_vec2")
 H53_MODES = ("h53_ro_all", "h53_compact2", "h53_bf16_buf", "h53_l2_scratch", "h53_lockin")
-HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2") + H53_MODES
+HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2") + H53_MODES + ("h55_lockin",)
 
 
 def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
@@ -4581,6 +4581,12 @@ def _plan_launch(  # noqa: C901, PLR0912
     )
     w54 = _scan_mode("LNET_SCAN_W54A", W54A_MODES) if vertical else "off"
     w55 = _scan_mode("LNET_SCAN_W55A", W55A_MODES) if vertical else "off"
+    if wave53a == "w55_lockin":
+        wave53a = "w53_lockin"
+        if backward:
+            w55 = "v55_bf16x2_predp" if not coarse and height <= 8 else "v55_bf16x2_bf16w"
+        elif (coarse and height >= 48) or (not coarse and 24 <= height < 48):
+            w55 = "v55_bf16x2_bf16w"
     if (w54 != "off" or w55 != "off") and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
         wave53a = "w53_lockin"
     if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
@@ -4600,6 +4606,14 @@ def _plan_launch(  # noqa: C901, PLR0912
         h54 = _scan_mode("LNET_SCAN_H54", H54_MODES)
         if h54 != "off":
             return _plan_h54(device, launch, shape, h54, aligned)
+    if mode == "h55_lockin":
+        short_dense = not compact and width <= 8
+        if source.dtype in (torch.float16, torch.bfloat16):
+            if not backward and (width >= 48 or short_dense):
+                return _plan_h54(device, launch, shape, "h55_fwd_vec2_cached", aligned)
+            if backward and ((compact and width >= 48) or short_dense):
+                return _plan_h54(device, launch, shape, "h55_bwd_vec2_nocs", aligned)
+        mode = "h53_lockin"
     if mode in H53_MODES:
         return _plan_h53(device, launch, shape, mode)
     if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):

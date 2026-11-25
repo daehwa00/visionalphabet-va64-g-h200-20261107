@@ -1,4 +1,4 @@
-"""Run one Wave 53 ABBA arm using the Wave 51 full-model measurement protocol."""
+"""Run one scan lock-in ABBA arm using the Wave 51 full-model measurement protocol."""
 
 import argparse
 import os
@@ -13,6 +13,9 @@ def lockin_arm_env(name: str) -> dict[str, str]:
     if mode == REF:
         return {**arm_env(REF), "LNET_SCAN_W52A": "off", "LNET_SCAN_W53A": "off",
                 "LNET_FUSED_STEM_CONV": "auto"}
+    if mode == "w55_lockin":
+        return {**lockin_arm_env("w53_lockin"), "LNET_SCAN_W53A": mode,
+                "LNET_SCAN_HSCAN": "h55_lockin"}
     if mode != "w53_lockin":
         raise ValueError(f"Unknown arm {name!r}")
     return {**arm_env(WIN), "LNET_SCAN_W52A": "off", "LNET_SCAN_W53A": "w53_lockin",
@@ -22,7 +25,8 @@ def lockin_arm_env(name: str) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--arm", required=True, choices=(REF, "w53_lockin", "w53_lockin_rev", REF + "_rev"))
+    arms = (REF, "w53_lockin", "w55_lockin")
+    parser.add_argument("--arm", required=True, choices=(*arms, *(arm + "_rev" for arm in arms)))
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()

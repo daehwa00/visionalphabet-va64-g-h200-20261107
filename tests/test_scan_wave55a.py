@@ -52,6 +52,8 @@ def plan(module, shape, vertical, backward, dtype=torch.bfloat16, aligned=True):
 @pytest.mark.parametrize("lockin", [False, True])
 def test_lockin_ptx(monkeypatch, lockin):
     root = Path(scans.__file__).resolve().parents[2]
+    if subprocess.run(["git", "cat-file", "-e", BASE], cwd=root).returncode:
+        pytest.skip(f"Baseline commit {BASE} unavailable")
     code = subprocess.check_output(
         ["git", "show", f"{BASE}:src/lnet/general_cuda_scans.py"], cwd=root
     )
@@ -219,11 +221,15 @@ def test_planner_precision_and_arch(monkeypatch):
                     assert key.partial_shared_acc == backward
 
 
-def test_ablation17_cpu_bf16():
+@pytest.mark.parametrize("lockin", [False, True])
+def test_ablation17_cpu_bf16(lockin):
     from run_va_eight_ablations import build_variant
 
     bench.configure("v55_bf16x2_chunkacc")
     os.environ["LNET_SCAN_H55"] = "h55_bwd_vec2_nocs"
+    if lockin:
+        bench.configure("w55_lockin")
+        os.environ.update(LNET_SCAN_HSCAN="h55_lockin", LNET_STEM_STAGE0_MODE="triton_v3_m64_w4")
     model = build_variant("17-p1-nr4-1024d-v3").train()
     with torch.autocast("cpu", dtype=torch.bfloat16):
         logits = model(torch.randn(1, 3, 224, 224))[0]
@@ -232,13 +238,13 @@ def test_ablation17_cpu_bf16():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("mode", (*scans.W55A_MODES[1:], *scans.H55_MODES[1:]))
+@pytest.mark.parametrize("mode", (*scans.W55A_MODES[1:], *scans.H55_MODES[1:], "w55_lockin", "h55_lockin"))
 def test_cuda(mode):
     rows = bench.check_mode(mode, 1, 0.035)
     assert all(row["passed"] for row in rows.values()), rows
     for direction in ("fwd", "bwd"):
         bench.configure(mode)
-        op = ("vscan_" if mode in scans.W55A_MODES else "hscan_") + direction
+        op = ("vscan_" if mode in bench.VERTICAL else "hscan_") + direction
         run, _ = micro._case(
             op, micro.MODEL_SHAPES[1], 1, torch.bfloat16, compact=direction == "bwd"
         )
@@ -271,3 +277,35 @@ def test_misaligned_cuda():
         atol=0,
         rtol=0,
     )
+
+
+# Columns are vertical forward/backward and horizontal forward/backward.
+V, W, P = "w53_lockin", "v55_bf16x2_bf16w", "v55_bf16x2_predp"
+H, F, B = "h53_lockin", "h55_fwd_vec2_cached", "h55_bwd_vec2_nocs"
+TARGETS = {
+    "56d": (V, W, F, H),
+    "56c": (W, W, F, B),
+    "28d": (W, W, H, H),
+    "28c": (V, W, H, H),
+    "14d": (V, W, H, H),
+    "14c": (V, W, H, H),
+    "7d": (V, P, F, B),
+}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_delegation(monkeypatch, dtype):
+    limits(monkeypatch, scans)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    for shape in micro.MODEL_SHAPES:
+        for col, target in enumerate(TARGETS[shape[0]]):
+            vertical, backward = col < 2, bool(col % 2)
+            for odd in (False, True):
+                case = (*shape[:3], shape[3] + int(odd), *shape[4:])
+                expected = H if not vertical and (odd or dtype == torch.float32) else target
+                bench.configure(expected)
+                ref = plan(scans, case, vertical, backward, dtype)
+                bench.configure("w55_lockin" if vertical else "h55_lockin")
+                actual = plan(scans, case, vertical, backward, dtype)
+                assert actual == ref, (case, col, dtype, expected)
+                assert scans._compile_ptx(actual.key, (9, 0)).value == scans._compile_ptx(ref.key, (9, 0)).value

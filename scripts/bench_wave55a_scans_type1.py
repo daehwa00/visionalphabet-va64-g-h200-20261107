@@ -12,8 +12,10 @@ from bench_wave52_vscan_type1 import configure as configure_w52
 
 from lnet import general_cuda_scans as scans
 
-VERTICAL = ("w53_lockin", *scans.W55A_MODES[1:])
-HORIZONTAL = ("h53_lockin", *scans.H55_MODES[1:])
+VERTICAL_SCREEN = ("w53_lockin", *scans.W55A_MODES[1:])
+HORIZONTAL_SCREEN = ("h53_lockin", *scans.H55_MODES[1:])
+VERTICAL = (*VERTICAL_SCREEN, "w55_lockin")
+HORIZONTAL = (*HORIZONTAL_SCREEN, "h55_lockin")
 ODD_SHAPES = (("15x17x33", 15, 17, 33, False, 1), *bench.EDGE_SHAPES[:2])
 ODD_WIDTHS = ODD_SHAPES[:1]
 
@@ -21,8 +23,8 @@ ODD_WIDTHS = ODD_SHAPES[:1]
 def configure(mode: str) -> None:
     configure_w52("w51a_fp32")
     os.environ.update(
-        LNET_SCAN_W53A="w53_lockin",
-        LNET_SCAN_HSCAN="h53_lockin",
+        LNET_SCAN_W53A=mode if mode == "w55_lockin" else "w53_lockin",
+        LNET_SCAN_HSCAN=mode if mode == "h55_lockin" else "h53_lockin",
         LNET_SCAN_W54A="off",
         LNET_SCAN_H54="off",
         LNET_SCAN_W55A=mode if mode in scans.W55A_MODES else "off",
@@ -143,8 +145,8 @@ def benchmark(mode: str, batch: int, warmup: int, iters: int, flush: torch.Tenso
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vscan-modes", nargs="*", choices=VERTICAL, default=VERTICAL)
-    parser.add_argument("--hscan-modes", nargs="*", choices=HORIZONTAL, default=HORIZONTAL)
+    parser.add_argument("--vscan-modes", nargs="*", choices=VERTICAL, default=VERTICAL_SCREEN)
+    parser.add_argument("--hscan-modes", nargs="*", choices=HORIZONTAL, default=HORIZONTAL_SCREEN)
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--parity-batch", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=2)
