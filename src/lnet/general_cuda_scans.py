@@ -147,6 +147,7 @@ class Kernel:
     horizontal_span: int = 0
     backward_segment_source: bool = False
     fp32_path: bool = False
+    tanh_gain: bool = False
     l2_single_write: bool = False
     dw1_tile: int = 0
     dw1_fp32: bool = False
@@ -1816,6 +1817,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _sgs_source(source, persistent=key.l2_single_write)
     if key.fp32_path:
         source = _fp32_path_source(source)
+    if key.tanh_gain:
+        source = _tanh_gain_source(source)
     if key.backward_reduce_warps:
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
     if key.saved_trajectory:
@@ -2157,6 +2160,59 @@ def _fp32_path_source(source: str) -> str:
         "weights[slot] = (value);", "weights[slot] = rounded<T>(value);",
     )
     return source[:start] + path + source[end:]
+
+
+def _tanh_gain_source(source: str) -> str:
+    sigmoid = """__device__ __forceinline__ float fast_sigmoid_tanh(float z) {
+#if __CUDA_ARCH__ >= 750
+    float t;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(0.5f * z));
+    return __fmaf_rn(0.5f, t, 0.5f);
+#else
+    return __fdividef(1.0f, 1.0f + __expf(-z));
+#endif
+}
+
+"""
+    for value in ("pre", "z"):
+        source = source.replace(
+            f"const float sig = __fdividef(1.0f, 1.0f + __expf(-{value}));",
+            f"const float sig = fast_sigmoid_tanh({value});",
+        ).replace(
+            f"(sig * (1.0f + {value} * (1.0f - sig)))",
+            "__fmaf_rn(-act, sig, sig + act)",
+        )
+    source = source.replace("template<class T, class I>\nstruct Column", sigmoid + (
+        "template<class T, class I>\nstruct Column"
+    ))
+    source = source.replace("float vx_a, vx_b, eps;", "float inv_vx_a, inv_vx_b, inv_eps;")
+    # Keep zero variances at the epsilon cap via rsqrt(0) = +infinity.
+    source = source.replace(
+        "vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps};",
+        "rsqrtf(fmaxf(vx[I(xa) * M + m], 0.0f)),\n"
+        "                           rsqrtf(fmaxf(vx[(I(W) + xb) * M + m], 0.0f)), rsqrtf(eps)};",
+    )
+    source = source.replace(
+        "return make_float2(rsqrtf(fmaxf(vx_a * v, eps)), rsqrtf(fmaxf(vx_b * v, eps)));",
+        "const float rv = rsqrtf(fmaxf(v, 0.0f));\n"
+        "        return make_float2(fminf(inv_vx_a * rv, inv_eps), "
+        "fminf(inv_vx_b * rv, inv_eps));",
+    )
+    source = source.replace(
+        "const auto pp = normalize<T>(seg[j * THREADS], c.gain(y, false));",
+        "gp_c[i] = c.gain(y, false);\n"
+        "                gn_c[i] = c.gain(y - int(COARSE), true);\n"
+        "                const auto pp = normalize<T>(seg[j * THREADS], gp_c[i]);",
+    ).replace(
+        "const auto pn = normalize<T>(neg, c.gain(y - int(COARSE), true));",
+        "const auto pn = normalize<T>(neg, gn_c[i]);",
+    ).replace(
+        "make_float4(dp[i][0], dp[i][4], dp[i][1], dp[i][5]), c.gain(y, false));",
+        "make_float4(dp[i][0], dp[i][4], dp[i][1], dp[i][5]), gp_c[i]);",
+    ).replace(
+        "                    c.gain(y - int(COARSE), true));", "                    gn_c[i]);",
+    )
+    return source.replace("float2 dy[2];", "float2 dy[2], gp_c[2], gn_c[2];", 1)
 
 
 def _sgs_source(source: str, *, persistent: bool = False) -> str:
@@ -2917,6 +2973,9 @@ def _plan_scan_auto(
 
 W51A_MODES = ("off", "fp32", "l2", "fp32_l2", "fp32_hiocc")
 W51B_MODES = ("off", "tiled_dw", "tiled_dw_fp32")
+W52A_MODES = (
+    "off", "tanh_gain", "tanh_gain_smemw", "l2_floor_g2", "l2_floor_sw", "combo_g2", "combo_sw",
+)
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2")
@@ -2927,6 +2986,10 @@ def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
     if mode not in allowed:
         raise ValueError(f"{env}={mode!r}; allowed modes: {', '.join(allowed)}")
     return mode
+
+
+def _wave52a_mode(itemsize: int) -> str:
+    return _scan_mode("LNET_SCAN_W52A", W52A_MODES) if itemsize == 2 else "off"
 
 
 @cache
@@ -3299,6 +3362,62 @@ def _persistent_workers(
     return workers, bool(height and scan_bytes + height * quad_bytes <= budget)
 
 
+def _persistent_workers_floor(
+    lines: int, rows: int, height: int, modes: int, itemsize: int,
+    warps: int, sms: int, resident: int, budget: int, checkpoint_rows: int = 0,
+) -> tuple[int, bool]:
+    tiles = _ceil(modes, _WARP_SIZE)
+    capacity = sms * resident
+    groups = min(_ceil(lines, warps), max(1, capacity // tiles))
+    if groups * tiles > capacity:
+        return 0, False
+    workers = groups * warps
+    quad_bytes = workers * modes * 4 * itemsize
+    scan_bytes = rows * quad_bytes + checkpoint_rows * workers * modes * 16
+    if scan_bytes > budget:
+        return 0, False
+    return workers, bool(height and scan_bytes + height * quad_bytes <= budget)
+
+
+@lru_cache(maxsize=512)
+def _plan_w52a(device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str) -> Launch:
+    plan, key, old_workers, _ = launch
+    b, h, w, m = shape
+    key = replace(key, fp32_path=True, tanh_gain=mode.startswith(("tanh_gain", "combo")))
+    smem_weights = mode in ("tanh_gain_smemw", "combo_g2", "combo_sw")
+    if key.register_path and not key.backward and smem_weights:
+        rows = h // (1 + key.coarse)
+        line_bytes = rows * key.warps * _WARP_SIZE * 4 * key.dtype.itemsize * plan.cache_line
+        weights = 11 * _REGISTER_HIDDEN * _WARP_SIZE * 4
+        smem = plan.smem - line_bytes + weights
+        candidate = replace(
+            key, register_path=False, cache_weights=True, vector_weights=True, cache_line=False,
+        )
+        if _resident(device, candidate, smem):
+            key = candidate
+            plan = plan._replace(cache_weights=True, cache_line=False, smem=smem)
+    launch = launch._replace(plan=plan, key=key)
+    if not mode.startswith(("l2_floor", "combo")) or plan.cache_line:
+        return launch
+    resident = _resident(device, key, plan.smem)
+    sms, _, _ = device_limits(device)
+    step = 1 + key.coarse
+    checkpoints = (h - 1) // plan.chunk if plan.global_checkpoints else 0
+    workers, single = _persistent_workers_floor(
+        b * (w // step), h // step, h if key.backward and not key.sgs else 0,
+        m, key.dtype.itemsize, key.warps, sms, resident, _l2_size(device) * 3 // 4, checkpoints,
+    )
+    if not 0 < workers < old_workers:
+        return launch
+    if single and mode.endswith("_sw"):
+        candidate = replace(key, l2_single_write=True)
+        if _resident(device, candidate, plan.smem) >= resident:
+            key = candidate
+    group = key.backward_reduce_warps or key.warps
+    reduce = key.backward and (key.shared_acc or key.hidden8)
+    return Launch(plan, key, workers, workers // group if reduce else workers)
+
+
 def _fp32_hiocc(
     device: int, launch: Launch, shape: tuple[int, int, int, int], budget: int,
 ) -> Launch:
@@ -3492,9 +3611,13 @@ def _plan_launch(  # noqa: C901, PLR0912
             backward_batch2=False, backward_batch_tail=False,
         ))
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES) if vertical else "off"
+    wave52a = (
+        _wave52a_mode(source.dtype.itemsize)
+        if vertical and not (pure_vertical or saved_trajectory) else "off"
+    )
     if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
         "off", "strict_ro",
-    ):
+    ) and wave52a == "off":
         wave51b = _scan_mode("LNET_SCAN_W51B", W51B_MODES)
         if wave51b != "off":
             candidate = _plan_w51b(device, launch, shape, wave51b)
@@ -3511,6 +3634,9 @@ def _plan_launch(  # noqa: C901, PLR0912
             launch = _plan_sgs(device, launch, shape, mode)
         else:
             launch = _plan_vfwd(device, launch, height, mode)
+    if wave52a != "off":
+        # Both waves tune the same fused kernel and scratch allocation.
+        return _plan_w52a(device, launch, shape, wave52a)
     return launch if wave51a == "off" else _plan_w51a(device, launch, shape, wave51a)
 
 
@@ -3822,7 +3948,8 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     ):
         raise ValueError("Invalid saved vertical features")
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES)
-    if wave51a == "off" and trajectory is None and not pure and not (
+    wave52a = "off" if pure else _wave52a_mode(states.element_size())
+    if wave51a == wave52a == "off" and trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None and (
             mode != "off"
@@ -3981,6 +4108,8 @@ def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
     if not states.is_cuda or policy not in {"saved", "test_saved"}:
         return False
     if _scan_mode("LNET_SCAN_W51A", W51A_MODES) != "off":
+        return False
+    if _wave52a_mode(states.element_size()) != "off":
         return False
     vram = _total_vram(states.device)
     if policy == "saved" and vram < 48 * 1024**3:
@@ -4328,6 +4457,8 @@ def _vscan_saved_policy(
     if mode in ("off", "auto_vram") or not states.is_cuda or not path or path[0].shape[1] != 8:
         return "off"
     if _scan_mode("LNET_SCAN_W51A", W51A_MODES) != "off":
+        return "off"
+    if _wave52a_mode(states.element_size()) != "off":
         return "off"
     _, _, h, w, _ = states.shape
     oh, ow = h // (1 + coarse), w // (1 + coarse)
