@@ -108,6 +108,8 @@ class _Wave53Options:
     backward_reload_source: bool = False
     partial_shared_acc: bool = False
     horizontal_stream: bool = False
+    vertical_w55: str = "off"
+    horizontal_nocs: bool = False
     horizontal_vec2: bool = False
     path_bwd_pipe: int = 0
     horizontal_half_replay: bool = False
@@ -1855,6 +1857,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _vertical_wave54_source(source, key)
         if key.backward_batch4:
             source = _quad_adjoint_source(source)
+    if key.vertical_w55 != "off":
+        source = _vertical_w55_source(source, key)
     return source + wrapper
 
 
@@ -2151,6 +2155,202 @@ __device__ void store_complex_cs(T* dst, I off, I plane, Complex z) {
 """
 
 
+def _vertical_w55_source(source: str, key: Kernel) -> str:
+    marker = "template<class T, class I, bool CACHED>"
+    helper = r"""
+template<class T> struct Half2 {
+    using V = decltype(Pair<T>{}.value);
+    __device__ static V pack(float a, float b) { return Pair<T>::pack({a,b}).value; }
+    __device__ static V splat(float a) { return pack(a,a); }
+    __device__ static V fma(V a,V b,V c) { return __hfma2(a,b,c); }
+    __device__ static float unpack_lo(V x) { return Pair<T>{x}.unpack().r; }
+    __device__ static float unpack_hi(V x) { return Pair<T>{x}.unpack().i; }
+};
+"""
+    source = source.replace(marker, "#if __CUDA_ARCH__ >= 800\n" + helper + "#endif\n" + marker, 1)
+
+    def guard(old: str, new: str) -> str:
+        return "\n#if __CUDA_ARCH__ >= 800\n" + new + "\n#else\n" + old + "\n#endif\n"
+
+    begin = source.index("void path_mlp_batch(")
+    a = source.index("        #pragma unroll\n        for (int t", begin)
+    b = source.index("            pre = ", a)
+    old = source[a:b]
+    source = (
+        source[:a]
+        + guard(
+            old,
+            r"""
+        float pres[K];
+        #pragma unroll
+        for (int t=0;t<K;t+=2) {
+            using P=Half2<T>;
+            auto v=P::splat(0);
+            #pragma unroll
+            for (int k=0;k<8;++k)
+                v=P::fma(P::splat(weights[k]),P::pack(p[t][k],p[t+1][k]),v);
+            pres[t]=P::unpack_lo(v); pres[t+1]=P::unpack_hi(v);
+        }
+        #pragma unroll
+        for (int t=0;t<K;++t) {
+            float pre=pres[t];""",
+        )
+        + source[b:]
+    )
+    begin = source.index("void path_adjoint_pair(")
+    a = source.index("    #pragma unroll", begin)
+    source = (
+        source[:a]
+        + guard(
+            "",
+            r"""
+    using P=Half2<T>;
+    typename P::V p2[8], dp2[8];
+    #pragma unroll
+    for (int k=0;k<8;++k) { p2[k]=P::pack(p[0][k],p[1][k]); dp2[k]=P::splat(0); }
+""",
+        )
+        + source[a:]
+    )
+    a = source.rindex("        #pragma unroll", begin, source.index("            pre[0] =", begin))
+    b = source.index("        // Keep each", a)
+    source = (
+        source[:a]
+        + guard(
+            source[a:b],
+            r"""
+        float dzs[2];
+        auto v=P::splat(0);
+        #pragma unroll
+        for (int k=0;k<8;++k) v=P::fma(P::splat(weights[k]),p2[k],v);
+        pre[0]=P::unpack_lo(v); pre[1]=P::unpack_hi(v);
+""",
+        )
+        + source[b:]
+    )
+    marker = "                dp[cell][k] += dz * weights[k];"
+    off = source.index(marker, begin)
+    source = source[:off] + source[off:].replace(
+        marker, guard(marker, "                dzs[cell]=dz;"), 1
+    )
+    off = source.index("\n    }\n}\n#endif", off)
+    source = (
+        source[:off]
+        + guard(
+            "",
+            r"""
+        auto dz2=P::pack(dzs[0],dzs[1]);
+        #pragma unroll
+        for (int k=0;k<8;++k) dp2[k]=P::fma(dz2,P::splat(weights[k]),dp2[k]);
+""",
+        )
+        + source[off:]
+    )
+    off = source.index("\n}\n#endif", off)
+    source = (
+        source[:off]
+        + guard(
+            "",
+            r"""
+    #pragma unroll
+    for (int k=0;k<8;++k) { dp[0][k]=P::unpack_lo(dp2[k]); dp[1][k]=P::unpack_hi(dp2[k]); }
+""",
+        )
+        + source[off:]
+    )
+    if key.vertical_w55 != "v55_bf16x2_predp":
+        helper = r"""
+template<class T> struct NativeWeights;
+template<class T, class W>
+__device__ auto packed_weight(W, int, int, float value) {
+    return Half2<T>::splat(value);
+}
+template<class T>
+__device__ auto packed_weight(NativeWeights<T> path, int j, int k, float) {
+    uint4 row=reinterpret_cast<const uint4*>(path.cache)[j*32+path.lane];
+    T value=reinterpret_cast<const T*>(&row)[k];
+    return Pair<T>::from(value,value).value;
+}
+"""
+        source = source.replace(
+            "#endif\ntemplate<class T, class I, bool CACHED>",
+            helper + "#endif\ntemplate<class T, class I, bool CACHED>",
+            1,
+        )
+        source = source.replace("P::splat(weights[k])", "packed_weight<T>(path,j,k,weights[k])")
+        marker = "struct ProjectWeights {"
+        source = (
+            source.replace(
+                marker,
+                r"""
+template<class T> struct NativeWeights {
+    static constexpr bool vector_weights=true;
+    const T* cache;
+    int size,lane;
+    __device__ float4 input_group(int group) const {
+        uint4 v=reinterpret_cast<const uint4*>(cache)[(group/2)*32+lane];
+        const T* w=reinterpret_cast<const T*>(&v)+(group%2)*4;
+        return make_float4(read(w[0]),read(w[1]),read(w[2]),read(w[3]));
+    }
+    __device__ float bias(int j) const { return read(cache[(8*size+j)*32+lane]); }
+    __device__ float output(int j) const { return read(cache[(9*size+j)*32+lane]); }
+};
+"""
+                + marker,
+            )
+            .replace(
+                "(field / 4 * 32 + mode) * 4 + field % 4", "(field / 8 * 32 + mode) * 8 + field % 8"
+            )
+            .replace(
+                "reinterpret_cast<float*>(shared), wi, bi, wo, nullptr",
+                "weights_shared, wi, bi, wo, nullptr",
+            )
+            .replace(
+                "return ProjectWeights{reinterpret_cast<const float*>(shared), size, lane};",
+                "return NativeWeights<T>{weights_shared, size, lane};",
+            )
+            .replace("VECTOR_WEIGHTS ? sizeof(float) : sizeof(T)", "sizeof(T)")
+        )
+    if key.vertical_w55 == W55A_MODES[3] and key.backward:
+        marker = "float* acc, float* tail, I stride, float (&dp)"
+        source = source.replace(marker, "Pair<T>* dw_chunk, " + marker)
+        source = source.replace(
+            "path, acc, tail, acc_stride, dp);", "path, dw_chunk, acc, tail, acc_stride, dp);"
+        )
+        marker = "        Quad<T>* source_cache"
+        source = source.replace(marker, "        Pair<T> dw_chunk[64]{};\n" + marker, 1)
+        marker = "                acc[(8 * j + k) * stride] += dz * p[cell][k];"
+        begin = source.index("void path_adjoint_pair(")
+        source = source[:begin] + source[begin:].replace(marker, guard(marker, ""), 1)
+        marker = "        auto dz2=P::pack(dzs[0],dzs[1]);"
+        source = source.replace(
+            marker,
+            marker
+            + r"""
+        #pragma unroll
+        for (int k=0;k<8;++k) {
+            auto &v=dw_chunk[8*j+k].value;
+            v=P::fma(dz2,p2[k],v);
+        }
+""",
+        )
+        # Flush after the paired loop and before any scalar remainder.
+        begin = source.index("path_adjoint_pair<T, I>(p, dy")
+        off = source.index("#if !defined(BACKWARD_BATCH2)", begin)
+        source = (
+            source[:off]
+            + r"""
+        #pragma unroll
+        for (int k=0;k<64;++k) {
+            auto v=dw_chunk[k].unpack();
+            acc[k*acc_stride]+=v.r+v.i;
+        }
+"""
+            + source[off:]
+        )
+    return source
+
+
 def _horizontal_vec2_source(kernel: str) -> str:
     start = kernel.index("template<class T, class I, int WARPS")
     body = kernel.index("    const I stride_r", start)
@@ -2284,6 +2484,48 @@ __device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
         kernel = _horizontal_wave53_source(kernel, key)
     if key.horizontal_span:
         kernel = _horizontal_chunk_source(kernel, key.horizontal_span)
+    if key.horizontal_vec2 and key.horizontal_nocs:
+        vector = _horizontal_vec2_source(kernel).removeprefix(_STREAM_STORES)
+        vector = vector.replace("stream_store(reinterpret_cast<unsigned*>(dst),*reinterpret_cast<const unsigned*>(&value));",
+                                "*reinterpret_cast<unsigned*>(dst)=*reinterpret_cast<const unsigned*>(&value);")
+        if key.cache_line and not key.backward:
+            vector = vector.replace(
+                "if (!BACKWARD || pass) inputs(x,r,i);",
+                """
+                    auto* slot=reinterpret_cast<uint2*>(shared)+I(x)*threads+threadIdx.x;
+                    if (!pass) {
+                        inputs(x,r,i);
+                        auto rp=Pair<T>::pack(r), ip=Pair<T>::pack(i);
+                        *slot=make_uint2(*reinterpret_cast<unsigned*>(&rp),*reinterpret_cast<unsigned*>(&ip));
+                    } else {
+                        auto v=*slot;
+                        r=reinterpret_cast<Pair<T>*>(&v.x)->unpack();
+                        i=reinterpret_cast<Pair<T>*>(&v.y)->unpack();
+                    }""",
+            )
+        if key.horizontal_half_replay:
+            vector = vector.replace("pass<2", "pass<4").replace(
+                "t<W;++t", "t<(pass==0?W:pass==1?W-W/2:W/2);++t"
+            )
+            vector = vector.replace(
+                "int x=pass?W-1-t:t;",
+                """
+                    const bool reverse=pass&1;
+                    int x=pass==0?t:pass==1?W-1-t:pass==2?t:W/2-1-t;""",
+            )
+            a = vector.index("                    I off=base")
+            b = vector.index("            }\n        }", a)
+            loop = re.sub(r"\bpass\b", "reverse", vector[a:b])
+            loop = loop.replace("I(x/(1+COMPACT))*threads", "I(pass<2?max(0,x-W/2):x)*threads")
+            loop = loop.replace("if (!reverse &&", "if (!reverse && (pass!=0 || x>=W/2) &&")
+            vector = vector[:a] + loop + vector[b:]
+            vector = vector.replace(
+                "                #pragma unroll 4",
+                "                if (pass==2) { right[0]={}; right[1]={}; }\n                #pragma unroll 4",
+            )
+        return source[:start] + vector + source[end:]
+    if key.horizontal_nocs and key.horizontal_bf16_buf:
+        kernel = kernel.replace("Pair<float>::pack(right)", "Pair<__nv_bfloat16>::pack(right)")
     if key.horizontal_stream:
         if key.horizontal_vec2:
             return source[:start] + _horizontal_vec2_source(kernel) + source[end:]
@@ -3377,6 +3619,8 @@ W52A_MODES = (
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin")
+W55A_MODES = ("off", "v55_bf16x2_predp", "v55_bf16x2_bf16w", "v55_bf16x2_chunkacc")
+H55_MODES = ("off", "h55_fwd_vec2_cached", "h55_bwd_vec2_nocs", "h55_bwd_vec2_half", "h55_bwd_bf16_nocs")
 W54A_MODES = ("off", "v54_sacc_aw12", "v54_psacc_aw12", "v54_gacc_aw12", "v54_sacc_b4")
 H54_MODES = ("off", "h54_fwd_nocache", "h54_fwd_vec2", "h54_bwd_bf16_all",
              "h54_bwd_bf16_half", "h54_bwd_vec2", "h54_combo_vec2")
@@ -3985,21 +4229,30 @@ def _plan_h54(device: int, launch: Launch, shape: tuple, mode: str, aligned: boo
     key = base.key
     if (
         key.backward
-        and mode.startswith("h54_fwd")
+        and "_fwd_" in mode
         or not key.backward
-        and mode.startswith("h54_bwd")
+        and "_bwd_" in mode
     ):
         return base
     _, _, width, m = shape
     vec = "vec2" in mode and aligned and m % 2 == 0
+    nocs = mode in H55_MODES
+    if nocs and "vec2" in mode and not vec:
+        return base
+    if mode == "h55_bwd_bf16_nocs" and width < (48 if key.compact else 24):
+        return base
+    cached = key.backward or (nocs and width >= 24)
     half = key.backward and mode.endswith("half") and width >= 48 and not key.compact
     narrow = key.backward and (vec or width >= (48 if key.compact else 24))
     saved = (width + 1) // 2 if half else width // (1 + key.compact)
     smem = 128 * max(16, saved * (8 if vec or not narrow else 4)) if key.backward else 0
+    if cached and not key.backward:
+        smem = 128 * width * 8
     k = replace(
         key,
         warps=4,
-        horizontal_stream=True,
+        horizontal_stream=not nocs,
+        horizontal_nocs=nocs,
         horizontal_vec2=vec,
         horizontal_wave53=key.backward,
         horizontal_readonly=True,
@@ -4007,16 +4260,120 @@ def _plan_h54(device: int, launch: Launch, shape: tuple, mode: str, aligned: boo
         horizontal_compact2=narrow and not vec,
         horizontal_half_replay=half,
         horizontal_bf16_buf=narrow,
-        cache_line=key.backward,
+        cache_line=cached,
     )
     if smem > device_limits(device)[1] or not _resident(device, k, smem):
         return base
     return Launch(
-        base.plan._replace(warps=4, smem=smem, cache_line=key.backward),
+        base.plan._replace(warps=4, smem=smem, cache_line=cached),
         k,
         base.workers,
         _ceil(base.workers, 4),
     )
+
+
+@lru_cache(maxsize=512)
+def _plan_w55(device: int, launch: Launch, shape: tuple, w55: str) -> Launch:
+    height = shape[1]
+    backward, coarse = launch.key.backward, launch.key.coarse
+    if w55 == W55A_MODES[3] and launch.key.dtype == torch.float16:
+        w55 = W55A_MODES[2]
+    if w55 == W55A_MODES[3] and backward and not launch.key.odd_coarse_backward:
+        key = launch.key
+        span = height if height <= 14 else (12 if coarse else 14)
+        chunk = 0 if span == height else span
+        smem = 5632 + 128 * (16 * span + 64 * 4)
+        key = replace(
+            key,
+            vertical_w55=w55,
+            warps=4,
+            chunk=chunk,
+            backward_reduce_warps=0,
+            shared_acc=True,
+            partial_shared_acc=True,
+            backward_reload_source=True,
+            backward_segment_source=False,
+            global_checkpoints=True,
+            cache_source=False,
+            cache_line=False,
+            cache_weights=True,
+            vector_weights=True,
+            backward_readonly=True,
+            fp32_path=True,
+            tanh_gain=True,
+            backward_batch2=True,
+            backward_batch_tail=bool(height % (2 * (1 + coarse))),
+            path_bwd_pipe=0,
+            sgs=0,
+            l2_single_write=False,
+            min_blocks=0,
+        )
+        plan = ScanPlan(
+            4,
+            smem,
+            chunk,
+            cache_weights=True,
+            global_checkpoints=True,
+            shared_acc=True,
+            full_trajectory=chunk == 0,
+        )
+        scratch = _scratch_per_worker(
+            plan, height, vertical=True, coarse=coarse, backward=True, itemsize=2
+        )
+        per_worker = shape[3] * (scratch + 94 * 4 // 4)
+        workers = min(launch.workers, _scan_workspace_budget(device) // per_worker)
+        if workers and smem <= device_limits(device)[1] and _resident(device, key, smem):
+            return Launch(plan, key, workers, _ceil(workers, 4))
+        w55 = W55A_MODES[2]
+    elif w55 == W55A_MODES[3] and backward:
+        w55 = W55A_MODES[2]
+    key = replace(launch.key, vertical_w55=w55, path_bwd_pipe=0, tanh_gain=True)
+    savings = (
+        5632
+        if w55 != W55A_MODES[1]
+        and key.cache_weights
+        and key.vector_weights
+        and not key.register_path
+        else 0
+    )
+    plan = launch.plan._replace(smem=launch.plan.smem - savings)
+    if not backward and key.register_path:
+        # The register-resident weight tile competes with packed preactivations.
+        # Cache it once per CTA. A two-cell batch leaves one scalar tail at seven cells.
+        size = 11264 if w55 == W55A_MODES[1] else 5632
+        smem = plan.smem + size
+        cached = replace(key, register_path=False, cache_weights=True, vector_weights=True,
+                         register_batch2=(height // (1 + coarse) == 7))
+        if smem <= device_limits(device)[1] and _resident(device, cached, smem):
+            return launch._replace(key=cached, plan=plan._replace(cache_weights=True, smem=smem))
+
+    if backward and not key.odd_coarse_backward and key.cache_source:
+        step = 1 + coarse
+        if not (height % step or (key.chunk or height) % step):
+            key = replace(
+                key,
+                backward_batch2=True,
+                backward_batch_tail=bool(
+                    (height % (2 * step)) or ((key.chunk or height) % (2 * step))
+                ),
+            )
+    if w55 != W55A_MODES[1] and key.cache_weights and not key.register_path:
+        key = replace(key, vector_weights=True)
+        if backward and not coarse and height == 56 and key.cache_source:
+            baseline_aw = _active_warps(device, launch)
+            for span in (24, 22):
+                trial_key = replace(key, chunk=span)
+                trial_smem = _sgs_smem(trial_key, height) - 5632
+                trial = launch._replace(
+                    key=trial_key,
+                    plan=plan._replace(chunk=span, smem=trial_smem, full_trajectory=False),
+                )
+                if (
+                    trial_smem <= device_limits(device)[1]
+                    and _active_warps(device, trial) >= baseline_aw
+                ):
+                    return trial
+    return launch._replace(key=key, plan=plan)
 
 
 def _fp32_hiocc(
@@ -4223,7 +4580,8 @@ def _plan_launch(  # noqa: C901, PLR0912
         if vertical and not (pure_vertical or saved_trajectory) else "off"
     )
     w54 = _scan_mode("LNET_SCAN_W54A", W54A_MODES) if vertical else "off"
-    if w54 != "off" and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
+    w55 = _scan_mode("LNET_SCAN_W55A", W55A_MODES) if vertical else "off"
+    if (w54 != "off" or w55 != "off") and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
         wave53a = "w53_lockin"
     if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
         "off", "strict_ro",
@@ -4236,6 +4594,9 @@ def _plan_launch(  # noqa: C901, PLR0912
             if wave51a == "fp32_hiocc":
                 wave51a = "fp32"
     if not vertical and source.dtype.itemsize == 2:
+        h55 = _scan_mode("LNET_SCAN_H55", H55_MODES)
+        if h55 != "off":
+            return _plan_h54(device, launch, shape, h55, aligned)
         h54 = _scan_mode("LNET_SCAN_H54", H54_MODES)
         if h54 != "off":
             return _plan_h54(device, launch, shape, h54, aligned)
@@ -4252,6 +4613,10 @@ def _plan_launch(  # noqa: C901, PLR0912
             launch = _plan_vfwd(device, launch, height, mode)
     if wave53a != "off":
         launch = _plan_w53a(device, launch, shape, wave53a)
+        if (w55 != "off" and launch.key.hidden8 and launch.key.index32
+                and not (pure_vertical or saved_trajectory)
+                and torch.cuda.get_device_capability(device) >= (8, 0)):
+            return _plan_w55(device, launch, shape, w55)
         return launch if w54 == "off" else _plan_w54(device, launch, shape, w54)
     if wave52a != "off":
         # Both waves tune the same fused kernel and scratch allocation.
@@ -4467,7 +4832,7 @@ def _hscan(
         real, shape, backward=backward, vertical=False, coarse=False, hidden=0, precise=False,
         compact=compact,
         aligned=_vec2_aligned(real, imag, states, adjoints)
-                if os.getenv("LNET_SCAN_H54", "off") != "off" else True,
+                if any(os.getenv(v, "off") != "off" for v in ("LNET_SCAN_H54","LNET_SCAN_H55")) else True,
         **layout,
     )
     if launch is None:
@@ -4575,7 +4940,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         raise ValueError("Invalid saved vertical features")
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES)
     wave52a = "off" if pure else _wave52a_mode(states.element_size())
-    if _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
+    if _scan_mode("LNET_SCAN_W55A", W55A_MODES) == _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None and (
             mode != "off"
