@@ -146,6 +146,8 @@ class Kernel:
     min_blocks: int = 0
     horizontal_span: int = 0
     backward_segment_source: bool = False
+    dw1_tile: int = 0
+    dw1_fp32: bool = False
 
 
 class Launch(NamedTuple):
@@ -1811,7 +1813,135 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
     if key.saved_trajectory:
         source = _with_saved_quads(_saved_forward_source(source))
+    if key.dw1_tile:
+        source = _tiled_dw1_source(source, key)
     return source + wrapper
+
+
+_FLUSH_DW1 = """
+template<class T, class I, int THREADS>
+__device__ __forceinline__ void flush_dw1(
+    const Pair<T>* tile, int count, float* dw1, int M
+) {
+    // One 32-bit word per lane in every tile plane.
+    #pragma unroll 1
+    for (int j = 0; j < 8; ++j) {
+        float acc[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) acc[k] = dw1[I(8 * j + k) * M];
+        #pragma unroll 1
+        for (int t = 0; t < count; ++t) {
+            const auto* row = tile + t * 8 * THREADS;
+            const auto z = row[(4 + j / 2) * THREADS].unpack();
+            const float dz = j & 1 ? z.i : z.r;
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const auto p = row[k * THREADS].unpack();
+                acc[2 * k] = __fmaf_rn(dz, p.r, acc[2 * k]);
+                acc[2 * k + 1] = __fmaf_rn(dz, p.i, acc[2 * k + 1]);
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) dw1[I(8 * j + k) * M] = acc[k];
+    }
+}
+"""
+
+
+def _tiled_dw1_source(source: str, key: Kernel) -> str:
+    start = source.index("template<class T, class I, int HIDDEN, bool PRECISE, bool BACKWARD")
+    end = source.index("template<class T, class I, int HIDDEN, bool PRECISE, int K", start)
+    path = source[start:end].replace("int SHARED_HIDDEN = 0", "int THREADS").replace(
+        "float2 path_mlp(", "float2 path_mlp_tiled(",
+    ).replace(
+        "float* shared_dwi = nullptr, int shared_stride = 0", "Pair<T>* tile",
+    ).replace("8 * SHARED_HIDDEN", "64")
+    path = path.replace(
+        "    Sum<PRECISE> out_r, out_i;",
+        """    #pragma unroll
+    for (int k = 0; k < 4; ++k) tile[k * THREADS] = Pair<T>::pack({p[2*k], p[2*k+1]});
+    float dz_even = 0;
+    Sum<PRECISE> out_r, out_i;""",
+    ).replace(
+        "            #pragma unroll\n            for (int k = 0; k < 8; ++k) {",
+        """            if (j & 1) tile[(4 + j / 2) * THREADS] = Pair<T>::pack({dz_even, dz});
+            else dz_even = dz;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {""",
+    ).replace(
+        "                if (j < SHARED_HIDDEN) "
+        "shared_dwi[(8 * j + k) * shared_stride] += dz * p[k];\n"
+        "                else partial[(8 * (I(j) - SHARED_HIDDEN) + k) "
+        "* partial_stride] += dz * p[k];",
+        "",
+    )
+    if key.dw1_fp32:
+        path = path.replace("rounded<T>", "rounded<float>")
+    source = source[:end] + path + _FLUSH_DW1 + source[end:]
+    source = _sgs_source(source)
+    source = source.replace("T* gs, Quad<T>* pos_grad", "T*, Quad<T>* pos_grad, I pos_stride")
+    source = source.replace("const Quad<T>* pos_grad", "const Quad<T>* pos_grad, I pos_stride")
+    source = source.replace("pos_grad[I(y) * THREADS]", "pos_grad[I(y) * pos_stride]")
+    source = source.replace("gs, pos_grad);", "gs, pos_grad, g2_stride);")
+    source = source.replace(
+        "Complex& dg, Quad<T>* pos_grad\n",
+        "Complex& dg, Quad<T>* pos_grad, Pair<T>* tile, float* dw1\n",
+    )
+    source = source.replace(
+        "line_buf + (CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x",
+        "buf + I(oh) * stride, reinterpret_cast<Pair<T>*>(seg_src) + threadIdx.x, row + 4 * I(M)",
+    )
+    before = source.index("void column_backward(")
+    after = source.index("#undef CACHED_SOURCE_AT", before)
+    column = source[before:after].replace(
+        "source_cache[(j) * THREADS].unpack()", "c.source(y0 + (j))",
+    ).replace(
+        "        Quad<T>* source_cache = seg_src + (CACHE_SOURCE ? I(y0) * THREADS : 0);\n", "",
+    ).replace("source_cache[j * THREADS].unpack()", "c.source(y0 + j)")
+    column = "\n".join(
+        line for line in column.split("\n")
+        if "seg_src[" not in line
+    ).replace(
+        "#if !defined(BACKWARD_BATCH2) || defined(BACKWARD_BATCH_TAIL)",
+        "#if !defined(BACKWARD_BATCH2) || defined(BACKWARD_BATCH_TAIL)"
+        "\n        int tile_count = 0;",
+    ).replace(
+        "else path_mlp<T, I, HIDDEN, false, true>(",
+        "else path_mlp_tiled<T, I, HIDDEN, false, true, THREADS>(",
+    ).replace(
+        "acc, acc_stride, dp);", "acc, acc_stride, dp, tile + tile_count * 8 * THREADS);",
+    ).replace(
+        "            if constexpr (full) {\n                // The positive adjoint",
+        f"""            if (++tile_count == {key.dw1_tile}) {{
+                flush_dw1<T, I, THREADS>(tile, tile_count, dw1, c.M);
+                tile_count = 0;
+            }}
+            if constexpr (full) {{
+                // The positive adjoint""",
+    ).replace(
+        "        }\n#endif\n    }\n\n    adj_a",
+        "        }\n        if (tile_count) flush_dw1<T, I, THREADS>(tile, tile_count, dw1, c.M);"
+        "\n#endif\n    }\n\n    adj_a",
+    )
+    source = source[:before] + column + source[after:]
+    return source.replace(
+        "constexpr bool reduce = (PURE || SHARED_ACC || register_acc) && WARPS > 1;",
+        "constexpr bool reduce = false;",
+    ).replace(
+        "float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};",
+        "float local_acc[26]{};",
+    ).replace(
+        "            acc = local_acc;",
+        """            acc = local_acc;
+            if (active) {
+                #pragma unroll 1
+                for (int j = 0; j < 64; ++j) row[(4 + I(j)) * M] = 0;
+            }""",
+        1,
+    ).replace(
+        "for (int j = 0; j < 11 * HIDDEN + 2; ++j) row[(4 + I(j)) * M] = local_acc[j];",
+        "for (int j = 0; j < 26; ++j) row[(68 + I(j)) * M] = local_acc[j];",
+    )
 
 
 def _with_saved_quads(source: str) -> str:
@@ -2062,6 +2192,9 @@ def _odd_compact_source(source: str) -> str:
 
 
 def _effective_kernel(key: Kernel, capability: tuple[int, int]) -> Kernel:
+    if key.dw1_tile and capability < (9, 0):
+        # Ampere and Ada need more room than Hopper for the packed adjoint.
+        return replace(key, min_blocks=min(key.min_blocks, 12 // key.warps))
     if (
         (key.horizontal_unroll8 or key.horizontal_unroll) and capability >= (9, 0)
         and key.warps == 1 and (key.real_interleaved or key.imag_interleaved)
@@ -2192,7 +2325,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     with torch.cuda.device(device):
         _ensure_context(driver, device)
         if (
-            key.sgs or key.batch_path or key.register_path or key.horizontal_unroll8
+            key.dw1_tile or key.sgs or key.batch_path or key.register_path or key.horizontal_unroll8
             or key.backward_batch2 or key.backward_readonly
             or key.forward_readonly or key.horizontal_readonly or key.horizontal_unroll
             or (key.vertical and key.backward and key.chunk and key.cache_source)
@@ -2747,6 +2880,7 @@ def _plan_scan_auto(
     return launch
 
 
+W51B_MODES = ("off", "tiled_dw", "tiled_dw_fp32")
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2")
@@ -3116,6 +3250,56 @@ def _plan_structural(device: int, launch: Launch, shape: tuple[int, ...], mode: 
     return _structural_vfwd(device, launch, base, shape, mode)
 
 
+def _w51b_key(
+    base: Kernel, warps: int, chunk: int, tile: int, minimum: int, mode: str,
+) -> Kernel:
+    return replace(
+        base, warps=warps, chunk=chunk, dw1_tile=tile, dw1_fp32=mode == "tiled_dw_fp32",
+        min_blocks=minimum, cache_weights=True, vector_weights=True, cache_source=False,
+        cache_line=False, global_checkpoints=False, shared_acc=False,
+        backward_batch2=False, backward_batch_tail=False, backward_readonly=False,
+        backward_segment_source=False, backward_reduce_warps=0,
+    )
+
+
+def _w51b_smem(key: Kernel, height: int) -> int:
+    weights = 11 * 8 * 32 * 4
+    boundaries = (height - 1) // key.chunk
+    per_lane = 16 * (key.chunk + boundaries) + 32 * key.dw1_tile
+    return weights + key.warps * 32 * per_lane
+
+
+def _w51b_workspace(height: int, coarse: bool, modes: int) -> int:
+    return modes * (94 * 4 + (height + height // (1 + coarse)) * 8)
+
+
+@lru_cache(maxsize=128)
+def _plan_w51b(
+    device: int, base: Launch, shape: tuple[int, ...], mode: str,
+) -> Launch:
+    batch, height, width, modes = shape
+    if mode == "off" or height < 8 or not base.key.hidden8 or base.key.dtype.itemsize != 2:
+        return base
+    sms, limit, _ = device_limits(device)
+    tiles = _ceil(modes, 32)
+    budget = _l2_size(device) * 7 // 8 // _w51b_workspace(height, base.key.coarse, modes)
+    lines = batch * (width // (1 + base.key.coarse))
+    for target in (16, 12):
+        for warps, tile in ((4, 8), (4, 4), (8, 4)):
+            key = _w51b_key(base.key, warps, 8, tile, _ceil(target, warps), mode)
+            smem = _w51b_smem(key, height)
+            if smem > limit or not _launch_bound(device, warps, smem, target):
+                continue
+            resident = _resident(device, key, smem)
+            if resident * warps < target:
+                continue
+            workers = min(lines, _ceil(sms * resident, tiles) * warps, budget)
+            if workers <= 0:
+                continue
+            return Launch(ScanPlan(warps, smem, 8, cache_weights=True), key, workers, workers)
+    return base
+
+
 def _plan_launch(  # noqa: C901, PLR0911, PLR0912
     source: Tensor,
     shape: tuple[int, int, int, int],
@@ -3129,6 +3313,7 @@ def _plan_launch(  # noqa: C901, PLR0911, PLR0912
     interleaved: tuple[bool, bool] = (False, False),
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
+    saved_trajectory: bool = False,
 ) -> Launch | None:
     if vertical and backward:
         mode = _scan_mode("LNET_SCAN_SGS", SGS_MODES)
@@ -3167,6 +3352,12 @@ def _plan_launch(  # noqa: C901, PLR0911, PLR0912
         ))
     if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
         return _plan_structural(device, launch, shape, mode)
+    if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
+        "off", "strict_ro",
+    ):
+        candidate = _plan_w51b(device, launch, shape, _scan_mode("LNET_SCAN_W51B", W51B_MODES))
+        if candidate.key.dw1_tile:
+            return candidate
     if mode != "off":
         if not vertical:
             return _plan_hscan(device, launch, shape, mode)
@@ -3485,8 +3676,11 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         raise ValueError("Invalid saved vertical features")
     if trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
-        or (backward and saved_features is None
-            and mode != "off")
+        or (backward and saved_features is None and (
+            mode != "off"
+            or (hidden == 8 and h >= 8 and states.element_size() == 2
+                and _scan_mode("LNET_SCAN_W51B", W51B_MODES) != "off")
+        ))
     ):
         chunk = (
             _saved_backward_chunk(states, coarse)
@@ -3511,6 +3705,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         compact=compact,
         interleaved=interleaved,
         pure_vertical=pure,
+        saved_trajectory=trajectory is not None,
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
@@ -3556,7 +3751,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         gr = gi = gs = partial = None
     scratch = (
         None if launch.plan.cache_line or trajectory is not None else
-        states.new_empty((oh, launch.workers, m, 4))
+        states.new_empty((oh + (h if launch.key.dw1_tile else 0), launch.workers, m, 4))
     )
     inputs = (
         *(p.float().contiguous() for p in pole),
