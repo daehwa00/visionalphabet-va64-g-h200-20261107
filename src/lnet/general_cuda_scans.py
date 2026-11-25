@@ -104,6 +104,7 @@ class ScanPlan(NamedTuple):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Wave53Options:
     # Keep the legacy positional constructor and vars(key) snapshot compatible.
+    backward_batch4: bool = False
     backward_reload_source: bool = False
     partial_shared_acc: bool = False
     horizontal_stream: bool = False
@@ -1852,6 +1853,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _tiled_dw1_source(source, key)
     if key.backward_reload_source:
         source = _vertical_wave54_source(source, key)
+        if key.backward_batch4:
+            source = _quad_adjoint_source(source)
     return source + wrapper
 
 
@@ -2043,6 +2046,23 @@ def _saved_backward_source(key: Kernel, io: str, index: str, bounds: str) -> str
         trajectory, dp, B, H, W, M, workers, types, eps);
 }}
 """
+
+
+def _quad_adjoint_source(source: str) -> str:
+    start = source.index("void path_adjoint_pair(")
+    end = source.index("#endif", source.index("if constexpr (full) {",
+                                              source.index("path_adjoint_pair<T")))
+    quad = source[start:end]
+    for field in ("(&p)", "(&dy)", "(&dp)", "pre", " p", " dp", "dy", "gp_c",
+                  "gn_c", "next", "next_even"):
+        quad = quad.replace(field + "[2]", field + "[4]")
+    quad = quad.replace("cell < 2", "cell < 4").replace("i < 2", "i < 4")
+    quad = quad.replace("2 * step", "4 * step").replace(
+        "pre[1] = __fmaf_rn(weights[k], p[1][k], pre[1]);",
+        "\n".join(f"            pre[{i}] = __fmaf_rn(weights[k], p[{i}][k], pre[{i}]);"
+                  for i in (1, 2, 3)),
+    )
+    return source[:start] + quad.replace("path_adjoint_pair", "path_adjoint_quad") + source[end:]
 
 
 def _vertical_wave54_source(source: str, key: Kernel) -> str:
@@ -3357,7 +3377,7 @@ W52A_MODES = (
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin")
-W54A_MODES = ("off", "v54_sacc_aw12", "v54_psacc_aw12", "v54_gacc_aw12")
+W54A_MODES = ("off", "v54_sacc_aw12", "v54_psacc_aw12", "v54_gacc_aw12", "v54_sacc_b4")
 H54_MODES = ("off", "h54_fwd_nocache", "h54_fwd_vec2", "h54_bwd_bf16_all",
              "h54_bwd_bf16_half", "h54_bwd_vec2", "h54_combo_vec2")
 H53_MODES = ("h53_ro_all", "h53_compact2", "h53_bf16_buf", "h53_l2_scratch", "h53_lockin")
@@ -3900,15 +3920,19 @@ def _plan_w54(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
         return launch
     shared = mode != "v54_gacc_aw12"
     partial = mode == "v54_psacc_aw12"
+    # The coarse four-cell adjoint needs 254–255 registers on SM90.
+    quad = mode == "v54_sacc_b4" and not key.coarse
     step = 1 + key.coarse
     # The scalar tail of global accumulation exceeded the SM90 register budget.
     if not shared and h % (2 * step):
         return launch
     candidates = []
-    for warps in (4, 3):
+    for warps in ((4,) if quad else (4, 3)):
         spans = set(range(2 * step, min(h, 20) + 1, 2 * step))
         if h <= 14:
             spans.add(h)
+        if quad:
+            spans = {min(8, h)}
         for span in spans:
             chunk = 0 if span == h else span
             fields = (64 if partial else 90) if shared else 0
@@ -3933,8 +3957,9 @@ def _plan_w54(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
                 fp32_path=True,
                 tanh_gain=True,
                 backward_batch2=True,
+                backward_batch4=quad,
                 path_bwd_pipe=0,
-                backward_batch_tail=bool(h % (2 * step)),
+                backward_batch_tail=bool(h % ((4 if quad else 2) * step)),
                 sgs=0,
                 l2_single_write=False,
                 min_blocks=0,

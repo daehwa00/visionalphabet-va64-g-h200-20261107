@@ -170,6 +170,8 @@ def test_sm90(monkeypatch, resources, dtype):
                 if vertical:
                     if key.backward_reload_source:
                         assert aw >= 12 and regs <= 168
+                        if mode == "v54_sacc_b4":
+                            assert key.backward_batch4 == (not shape[4])
                         if not key.shared_acc:
                             assert launch.workers == launch.partials
                             assert launch.workers * 94 * shape[3] * 4 <= 36 << 20
