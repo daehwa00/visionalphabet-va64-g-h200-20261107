@@ -28,6 +28,75 @@ requires_cuda = pytest.mark.skipif(
 def isolate_reader_options(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LNET_READER_OPT", raising=False)
     monkeypatch.delenv("LNET_READER_VEC", raising=False)
+    monkeypatch.delenv("LNET_READER_W44", raising=False)
+
+
+def test_w44_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert kernels._reader_w44() == "off"
+    assert kernels._lane_utilization(160, 1) == 1
+    assert kernels._lane_utilization(160, 2) == 160 / 192
+    assert kernels._lane_utilization(128, 2) == 1
+    assert kernels._halo_extent(13, 4, 3) == 19
+    monkeypatch.setenv("LNET_READER_W44", "unknown")
+    with pytest.raises(ValueError, match="LNET_READER_W44"):
+        kernels.real_packed_spatial(torch.empty(1, 1, 1, 1), torch.empty(1, 2, 1, 1, 1))
+
+
+@pytest.mark.parametrize("mode", kernels._W44_MODES[1:])
+def test_w44_plans_reject_local_memory(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    monkeypatch.setenv("LNET_READER_W44", mode)
+    props = SimpleNamespace(major=9, multi_processor_count=132, shared_memory_per_block=49152,
+                            max_threads_per_multi_processor=2048, total_memory=140 * 2**30)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+    monkeypatch.setattr(kernels, "_reader_module_for", lambda *_a, **kw: kw)
+
+    def resident(module, op, warps) -> int:
+        if op == "dweight" and module.get("convert_weight"):
+            return 0
+        if op != "dweight" and module["launch"].vec == 2:
+            return 0
+        return 16 // warps
+
+    monkeypatch.setattr(kernels, "_reader_resident", resident)
+    p = torch.empty((1024, 56, 56, 640), device="meta", dtype=torch.bfloat16)
+    w = torch.empty((160, 4, 3, 3), device="meta", dtype=p.dtype)
+    g = torch.empty((1024, 56, 56, 320), device="meta", dtype=p.dtype)
+    if mode in ("dw_fullrank", "dw_fullrank_cvt", "all_opt"):
+        launch = kernels._reader_weight_plan(p, w, g, strict=False)
+        assert launch.module["weight_geometry"][0] == 4
+        assert launch.module["weight_vec"] == 1
+        assert not launch.module.get("convert_weight")
+    for backward, spatial_mode in ((False, "fwd_lane_opt"), (True, "dinput_wide")):
+        if mode in (spatial_mode, "all_opt"):
+            launch, module = kernels._reader_spatial_plan(
+                p, w, g if backward else None, strict=False,
+            )
+            assert launch.vec == 1
+            assert module["updated"]
+
+
+@requires_cuda
+@pytest.mark.parametrize("mode", kernels._W44_MODES[1:])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("h", "w", "modes", "rank"), [(14, 14, 160, 4), (13, 19, 63, 4), (9, 11, 34, 4)],
+)
+def test_w44_cuda_parity(monkeypatch, mode, dtype, h, w, modes, rank) -> None:
+    torch.manual_seed(44)
+    options = {"device": "cuda", "dtype": dtype}
+    p = torch.randn(16, h, w, modes * rank, **options).mul_(0.125)
+    g = torch.randn(16, h, w, modes * 2, **options).mul_(0.125)
+    filters = torch.randn(2, modes, rank, 3, 3, **options).mul_(0.125)
+
+    def run() -> tuple[torch.Tensor, ...]:
+        return (kernels.real_packed_spatial(p, filters, component_first=True),
+                *kernels._packed_spatial_backward(g, p, *filters.unbind(), strict_complex=False))
+
+    monkeypatch.setenv("LNET_READER_W44", "off")
+    expected = run()
+    monkeypatch.setenv("LNET_READER_W44", mode)
+    for actual, reference in zip(run(), expected, strict=True):
+        torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.005)
 
 
 @pytest.mark.parametrize(
