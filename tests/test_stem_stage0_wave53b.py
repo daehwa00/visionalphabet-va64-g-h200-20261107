@@ -2,12 +2,17 @@
 
 import re
 import subprocess
+import sys
+from functools import partial
 
+import bench_wave53b_stem_type1 as bench
 import pytest
 import torch
+from bench_wave52b_stem_type1 import reference_gradients
 from bench_wave53b_stem_type1 import DTYPES, LAYOUTS, MODES, check_case, check_large_reductions
 
 from lnet import fused_stem_ops as stem
+from lnet.image_layers import LayerNorm2d, _fused_stem_block
 
 V3 = MODES[2:]
 
@@ -29,6 +34,31 @@ def test_config(mode, monkeypatch) -> None:
             block,
             1024 * 112**2 // block,
         )
+
+
+def test_cpu_check_case_has_no_grad_fn_at_capture(monkeypatch) -> None:
+    x = torch.randn(1, 3, 5, 7, requires_grad=True)
+    conv = torch.nn.Conv2d(3, 32, 3, stride=2, padding=1)
+    norm = LayerNorm2d(32)
+    dy = torch.randn(1, 32, 3, 4)
+    assert all(t.grad_fn is None for t in reference_gradients(x, conv, norm, dy))
+    monkeypatch.setattr(bench, "stem_case", lambda *args, **kwargs: (x, conv, norm, dy))
+    monkeypatch.setattr(bench, "stem_forward", lambda *_: lambda v: _fused_stem_block(v, conv, norm))
+    monkeypatch.setattr(torch, "compile", partial(torch.compile, backend="aot_eager"))
+    captures = []
+
+    def capture_probe(step):
+        # Inspect check_case at the exact boundary where CUDA capture would begin.
+        scope = sys._getframe(1).f_locals
+        assert all(t.grad_fn is None for t in scope.values() if isinstance(t, torch.Tensor))
+        assert all(t.grad_fn is None for name in ("expected", "eager") for t in scope[name])
+        assert all(t.grad_fn is None for t in step())
+        captures.append(True)
+        return True
+
+    monkeypatch.setattr(bench, "graph_finite", capture_probe)
+    check_case(torch.contiguous_format, torch.float32, needs_dx=True, bias=True)
+    assert captures == [True]
 
 
 def _compile(kernel, pointers, constants, warps, stages, tmp_path, spill_limit=(0, 0)):
