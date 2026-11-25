@@ -109,6 +109,8 @@ class Kernel:
     coarse: bool = False
     hidden8: bool = False
     pure_vertical: bool = False
+    state_layout: str = "planar"
+    forward_cache_source: bool = False
     index32: bool = True
     chunk: int = _CHECKPOINT_CHUNK
     cache_weights: bool = False
@@ -1615,7 +1617,173 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _sgs_source(source)
     if key.backward_reduce_warps:
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
+    if key.state_layout != "planar":
+        source = _quad_state_source(source, key)
+    if key.forward_cache_source:
+        source = _vfwd_cache_source(source).replace(
+            "seg_src + (BACKWARD ? I(CACHE_SOURCE ? H : span) * threads : 0)",
+            "seg_src + I(H) * threads",
+        )
     return source + wrapper
+
+
+def _quad_state_source(source: str, key: Kernel) -> str:
+    transposed = str(key.state_layout == "quad_whm").lower()
+    load = "__ldg(address)" if (
+        key.forward_readonly or key.backward_readonly or key.horizontal_readonly
+    ) else "*address"
+    helper = r"""
+constexpr bool quad_whm = TRANSPOSED;
+
+template<class T> struct Quad;
+template<class T, class I>
+__device__ __forceinline__ Quad<T> load_quad(const T* ptr, I i) {
+    const auto* address = reinterpret_cast<const uint2*>(ptr) + i;
+    const uint2 bits = LOAD;
+    return {*reinterpret_cast<const Pair<T>*>(&bits.x),
+            *reinterpret_cast<const Pair<T>*>(&bits.y)};
+}
+
+template<class T, class I>
+__device__ __forceinline__ void store_quad(T* ptr, I i, Pair<T> a, Pair<T> b) {
+    reinterpret_cast<uint2*>(ptr)[i] = make_uint2(
+        *reinterpret_cast<const unsigned*>(&a), *reinterpret_cast<const unsigned*>(&b));
+}
+
+template<class I>
+__device__ __forceinline__ I quad_index(I line, int x, int h, int w, int m) {
+    return quad_whm ? ((line / h) * w * h + I(x) * h + line % h) * m : (line * w + x) * m;
+}
+
+""".replace("TRANSPOSED", transposed).replace("LOAD", load)
+    if (key.backward and not key.vertical) or key.coarse:
+        # Retain the vector width when the recurrence consumes only one pair.
+        helper = helper.replace(
+            f"const uint2 bits = {load};",
+            'uint2 bits;\n    asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];"'
+            ' : "=r"(bits.x), "=r"(bits.y) : "l"(address));',
+        )
+    start = source.rindex("template<", 0, source.index("void horizontal("))
+    quad = source.index("template<class T> struct Quad {")
+    quad_end = source.index("template<class T, class I>\nstruct Column", quad)
+    source = (
+        source[:start] + helper + source[quad:quad_end] + source[start:quad] + source[quad_end:]
+    )
+    if key.vertical:
+        return _quad_vertical_source(source, key)
+    if key.backward:
+        source = source.replace("#pragma unroll BACKWARD_UNROLL", "#pragma unroll 1")
+    return (source.replace(
+        "const I base = line * W * M + m;",
+        "const I base = line * W * M + m;"
+        " const I qs = quad_index(line, 0, H, W, M) + m;"
+        " const I qg = COMPACT ? quad_index(line, 0, H, W / 2, M) + m : qs;"
+        " const I pitch = I(quad_whm ? H : 1) * M;",
+    ).replace(
+        "store_complex(out, base + I(x) * M, plane, pos);",
+        "reinterpret_cast<Pair<T>*>(out)[2 * (qs + I(x) * pitch)]"
+        " = Pair<T>::pack(pos);",
+    ).replace(
+        "store_complex(out, 2 * plane + base + I(x) * M, plane, neg);",
+        "const I idx = qs + I(x) * pitch;\n"
+        "                    store_quad(out, idx, reinterpret_cast<Pair<T>*>(out)[2 * idx],"
+        " Pair<T>::pack(neg));",
+    ).replace(
+        "const I gi = COMPACT ? grad_base + I(x / 2) * M : i;",
+        "const I gi = qg + I(x / (1 + COMPACT)) * pitch;",
+    ).replace(
+        f"{'load_complex_readonly' if key.horizontal_readonly else 'load_complex'}"
+        "(grad, 2 * grad_plane + gi, grad_plane)",
+        "load_quad(grad, gi).b.unpack()",
+    ).replace(
+        f"{'load_complex_readonly' if key.horizontal_readonly else 'load_complex'}"
+        "(grad, gi, grad_plane)",
+        "load_quad(grad, gi).a.unpack()",
+    ).replace(
+        f"{'load_complex_readonly' if key.horizontal_readonly else 'load_complex'}"
+        "(states, i - M, plane)",
+        "load_quad(states, qs + I(x - 1) * pitch).a.unpack()",
+    ))
+
+
+def _quad_vertical_source(source: str, key: Kernel) -> str:
+    start = source.index("    __device__ Quad<T> packed_source(int y)")
+    end = source.index("    __device__ float2 gain", start)
+    source = source[:start] + r"""
+    I packed_a, packed_b, grad_a, grad_b;
+
+    __device__ Quad<T> packed_source(int y) const {
+        const I row = I(y) * (quad_whm ? 1 : W) * M;
+        const auto first = load_quad(states, packed_a + row);
+        return {first.a, PACKED_SECOND};
+    }
+
+    __device__ float4 source(int y) const { return packed_source(y).unpack(); }
+
+""" + source[end:]
+    second = "load_quad(states, packed_b + row).b" if key.coarse else "first.b"
+    source = source.replace("PACKED_SECOND", second).replace(
+        "vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps};",
+        "vx[I(xa) * M + m], vx[(I(W) + xb) * M + m], eps,"
+        " quad_index(b * H, xa, H, W, M) + m, quad_index(b * H, xb, H, W, M) + m,"
+        " quad_index(b * H, COMPACT ? x : xa, H, COMPACT ? ow : W, M) + m,"
+        " quad_index(b * H, COMPACT ? x : xb, H, COMPACT ? ow : W, M) + m};",
+    )
+    if not key.backward:
+        return source
+    start = source.index("    Complex ds_a", source.index("void write_column_gradient("))
+    end = source.index("\n}", start)
+    source = source[:start] + r"""
+    const I row = I(y) * (quad_whm ? 1 : COMPACT ? c.OW : c.W) * c.M;
+    const I ia = c.grad_a + row;
+    const I ib = c.grad_b + row;
+    auto packed = Quad<T>::pack(ds);
+    if constexpr (REVERSE) {
+        const auto a = packed.a.unpack(), b = packed.b.unpack();
+        const auto first = ACCUMULATE ? load_quad(gs, ia) : positive;
+        const auto second = ACCUMULATE && ia != ib ? load_quad(gs, ib) : first;
+        packed = {Pair<T>::pack(a + first.a.unpack()), Pair<T>::pack(b + second.b.unpack())};
+    }
+    if (ia == ib) {
+        store_quad(gs, ia, packed.a, packed.b);
+    } else {
+        store_quad(gs, ia, packed.a, Pair<T>::pack({}));
+        store_quad(gs, ib, Pair<T>::pack({}), packed.b);
+    }""" + source[end:]
+    if not key.coarse or key.compact:
+        source = source.replace(
+            "const I ib = c.grad_b + row;",
+            "const I ib = ia;",
+        )
+    start = source.index("    if constexpr (!COMPACT)", source.index("void clear_unused_columns("))
+    end = source.index("\n}", start)
+    source = source[:start] + source[end:]
+    return source.replace(
+        "const I tail = I(y) * c.W * c.M + c.offset_b + 2 * I(c.M);\n"
+        "                        store_complex(gs, tail, c.plane, {});\n"
+        "                        store_complex(gs, tail + 2 * c.plane, {});",
+        "const I tail = c.grad_b + "
+        "(I(y) * (quad_whm ? 1 : c.W) + 2 * (quad_whm ? c.H : 1)) * c.M;\n"
+        "                        store_quad(gs, tail, Pair<T>::pack({}), Pair<T>::pack({}));",
+    )
+
+
+def _vfwd_cache_source(source: str) -> str:
+    start = source.index("                float4 state{};", source.index("void vertical("))
+    end = source.index("            }\n        }", start)
+    forward, reverse = source[start:end].split("                state = {};", 1)
+    forward = forward.replace(
+        "                for (int y = 0;", "                auto* cache = seg_src + threadIdx.x;\n"
+        "                for (int y = 0;",
+    ).replace(
+        "                    state = advance_forward",
+        "                    const auto packed = c.packed_source(y);\n"
+        "                    cache[I(y) * threads] = packed;\n"
+        "                    state = advance_forward",
+    ).replace("c.source(y)", "packed.unpack()")
+    for row in ("y", "y + 1", "H - 1"):
+        reverse = reverse.replace(f"c.source({row})", f"cache[I({row}) * threads].unpack()")
+    return source[:start] + forward + "                state = {};" + reverse + source[end:]
 
 
 def _horizontal_candidate_source(source: str, key: Kernel) -> str:
@@ -1933,6 +2101,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
         _ensure_context(driver, device)
         if (
             key.sgs or key.batch_path or key.register_path or key.horizontal_unroll8
+            or key.state_layout != "planar" or key.forward_cache_source
             or key.backward_batch2 or key.backward_readonly
             or key.forward_readonly or key.horizontal_readonly or key.horizontal_unroll
             or (key.vertical and key.backward and key.chunk and key.cache_source)
@@ -2488,7 +2657,7 @@ def _plan_scan_auto(
 
 
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
-VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
+VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc", "batch4_w2_cs")
 HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2")
 
 
@@ -2856,7 +3025,69 @@ def _plan_structural(device: int, launch: Launch, shape: tuple[int, ...], mode: 
     return _structural_vfwd(device, launch, base, shape, mode)
 
 
-def _plan_launch(  # noqa: C901, PLR0911, PLR0912
+def _cache_vertical_source(device: int, launch: Launch, height: int) -> Launch:
+    key = launch.key
+    if not (key.hidden8 and key.dtype.itemsize == 2):
+        return launch
+    smem = launch.plan.smem + height * key.warps * _WARP_SIZE * 8
+    if smem > device_limits(device)[1]:
+        return launch
+    # Shared memory alone can rule out the candidate before compiling it.
+    baseline = _resident(device, key, launch.plan.smem)
+    shared, _, reserved = _sgs_device_limits(device)
+    if not baseline or (smem + reserved) * baseline > shared:
+        return launch
+    candidate = replace(key, forward_cache_source=True)
+    if _resident(device, candidate, smem) < baseline:
+        return launch
+    return launch._replace(key=candidate, plan=launch.plan._replace(smem=smem))
+
+
+STATE_LAYOUTS = ("planar", "quad_hwm", "quad_whm")
+
+
+def scan_state_layout(source: Tensor) -> str:
+    if not source.is_cuda or source.dtype.itemsize != 2:
+        return "planar"
+    layout = _scan_mode("LNET_SCAN_STATE_LAYOUT", ("off", *STATE_LAYOUTS))
+    return "planar" if layout == "off" else layout
+
+
+def state_storage_shape(shape: tuple, layout: str) -> tuple:
+    b, h, w, m = shape
+    if layout == "quad_hwm":
+        return b, h, w, m, 4
+    if layout == "quad_whm":
+        return b, w, h, m, 4
+    return 4, b, h, w, m
+
+
+def convert_state_layout(states: Tensor, layout: str, target: str) -> Tensor:
+    if layout == target:
+        return states
+    if layout == "quad_hwm":
+        states = states.permute(4, 0, 1, 2, 3)
+    elif layout == "quad_whm":
+        states = states.permute(4, 0, 2, 1, 3)
+    if target == "quad_hwm":
+        states = states.permute(1, 2, 3, 4, 0)
+    elif target == "quad_whm":
+        states = states.permute(1, 3, 2, 4, 0)
+    return states.contiguous()
+
+
+def _vertical_state_metadata(states: Tensor, auxiliary: list[Tensor]) -> tuple[str, tuple]:
+    # The gain tables carry the logical axes independently of the state buffer.
+    layout = scan_state_layout(states)
+    if layout != "planar" and states.ndim == 5 and len(auxiliary) == 2:
+        b, first, second, m, p = states.shape
+        h, w = (first, second) if layout == "quad_hwm" else (second, first)
+        if p == 4 and auxiliary[0].shape == (2, w, m) and auxiliary[1].shape == (2, h, m):
+            return layout, (b, h, w, m)
+    return "planar", tuple(states.shape[1:])
+
+
+def _plan_launch(  # noqa: C901, PLR0912
     source: Tensor,
     shape: tuple[int, int, int, int],
     *,
@@ -2869,11 +3100,16 @@ def _plan_launch(  # noqa: C901, PLR0911, PLR0912
     interleaved: tuple[bool, bool] = (False, False),
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
+    state_layout: str = "planar",
 ) -> Launch | None:
+    cache_forward = False
     if vertical and backward:
         mode = _scan_mode("LNET_SCAN_SGS", SGS_MODES)
     elif vertical:
         mode = _scan_mode("LNET_SCAN_VFWD", VFWD_MODES)
+        cache_forward = mode == "batch4_w2_cs" and not pure_vertical
+        if mode == "batch4_w2_cs":
+            mode = "batch4_w2"
     else:
         mode = _scan_mode("LNET_SCAN_HSCAN", HSCAN_MODES)
     if not source.is_cuda or source.dtype not in _DTYPES:
@@ -2883,7 +3119,9 @@ def _plan_launch(  # noqa: C901, PLR0911, PLR0912
     index_bound = source.numel() * (2 if pure_vertical else 1)
     if pure_vertical:
         index_bound = max(index_bound, source.stride(0) * 4)
-    if not vertical:
+    if state_layout != "planar":
+        index_bound = 2 * shape[0] * shape[1] * shape[2] * shape[3]
+    elif not vertical:
         index_bound *= 4
     device = source.device.index or 0
     launch = _launch_for_shape(
@@ -2906,14 +3144,22 @@ def _plan_launch(  # noqa: C901, PLR0911, PLR0912
             backward_batch2=False, backward_batch_tail=False,
         ))
     if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
-        return _plan_structural(device, launch, shape, mode)
-    if mode != "off":
+        launch = _plan_structural(device, launch, shape, mode)
+    elif mode != "off":
         if not vertical:
-            return _plan_hscan(device, launch, shape, mode)
-        if backward:
-            return _plan_sgs(device, launch, shape, mode)
-        return _plan_vfwd(device, launch, height, mode)
-    return launch
+            launch = _plan_hscan(device, launch, shape, mode)
+        elif backward:
+            launch = _plan_sgs(device, launch, shape, mode)
+        else:
+            launch = _plan_vfwd(device, launch, height, mode)
+    if state_layout != "planar":
+        # The planar minimum-block hints were tuned for different address
+        # lifetimes, and can force spills when inherited by packed kernels.
+        min_blocks = 1 if backward and not vertical else 0
+        launch = launch._replace(key=replace(
+            launch.key, state_layout=state_layout, min_blocks=min_blocks,
+        ))
+    return _cache_vertical_source(device, launch, height) if cache_forward else launch
 
 
 # Custom ops and public API
@@ -2953,10 +3199,17 @@ def _vertical_inputs_ok(
     path: list[Tensor],
     *,
     coarse: bool,
+    state_layout: str | None = None,
 ) -> bool:
-    if states.ndim != 5 or states.shape[0] != 4 or len(auxiliary) != 2 or len(path) != 4:
+    if states.ndim != 5 or len(auxiliary) != 2 or len(path) != 4:
         return False
-    _, _, h, w, m = states.shape
+    layout, shape = (
+        ("planar", tuple(states.shape[1:])) if state_layout == "planar"
+        else _vertical_state_metadata(states, auxiliary)
+    )
+    _, h, w, m = shape
+    if tuple(states.shape) != state_storage_shape(shape, layout):
+        return False
     if coarse and (h % 2 or w % 2) and states.dtype.itemsize != 2:
         return False
     if not _matching(states, [*auxiliary, *path]):
@@ -3000,7 +3253,7 @@ def can_use_general_vscan(
         and (pole is None or _pole_ok(pole, states))
         and _eligible(
             states,
-            tuple(states.shape[1:]),
+            _vertical_state_metadata(states, auxiliary)[1],
             vertical=True,
             coarse=coarse,
             hidden=path[0].shape[1],
@@ -3076,6 +3329,13 @@ def _horizontal_layout(real: Tensor, imag: Tensor) -> dict[str, tuple[bool, bool
     }
 
 
+def _contiguous_scan_states(states: Tensor, layout: str) -> Tensor:
+    states = states.contiguous()
+    if layout != "planar" and states.storage_offset() % 4:
+        return states.clone()
+    return states
+
+
 def _hscan(
     pole: list[Tensor],
     real: Tensor,
@@ -3096,18 +3356,27 @@ def _hscan(
         raise ValueError("Invalid horizontal scan inputs")
     backward = adjoints is not None
     b, h, w, m = shape
-    adjoint_shape = (4, b, h, w // 2 if compact else w, m)
+    state_layout = scan_state_layout(real)
+    if states is not None and tuple(states.shape) != state_storage_shape(shape, state_layout):
+        state_layout = "planar"
+    adjoint_shape = state_storage_shape((b, h, w // 2 if compact else w, m), state_layout)
     if backward and (
         states is None
-        or tuple(states.shape) != (4, b, h, w, m)
+        or tuple(states.shape) != state_storage_shape(shape, state_layout)
         or tuple(adjoints.shape) != adjoint_shape
-        or (compact and w % 2)
         or states.dtype != real.dtype
         or adjoints.dtype != real.dtype
         or states.device != real.device
         or adjoints.device != real.device
     ):
         raise ValueError("Expected packed horizontal states and adjoints matching the source")
+    if adjoints is not None and compact and w % 2:
+        planes = convert_state_layout(adjoints, state_layout, "planar")
+        dense = planes.new_zeros((4, b, h, w, m))
+        dense[:2, :, :, 1::2] = planes[:2]
+        dense[2:, :, :, :w - 1:2] = planes[2:]
+        adjoints = convert_state_layout(dense, "planar", state_layout)
+        compact = False
     layout = _horizontal_layout(real, imag)
     real_input, imag_input = (
         value if interleaved or transposed else value.contiguous()
@@ -3118,6 +3387,7 @@ def _hscan(
     launch = _plan_launch(
         real, shape, backward=backward, vertical=False, coarse=False, hidden=0, precise=False,
         compact=compact,
+        state_layout=state_layout,
         **layout,
     )
     if launch is None:
@@ -3130,14 +3400,14 @@ def _hscan(
             real.new_empty((w // (1 + int(compact)), launch.workers, m, 2), dtype=torch.float32)
         )
     else:
-        out = real.new_empty((4, b, h, w, m))
+        out = real.new_empty(state_storage_shape(shape, state_layout))
         partial = scratch = None
     inputs = (
         *(p.float().contiguous() for p in pole),
         real_input,
         imag_input,
-        states.contiguous() if states is not None else None,
-        adjoints.contiguous() if adjoints is not None else None,
+        _contiguous_scan_states(states, state_layout) if states is not None else None,
+        _contiguous_scan_states(adjoints, state_layout) if adjoints is not None else None,
     )
     _dispatch(
         real,
@@ -3180,7 +3450,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     state_grad: Tensor | None = None,
     pure: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
-    shape = tuple(states.shape[1:])
+    state_layout, shape = _vertical_state_metadata(states, auxiliary)
     if (
         not _shape_supported(shape)
         or not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
@@ -3206,7 +3476,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         interleaved = (not gr.is_contiguous(), not gi.is_contiguous())
     if coarse and not (oh and ow):
         if backward:
-            grad_shape = (4, b, h, ow if compact else w, m)
+            grad_shape = state_storage_shape((b, h, ow if compact else w, m), state_layout)
             return [
                 *[torch.zeros_like(t) for t in pole], states.new_zeros(grad_shape),
                 *[torch.zeros_like(t) for t in path],
@@ -3222,7 +3492,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or not saved_features.is_contiguous()
     ):
         raise ValueError("Invalid saved vertical features")
-    if not pure and not (
+    if state_layout == "planar" and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None
             and mode != "off")
@@ -3250,6 +3520,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         compact=compact,
         interleaved=interleaved,
         pure_vertical=pure,
+        state_layout=state_layout,
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
@@ -3259,7 +3530,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         outr = outi = None
         # Coarse selects odd columns from positive and even columns from negative.
         gs = (
-            states.new_empty((4, b, h, ow if compact else w, m))
+            states.new_empty(state_storage_shape((b, h, ow if compact else w, m), state_layout))
             if state_grad is None else state_grad
         )
         fields = 4 if pure else 11 * hidden + 6
@@ -3289,7 +3560,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     )
     inputs = (
         *(p.float().contiguous() for p in pole),
-        states if pure else states.contiguous(),
+        states if pure else _contiguous_scan_states(states, state_layout),
         *(t.float().contiguous() for t in auxiliary),
         *(None if pure else tensor.contiguous() for tensor in path),
     )
@@ -3361,7 +3632,9 @@ def _total_vram(device: torch.device) -> int:
 
 def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
     policy = os.environ.get("LNET_VSCAN_DECOUPLED")
-    if not states.is_cuda or policy not in {"saved", "test_saved"}:
+    if scan_state_layout(states) != "planar" or not states.is_cuda or policy not in {
+        "saved", "test_saved",
+    }:
         return False
     vram = _total_vram(states.device)
     if policy == "saved" and vram < 48 * 1024**3:
@@ -3535,7 +3808,7 @@ def _reference_vertical(
     coarse: bool,
     epsilon: float,
 ) -> tuple[Tensor, Tensor]:
-    if not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse):
+    if not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse, state_layout="planar"):
         raise ValueError("Invalid vertical reference inputs")
     dr, di, gr, gi = (p.reshape(-1).float() for p in pole)
     vx, vy = (v.detach().float() for v in auxiliary)
@@ -3585,9 +3858,10 @@ def _fake_hforward(
     pole: list[Tensor],  # noqa: ARG001
     real: Tensor,
     imag: Tensor,  # noqa: ARG001
-    mode: str = "cuda",  # noqa: ARG001
+    mode: str = "cuda",
 ) -> Tensor:
-    return real.new_empty((4, *real.shape))
+    layout = scan_state_layout(real) if mode == "cuda" else "planar"
+    return real.new_empty(state_storage_shape(tuple(real.shape), layout))
 
 
 @torch.library.custom_op("lnet::general_hscan_backward", mutates_args=())
@@ -3644,14 +3918,17 @@ def _vertical_forward(
 def _fake_vforward(
     pole: list[Tensor],  # noqa: ARG001
     states: Tensor,
-    auxiliary: list[Tensor],  # noqa: ARG001
+    auxiliary: list[Tensor],
     path: list[Tensor],  # noqa: ARG001
     coarse: bool = False,
     epsilon: float = 1e-6,  # noqa: ARG001
     precise: bool = True,  # noqa: ARG001
-    mode: str = "cuda",  # noqa: ARG001
+    mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
-    _, b, h, w, m = states.shape
+    _, (b, h, w, m) = (
+        ("planar", tuple(states.shape[1:])) if mode == "reference"
+        else _vertical_state_metadata(states, auxiliary)
+    )
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
     return states.new_empty(shape), states.new_empty(shape)
@@ -3678,13 +3955,13 @@ def vertical_forward_packed(
 def _fake_vforward_packed(
     pole: list[Tensor],  # noqa: ARG001
     states: Tensor,
-    auxiliary: list[Tensor],  # noqa: ARG001
+    auxiliary: list[Tensor],
     path: list[Tensor],  # noqa: ARG001
     coarse: bool,
     epsilon: float,  # noqa: ARG001
     planar: bool,
 ) -> Tensor:
-    _, b, h, w, m = states.shape
+    _, (b, h, w, m) = _vertical_state_metadata(states, auxiliary)
     step = 2 if coarse else 1
     shape = (b, h // step, w // step)
     return states.new_empty((2, *shape, m) if planar else (*shape, 2 * m))
@@ -3716,7 +3993,7 @@ def vertical_backward(
 def _fake_vbackward(
     pole: list[Tensor],
     states: Tensor,
-    auxiliary: list[Tensor],  # noqa: ARG001
+    auxiliary: list[Tensor],
     path: list[Tensor],
     grad_real: Tensor,  # noqa: ARG001
     grad_imag: Tensor,  # noqa: ARG001
@@ -3725,10 +4002,10 @@ def _fake_vbackward(
     compact: bool = False,
     saved_features: Tensor | None = None,  # noqa: ARG001
 ) -> list[Tensor]:
-    _, b, h, w, m = states.shape
+    layout, (b, h, w, m) = _vertical_state_metadata(states, auxiliary)
     return [
         *(p.new_empty(p.shape) for p in pole),
-        states.new_empty((4, b, h, w // 2 if compact else w, m)),
+        states.new_empty(state_storage_shape((b, h, w // 2 if compact else w, m), layout)),
         *(p.new_empty(p.shape) for p in path),
     ]
 
@@ -3914,7 +4191,8 @@ def try_general_horizontal_forward(
     pole: Sequence[Tensor], source: tuple[Tensor, Tensor],
 ) -> Tensor | None:
     if can_use_general_hscan(*source, list(pole)):
-        return horizontal_forward(list(pole), *source)
+        states = horizontal_forward(list(pole), *source)
+        return convert_state_layout(states, scan_state_layout(source[0]), "planar")
     return None
 
 
@@ -3930,7 +4208,12 @@ def try_general_horizontal_backward(
         states = torch.stack(tuple(states))
     if not isinstance(adjoints, Tensor):
         adjoints = torch.stack(tuple(adjoints))
-    return horizontal_backward(list(pole), list(source), states, adjoints)
+    layout = scan_state_layout(source[0])
+    return horizontal_backward(
+        list(pole), list(source),
+        convert_state_layout(states, "planar", layout),
+        convert_state_layout(adjoints, "planar", layout),
+    )
 
 
 def _general_vertical_inputs(
@@ -3945,12 +4228,24 @@ def _general_vertical_inputs(
             return None
         states = torch.stack(tuple(states))
     coarse = epilogue == "coarse_path"
-    if coarse and states.ndim == 5 and (states.shape[2] % 2 or states.shape[3] % 2):
+    _, shape = _vertical_state_metadata(states, list(auxiliary[:2]))
+    if coarse and scan_state_layout(states) == "planar" and len(shape) == 4 and (
+        shape[1] % 2 or shape[2] % 2
+    ):
         return None
     pole, auxiliary, path = list(pole), list(auxiliary[:2]), list(path)
     if not can_use_general_vscan(states, auxiliary, path, coarse=coarse, pole=pole):
         return None
     return pole, states, auxiliary, path, coarse
+
+
+def _legacy_vertical_storage(states: Tensor | Sequence[Tensor]) -> Tensor | Sequence[Tensor]:
+    if isinstance(states, Tensor):
+        return convert_state_layout(states, "planar", scan_state_layout(states))
+    layout = scan_state_layout(states[0])
+    if layout != "planar":
+        return convert_state_layout(torch.stack(tuple(states)), "planar", layout)
+    return states
 
 
 def try_general_vertical_forward(
@@ -3959,7 +4254,9 @@ def try_general_vertical_forward(
     epilogue: str, epsilon: float, kind: int,
     packed: bool, planar: bool, swiglu: bool, squeeze: bool,
 ) -> tuple[Tensor, Tensor, Tensor] | None:
-    inputs = _general_vertical_inputs(pole, states, auxiliary, path, epilogue, kind, swiglu)
+    inputs = _general_vertical_inputs(
+        pole, _legacy_vertical_storage(states), auxiliary, path, epilogue, kind, swiglu,
+    )
     if inputs is None:
         return None
     real, imag = vertical_forward(*inputs, float(epsilon))
@@ -3979,12 +4276,16 @@ def try_general_vertical_backward(
     grad_real: Tensor, grad_imag: Tensor,
     epilogue: str, epsilon: float, kind: int, swiglu: bool,
 ) -> list[Tensor] | None:
-    inputs = _general_vertical_inputs(pole, states, auxiliary, path, epilogue, kind, swiglu)
+    inputs = _general_vertical_inputs(
+        pole, _legacy_vertical_storage(states), auxiliary, path, epilogue, kind, swiglu,
+    )
     if inputs is None:
         return None
     pole_list, states, auxiliary_list, path_list, coarse = inputs
     if grad_real.ndim == 5:
         grad_real, grad_imag = grad_real.squeeze(-2), grad_imag.squeeze(-2)
-    return vertical_backward(
+    result = vertical_backward(
         pole_list, states, auxiliary_list, path_list, grad_real, grad_imag, coarse, float(epsilon),
     )
+    result[4] = convert_state_layout(result[4], scan_state_layout(states), "planar")
+    return result

@@ -17,9 +17,11 @@ from .general_cuda_scans import (
     _should_save_vscan,
     _vertical_forward_saved,
     can_use_general_hscan,
+    convert_state_layout,
     general_scans_enabled,
     horizontal_backward,
     horizontal_forward,
+    scan_state_layout,
     vertical_backward,
     vertical_forward,
     vertical_forward_packed,
@@ -1167,7 +1169,8 @@ def _packed_horizontal_forward(
         coefficients = list(pole)
         if can_use_general_hscan(*source, coefficients):
             return horizontal_forward(coefficients, *source)
-    return _horizontal_forward_planes_op(*pole, *source)
+    storage = _horizontal_forward_planes_op(*pole, *source)
+    return convert_state_layout(storage, "planar", scan_state_layout(source[0]))
 
 
 def _run_packed_cuda_forward(
@@ -1220,7 +1223,9 @@ def _run_packed_cuda_forward(
             if not squeeze_collapsed:
                 real, imag = real.unsqueeze(-2), imag.unsqueeze(-2)
             return real, imag, real.new_empty((0,), dtype=torch.float32), saved
-    horizontal = horizontal_storage.unbind(0)
+    horizontal = convert_state_layout(
+        horizontal_storage, scan_state_layout(source[0]), "planar",
+    ).unbind(0)
     primary, secondary, descriptor = _launch_product_scan4_forward(
         *pole_y,
         *horizontal,
@@ -1325,7 +1330,10 @@ def _run_packed_cuda_backward(
             return result
     if not packed_output:
         grad_real, grad_imag = grad_real.contiguous(), grad_imag.contiguous()
-    horizontal = cast("tuple[Tensor, Tensor, Tensor, Tensor]", horizontal_storage.unbind(0))
+    horizontal = cast(
+        "tuple[Tensor, Tensor, Tensor, Tensor]",
+        convert_state_layout(horizontal_storage, scan_state_layout(source[0]), "planar").unbind(0),
+    )
     vertical = _launch_product_scan4_backward(
         *pole_y,
         *horizontal,

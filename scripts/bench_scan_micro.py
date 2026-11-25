@@ -5,6 +5,7 @@ from __future__ import annotations
 # Shape descriptors carry a positional coarse flag.
 # ruff: noqa: FBT001
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -113,7 +114,8 @@ def _case(op: str, shape: tuple, batch: int, dtype: torch.dtype, *, compact: boo
     metadata = {"interleaved": (True, True)}
     if vertical:
         inputs = make_inputs(batch, h, w, m, coarse, dtype)
-        source = inputs.states
+        source = scans.convert_state_layout(inputs.states, "planar", scans.scan_state_layout(inputs.states))
+        inputs = inputs._replace(states=source)
     if op == "vscan_bwd":
         def run() -> list[Tensor]:
             return scans.vertical_backward(*inputs, coarse, compact=compact)
@@ -136,6 +138,7 @@ def _case(op: str, shape: tuple, batch: int, dtype: torch.dtype, *, compact: boo
             adjoints = torch.randn(
                 4, batch, h, w // (1 + compact), m, device="cuda", dtype=dtype,
             ).mul_(0.05)
+            adjoints = scans.convert_state_layout(adjoints, "planar", scans.scan_state_layout(real))
 
             def run() -> list[Tensor]:
                 return scans.horizontal_backward(pole, [real, imag], states, adjoints, compact=compact)
@@ -147,7 +150,8 @@ def _case(op: str, shape: tuple, batch: int, dtype: torch.dtype, *, compact: boo
         launch = scans._plan_launch(
             source, (batch, h, w, m), backward=backward, vertical=vertical,
             coarse=vertical and coarse, hidden=8 if vertical else 0,
-            precise=op == "vscan_fwd", compact=backward and compact, **metadata,
+            precise=op == "vscan_fwd", compact=backward and compact and (vertical or w % 2 == 0),
+            state_layout=scans.scan_state_layout(source), **metadata,
         )
         if launch is None:
             raise RuntimeError(f"No fused {op} plan")
@@ -160,7 +164,7 @@ def _describe(launch: scans.Launch) -> dict[str, int | bool]:
     plan, key, workers, partials = launch
     return {
         "warps": key.warps, "chunk": key.horizontal_span or key.chunk,
-        "cache_source": key.cache_source,
+        "cache_source": key.cache_source or key.forward_cache_source,
         "readonly": key.backward_readonly or key.forward_readonly or key.horizontal_readonly,
         "cache_line": key.cache_line, "cache_weights": key.cache_weights,
         "vector_weights": key.vector_weights, "register_path": key.register_path,
@@ -198,6 +202,7 @@ def _parity(
     timed_keys: dict[str, dict[str, scans.Kernel]],
 ) -> dict:
     env = OPS[op][0]
+    layout = os.environ["LNET_SCAN_STATE_LAYOUT"]
     report = {}
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     for dtype_name, dtype in DTYPES.items():
@@ -210,16 +215,33 @@ def _parity(
                 # Exercise the two-wave grouping even when timing a small batch.
                 batch = max(batch, 8, scans._ceil(16 * sms, w * scans._ceil(m, 32)))
             for compact in _layouts(op, label, coarse, w):
+                print(
+                    f"parity {op} {layout} {dtype_name} {label} compact={compact}",
+                    file=sys.stderr, flush=True,
+                )
                 os.environ[env] = "off"
+                state = torch.cuda.get_rng_state()
+                os.environ["LNET_SCAN_STATE_LAYOUT"] = "planar"
                 run, plan = _case(op, shape, batch, dtype, compact=compact)
                 expected = run()
+                if layout != "planar":
+                    del run, plan
+                    torch.cuda.set_rng_state(state)
+                    os.environ["LNET_SCAN_STATE_LAYOUT"] = layout
+                    run, plan = _case(op, shape, batch, dtype, compact=compact)
                 samples = {}
                 record = report[f"{dtype_name}/{label}/compact={compact}"] = {"batch": batch, "modes": {}}
                 for mode in modes:
                     os.environ[env] = mode
                     launch = plan()
                     if launch not in samples:
-                        actual = expected if mode == "off" else run()
+                        actual = expected if mode == "off" and layout == "planar" else run()
+                        if layout != "planar":
+                            actual = [
+                                scans.convert_state_layout(value, layout, "planar")
+                                if name == "states" else value
+                                for name, value in zip(TENSOR_NAMES[op], actual, strict=True)
+                            ]
                         samples[launch] = {
                             "plan": _describe(launch),
                             "tensors": {
@@ -262,6 +284,7 @@ def _screen(
         samples = {}
         timed_keys[label] = {}
         for mode in modes:
+            print(f"{op} {os.environ['LNET_SCAN_STATE_LAYOUT']} {label} {mode}", file=sys.stderr, flush=True)
             os.environ[env] = mode
             launch = plan()
             timed_keys[label][mode] = launch.key
@@ -333,6 +356,7 @@ def main() -> None:
     parser.add_argument("--modes", help="Comma-separated policies for VScan backward.")
     parser.add_argument("--ops", default="vscan_bwd", help="Comma-separated operation names.")
     parser.add_argument("--all-ops", action="store_true", help="Screen all four scan operations.")
+    parser.add_argument("--state-layouts", help="Comma-separated scan state layouts (default: planar).")
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
     parser.add_argument("--warmup", type=int, default=1)
@@ -345,6 +369,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, help="Write JSON to this path instead of stdout.")
     args = parser.parse_args()
     ops = tuple(OPS) if args.all_ops else tuple(dict.fromkeys(token.strip() for token in args.ops.split(",")))
+    layouts = tuple(dict.fromkeys(token.strip() for token in (args.state_layouts or "planar").split(",")))
+    if set(layouts).difference(scans.STATE_LAYOUTS):
+        parser.error(f"--state-layouts must contain names from {', '.join(scans.STATE_LAYOUTS)}")
     if set(ops).difference(OPS):
         parser.error(f"--ops must contain names from {', '.join(OPS)}")
     requested = tuple(token.strip() for token in args.modes.split(",")) if args.modes else scans.SGS_MODES
@@ -364,17 +391,47 @@ def main() -> None:
     report.update(flush_l2=args.flush_l2, flush_bytes=flush_bytes)
     with torch.inference_mode():
         flush_buffer = torch.empty(flush_bytes, device="cuda", dtype=torch.uint8) if flush_bytes else None
-        for op in ops:
-            for env, _ in OPS.values():
-                os.environ[env] = "off"
-            modes = OPS[op][1]
-            if op == "vscan_bwd" and args.modes:
-                modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
-            report[op] = _screen(op, args, modes, flush_buffer)
-    if ops == ("vscan_bwd",):
+        compile_stats = {"count": 0, "seconds": 0.0}
+        compile_ptx = scans._compile_ptx
+
+        def tracked_compile(key: scans.Kernel, capability: tuple[int, int]) -> ctypes.Array:
+            start = perf_counter()
+            try:
+                return compile_ptx(key, capability)
+            finally:
+                compile_stats["count"] += 1
+                compile_stats["seconds"] += perf_counter() - start
+                print(f"NVRTC {compile_stats}", file=sys.stderr, flush=True)
+
+        scans._compile_ptx = tracked_compile
+        try:
+            by_layout = {}
+            for layout in layouts:
+                os.environ["LNET_SCAN_STATE_LAYOUT"] = layout
+                torch.manual_seed(141)
+                results = by_layout[layout] = {}
+                before = compile_stats.copy()
+                for op in ops:
+                    for env, _ in OPS.values():
+                        os.environ[env] = "off"
+                    modes = OPS[op][1]
+                    if op == "vscan_fwd" and args.state_layouts is None:
+                        modes = tuple(mode for mode in modes if mode != "batch4_w2_cs")
+                    if op == "vscan_bwd" and args.modes:
+                        modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
+                    results[op] = _screen(op, args, modes, flush_buffer)
+                results["nvrtc"] = {name: value - before[name] for name, value in compile_stats.items()}
+        finally:
+            scans._compile_ptx = compile_ptx
+    report["state_layouts"] = by_layout
+    report.update(by_layout.get("planar", {}))
+    report["nvrtc"] = compile_stats
+    if ops == ("vscan_bwd",) and "vscan_bwd" in report:
         report.update(report["vscan_bwd"])
-    if all(op in report and set(modes) <= report[op]["weighted_ms"].keys()
-           for op, (_, modes) in OPS.items()):
+    if (
+        all(op in report and W43_MODES[op] in report[op]["weighted_ms"] for op in OPS)
+        and "strict" in report["vscan_bwd"]["weighted_ms"]
+    ):
         report["combined_projection"] = _combined_projection(report)
     report["elapsed_seconds"] = perf_counter() - started
     output = json.dumps(report, indent=2, allow_nan=False) + "\n"

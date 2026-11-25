@@ -523,6 +523,49 @@ def test_fake_shapes_and_autograd(
         assert [(g.shape, g.dtype) for g in gradients] == [(p.shape, p.dtype) for p in params]
 
 
+@pytest.mark.parametrize("layout", scans.STATE_LAYOUTS[1:])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_quad_state_storage_and_compact_fake(
+    monkeypatch: pytest.MonkeyPatch, layout: str, dtype: torch.dtype,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_STATE_LAYOUT", layout)
+    b, h, w, m = 2, 7, 9, 3
+    shape = (b, h, w, m)
+    planes = torch.arange(4 * b * h * w * m).reshape(4, *shape)
+    packed = scans.convert_state_layout(planes, "planar", layout)
+    assert packed.is_contiguous()
+    expected = (b, h, w, m, 4) if layout == "quad_hwm" else (b, w, h, m, 4)
+    assert packed.shape == expected
+    coordinate = (1, 3, 5, 2) if layout == "quad_hwm" else (1, 5, 3, 2)
+    torch.testing.assert_close(packed[coordinate], planes[:, 1, 3, 5, 2])
+    torch.testing.assert_close(scans.convert_state_layout(packed, layout, "planar"), planes)
+
+    with FakeTensorMode():
+        real, imag = (torch.empty(shape, dtype=dtype, device="cuda") for _ in range(2))
+        pole = [torch.empty(m, device="cuda") for _ in range(4)]
+        gains = [torch.empty(2, dimension, m, device="cuda") for dimension in (w, h)]
+        path = [
+            torch.empty(size, device="cuda")
+            for size in ((m, 8, 8), (m, 8), (m, 2, 8), (m, 2))
+        ]
+        states = scans.horizontal_forward(pole, real, imag)
+        assert states.shape == expected
+        output = scans.vertical_forward_packed(
+            pole, states, gains, path, coarse=True, epsilon=1e-6, planar=False,
+        )
+        assert output.shape == (b, h // 2, w // 2, 2 * m)
+        gr, gi = output.split(m, dim=-1)
+        gs = scans.vertical_backward(
+            pole, states, gains, path, gr, gi, coarse=True, compact=True,
+        )[4]
+        expected_compact = (
+            (b, h, w // 2, m, 4) if layout == "quad_hwm" else (b, w // 2, h, m, 4)
+        )
+        assert gs.shape == expected_compact
+        grad = scans.horizontal_backward(pole, [real, imag], states, gs, compact=True)[-1]
+        assert grad.shape == (b, h, w, 2 * m)
+
+
 def test_reference_forward_mode_on_cpu() -> None:
     px, py, r, i, aux, path = _inputs(6, 10, 3, 5, torch.float32, "cpu")
     states = scans.horizontal_forward(px, r, i, mode="reference")
