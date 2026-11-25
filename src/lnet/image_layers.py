@@ -14,6 +14,14 @@ from .model_w28c import model_cuda_supported
 _FUSED_FACTORIZED_READER_ENV = "LNET_FUSED_FACTORIZED_READER"
 _GENERAL_SCANS_ENV = "LNET_GENERAL_SCANS"
 _FUSED_STEM_MIN_ELEMENTS = 8 * 1024 * 1024
+STEM_STAGE0_MODES = ("off", "cudnn_split", "cudnn_pad4")
+
+
+def _stem_stage0_mode() -> str:
+    mode = os.environ.get("LNET_STEM_STAGE0_OPT", "off")
+    if mode not in STEM_STAGE0_MODES:
+        raise ValueError("LNET_STEM_STAGE0_OPT must be off, cudnn_split, or cudnn_pad4")
+    return mode
 
 
 class LayerNorm2d(nn.Module):
@@ -152,23 +160,52 @@ def _fused_conv_stem_supported(inputs: Tensor, conv: nn.Conv2d) -> bool:
     )
 
 
+def _stage0_split_conv(inputs: Tensor, conv: nn.Conv2d, *, pad4: bool) -> Tensor:
+    device_type = inputs.device.type
+    dtype = (
+        torch.get_autocast_dtype(device_type)
+        if torch.is_autocast_enabled(device_type) and inputs.dtype == torch.float32
+        else inputs.dtype
+    )
+    x = inputs.to(dtype=dtype, memory_format=torch.channels_last)
+    weight = conv.weight.to(dtype=dtype, memory_format=torch.channels_last)
+    if pad4 and conv.groups == 1:
+        extra = -x.shape[1] % 4
+        if extra:
+            # Pad the physically contiguous dimension of NHWC and OHWI.
+            x = functional.pad(x.permute(0, 2, 3, 1), (0, extra)).permute(0, 3, 1, 2)
+            weight = functional.pad(weight.permute(0, 2, 3, 1), (0, extra)).permute(0, 3, 1, 2)
+    # Native convolution autograd requests only the needed gradients. In
+    # particular it omits dInput when the training image requires no gradient.
+    with torch.autocast(device_type, enabled=False):
+        return functional.conv2d(
+            x, weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
+        )
+
+
 def _fused_stem_block(
     inputs: Tensor,
     conv: nn.Conv2d,
     norm: LayerNorm2d,
     *,
     nhwc_output: bool = False,
+    stage0_mode: str | None = None,
 ) -> Tensor:
-    if not nhwc_output and _fused_conv_stem_supported(inputs, conv):
+    if not nhwc_output and stage0_mode is None:
+        stage0_mode = _stem_stage0_mode()
+    if not nhwc_output and stage0_mode != "off":
+        hidden = _stage0_split_conv(inputs, conv, pad4=stage0_mode == "cudnn_pad4")
+    elif not nhwc_output and _fused_conv_stem_supported(inputs, conv):
         dtype = (
             torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else inputs.dtype
         )
         return fused_conv_stem(
             inputs, conv.weight, conv.bias, norm.norm.weight, norm.norm.bias, norm.norm.eps, dtype
         )
-    hidden = functional.conv2d(
-        inputs, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
-    )
+    else:
+        hidden = functional.conv2d(
+            inputs, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
+        )
     return fused_nhwc_layernorm_gelu(
         hidden,
         norm.norm.weight,
@@ -232,15 +269,19 @@ class ModeScaledTwoConvStem(nn.Module):
 
     def forward(self, inputs: Tensor) -> Tensor:
         first, first_norm, first_activation, second, second_norm, second_activation = self.layers
+        stage0_mode = _stem_stage0_mode()
         if (
             _fused_stem_enabled(inputs)
             and _supports_fused_stem_block(first, first_norm, first_activation)
             and _supports_fused_stem_block(second, second_norm, second_activation)
             and _fused_stem_large_enough(inputs, first, second)
         ):
-            hidden = _fused_stem_block(inputs, first, first_norm)
+            hidden = _fused_stem_block(inputs, first, first_norm, stage0_mode=stage0_mode)
             return _fused_stem_block(hidden, second, second_norm, nhwc_output=True)
-        hidden = first_activation(first_norm(first(inputs)))
+        if stage0_mode != "off" and _supports_fused_stem_block(first, first_norm, first_activation):
+            hidden = _fused_stem_block(inputs, first, first_norm, stage0_mode=stage0_mode)
+        else:
+            hidden = first_activation(first_norm(first(inputs)))
         features = second(hidden)
         if not isinstance(second_norm, LayerNorm2d):
             message = "mode-scaled stem requires a terminal LayerNorm2d"

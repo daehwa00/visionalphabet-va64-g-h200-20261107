@@ -6,7 +6,41 @@ import torch
 from torch import nn
 from torch.nn import functional
 
-from lnet.image_layers import LayerNorm2d, _fused_stem_block
+from lnet.image_layers import LayerNorm2d, ModeScaledTwoConvStem, _fused_stem_block
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(2, 3, 11, 13, 32), (1, 4, 8, 6, 64), (1, 5, 9, 7, 35)])
+@pytest.mark.parametrize("input_grad", [False, True])
+def test_stage0_split_cpu(monkeypatch, dtype, shape, input_grad) -> None:
+    torch.manual_seed(160)
+    batch, ci, height, width, co = shape
+    stem = ModeScaledTwoConvStem(4, input_channels=ci, hidden_width=co)
+    conv, norm = stem.layers[:2]
+    x = torch.randn(batch, ci, height, width).requires_grad_(input_grad)
+    params = (*conv.parameters(), *norm.parameters(), *((x,) if input_grad else ()))
+    with torch.autocast("cpu", dtype=dtype, enabled=dtype != torch.float32):
+        # The default CPU model uses separate modules, while the
+        # existing split block provides the CUDA rounding contract on CPU.
+        monkeypatch.setenv("LNET_STEM_STAGE0_OPT", "off")
+        expected = _fused_stem_block(x, conv, norm)
+        dy = torch.randn_like(expected)
+        targets = (expected, *torch.autograd.grad(expected, params, dy))
+        for mode in ("cudnn_split", "cudnn_pad4"):
+            monkeypatch.setenv("LNET_STEM_STAGE0_OPT", mode)
+            actual = _fused_stem_block(x, conv, norm)
+            assert actual.dtype == dtype
+            assert actual.is_contiguous(memory_format=torch.channels_last)
+            grads = torch.autograd.grad(actual, params, dy)
+            errors = [((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-8)).item()
+                      for a, b in zip((actual, *grads), targets, strict=True)]
+            bound = {torch.float32: 1e-5, torch.float16: 0.006, torch.bfloat16: 0.035}[dtype]
+            assert max(errors) < bound, errors
+            features = stem(x)
+            expected_features = stem.layers[5](
+                stem.layers[4].norm(stem.layers[3](actual).permute(0, 2, 3, 1))
+            )
+            torch.testing.assert_close(features, expected_features, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
