@@ -15,6 +15,7 @@ from torch.nn import functional
 from .complex_layers import ComplexLinear
 from .factorized_complex_scan_reader import FactorizedComplexConv2dReader
 from .factorized_reader_kernels import real_gram_kernel_energy, real_packed_spatial
+from .fused_readproj_ops import readproj
 from .gated_post_fusion import GatedComplexPostFusion
 from .model_w28c import model_w28c_enabled, packed_swiglu
 from .model_w29c import (
@@ -328,6 +329,10 @@ class MemoryReadProjection(nn.Module):
     def forward_planes(self, first: Tensor, second: Tensor) -> Tensor:
         """Project separate contiguous real and imaginary planes into features."""
         width = self.weight.shape[-1] // 2
+        mode = os.environ.get("LNET_READPROJ_OPT", "off")
+        if mode != "off":
+            real_weight, imag_weight = self.weight.split((width, self.weight.shape[-1] - width), 1)
+            return readproj(first, second, real_weight, imag_weight, None, mode)
         return functional.linear(first, self.weight[:, :width]) + functional.linear(
             second, self.weight[:, width:]
         )
