@@ -93,7 +93,9 @@ def check_case(
     )
     y = functional.gelu(z).permute(0, 3, 1, 2)
     ref_params = stem_parameters(x_ref, conv, norm)
-    expected = (y, *torch.autograd.grad(y, ref_params, dy.float()))
+    ref_grads = torch.autograd.grad(y, ref_params, dy.float())
+    expected = (y.detach(), *ref_grads)
+    del y, z, x_ref, ref_grads, ref_params
     eager = run_step(forward, x, params, dy)
     names = ["y", "dw", "dg", "db"] + (["dc"] if bias else []) + (["dx"] if needs_dx else [])
     errors = {

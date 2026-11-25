@@ -65,14 +65,16 @@ def reference_gradients(
         z.permute(0, 2, 3, 1), (32,), norm.norm.weight, norm.norm.bias, norm.norm.eps,
     )
     y = functional.gelu(z).permute(0, 3, 1, 2)
-    return (y, *torch.autograd.grad(y, stem_parameters(x_fp32, conv, norm), dy.float()))
+    grads = torch.autograd.grad(y, stem_parameters(x_fp32, conv, norm), dy.float())
+    return (y.detach(), *grads)
 
 
 def run_step(
     forward: Callable, x: Tensor, params: tuple[Tensor, ...], dy: Tensor,
 ) -> tuple[Tensor, ...]:
     y = forward(x)
-    return (y, *torch.autograd.grad(y, params, dy))
+    grads = torch.autograd.grad(y, params, dy)
+    return (y.detach(), *grads)
 
 
 def parity_errors(actual: tuple[Tensor, ...], ref: tuple[Tensor, ...]) -> dict[str, float]:
@@ -89,6 +91,7 @@ def graph_finite(fn: Callable[[], tuple[Tensor, ...]]) -> bool:
     warmup = torch.cuda.Stream()
     with torch.cuda.stream(warmup):
         for _ in range(3):
+            # Drop each warmup result before capture on this stream.
             fn()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

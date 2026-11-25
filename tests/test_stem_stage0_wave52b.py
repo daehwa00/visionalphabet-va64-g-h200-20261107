@@ -32,6 +32,19 @@ from lnet.image_layers import LayerNorm2d, _fused_stem_block
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def test_cpu_stem_results_have_no_grad_fn() -> None:
+    x = torch.randn(1, 3, 5, 7, requires_grad=True)
+    conv = torch.nn.Conv2d(3, 32, 3, stride=2, padding=1)
+    norm = LayerNorm2d(32)
+    dy = torch.randn(1, 32, 3, 4)
+
+    def forward(inputs):
+        return _fused_stem_block(inputs, conv, norm)
+
+    assert all(t.grad_fn is None for t in reference_gradients(x, conv, norm, dy))
+    assert all(t.grad_fn is None for t in run_step(forward, x, stem_parameters(x, conv, norm), dy))
+
+
 def test_default_and_invalid_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LNET_STEM_STAGE0_MODE", raising=False)
     assert stem_stage0_mode() == "off"
