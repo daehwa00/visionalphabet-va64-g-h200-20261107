@@ -11,8 +11,10 @@ from bench_scan_micro import (
     MODEL_SHAPES,
     OPS,
     TENSOR_NAMES,
+    W43_MODES,
     _case,
     _layouts,
+    _time,
     best_mode,
     parity_stats,
 )
@@ -673,7 +675,7 @@ def _pipeline(
 _compiled_pipeline = torch.compile(_pipeline, fullgraph=True, dynamic=True)
 
 
-@pytest.mark.parametrize("mode", scans.SGS_MODES)
+@pytest.mark.parametrize("mode", ["off", "strict", "strict_ro"])
 def test_sgs_aot_eager(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     monkeypatch.setenv("LNET_SCAN_SGS", mode)
     args = _inputs(4, 6, 3, 8, torch.bfloat16, "cpu")
@@ -1425,17 +1427,21 @@ def test_cuda_sgs_parity(
     # Queue enough 56d CTAs to exercise widening on high-SM devices.
     batch = 2
     if label == "56d":
-        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        sms, _, max_warps = scans.device_limits(0)
         tiles = scans._ceil(m, scans._WARP_SIZE)
-        batch = max(batch, scans._ceil(16 * sms, w * tiles))
+        batch = max(batch, scans._ceil(max_warps * sms, w * tiles))
     shape = (label, h, w, m, coarse, _calls)
     for compact in _layouts("vscan_bwd", label, coarse, w):
         monkeypatch.setenv("LNET_SCAN_SGS", "off")
         run, plan = _case("vscan_bwd", shape, batch, dtype, compact=compact)
         expected = run()
+        outputs = {plan(): expected}
         for mode in scans.SGS_MODES[1:]:
             monkeypatch.setenv("LNET_SCAN_SGS", mode)
-            actual = run()
+            launch = plan()
+            if launch not in outputs:
+                outputs[launch] = run()
+            actual = outputs[launch]
             diagnosed = mode == "strict_ro" and label == "56d" and dtype == torch.bfloat16
             if diagnosed:
                 key = plan().key
@@ -1458,24 +1464,42 @@ def test_cuda_sgs_parity(
 @pytest.mark.parametrize(
     "op", ["vscan_fwd", "hscan_fwd", "hscan_bwd"], ids=["vfwd", "hscan_fwd", "hscan_bwd"],
 )
-def test_cuda_scan_winner_exact(
+def test_cuda_vfwd_hscan_parity(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, shape: tuple, op: str,
 ) -> None:
     torch.manual_seed(141)
     label, h, w, _, coarse, _ = shape
     batch = 2 if shape in EDGE_SHAPES else min(64, 64 * 28 * 28 // (h * w))
-    env, (off, winner) = OPS[op]
+    if op == "vscan_fwd" and shape in MODEL_SHAPES[:2]:
+        sms, _, max_warps = scans.device_limits(0)
+        tiles = scans._ceil(shape[3], scans._WARP_SIZE)
+        batch = max(batch, scans._ceil(2 * sms * max_warps, (w // (1 + coarse)) * tiles))
+    if op == "hscan_bwd" and shape == MODEL_SHAPES[0]:
+        sms, _, max_warps = scans.device_limits(0)
+        tiles = scans._ceil(shape[3], scans._WARP_SIZE)
+        batch = max(batch, scans._ceil(2 * sms * max_warps, h * tiles))
+    env, modes = OPS[op]
+    off, winner = "off", W43_MODES[op]
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
     for compact in _layouts(op, label, coarse, w):
         monkeypatch.setenv(env, off)
         run, plan = _case(op, shape, batch, dtype, compact=compact)
         baseline = plan()
         expected = run()
-        monkeypatch.setenv(env, winner)
-        if op == "hscan_fwd":
-            assert plan() == baseline
-        for name, actual, reference in zip(TENSOR_NAMES[op], run(), expected, strict=True):
-            assert torch.equal(actual, reference), (label, name)
+        outputs = {baseline: expected}
+        for mode in modes[1:]:
+            monkeypatch.setenv(env, mode)
+            launch = plan()
+            if op == "hscan_fwd":
+                assert launch == baseline
+            if launch not in outputs:
+                outputs[launch] = run()
+            tensors = zip(TENSOR_NAMES[op], outputs[launch], expected, strict=True)
+            for name, actual, reference in tensors:
+                if mode == winner or op == "hscan_fwd":
+                    assert torch.equal(actual, reference), (label, mode, name)
+                else:
+                    assert parity_stats(actual, reference)["tol_pass"], (label, mode, name)
 
 
 def test_scan_micro_parity_diagnostics() -> None:
@@ -1565,3 +1589,93 @@ def test_invalid_scan_mode(monkeypatch: pytest.MonkeyPatch, op: str) -> None:
             torch.empty(1), (1, 1, 1, 1), backward=op.endswith("_bwd"),
             vertical=op.startswith("vscan"), coarse=False, hidden=8, precise=False,
         )
+
+
+@pytest.mark.parametrize(
+    "mode", [*scans.SGS_MODES[3:], *scans.VFWD_MODES[2:], *scans.HSCAN_MODES[2:]],
+)
+def test_structural_scan_resource_gates(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    monkeypatch.setattr(scans, "device_limits", lambda _: (8, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_sgs_device_limits", lambda _: (228 * 1024, 65536, 1024))
+    shape = (1024, 56, 56, 128)
+    if mode in scans.SGS_MODES:
+        key = scans.Kernel(
+            torch.bfloat16, 2, backward=True, vertical=True, hidden8=True, chunk=14,
+            cache_source=True, cache_weights=True, backward_readonly=True,
+        )
+        plan = scans.ScanPlan(
+            2, scans._sgs_smem(key, 56), 14, cache_weights=True, cache_source=True,
+        )
+        base = scans.Launch(plan, key, 512, 256)
+        choose = scans._structural_sgs
+    elif mode in scans.VFWD_MODES:
+        key = scans.Kernel(
+            torch.bfloat16, 1, backward=False, vertical=True, hidden8=True,
+            cache_weights=True, batch_path=True, forward_readonly=True,
+        )
+        base = scans.Launch(scans.ScanPlan(1, 5632, cache_weights=True), key, 512, 512)
+
+        def choose(device, launch, shape, mode):
+            return scans._structural_vfwd(device, launch, launch, shape, mode)
+    else:
+        key = scans.Kernel(torch.bfloat16, 4, backward=True, cache_line=True)
+        base = scans.Launch(scans.ScanPlan(4, 57344, cache_line=True), key, 512, 128)
+        choose = scans._structural_hscan
+
+    monkeypatch.setattr(scans, "_resident", lambda _, probe, _smem: 4 if probe == key else 0)
+    assert choose(0, base, shape, mode) == base
+
+    def resident(_, probe, smem):
+        if probe == key:
+            return 4
+        return min(16, (228 * 1024) // (smem + 1024))
+
+    monkeypatch.setattr(scans, "_resident", resident)
+    selected = choose(0, base, shape, mode)
+    assert selected.key != key
+    assert selected.workers == base.workers
+    if mode in scans.SGS_MODES:
+        assert selected.partials == base.partials
+        assert (selected.key.backward_reduce_warps or selected.key.warps) == key.warps
+        if mode == "strict_ro_seg2":
+            assert scans._ceil(shape[1], selected.plan.chunk) == 2
+        if not selected.key.cache_source:
+            threads = selected.key.warps * scans._WARP_SIZE
+            assert selected.key.backward_segment_source
+            assert selected.plan.smem >= threads * selected.key.chunk * (16 + 8)
+            source = scans._kernel_source(selected.key)
+            assert source.count("if constexpr (!CACHE_SOURCE) seg_src") == 3
+    elif mode in scans.HSCAN_MODES:
+        assert selected.partials == scans._ceil(base.workers, selected.key.warps)
+    assert scans._active_warps(0, selected) >= key.warps * 4
+
+
+@pytest.mark.parametrize("flush", [False, True])
+def test_scan_micro_flush_excludes_fill(monkeypatch: pytest.MonkeyPatch, flush: bool) -> None:
+    calls = []
+
+    class Event:
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing
+
+        def record(self):
+            calls.append("record")
+
+        def synchronize(self):
+            calls.append("stop_wait")
+
+        def elapsed_time(self, _stop):
+            return 1.0
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: calls.append("stream_wait")),
+    )
+    buffer = SimpleNamespace(zero_=lambda: calls.append("fill")) if flush else None
+    assert _time(lambda: calls.append("scan"), 1, 2, buffer) == 1.0
+    assert calls == [
+        "scan", *["record"] * 4, "stream_wait",
+        *((["fill"] if flush else []) + ["record", "scan", "record"]) * 2,
+        "stop_wait",
+    ]

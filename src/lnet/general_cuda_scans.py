@@ -141,6 +141,9 @@ class Kernel:
     forward_readonly: bool = False
     horizontal_readonly: bool = False
     horizontal_unroll: int = 0
+    min_blocks: int = 0
+    horizontal_span: int = 0
+    backward_segment_source: bool = False
 
 
 class Launch(NamedTuple):
@@ -1511,8 +1514,9 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             key.cache_line, key.shared_acc, key.precise,
         )
     )
+    minimum = f", {key.min_blocks}" if key.min_blocks else ""
     bounds = (
-        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE})'
+        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}{minimum})'
         f" void {_kernel_name(key)}"
     )
     compact = str(key.compact).lower()
@@ -1574,6 +1578,19 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = "#define BACKWARD_BATCH2\n" + source
         if key.backward_batch_tail:
             source = "#define BACKWARD_BATCH_TAIL\n" + source
+    if key.backward_segment_source:
+        # Dense backward also reads the segment source in the paired adjoint
+        # and writes it during the negative replay.
+        source = source.replace(
+            "if constexpr (COARSE && !CACHE_SOURCE) seg_src",
+            "if constexpr (!CACHE_SOURCE) seg_src",
+        ).replace(
+            "c.source(y0 + j)", "c.packed_source(y0 + j).unpack()",
+        ).replace(
+            "const auto s = (COARSE || CACHE_SOURCE)\n"
+            "                ? CACHED_SOURCE_AT(j) : c.source(y);",
+            "const auto s = CACHED_SOURCE_AT(j);",
+        )
     if key.vertical and (key.backward_readonly or key.forward_readonly):
         source = (
             source.replace("states[ia]", "__ldg(states + ia)")
@@ -1617,11 +1634,51 @@ __device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
 }
 """
         kernel = helper + kernel
+    if key.horizontal_span:
+        kernel = _horizontal_chunk_source(kernel, key.horizontal_span)
     if key.horizontal_unroll and not key.backward:
         for loop in ("for (int x = 0;", "for (int x = W - 1;"):
             pragma = "#pragma unroll BACKWARD_UNROLL\n                "
             kernel = kernel.replace(loop, pragma + loop, 1)
     return source[:start] + kernel + source[end:]
+
+
+def _horizontal_chunk_source(kernel: str, span: int) -> str:
+    # Save the right recurrence at segment boundaries and replay one segment
+    # at a time. The left and negative recurrences keep their original order.
+    start = kernel.index("                #pragma unroll BACKWARD_UNROLL")
+    reverse = kernel.index("                #pragma unroll BACKWARD_UNROLL", start + 1)
+    update = kernel[kernel.index("                    const I i", start):kernel.index(
+        "                    // Odd compact", start,
+    )]
+    descending = kernel[reverse:].replace("x = W - 1; x >= 0;", "x = end - 1; x >= begin;", 1)
+    descending = descending.replace(
+        "buf[I(x / (1 + COMPACT))", "buf[I((x - begin) / (1 + COMPACT))",
+    )
+    descending = descending.replace(
+        "                }\n            }",
+        "                }\n                }\n            }", 1,
+    )
+    return kernel[:start] + f"""
+                constexpr int span = {span};
+                constexpr int slots = span / (1 + COMPACT);
+                for (int x = 0; x < W; ++x) {{
+{update}
+                    if (x % span == span - 1 && x + 1 < W)
+                        buf[I(slots + x / span) * stride] = Pair<float>::pack(right);
+                }}
+                for (int segment = (W - 1) / span; segment >= 0; --segment) {{
+                    const int begin = segment * span;
+                    const int end = begin + min(span, W - begin);
+                    right = segment
+                        ? buf[I(slots + segment - 1) * stride].unpack() : Complex{{}};
+                    #pragma unroll BACKWARD_UNROLL
+                    for (int x = begin; x < end; ++x) {{
+{update}
+                        if (!COMPACT || !(x & 1))
+                            buf[I((x - begin) / (1 + COMPACT)) * stride] = Pair<float>::pack(right);
+                    }}
+""" + descending
 
 
 _SGS_ADJOINT = r"""
@@ -1744,10 +1801,18 @@ def _odd_compact_source(source: str) -> str:
     )
 
 
+def _effective_kernel(key: Kernel, capability: tuple[int, int]) -> Kernel:
+    if (
+        (key.horizontal_unroll8 or key.horizontal_unroll) and capability >= (9, 0)
+        and key.warps == 1 and (key.real_interleaved or key.imag_interleaved)
+    ):
+        # Task 92 observed inexact forced unrolls on this layout.
+        return replace(key, horizontal_unroll8=False, horizontal_unroll=0)
+    return key
+
+
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
-    if capability >= (9, 0) and key.warps == 1 and (key.real_interleaved or key.imag_interleaved):
-        # Task 92 observed inexact forced unrolls on this Hopper layout.
-        key = replace(key, horizontal_unroll8=False, horizontal_unroll=0)
+    key = _effective_kernel(key, capability)
     nvrtc = _nvrtc()
     program = ct.c_void_p()
     source = _kernel_source(key).encode()
@@ -1829,7 +1894,11 @@ def _horizontal_cache_budget(device: int) -> int:
 
 @cache
 def _function(device: int, key: Kernel) -> tuple[ct.CDLL, ct.c_void_p]:
-    image = _compile_ptx(key, torch.cuda.get_device_capability(device))
+    capability = torch.cuda.get_device_capability(device)
+    effective = _effective_kernel(key, capability)
+    if key != effective:
+        return _function(device, effective)
+    image = _compile_ptx(key, capability)
     driver = _load_cuda_driver()
     module, func = ct.c_void_p(), ct.c_void_p()
     with torch.cuda.device(device):
@@ -2418,9 +2487,9 @@ def _plan_scan_auto(
     return launch
 
 
-SGS_MODES = ("off", "strict", "strict_ro")
-VFWD_MODES = ("off", "batch4")
-HSCAN_MODES = ("off", "bwd_opt")
+SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
+VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
+HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2")
 
 
 def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
@@ -2448,7 +2517,9 @@ def _sgs_smem(key: Kernel, height: int) -> int:
     threads = key.warps * _WARP_SIZE
     span = key.chunk or height
     checkpoints = 0 if key.global_checkpoints else (height - 1) // span
-    source_rows = height if key.cache_source else span if key.coarse else 0
+    source_rows = span if key.coarse or key.backward_segment_source else 0
+    if key.cache_source:
+        source_rows = height
     line_rows = height // (1 + key.coarse) if key.cache_line else 0
     itemsize = key.dtype.itemsize
     weights = 11 * _REGISTER_HIDDEN * _WARP_SIZE * (
@@ -2605,7 +2676,187 @@ def _plan_hscan(
     return launch._replace(key=candidate) if occupancy >= base_occupancy else launch
 
 
-def _plan_launch(  # noqa: C901
+
+def _active_warps(device: int, launch: Launch) -> int:
+    try:
+        return launch.key.warps * _resident(device, launch.key, launch.plan.smem)
+    except RuntimeError:
+        return 0
+
+
+def _structural_probe(device: int, launch: Launch, modes: int, minimum: int) -> int:
+    sms, limit, warp_limit = device_limits(device)
+    key = launch.key
+    if launch.plan.smem > limit or minimum > warp_limit:
+        return 0
+    grid = _ceil(launch.workers, key.warps) * _ceil(modes, _WARP_SIZE)
+    if grid < 2 * sms * _ceil(minimum, key.warps):
+        return 0
+    active = _active_warps(device, launch)
+    return active if active >= minimum and grid >= 2 * sms * (active // key.warps) else 0
+
+
+def _launch_bound(device: int, warps: int, smem: int, target: int) -> int:
+    _, limit, warp_limit = device_limits(device)
+    shared, registers, reserved = _sgs_device_limits(device)
+    blocks = _ceil(target, warps)
+    if (
+        blocks * warps <= min(warp_limit, registers // _WARP_SIZE)
+        and smem <= _sgs_cap(limit, shared, reserved, blocks)
+    ):
+        return blocks
+    return 0
+
+
+def _structural_sgs(  # noqa: C901
+    device: int, base: Launch, shape: tuple[int, ...], mode: str,
+) -> Launch:
+    _, height, _, modes = shape
+    key = base.key
+    if not (
+        key.hidden8 and key.backward_readonly and key.cache_source
+        and not (key.global_checkpoints or key.shared_acc or key.odd_coarse_backward)
+    ):
+        return base
+    occupancy = _active_warps(device, base)
+    if not occupancy:
+        return base
+    group = key.backward_reduce_warps or key.warps
+    span = key.chunk
+    segment_mode = mode == "strict_ro_seg2"
+    if segment_mode:
+        pair_rows = (1 + key.coarse) * (1 + key.backward_batch2)
+        span = _ceil(height, 2 * pair_rows) * pair_rows
+        if not key.chunk or span <= key.chunk or span >= height or key.chunk % pair_rows:
+            return base
+    minimum = occupancy + (not segment_mode)
+    best, score = base, None
+    for warps in (2, 3, 4, 6, 8, 1):
+        if warps % group:
+            continue
+        source_options = (True,) if key.cache_line or not key.chunk else (True, False)
+        for cache_source in source_options:
+            candidate = replace(
+                key, warps=warps, chunk=span, cache_source=cache_source,
+                backward_segment_source=not cache_source and not key.coarse,
+                backward_reduce_warps=group if warps != group else 0,
+            )
+            smem = max(warps * _WARP_SIZE * 128, _sgs_smem(candidate, height))
+            if key.sgs:
+                smem += height * warps * _WARP_SIZE * 8
+            trial = base._replace(
+                key=candidate, plan=base.plan._replace(
+                    warps=warps, chunk=span or base.plan.chunk,
+                    smem=smem, cache_source=cache_source,
+                ),
+            )
+            blocks = _launch_bound(device, warps, smem, minimum)
+            if not blocks:
+                continue
+            active = 0 if trial == base else _structural_probe(device, trial, modes, minimum)
+            if not segment_mode and not active:
+                trial = trial._replace(key=replace(candidate, min_blocks=blocks))
+                active = _structural_probe(device, trial, modes, minimum)
+            if active and (score is None or (active, cache_source, -smem) > score):
+                best, score = trial, (active, cache_source, -smem)
+    return best
+
+
+def _structural_vfwd(
+    device: int, launch: Launch, base: Launch, shape: tuple[int, ...], mode: str,
+) -> Launch:
+    _, height, _, modes = shape
+    capped = mode == "batch4_hiocc"
+    seed = launch if launch.key.cache_weights else base
+    key = seed.key
+    register_batch4 = key.register_path and key.batch_path and not key.register_batch2
+    if not (
+        key.hidden8 and base.key.forward_readonly and height // (1 + key.coarse) >= 4
+        and (key.cache_weights or (capped and register_batch4))
+    ):
+        return base
+    occupancy = _active_warps(device, base)
+    if not occupancy:
+        return base
+    minimum = occupancy + capped
+    weight_itemsize = 4 if key.vector_weights else key.dtype.itemsize
+    weights = 11 * _REGISTER_HIDDEN * _WARP_SIZE * weight_itemsize if key.cache_weights else 0
+    best, score = base, None
+    line = (seed.plan.smem - weights) // key.warps
+    for warps in (2, 4):
+        smem = weights + line * warps
+        blocks = _launch_bound(device, warps, smem, minimum)
+        if not blocks:
+            continue
+        candidate = replace(
+            key, warps=warps, forward_readonly=True, batch_path=True,
+            register_batch2=False,
+        )
+        trial = base._replace(
+            key=candidate, plan=seed.plan._replace(warps=warps, smem=smem),
+        )
+        bounds = (0,)
+        if capped:
+            extra = _launch_bound(device, warps, smem, (blocks + 1) * warps)
+            bounds = (extra, blocks) if extra else (blocks,)
+        for bound in bounds:
+            probe = trial._replace(key=replace(candidate, min_blocks=bound))
+            active = _structural_probe(device, probe, modes, minimum)
+            if active and (score is None or (active, warps) > score):
+                best, score = probe, (active, warps)
+    return best
+
+
+def _structural_hscan(device: int, base: Launch, shape: tuple[int, ...], mode: str) -> Launch:
+    _, _, width, modes = shape
+    key = base.key
+    if not (key.backward and key.cache_line and key.dtype.itemsize == 2 and width > 2 * key.chunk):
+        return base
+    if key.chunk // 2 < (1 + key.compact) or key.chunk // 2 % (1 + key.compact):
+        return base
+    occupancy = _active_warps(device, base)
+    _, _, max_warps = device_limits(device)
+    if not 0 < occupancy < max_warps * 3 // 8:
+        return base
+    # A smaller cache can help only when shared memory blocks the next CTA.
+    if _launch_bound(device, key.warps, base.plan.smem, occupancy + 1):
+        return base
+    narrower = mode == "bwd_opt_w2"
+    warps = 2 if narrower else key.warps
+    minimum = occupancy + (not narrower)
+    best, score = base, None
+    for span in ((0, key.chunk // 2) if narrower else (key.chunk // 2,)):
+        slots = (
+            span // (1 + key.compact) + (width - 1) // span
+            if span else width // (1 + key.compact)
+        )
+        smem = warps * _WARP_SIZE * max(16 if warps > 1 else 0, 8 * slots)
+        for unroll in (4, 8):
+            trial = base._replace(
+                key=replace(key, warps=warps, horizontal_span=span, horizontal_readonly=True,
+                            horizontal_unroll=unroll),
+                plan=base.plan._replace(warps=warps, smem=smem),
+                partials=_ceil(base.workers, warps),
+            )
+            active = _structural_probe(device, trial, modes, minimum)
+            if active and (score is None or (active, not span) > score):
+                best, score = trial, (active, not span)
+    return best
+
+
+@lru_cache(maxsize=512)
+def _plan_structural(device: int, launch: Launch, shape: tuple[int, ...], mode: str) -> Launch:
+    if not launch.key.vertical:
+        base = _plan_hscan(device, launch, shape, "bwd_opt")
+        return _structural_hscan(device, base, shape, mode)
+    if launch.key.backward:
+        base = _plan_sgs(device, launch, shape, "strict_ro")
+        return _structural_sgs(device, base, shape, mode)
+    base = _plan_vfwd(device, launch, shape[1], "batch4")
+    return _structural_vfwd(device, launch, base, shape, mode)
+
+
+def _plan_launch(  # noqa: C901, PLR0911, PLR0912
     source: Tensor,
     shape: tuple[int, int, int, int],
     *,
@@ -2654,6 +2905,8 @@ def _plan_launch(  # noqa: C901
             odd_compact_width=backward and compact and bool(width % 2),
             backward_batch2=False, backward_batch_tail=False,
         ))
+    if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
+        return _plan_structural(device, launch, shape, mode)
     if mode != "off":
         if not vertical:
             return _plan_hscan(device, launch, shape, mode)

@@ -46,6 +46,9 @@ OPS = {
     "hscan_fwd": ("LNET_SCAN_HSCAN", scans.HSCAN_MODES),
     "hscan_bwd": ("LNET_SCAN_HSCAN", scans.HSCAN_MODES),
 }
+W43_MODES = {
+    "vscan_bwd": "strict_ro", "vscan_fwd": "batch4", "hscan_fwd": "bwd_opt", "hscan_bwd": "bwd_opt",
+}
 POLE_NAMES = ("decay_real", "decay_imag", "gain_real", "gain_imag")
 TENSOR_NAMES = {
     "vscan_bwd": (*POLE_NAMES, "states", "path_wi", "path_bi", "path_wo", "path_bo"),
@@ -84,11 +87,18 @@ def best_mode(totals: dict[str, float], parity: dict[str, bool], threshold: floa
     return min(eligible, key=totals.__getitem__, default="off")
 
 
-def _time(run: Callable, warmup: int, iters: int) -> float:
+def _time(run: Callable, warmup: int, iters: int, flush_buffer: Tensor | None = None) -> float:
     for _ in range(warmup):
         run()
     events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(iters)]
+    # Initialize lazy event handles before the first measured call.
     for start, stop in events:
+        start.record()
+        stop.record()
+    torch.cuda.current_stream().synchronize()
+    for start, stop in events:
+        if flush_buffer is not None:
+            flush_buffer.zero_()
         start.record()
         run()
         stop.record()
@@ -149,7 +159,8 @@ def _case(op: str, shape: tuple, batch: int, dtype: torch.dtype, *, compact: boo
 def _describe(launch: scans.Launch) -> dict[str, int | bool]:
     plan, key, workers, partials = launch
     return {
-        "warps": key.warps, "chunk": key.chunk, "cache_source": key.cache_source,
+        "warps": key.warps, "chunk": key.horizontal_span or key.chunk,
+        "cache_source": key.cache_source,
         "readonly": key.backward_readonly or key.forward_readonly or key.horizontal_readonly,
         "cache_line": key.cache_line, "cache_weights": key.cache_weights,
         "vector_weights": key.vector_weights, "register_path": key.register_path,
@@ -234,7 +245,9 @@ def _layouts(op: str, label: str, coarse: bool, width: int) -> tuple[bool, ...]:
     return (False, True) if label in EDGE_LABELS else (True,)
 
 
-def _screen(op: str, args: argparse.Namespace, modes: tuple[str, ...]) -> dict:
+def _screen(
+    op: str, args: argparse.Namespace, modes: tuple[str, ...], flush_buffer: Tensor | None,
+) -> dict:
     env = OPS[op][0]
     results = {mode: {} for mode in modes}
     totals = dict.fromkeys(modes, 0.0)
@@ -253,11 +266,17 @@ def _screen(op: str, args: argparse.Namespace, modes: tuple[str, ...]) -> dict:
             launch = plan()
             timed_keys[label][mode] = launch.key
             if launch not in samples:
-                samples[launch] = _time(run, args.warmup, args.iters), _describe(launch)
+                ms = _time(run, args.warmup, args.iters, flush_buffer)
+                samples[launch] = ms, _describe(launch)
             ms, details = samples[launch]
             totals[mode] += calls * ms
             results[mode][label] = {"median_ms": ms, "calls": calls, "plan": details}
         del run, plan
+    winner = W43_MODES[op]
+    for shapes in results.values():
+        for label, sample in shapes.items():
+            sample["delta_vs_off_ms"] = sample["median_ms"] - results["off"][label]["median_ms"]
+            sample["delta_vs_w43_ms"] = sample["median_ms"] - results[winner][label]["median_ms"]
     diagnostics = _parity(op, modes, args, timed_keys) if args.parity else {}
     passes = {
         field: {
@@ -284,10 +303,11 @@ def _screen(op: str, args: argparse.Namespace, modes: tuple[str, ...]) -> dict:
     }
     return {
         "best_mode": best_mode(totals, exact),
-        "best_tolerated_mode": best_mode(totals, tolerated if op == "vscan_bwd" else exact),
+        "best_tolerated_mode": best_mode(totals, tolerated if op in ("vscan_bwd", "hscan_bwd") else exact),
         "timing_kernel_covered": covered,
         "weighted_ms": totals,
         "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
+        "delta_vs_w43_ms": {mode: ms - totals[winner] for mode, ms in totals.items()},
         "parity_pass": passes["exact_match"],
         "parity_mismatches": {
             mode: [
@@ -300,7 +320,7 @@ def _screen(op: str, args: argparse.Namespace, modes: tuple[str, ...]) -> dict:
 
 
 def _combined_projection(report: dict) -> dict[str, float]:
-    winners = {"vscan_bwd": "strict_ro", "vscan_fwd": "batch4", "hscan_fwd": "bwd_opt", "hscan_bwd": "bwd_opt"}
+    winners = W43_MODES
     totals = {op: report[op]["weighted_ms"] for op in winners}
     projected = sum(totals[op][mode] for op, mode in winners.items())
     off = sum(times["off"] for times in totals.values())
@@ -317,6 +337,10 @@ def main() -> None:
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument(
+        "--flush-l2", action=argparse.BooleanOptionalAction, default=True,
+        help="Clear the L2 working set before each timed iteration (default: enabled).",
+    )
     parser.add_argument("--parity", action="store_true", help="Collect BF16 and FP16 parity diagnostics.")
     parser.add_argument("--out", type=Path, help="Write JSON to this path instead of stdout.")
     args = parser.parse_args()
@@ -334,12 +358,19 @@ def main() -> None:
     started = perf_counter()
     torch.manual_seed(141)
     report = {"batch": args.batch, "dtype": args.dtype, "warmup": args.warmup, "iters": args.iters}
+    flush_bytes = 0
+    if args.flush_l2:
+        flush_bytes = max(64 * 1024**2, 2 * scans._l2_size(torch.cuda.current_device()))
+    report.update(flush_l2=args.flush_l2, flush_bytes=flush_bytes)
     with torch.inference_mode():
+        flush_buffer = torch.empty(flush_bytes, device="cuda", dtype=torch.uint8) if flush_bytes else None
         for op in ops:
             for env, _ in OPS.values():
                 os.environ[env] = "off"
-            modes = tuple(dict.fromkeys(("off", *requested))) if op == "vscan_bwd" else OPS[op][1]
-            report[op] = _screen(op, args, modes)
+            modes = OPS[op][1]
+            if op == "vscan_bwd" and args.modes:
+                modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
+            report[op] = _screen(op, args, modes, flush_buffer)
     if ops == ("vscan_bwd",):
         report.update(report["vscan_bwd"])
     if all(op in report and set(modes) <= report[op]["weighted_ms"].keys()
