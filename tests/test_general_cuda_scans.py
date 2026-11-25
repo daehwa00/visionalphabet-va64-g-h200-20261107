@@ -42,6 +42,11 @@ from lnet.product_scan_reference import (
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
     _cuda = pytest.mark.cuda
+    # Run these serial compilation-heavy cases as a separate pytest shard.
+    _cuda_compile = pytest.mark.cuda_compile
+    _cuda_matrix = pytest.mark.cuda_matrix
+
+_COMPILED = pytest.param(True, marks=_cuda_compile, id="inductor")
 
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 
@@ -759,6 +764,7 @@ def test_cuda_batched_forward_path(
 
 
 @_cuda
+@_cuda_compile
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("warps", [1, 2, 3, 4])
@@ -851,7 +857,7 @@ def test_auto_odd_modes_against_fp32_reference(
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(("h", "w", "m", "coarse", "dtype", "hidden"), _CASES)
-@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "inductor"])
+@pytest.mark.parametrize("compiled", [pytest.param(False, id="eager"), _COMPILED])
 def test_cuda_reference_equivalence(
     h: int,
     w: int,
@@ -948,7 +954,7 @@ def test_cuda_trajectory_replay_preserves_gradients(
 
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "inductor"])
+@pytest.mark.parametrize("compiled", [pytest.param(False, id="eager"), _COMPILED])
 @pytest.mark.parametrize("coarse", [False, True])
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_cuda_reference_forward_cuda_backward(
@@ -959,7 +965,7 @@ def test_cuda_reference_forward_cuda_backward(
 
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "inductor"])
+@pytest.mark.parametrize("compiled", [pytest.param(False, id="eager"), _COMPILED])
 @pytest.mark.parametrize(("h", "w", "m", "coarse"), [(128, 192, 7, True), (17, 35, 33, False)])
 def test_cuda_dense_scratch_fallback(
     monkeypatch: pytest.MonkeyPatch, compiled: bool, h: int, w: int, m: int, coarse: bool,
@@ -1048,7 +1054,7 @@ def test_cuda_mixed_parameter_storage_and_packed_outputs(hidden: int) -> None:
 
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("compiled", [False, _COMPILED])
 @inductor_config.patch(emulate_precision_casts=False)
 def test_cuda_terminal_dispatch(monkeypatch: pytest.MonkeyPatch, compiled: bool) -> None:
     monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
@@ -1413,6 +1419,7 @@ def test_scan_micro_selection() -> None:
 
 
 @_cuda
+@_cuda_matrix
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
@@ -1458,6 +1465,7 @@ def test_cuda_sgs_parity(
 
 
 @_cuda
+@_cuda_matrix
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [*MODEL_SHAPES, *EDGE_SHAPES], ids=lambda shape: shape[0])
