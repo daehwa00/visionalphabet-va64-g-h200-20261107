@@ -12,6 +12,7 @@ from __future__ import annotations
 # ruff: noqa: FBT001, FBT002
 import ctypes as ct
 import os
+import re
 from dataclasses import dataclass, replace
 from functools import cache, lru_cache
 from typing import TYPE_CHECKING, NamedTuple, Protocol
@@ -133,6 +134,7 @@ class Kernel:
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
+    saved_trajectory: int = 0
     sgs: int = 0  # 0: RMW, 1: full coverage
     backward_reduce_warps: int = 0
     odd_coarse_backward: bool = False
@@ -1455,9 +1457,199 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 """
 
+_SAVED_QUAD_CUDA = r"""
+__device__ unsigned int pair_bits(Pair<__half> p) {
+    const __half2_raw raw = p.value;
+    return raw.x | (static_cast<unsigned int>(raw.y) << 16);
+}
+
+__device__ unsigned int pair_bits(Pair<__nv_bfloat16> p) {
+    const __nv_bfloat162_raw raw = p.value;
+    return raw.x | (static_cast<unsigned int>(raw.y) << 16);
+}
+
+template<class T> __device__ Pair<T> unpack_pair_bits(unsigned int bits);
+template<> __device__ Pair<__half> unpack_pair_bits(unsigned int bits) {
+    return {__half2(__half2_raw{static_cast<unsigned short>(bits),
+                               static_cast<unsigned short>(bits >> 16)})};
+}
+template<> __device__ Pair<__nv_bfloat16> unpack_pair_bits(unsigned int bits) {
+    return {__nv_bfloat162(__nv_bfloat162_raw{static_cast<unsigned short>(bits),
+                                            static_cast<unsigned short>(bits >> 16)})};
+}
+
+template<class T, class I>
+__device__ __forceinline__ void store_saved_quad(void* base, I index, Quad<T> value) {
+    if constexpr (sizeof(T) == 2) {
+        reinterpret_cast<uint2*>(base)[index] = make_uint2(pair_bits(value.a), pair_bits(value.b));
+    } else {
+        reinterpret_cast<float4*>(base)[index] = value.unpack();
+    }
+}
+
+template<class T, class I>
+__device__ __forceinline__ float4 load_saved_quad(const void* base, I index) {
+    if constexpr (sizeof(T) == 2) {
+        const uint2 value = reinterpret_cast<const uint2*>(base)[index];
+        return Quad<T>{unpack_pair_bits<T>(value.x), unpack_pair_bits<T>(value.y)}.unpack();
+    } else {
+        return reinterpret_cast<const float4*>(base)[index];
+    }
+}
+"""
+
+_SAVED_TRAJECTORY_CUDA = r"""
+template<class T, class I, bool COARSE>
+__device__ __forceinline__ Column<T, I> saved_column(
+    const T* states, const float* vx, const float* vy,
+    I line, int b, int h, int w, int mcount, int m, float eps
+) {
+    const int ow = w / (1 + COARSE), oh = h / (1 + COARSE);
+    const I batch = line / ow;
+    const int x = line % ow, xa = COARSE ? 2 * x + 1 : x, xb = COARSE ? 2 * x : x;
+    const I base = batch * h * w * mcount + m;
+    const I plane = I(b) * h * w * mcount;
+    return {states, vy, base + I(xa) * mcount, base + I(xb) * mcount,
+            plane, plane, (batch * oh * ow + x) * mcount + m, I(b) * oh * ow * mcount,
+            h, w, mcount, ow, m, vx[I(xa) * mcount + m], vx[(I(w) + xb) * mcount + m], eps};
+}
+
+template<bool COARSE, bool RI, bool II, class T, class I, class Weights>
+__device__ __forceinline__ void saved_path_cell(
+    Column<T, I> c, int yo, const Quad<T>* trajectory, I start, I plane,
+    const T* gr, const T* gi,
+    Weights path, float* acc, float4& positive, Quad<T>& negative
+) {
+    const int yp = yo * (1 + COARSE) + COARSE, yn = yp - COARSE;
+    const I offset = c.cell(yo) - c.m;
+    const I stride = I(c.OW) * c.M;
+    const float2 gp = c.gain(yp, false), gn = c.gain(yn, true);
+    const auto p = load_saved_quad<T>(trajectory, start + yp * stride);
+    const auto n = load_saved_quad<T>(trajectory, plane + start + yn * stride);
+    const auto pos = Quad<T>::pack(
+        make_float4(p.x * gp.x, p.y * gp.x, p.z * gp.y, p.w * gp.y)).unpack();
+    const auto neg = Quad<T>::pack(
+        make_float4(n.x * gn.x, n.y * gn.x, n.z * gn.y, n.w * gn.y)).unpack();
+    float dp[8]{};
+    path_mlp<T, I, 8, false, true>(
+        pos, neg,
+        path, {}, make_float2(read(gr[offset * (1 + RI) + c.m]),
+                              read(gi[offset * (1 + II) + c.m])), acc, I(1), dp);
+    positive = normalize<T>(make_float4(dp[0], dp[4], dp[1], dp[5]), gp);
+    negative = normalize_packed<T>(make_float4(dp[2], dp[6], dp[3], dp[7]), gn);
+}
+
+template<class T, class I, bool COARSE, int WARPS, bool COMPACT, bool RI, bool II, int PASS>
+__device__ __forceinline__ void saved_backward(
+    const float* dr, const float* di, const float* gr_pole, const float* gi_pole,
+    const T* states, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo,
+    const T* gr, const T* gi, T* gs, float* partial,
+    const Quad<T>* trajectory, Quad<T>* dp,
+    int B, int H, int W, int M, int workers, int types, float eps
+) {
+    constexpr int threads = WARPS * 32;
+    constexpr int fields = PASS == 0 ? 94 : PASS == 1 ? 90 : 4;
+    extern __shared__ float4 shared[];
+    const int tiles = (M - 1) / 32 + 1, lane = threadIdx.x % 32;
+    const int group = blockIdx.x / tiles, mode0 = (blockIdx.x % tiles) * 32;
+    const int m = mode0 + lane, worker = group * WARPS + threadIdx.x / 32;
+    auto* weights = reinterpret_cast<T*>(shared);
+    if constexpr (PASS != 2) {
+        load_path_weights<T, I>(weights, wi, bi, wo, types, mode0, M, 8, threads);
+        __syncthreads();
+    }
+    float acc[PASS == 2 ? 1 : 90]{};
+    Complex da{}, dg{};
+    const int ow = W / (1 + COARSE), oh = H / (1 + COARSE);
+    const I stride = I(ow) * M, plane = I(B) * H * stride;
+    if (m < M && worker < workers) {
+        const auto path = path_weights<T, I, true>(weights, wi, bi, wo, types, m, 8, lane);
+        if constexpr (PASS == 1) {
+            for (I cell = worker; cell < I(B) * oh * ow; cell += workers) {
+                const I batch = cell / (oh * ow), x = cell % ow;
+                const int yo = cell / ow % oh;
+                const auto c = saved_column<T, I, COARSE>(
+                    states, vx, vy, batch * ow + x, B, H, W, M, m, eps);
+                float4 positive;
+                Quad<T> negative;
+                const I start = batch * H * stride + x * M + m;
+                saved_path_cell<COARSE, RI, II>(
+                    c, yo, trajectory, start, plane, gr, gi, path, acc,
+                    positive, negative);
+                store_saved_quad(dp, c.cell(yo), Quad<T>::pack(positive));
+                store_saved_quad(dp, c.feature_plane + c.cell(yo), negative);
+            }
+        } else {
+            const Complex a{dr[m], di[m]}, g{gr_pole[m], gi_pole[m]};
+            auto* negative_cache = weights + 88 * 32;
+            auto* cache = reinterpret_cast<Quad<T>*>(negative_cache) + threadIdx.x;
+            for (I line = worker; line < I(B) * ow; line += workers) {
+                const auto c = saved_column<T, I, COARSE>(
+                    states, vx, vy, line, B, H, W, M, m, eps);
+                const I start = (line / ow * H * ow + line % ow) * M + m;
+                Complex adj_a{}, adj_b{};
+                for (int y = H - 1; y >= 0; --y) {
+                    float4 positive{};
+                    if (!COARSE || (y & 1)) {
+                        const int yo = y / (1 + COARSE);
+                        if constexpr (PASS == 0) {
+                            Quad<T> negative;
+                            saved_path_cell<COARSE, RI, II>(
+                                c, yo, trajectory, start, plane, gr, gi, path, acc,
+                                positive, negative);
+                            cache[yo * threads] = negative;
+                        } else {
+                            positive = load_saved_quad<T>(dp, c.cell(yo));
+                        }
+                    }
+                    const auto prev = y
+                        ? load_saved_quad<T>(trajectory, start + (y - 1) * stride)
+                        : float4{};
+                    column_adjoint<false, COMPACT>(
+                        c, y, prev, c.source(y), positive, a, g, adj_a, adj_b, da, dg, gs);
+                }
+                adj_a = adj_b = {};
+                for (int y = 0; y < H; ++y) {
+                    float4 negative{};
+                    if (y / (1 + COARSE) < oh && (!COARSE || !(y & 1))) {
+                        const int yo = y / (1 + COARSE);
+                        if constexpr (PASS == 0) negative = cache[yo * threads].unpack();
+                        else negative = load_saved_quad<T>(dp, c.feature_plane + c.cell(yo));
+                    }
+                    const auto prev = y + 1 < H
+                        ? load_saved_quad<T>(
+                            trajectory, plane + start + (y + 1) * stride)
+                        : float4{};
+                    column_adjoint<true, COMPACT>(
+                        c, y, prev, c.source(y), negative, a.conj(), g.conj(),
+                        adj_a, adj_b, da, dg, gs);
+                    if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);
+                }
+            }
+        }
+    }
+    // One independent partial row per warp avoids atomics and reduction scratch.
+    if (m < M && worker < workers) {
+        auto* row = partial + I(worker) * fields * M + m;
+        if constexpr (PASS != 1) {
+            row[0] = da.r; row[M] = da.i; row[2 * I(M)] = dg.r; row[3 * I(M)] = dg.i;
+            if constexpr (PASS == 0) row += 4 * I(M);
+        }
+        if constexpr (PASS != 2) {
+            #pragma unroll
+            for (int j = 0; j < 90; ++j) row[I(j) * M] = acc[j];
+        }
+    }
+}
+"""
+
 # NVRTC compilation and driver launch
 
-def _kernel_name(key: Kernel) -> str:
+def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
+    if key.saved_trajectory:
+        return ("", "vscan_fwd_saved", "vscan_bwd_saved", "vscan_path_bwd",
+                "vscan_adj_bwd")[key.saved_trajectory]
     if key.sgs:
         return "vscan_sgs"
     if key.projection:
@@ -1519,6 +1711,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}{minimum})'
         f" void {_kernel_name(key)}"
     )
+    if key.saved_trajectory > 1:
+        return _saved_backward_source(key, io, index, bounds)
     compact = str(key.compact).lower()
     layout = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
     if key.vertical:
@@ -1615,7 +1809,73 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _sgs_source(source)
     if key.backward_reduce_warps:
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
+    if key.saved_trajectory:
+        source = _with_saved_quads(_saved_forward_source(source))
     return source + wrapper
+
+
+def _with_saved_quads(source: str) -> str:
+    start = source.index("template<class T, class I>\nstruct Column {")
+    return source[:start] + _SAVED_QUAD_CUDA + source[start:]
+
+
+def _saved_forward_source(source: str) -> str:
+    start = source.index("    const auto path = [&]", source.index("void vertical("))
+    end = source.index("template<class T, class I, int WARPS, int HIDDEN", start)
+    forward = source[start:end]
+    # Add one vector store after each recurrence update, including coarse
+    # rows that are not sampled by the projection but feed the pole adjoint.
+    forward, stores = re.subn(
+        r"(state = advance_forward<REGISTER_PATH && VECTOR_WEIGHTS>\(\s*"
+        r"state, c.source\(([^)]+)\), ([^;]+)\);)",
+        lambda match: match[0] + "\n" + " " * 24
+        + "store_saved_quad(global_checkpoints, "
+        + ("I(B) * H * ow * M + " if "conj" in match[3] else "")
+        + "((b * H + (" + match[2] + ")) * ow + x) * M + m, Quad<T>::pack(state));",
+        forward,
+    )
+    # Read the positive trajectory as the reverse pass projects each cell.
+    # The saved buffer replaces the temporary normalized line cache.
+    forward, caches = re.subn(
+        r"\s*if \(!COARSE \|\| \(y & 1\)\) \{\s*"
+        r"buf\[I\(COARSE \? y / 2 : y\) \* stride\] =\s*"
+        r"normalize_packed<T>\(state, c.gain\(y, false\)\);\s*\}",
+        "",
+        forward,
+    )
+    if stores not in (4, 5) or caches != 1:
+        raise RuntimeError("Unexpected vertical forward trajectory template")
+    positive = (
+        "normalize<T>(load_saved_quad<T>(global_checkpoints, "
+        "((b * H + y + int(COARSE)) * ow + x) * M + m), "
+        "c.gain(y + int(COARSE), false))"
+    )
+    forward = forward.replace(
+        "buf[I(COARSE ? y / 2 : y) * stride].unpack()", positive,
+    ).replace("buf[I(yo) * stride].unpack()", positive)
+    return source[:start] + forward + source[end:]
+
+
+def _saved_backward_source(key: Kernel, io: str, index: str, bounds: str) -> str:
+    flags = ", ".join(str(flag).lower() for flag in (
+        key.compact, key.real_interleaved, key.imag_interleaved,
+    ))
+    source = _odd_compact_source(_CUDA_SOURCE) if key.odd_compact_width else _CUDA_SOURCE
+    return _with_saved_quads(source) + _SAVED_TRAJECTORY_CUDA + f"""
+{bounds}(
+    const float* dr, const float* di, const float* decay_gr, const float* decay_gi,
+    const {io}* states, const float* vx, const float* vy,
+    const void* wi, const void* bi, const void* wo,
+    const {io}* gr, const {io}* gi, {io}* gs, float* partial,
+    const Quad<{io}>* trajectory, Quad<{io}>* dp,
+    int B, int H, int W, int M, int workers, int types, float eps
+) {{
+    saved_backward<{io}, {index}, {str(key.coarse).lower()}, {key.warps}, {flags},
+                   {key.saved_trajectory - 2}>(
+        dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo, gr, gi, gs, partial,
+        trajectory, dp, B, H, W, M, workers, types, eps);
+}}
+"""
 
 
 def _horizontal_candidate_source(source: str, key: Kernel) -> str:
@@ -3179,6 +3439,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     saved_features: Tensor | None = None,
     state_grad: Tensor | None = None,
     pure: bool = False,
+    trajectory: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     shape = tuple(states.shape[1:])
     if (
@@ -3222,7 +3483,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or not saved_features.is_contiguous()
     ):
         raise ValueError("Invalid saved vertical features")
-    if not pure and not (
+    if trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None
             and mode != "off")
@@ -3253,6 +3514,16 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
+    if trajectory is not None:
+        plan, base, _, _ = launch
+        line_bytes = oh * plan.warps * 32 * 4 * states.element_size() if plan.cache_line else 0
+        plan = plan._replace(cache_line=False, smem=plan.smem - line_bytes)
+        key = replace(
+            base, saved_trajectory=1, cache_line=False,
+            index32=base.index32 and trajectory.numel() // 4 < 2**31,
+        )
+        launch = launch._replace(plan=plan, key=key)
+        checkpoints = trajectory
     if backward:
         if pure:
             gr, gi = features, None
@@ -3284,7 +3555,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
             output = outr, outi
         gr = gi = gs = partial = None
     scratch = (
-        None if launch.plan.cache_line else
+        None if launch.plan.cache_line or trajectory is not None else
         states.new_empty((oh, launch.workers, m, 4))
     )
     inputs = (
@@ -3690,6 +3961,119 @@ def _fake_vforward_packed(
     return states.new_empty((2, *shape, m) if planar else (*shape, 2 * m))
 
 
+VSCAN_SAVED_MODES = ("off", "saved_fused", "saved_split", "auto_vram")
+
+
+def _trajectory_shape(states: Tensor, coarse: bool, split: bool) -> tuple[int, ...]:
+    _, b, h, w, m = states.shape
+    shape = (2, b, h, w // (1 + coarse), m, 4)
+    # Keep the selected backward schedule in the tensor metadata saved by autograd.
+    return (1, *shape) if split else shape
+
+
+@torch.compiler.assume_constant_result
+def _free_vram(device: torch.device) -> int:
+    return torch.cuda.mem_get_info(device)[0]
+
+
+def _vscan_saved_policy(
+    states: Tensor, path: list[Tensor], coarse: bool, mode: str | None = None,
+) -> str:
+    if mode is None:
+        mode = _scan_mode("LNET_SCAN_VSCAN_SAVED", VSCAN_SAVED_MODES)
+    if mode == "off" or not states.is_cuda or not path or path[0].shape[1] != 8:
+        return "off"
+    _, b, h, w, m = states.shape
+    oh, ow = h // (1 + coarse), w // (1 + coarse)
+    if not (oh and ow):
+        return "off"
+    if mode == "auto_vram":
+        nbytes = 8 * b * h * ow * m * states.element_size()
+        total = _total_vram(states.device)
+        if total < 48 * 1024**3 or 100 * nbytes > 15 * min(total, _free_vram(states.device)):
+            return "off"
+        return "saved_split"
+    return mode
+
+
+def _vscan_trajectory_backward(
+    pole: list[Tensor],
+    states: Tensor,
+    auxiliary: list[Tensor],
+    path: list[Tensor],
+    grad: tuple[Tensor, Tensor],
+    coarse: bool,
+    epsilon: float,
+    compact: bool,
+    trajectory: Tensor,
+) -> list[Tensor]:
+    split = trajectory.ndim == 7
+    if (
+        not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
+        or not _pole_ok(pole, states)
+        or (compact and not coarse) or not 0 < epsilon < float("inf")
+        or trajectory.shape != _trajectory_shape(states, coarse, split)
+        or trajectory.dtype != states.dtype or trajectory.device != states.device
+        or not trajectory.is_contiguous() or path[0].shape[1] != 8
+    ):
+        raise ValueError("Invalid saved vertical trajectory")
+    _, b, h, w, m = states.shape
+    oh, ow = h // (1 + coarse), w // (1 + coarse)
+    gr, gi = _vertical_adjoints(grad, states, (b, oh, ow, m))
+    gs = states.new_empty((4, b, h, ow if compact else w, m))
+    dp = states.new_empty((2, b, oh, ow, m, 4)) if split else None
+    inputs = (
+        *(p.float().contiguous() for p in pole),
+        states.contiguous(),
+        *(t.float().contiguous() for t in auxiliary),
+        *(p.contiguous() for p in path[:3]),
+        gr, gi, gs,
+    )
+    device = states.device.index or 0
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    tiles = _ceil(m, 32)
+    reduced = []
+    narrow_index = max(states.numel(), trajectory.numel() // 4) < 2**31
+    for variant, count, fields in (
+        ((3, b * oh * ow, 90), (4, b * ow, 4)) if split else ((2, b * ow, 94),)
+    ):
+        # Wide coarse adjoints use the two-warp schedule to avoid local spills.
+        warps = 2 if variant == 4 and coarse and not narrow_index else 4
+        weight_bytes = 88 * 32 * states.element_size() if variant != 4 else 0
+        smem = weight_bytes
+        if variant == 2:
+            per_warp = oh * 32 * 4 * states.element_size()
+            while warps * per_warp + weight_bytes > device_limits(device)[1] and warps > 1:
+                warps //= 2
+            smem += warps * per_warp
+            if smem > device_limits(device)[1]:
+                return vertical_backward(
+                    pole, states, auxiliary, path, gr, gi, coarse, epsilon, compact,
+                )
+        workers = min(count, _ceil(sms * 8, tiles) * warps)
+        partial = states.new_empty((workers, fields, m), dtype=torch.float32)
+        index32 = narrow_index and partial.numel() < 2**31
+        key = Kernel(
+            states.dtype, warps, backward=True, vertical=True, coarse=coarse,
+            hidden8=True, compact=compact, index32=index32,
+            min_blocks=3 if variant == 3 and index32 and not coarse else 0,
+            real_interleaved=not gr.is_contiguous(), imag_interleaved=not gi.is_contiguous(),
+            odd_compact_width=compact and bool(w % 2), saved_trajectory=variant,
+        )
+        _launch_kernel(
+            states, key, tiles * _ceil(workers, warps), smem,
+            (*map(_ptr, (*inputs, partial, trajectory, dp)),
+             *map(ct.c_int, (b, h, w, m, workers, _scalar_types(path))), ct.c_float(epsilon)),
+        )
+        if variant == 2:
+            reduced = _reduce_partials(partial, [*pole, *path], 8)
+        elif variant == 3:
+            reduced.extend(_reduce_partials(partial, path, 8, projection=True))
+        else:
+            reduced[:0] = _reduce_partials(partial, pole)
+    return [*reduced[:4], gs, *reduced[4:]]
+
+
 @torch.library.custom_op("lnet::general_vscan_backward", mutates_args=())
 def vertical_backward(
     pole: list[Tensor],
@@ -3703,6 +4087,11 @@ def vertical_backward(
     compact: bool = False,
     saved_features: Tensor | None = None,
 ) -> list[Tensor]:
+    if saved_features is not None and saved_features.ndim in (6, 7):
+        return _vscan_trajectory_backward(
+            pole, states, auxiliary, path, (grad_real, grad_imag), coarse, epsilon, compact,
+            saved_features,
+        )
     out = _vscan(
         pole, states, auxiliary, path, coarse, epsilon, False, (grad_real, grad_imag),  # noqa: FBT003
         compact=compact, saved_features=saved_features,
@@ -3744,10 +4133,26 @@ def _vertical_forward_saved(
     planar: bool,
     precise: bool,
     separate: bool,
+    trajectory_policy: str = "off",
 ) -> tuple[Tensor, Tensor, Tensor]:
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
+    if trajectory_policy != "off":
+        if trajectory_policy not in ("saved_fused", "saved_split") or not (shape[1] and shape[2]):
+            raise ValueError("Invalid vertical trajectory policy or shape")
+        trajectory = states.new_empty(
+            _trajectory_shape(states, coarse, trajectory_policy == "saved_split"),
+        )
+        out = _vscan(
+            pole, states, auxiliary, path, coarse, epsilon, precise,
+            packed=not separate, planar=planar, trajectory=trajectory,
+        )
+        if isinstance(out, tuple):
+            return *out, trajectory
+        if isinstance(out, Tensor):
+            return out, states.new_empty((0,)), trajectory
+        raise TypeError("Expected saved scan outputs")
     with torch.autocast(device_type="cuda", enabled=False):
         features = _vscan(
             pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise, pure=True,
@@ -3779,6 +4184,7 @@ def _fake_vertical_forward_saved(
     planar: bool,
     precise: bool,  # noqa: ARG001
     separate: bool,
+    trajectory_policy: str = "off",
 ) -> tuple[Tensor, Tensor, Tensor]:
     _, b, h, w, m = states.shape
     step = 2 if coarse else 1
@@ -3786,7 +4192,10 @@ def _fake_vertical_forward_saved(
     return (
         states.new_empty(shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))),
         states.new_empty(shape if separate else (0,)),
-        states.new_empty((8, b * (h // step) * (w // step), m)),
+        states.new_empty((8, b * (h // step) * (w // step), m)) if trajectory_policy == "off"
+        else states.new_empty(
+            _trajectory_shape(states, coarse, trajectory_policy == "saved_split"),
+        ),
     )
 
 
@@ -3862,7 +4271,7 @@ def _differentiate_vertical_features(
         [dr, di, gr, gi], states, [vx, vy], path, real, imag, ctx.coarse, ctx.epsilon,
         saved_features=features,
     )
-    result = gradients[:4], gradients[4], [None, None], gradients[5:], *(None,) * 6
+    result = gradients[:4], gradients[4], [None, None], gradients[5:], *(None,) * 7
     return result[:len(ctx.needs_input_grad)]
 
 
@@ -3879,10 +4288,11 @@ def vertical_forward(
     precise: bool = True,
     mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
-    if mode == "cuda" and _should_save_vscan(states, coarse):
+    policy = _vscan_saved_policy(states, path, coarse) if mode == "cuda" else "off"
+    if mode == "cuda" and (policy != "off" or _should_save_vscan(states, coarse)):
         real, imag, _ = _vertical_forward_saved(
             pole, states, auxiliary, path, coarse, epsilon,
-            planar=False, precise=precise, separate=True,
+            planar=False, precise=precise, separate=True, trajectory_policy=policy,
         )
         return real, imag
     return _vertical_forward(pole, states, auxiliary, path, coarse, epsilon, precise, mode)

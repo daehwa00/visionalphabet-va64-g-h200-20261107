@@ -16,6 +16,7 @@ from .general_cuda_scans import (
     _general_vertical_inputs,
     _should_save_vscan,
     _vertical_forward_saved,
+    _vscan_saved_policy,
     can_use_general_hscan,
     general_scans_enabled,
     horizontal_backward,
@@ -1200,10 +1201,15 @@ def _run_packed_cuda_forward(
             pole_y, horizontal_storage, auxiliary, path, epilogue, kind, path_swiglu,
         )
         saved = [] if recompute else [horizontal_storage]
-        if operands is not None and _should_save_vscan(horizontal_storage, operands[-1]):
+        policy = _vscan_saved_policy(horizontal_storage, operands[3], operands[-1]) if (
+            operands is not None and general_scans_enabled()
+        ) else "off"
+        if operands is not None and (
+            policy != "off" or _should_save_vscan(horizontal_storage, operands[-1])
+        ):
             output, secondary, features = _vertical_forward_saved(
                 *operands, float(epsilon), planar=planar_output,
-                precise=True, separate=not packed_output,
+                precise=True, separate=not packed_output, trajectory_policy=policy,
             )
             descriptor = output.new_empty((0,), dtype=torch.float32)
             return output, secondary, descriptor, [*saved, features]
@@ -1296,7 +1302,7 @@ def _run_packed_cuda_backward(
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
     saved_features = None
-    if horizontal_states and horizontal_states[-1].ndim == 3:
+    if horizontal_states and horizontal_states[-1].ndim in (3, 6, 7):
         *horizontal_states, saved_features = horizontal_states
     horizontal_storage = (
         horizontal_states[0] if horizontal_states

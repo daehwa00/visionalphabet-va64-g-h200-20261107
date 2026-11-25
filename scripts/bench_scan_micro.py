@@ -328,10 +328,113 @@ def _combined_projection(report: dict) -> dict[str, float]:
     return {"weighted_ms": projected, "delta_vs_off_ms": projected - off, "delta_vs_strict_ms": projected - strict}
 
 
+def _e2e_case(data: Inputs, coarse: bool, mode: str) -> tuple[Callable, Callable]:
+    policy = scans._vscan_saved_policy(data.states, data.path, coarse, mode)
+
+    def forward() -> tuple[Tensor, Tensor, Tensor | None]:
+        if policy == "off":
+            r, i = scans.vertical_forward(
+                data.pole, data.states, data.gains, data.path, coarse,
+            )
+            return r, i, None
+        return scans._vertical_forward_saved(
+            data.pole, data.states, data.gains, data.path, coarse, 1e-6,
+            planar=False, precise=True, separate=True, trajectory_policy=policy,
+        )
+
+    def backward(saved: Tensor | None) -> list[Tensor]:
+        return scans.vertical_backward(
+            data.pole, data.states, data.gains, data.path, data.gr, data.gi,
+            coarse=coarse, compact=coarse, saved_features=saved,
+        )
+
+    return forward, backward
+
+
+def _e2e_sample(
+    data: Inputs, coarse: bool, mode: str, args: argparse.Namespace, flush: Tensor | None,
+) -> dict:
+    forward, backward = _e2e_case(data, coarse, mode)
+
+    def full_step() -> None:
+        _, _, saved = forward()
+        backward(saved)
+
+    torch.cuda.reset_peak_memory_stats()
+    total_ms = _time(full_step, args.warmup, args.iters, flush)
+    peak = torch.cuda.max_memory_allocated() / 1024**3
+    _, _, trajectory = forward()
+    return {
+        "fwd_ms": _time(forward, args.warmup, args.iters, flush),
+        "bwd_ms": _time(lambda: backward(trajectory), args.warmup, args.iters, flush),
+        "total_ms": total_ms, "peak_vram_gib": peak,
+        "selected_saved_path": trajectory is not None,
+    }
+
+
+def _e2e_parity(shapes: tuple, modes: tuple[str, ...]) -> dict:
+    report = {}
+    for name, dtype in DTYPES.items():
+        cases = {}
+        for label, h, w, m, coarse, _ in shapes:
+            inputs = make_inputs(2, h, w, m, coarse, dtype)
+            outputs = {}
+            expected = None
+            for mode in modes:
+                forward, backward = _e2e_case(inputs, coarse, mode)
+                real, imag, trajectory = forward()
+                values = [real, imag, *backward(trajectory)]
+                if expected is None:
+                    expected = values
+                names = ("real", "imag", *TENSOR_NAMES["vscan_bwd"])
+                stats = {}
+                for key, got, want in zip(names, values, expected, strict=True):
+                    metrics = parity_stats(got, want)
+                    delta = torch.linalg.vector_norm(got.float() - want.float())
+                    rel_l2 = (delta / torch.linalg.vector_norm(want.float()).clamp_min(1e-12)).item()
+                    metrics["rel_l2"] = rel_l2 if math.isfinite(rel_l2) else None
+                    metrics["tol_pass"] &= rel_l2 < (1e-2 if name == "bf16" else 1e-3)
+                    stats[key] = metrics
+                outputs[mode] = stats
+            cases[label] = outputs
+        report[name] = cases
+    return report
+
+
+def _screen_e2e(args: argparse.Namespace, modes: tuple[str, ...], flush: Tensor | None) -> dict:
+    weighted = dict.fromkeys(modes, 0.0)
+    fwd_weighted = dict.fromkeys(modes, 0.0)
+    bwd_weighted = dict.fromkeys(modes, 0.0)
+    results = {}
+    for label, h, w, m, coarse, weight in MODEL_SHAPES:
+        data = make_inputs(args.batch, h, w, m, coarse, DTYPES[args.dtype])
+        cases = {}
+        for mode in modes:
+            result = _e2e_sample(data, coarse, mode, args, flush)
+            cases[mode] = result
+            weighted[mode] += weight * result["total_ms"]
+            fwd_weighted[mode] += weight * result["fwd_ms"]
+            bwd_weighted[mode] += weight * result["bwd_ms"]
+            result["delta_vs_off_ms"] = result["total_ms"] - cases["off"]["total_ms"]
+        results[label] = cases
+        del data
+    report = {
+        "shapes": results, "weighted_ms": weighted,
+        "weighted_fwd_ms": fwd_weighted, "weighted_bwd_ms": bwd_weighted,
+        "weighted_delta_vs_off_ms": {mode: ms - weighted["off"] for mode, ms in weighted.items()},
+    }
+    if args.parity:
+        edge = (("17x19x33d", 17, 19, 33, False, 1), ("31x23x65c", 31, 23, 65, True, 1))
+        report["parity"] = _e2e_parity((*MODEL_SHAPES, *edge), modes)
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--modes", help="Comma-separated policies for VScan backward.")
-    parser.add_argument("--ops", default="vscan_bwd", help="Comma-separated operation names.")
+    parser.add_argument("--modes", help="Comma-separated policies for vscan_bwd or vscan_e2e.")
+    parser.add_argument(
+        "--ops", default="vscan_bwd", help="Comma-separated operations, including vscan_e2e.",
+    )
     parser.add_argument("--all-ops", action="store_true", help="Screen all four scan operations.")
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
@@ -345,28 +448,43 @@ def main() -> None:
     parser.add_argument("--out", type=Path, help="Write JSON to this path instead of stdout.")
     args = parser.parse_args()
     ops = tuple(OPS) if args.all_ops else tuple(dict.fromkeys(token.strip() for token in args.ops.split(",")))
-    if set(ops).difference(OPS):
-        parser.error(f"--ops must contain names from {', '.join(OPS)}")
+    available = (*OPS, "vscan_e2e")
+    if set(ops).difference(available):
+        parser.error(f"--ops must contain names from {', '.join(available)}")
     requested = tuple(token.strip() for token in args.modes.split(",")) if args.modes else scans.SGS_MODES
-    if set(requested).difference(scans.SGS_MODES):
+    e2e_modes = ("off", "saved_fused", "saved_split", "auto_vram")
+    if args.modes and "vscan_e2e" in ops:
+        if "vscan_bwd" in ops:
+            parser.error("--modes applies to one VScan operation at a time")
+        if set(requested).difference(e2e_modes):
+            parser.error("--modes must contain valid LNET_SCAN_VSCAN_SAVED tokens")
+        e2e_modes = tuple(dict.fromkeys(("off", *requested)))
+    elif set(requested).difference(scans.SGS_MODES):
         parser.error("--modes must contain valid LNET_SCAN_SGS tokens")
     if args.batch < 1 or args.iters < 1 or args.warmup < 0:
         parser.error("--batch and --iters must be positive and --warmup cannot be negative")
     if not torch.cuda.is_available():
         parser.error("CUDA is required")
     os.environ["LNET_VSCAN_DECOUPLED"] = "off"
+    os.environ["LNET_SCAN_VSCAN_SAVED"] = "off"
     started = perf_counter()
     torch.manual_seed(141)
     report = {"batch": args.batch, "dtype": args.dtype, "warmup": args.warmup, "iters": args.iters}
     flush_bytes = 0
     if args.flush_l2:
-        flush_bytes = max(64 * 1024**2, 2 * scans._l2_size(torch.cuda.current_device()))
+        flush_bytes = max(
+            (128 if "vscan_e2e" in ops else 64) * 1024**2,
+            2 * scans._l2_size(torch.cuda.current_device()),
+        )
     report.update(flush_l2=args.flush_l2, flush_bytes=flush_bytes)
     with torch.inference_mode():
         flush_buffer = torch.empty(flush_bytes, device="cuda", dtype=torch.uint8) if flush_bytes else None
         for op in ops:
             for env, _ in OPS.values():
                 os.environ[env] = "off"
+            if op == "vscan_e2e":
+                report[op] = _screen_e2e(args, e2e_modes, flush_buffer)
+                continue
             modes = OPS[op][1]
             if op == "vscan_bwd" and args.modes:
                 modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
