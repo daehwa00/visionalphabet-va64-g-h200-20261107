@@ -98,15 +98,28 @@ def check_case(
     del y, z, x_ref, ref_grads, ref_params
     eager = run_step(forward, x, params, dy)
     names = ["y", "dw", "dg", "db"] + (["dc"] if bias else []) + (["dx"] if needs_dx else [])
-    errors = {
-        name: float((a.detach().float() - r.detach()).norm() / r.detach().norm().clamp_min(1e-8))
-        for name, a, r in zip(names, eager, expected, strict=True)
-    }
-    if not all(v < (0.04 if dtype == torch.bfloat16 else 0.008) for v in errors.values()):
-        raise AssertionError(errors)
+
+    def check_relative_l2(actual, reference, limit, comparison):
+        errors = {
+            name: float((a.float() - r.float()).norm() / r.float().norm().clamp_min(1e-8))
+            for name, a, r in zip(names, actual, reference, strict=True)
+        }
+        if not all(v < limit for v in errors.values()):
+            raise AssertionError(f"{comparison} (limit {limit}): {errors}")
+        return errors
+
+    limit = 0.04 if dtype == torch.bfloat16 else 0.008
+    errors = check_relative_l2(eager, expected, limit, "eager vs FP32")
     torch._dynamo.reset()
-    compiled = torch.compile(forward, fullgraph=True)
-    torch.testing.assert_close(run_step(compiled, x, params, dy), eager)
+    compiled_aot = torch.compile(forward, backend="aot_eager", fullgraph=True)
+    torch.testing.assert_close(run_step(compiled_aot, x, params, dy), eager)
+    if x.is_cuda:
+        compiled = torch.compile(forward, fullgraph=True)
+        compiled_outputs = run_step(compiled, x, params, dy)
+        check_relative_l2(compiled_outputs, expected, limit, "Inductor vs FP32")
+        eager_limit = 0.015 if dtype == torch.bfloat16 else 0.005
+        check_relative_l2(compiled_outputs, eager, eager_limit, "Inductor vs eager")
+        del compiled_outputs
     if not graph_finite(lambda: run_step(forward, x, params, dy)):
         raise AssertionError("Nonfinite CUDA Graph replay")
     return {
