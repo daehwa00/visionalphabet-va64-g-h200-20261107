@@ -191,8 +191,10 @@ def _parity(
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     for dtype_name, dtype in DTYPES.items():
         for shape in (*MODEL_SHAPES, *EDGE_SHAPES):
-            label, _, w, m, coarse, _ = shape
-            batch = 2 if label in EDGE_LABELS else min(args.batch, 64)
+            label, h, w, m, coarse, _ = shape
+            # Bound input volume, allowing short scans to exercise production kernel choices.
+            parity_batch = 64 * 56 * 56 // (h * w)
+            batch = 2 if label in EDGE_LABELS else min(args.batch, parity_batch)
             if label == "56d" and op == "vscan_bwd":
                 # Exercise the two-wave grouping even when timing a small batch.
                 batch = max(batch, 8, scans._ceil(16 * sms, w * scans._ceil(m, 32)))
