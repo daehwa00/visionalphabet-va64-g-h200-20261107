@@ -43,36 +43,45 @@ def test_w44_options(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("mode", kernels._W44_MODES[1:])
-def test_w44_plans_reject_local_memory(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+@pytest.mark.parametrize(("height", "modes"), [(56, 160), (7, 128)])
+def test_w44_plans_reject_local_memory(
+    monkeypatch: pytest.MonkeyPatch, mode: str, height: int, modes: int,
+) -> None:
     monkeypatch.setenv("LNET_READER_W44", mode)
     props = SimpleNamespace(major=9, multi_processor_count=132, shared_memory_per_block=49152,
                             max_threads_per_multi_processor=2048, total_memory=140 * 2**30)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
-    monkeypatch.setattr(kernels, "_reader_module_for", lambda *_a, **kw: kw)
+    compilations = []
+
+    def compile_module(*_args: object, **kwargs: object) -> dict:
+        compilations.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(kernels, "_reader_module_for", compile_module)
 
     def resident(module, op, warps) -> int:
-        if op == "dweight" and module.get("convert_weight"):
+        if op == "dweight_cvt":
             return 0
         if op != "dweight" and module["launch"].vec == 2:
             return 0
         return 16 // warps
 
     monkeypatch.setattr(kernels, "_reader_resident", resident)
-    p = torch.empty((1024, 56, 56, 640), device="meta", dtype=torch.bfloat16)
-    w = torch.empty((160, 4, 3, 3), device="meta", dtype=p.dtype)
-    g = torch.empty((1024, 56, 56, 320), device="meta", dtype=p.dtype)
-    if mode in ("dw_fullrank", "dw_fullrank_cvt", "all_opt"):
+    p = torch.empty((1024, height, height, modes * 4), device="meta", dtype=torch.bfloat16)
+    w = torch.empty((modes, 4, 3, 3), device="meta", dtype=p.dtype)
+    g = torch.empty((1024, height, height, modes * 2), device="meta", dtype=p.dtype)
+    if mode in ("dw_fullrank", "dw_fullrank_cvt"):
         launch = kernels._reader_weight_plan(p, w, g, strict=False)
         assert launch.module["weight_geometry"][0] == 4
         assert launch.module["weight_vec"] == 1
-        assert not launch.module.get("convert_weight")
-    for backward, spatial_mode in ((False, "fwd_lane_opt"), (True, "dinput_wide")):
-        if mode in (spatial_mode, "all_opt"):
-            launch, module = kernels._reader_spatial_plan(
-                p, w, g if backward else None, strict=False,
-            )
-            assert launch.vec == 1
-            assert module["updated"]
+        assert launch.operation == "dweight"
+        assert len(compilations) == 1
+    if mode == "dinput_wide":
+        launch, module = kernels._reader_spatial_plan(p, w, g, strict=False)
+        assert launch.vec == 1
+        assert launch.columns == height
+        assert launch.rows == min(height, 8)
+        assert module["updated"]
 
 
 @requires_cuda
@@ -95,6 +104,64 @@ def test_w44_cuda_parity(monkeypatch, mode, dtype, h, w, modes, rank) -> None:
     monkeypatch.setenv("LNET_READER_W44", "off")
     expected = run()
     monkeypatch.setenv("LNET_READER_W44", mode)
+    for actual, reference in zip(run(), expected, strict=True):
+        torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.005)
+
+
+@pytest.mark.parametrize("mode", kernels._READER_MODES)
+@pytest.mark.parametrize("modes", [23, 34, 40])
+@pytest.mark.parametrize("resident", [0, 16])
+def test_regslide_alignment_and_pass_selection(monkeypatch, mode, modes, resident) -> None:
+    monkeypatch.setenv("LNET_READER_OPT", mode)
+    props = SimpleNamespace(major=9, max_threads_per_multi_processor=2048)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+    monkeypatch.setattr(kernels, "_reader_cuda_module", lambda *args, **kw: (args, kw))
+    monkeypatch.setattr(kernels, "_reader_resident", lambda *_: resident)
+    projected = torch.empty((1, 9, 11, 4 * modes), device="meta", dtype=torch.float16)
+    real = torch.empty((modes, 4, 3, 3), device="meta", dtype=projected.dtype)
+    grad = torch.empty((1, 9, 11, 2 * modes), device="meta", dtype=projected.dtype)
+    vectors = {
+        "dinput_vec2": {"dinput": 2}, "dinput_vec4": {"dinput": 4},
+        "fwd_vec2_r4": {"forward": 2}, "fwd_vec4": {"forward": 4},
+        "dw_vec2_fullrank": {"dweight": 2},
+        "regslide_all": {"forward": 2, "dinput": 2, "dweight": 2},
+    }
+    for op, value in (("forward", None), ("dinput", grad), ("dweight", grad)):
+        candidate = kernels._regslide_candidate(projected, real, value, strict=False, op=op)
+        vec = vectors.get(mode, {}).get(op)
+        if not resident or vec is None or modes % vec:
+            assert candidate is None
+        else:
+            launch, (_, kwargs) = candidate
+            assert launch.vec == vec
+            assert launch.warps == 1
+            assert kwargs["operation"] == f"regslide{vec}"
+            if op == "dweight":
+                assert kwargs["weight_geometry"] == (4, 4, 1)
+
+
+@requires_cuda
+@pytest.mark.parametrize("mode", kernels._READER_MODES[1:])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("batch", "h", "w", "modes", "rank"), [
+    (1, 9, 11, 40, 4), (2, 13, 19, 63, 4), (1, 7, 5, 8, 2),
+])
+def test_regslide_cuda_parity(monkeypatch, mode, dtype, batch, h, w, modes, rank) -> None:
+    torch.manual_seed(47)
+    options = {"device": "cuda", "dtype": dtype}
+    projected = torch.randn(batch, h, w, modes * rank, **options).mul_(0.125)
+    grad = torch.randn(batch, h, w, 2 * modes, **options).mul_(0.125)
+    real, imag = torch.randn(2, modes, rank, 3, 3, **options).mul_(0.125).unbind()
+
+    def run() -> tuple[torch.Tensor, ...]:
+        return (
+            kernels._packed_spatial(projected, real, imag, strict_complex=False),
+            *kernels._packed_spatial_backward(grad, projected, real, imag, strict_complex=False),
+        )
+
+    monkeypatch.setenv("LNET_READER_OPT", "off")
+    expected = run()
+    monkeypatch.setenv("LNET_READER_OPT", mode)
     for actual, reference in zip(run(), expected, strict=True):
         torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.005)
 
@@ -717,7 +784,7 @@ def test_reader_spatial_auto_dispatch(monkeypatch, option, width, modes, rank, s
     projected = torch.empty((1024, 13, width, rank * modes), device="meta", dtype=torch.float16)
     real = torch.empty((modes, rank, 3, 3), device="meta", dtype=projected.dtype)
     launch, module = kernels._reader_spatial_plan(projected, real, None, strict=strict)
-    optimized = option != "off" and not strict and rank <= 4
+    optimized = not strict and rank <= 4
     assert module.get("updated", False) == optimized
     assert launch.vec == (vec if optimized else 1)
     if optimized:
