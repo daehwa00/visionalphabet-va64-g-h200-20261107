@@ -1460,7 +1460,7 @@ def _kernel_name(key: Kernel) -> str:
         return "reduce_path_mlp_partials"
     if key.reduction:
         return "reduce_vscan_partials" if key.vertical else "reduce_hscan_partials"
-    return "scan"
+    return "general_vscan" if key.vertical else "general_hscan"
 
 
 def _kernel_source(key: Kernel) -> str:  # noqa: C901
@@ -1505,7 +1505,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             key.cache_line, key.shared_acc, key.precise,
         )
     )
-    bounds = f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}) void scan'
+    bounds = (
+        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE})'
+        f" void {_kernel_name(key)}"
+    )
     compact = str(key.compact).lower()
     layout = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
     if key.vertical:
@@ -1584,7 +1587,6 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = _odd_compact_source(source)
     if key.sgs:
         source = _sgs_source(source)
-        wrapper = wrapper.replace("void scan(", f"void {_kernel_name(key)}(")
     if key.backward_reduce_warps:
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
     return source + wrapper

@@ -175,6 +175,9 @@ def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dic
 def kernel_bucket(name: str) -> str:
     scan_kernels = {
         "scan": "general_scan_shared",
+        "general_vscan": "general_vscan",
+        "general_hscan": "general_hscan",
+        "vscan_sgs": "general_vscan",
         "reduce_hscan_partials": "general_hscan",
         "reduce_vscan_partials": "general_vscan",
     }
