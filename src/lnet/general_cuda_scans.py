@@ -133,7 +133,8 @@ class Kernel:
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
-    sgs: int = 0  # 0: RMW, 1: full coverage, 2: runtime prefix
+    sgs: int = 0  # 0: RMW, 1: full coverage
+    backward_reduce_warps: int = 0
     odd_coarse_backward: bool = False
     odd_coarse_forward: bool = False
     odd_compact_width: bool = False
@@ -1582,8 +1583,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     if key.odd_compact_width:
         source = _odd_compact_source(source)
     if key.sgs:
-        source = _sgs_source(source, key)
+        source = _sgs_source(source)
         wrapper = wrapper.replace("void scan(", f"void {_kernel_name(key)}(")
+    if key.backward_reduce_warps:
+        source = _grouped_vscan_source(source, key.backward_reduce_warps)
     return source + wrapper
 
 
@@ -1592,16 +1595,10 @@ template<class T, class I, bool COMPACT, int THREADS>
 __device__ __forceinline__ void column_adjoint_positive(
     Column<T, I> c, int y, float4 prev, float4 source, float4 inject,
     Complex a, Complex g, Complex& adj_a, Complex& adj_b, Complex& da, Complex& dg,
-    T* gs, Quad<T>* pos_grad, int sgs_rows
+    T* gs, Quad<T>* pos_grad
 ) {
     const auto ds = column_adjoint_step<false>(
         prev, source, inject, a, g, adj_a, adj_b, da, dg);
-    if constexpr (SGS_PARTIAL) {
-        if (y >= sgs_rows) {
-            write_column_gradient<false, COMPACT>(c, y, ds, gs);
-            return;
-        }
-    }
     pos_grad[I(y) * THREADS] = Quad<T>::pack(ds);
 }
 
@@ -1609,16 +1606,10 @@ template<class T, class I, bool COMPACT, int THREADS>
 __device__ __forceinline__ void column_adjoint_negative(
     Column<T, I> c, int y, float4 prev, float4 source, float4 inject,
     Complex a, Complex g, Complex& adj_a, Complex& adj_b, Complex& da, Complex& dg,
-    T* gs, const Quad<T>* pos_grad, int sgs_rows
+    T* gs, const Quad<T>* pos_grad
 ) {
     const auto ds = column_adjoint_step<true>(
         prev, source, inject, a, g, adj_a, adj_b, da, dg);
-    if constexpr (SGS_PARTIAL) {
-        if (y >= sgs_rows) {
-            write_column_gradient<true, COMPACT, true>(c, y, ds, gs);
-            return;
-        }
-    }
     write_column_gradient<true, COMPACT, false>(c, y, ds, gs, pos_grad[I(y) * THREADS]);
 }
 """
@@ -1663,36 +1654,48 @@ def _odd_coarse_backward_source(source: str) -> str:
     return _odd_coarse_negative(source)
 
 
-def _sgs_source(source: str, key: Kernel) -> str:
-    source = f"#define SGS_PARTIAL {int(key.sgs == 2)}\n" + source
-    if not key.cache_source and not key.coarse:
-        source = source.replace(
-            "if constexpr (!CACHE_SOURCE) seg_src[j * THREADS] = Quad<T>::pack(s);", "",
-        ).replace(
-            "c, y, seg[j * THREADS], CACHED_SOURCE_AT(j), in, ar, gg,",
-            "c, y, seg[j * THREADS], c.source(y), in, ar, gg,",
-        )
-    if not key.cache_source:
-        source = source.replace("CACHE_SOURCE ? H : span", "CACHE_SOURCE ? H : (COARSE ? span : 0)")
+def _sgs_source(source: str) -> str:
     source = source.replace(
         "int chunks, Complex& da, Complex& dg",
-        "int chunks, Complex& da, Complex& dg, Quad<T>* pos_grad, int sgs_rows",
+        "int chunks, Complex& da, Complex& dg, Quad<T>* pos_grad",
     ).replace(
         "buf, stride, chunks, da, dg",
         "buf, stride, chunks, da, dg, line_buf + "
-        "(CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x, int(grad_plane)",
+        "(CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x",
     )
     start = source.index("void column_backward(")
     end = source.index("#undef CACHED_SOURCE_AT", start)
     column = source[start:end].replace(
         "column_adjoint<false, COMPACT>(", "column_adjoint_positive<T, I, COMPACT, THREADS>(",
-    ).replace("da, dg, gs);", "da, dg, gs, pos_grad, sgs_rows);").replace(
+    ).replace("da, dg, gs);", "da, dg, gs, pos_grad);").replace(
         "column_adjoint<true, COMPACT>(", "column_adjoint_negative<T, I, COMPACT, THREADS>(",
     )
     return (source[:start] + column + source[end:]).replace(
         "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
         _SGS_ADJOINT
         + "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
+    )
+
+
+def _grouped_vscan_source(source: str, reduce_warps: int) -> str:
+    # Keep baseline partial rows and worker stride so the final FP32
+    # reduction sees the same operands in the same order.
+    start = source.index("void write_vscan_partial(")
+    end = source.index("struct RegisterPathWeights", start)
+    reduction = source[start:end].replace(
+        "threadIdx.x < 32", f"(threadIdx.x / 32) % {reduce_warps} == 0",
+    ).replace("k < WARPS", f"k < {reduce_warps}").replace(
+        "int m, int M", "int m, int M, bool active",
+    ).replace("&& m < M", "&& active")
+    source = source[:start] + reduction + source[end:]
+    return source.replace(
+        "row += I(reduce ? group : worker) * fields * M + m;",
+        f"row += I(worker / {reduce_warps}) * fields * M + m;",
+        1,
+    ).replace(
+        "row, nullptr, da, dg, m, M);", "row, nullptr, da, dg, m, M, active);",
+    ).replace(
+        "row, local_acc, da, dg, m, M);", "row, local_acc, da, dg, m, M, active);",
     )
 
 
@@ -2380,7 +2383,7 @@ def _plan_scan_auto(
     return launch
 
 
-SGS_MODES = ("off", "strict", "chunked", "nocsrc", "partial", "auto")
+SGS_MODES = ("off", "strict", "strict_ro")
 
 
 @cache
@@ -2412,105 +2415,92 @@ def _sgs_smem(key: Kernel, height: int) -> int:
     ))
 
 
-def _sgs_layouts(key: Kernel, height: int, cache_source: bool, max_span: int) -> list[Kernel]:
-    # Favor the existing replay span and a few balanced subdivisions before
-    # considering every remaining span that could fit in the occupancy slot.
-    preferred = [_ceil(height, 2 * segments) * 2 for segments in (2, 3, 4)]
-    start = min(height - 1, max_span) & ~1
-    spans = [
-        span for span in (key.chunk, *preferred, *range(start, 1, -2))
-        if 0 < span <= start and span % 2 == 0
-    ]
-    if cache_source:
-        spans.insert(0, key.chunk)
-    return [
-        replace(
-            key, chunk=span, cache_source=cache_source, vector_weights=vector,
-            global_checkpoints=False,
-            backward_batch2=key.backward_batch2 and cache_source and (
-                not key.coarse or not (height % 4 or span % 4)
-            ),
-            backward_batch_tail=key.backward_batch2 and cache_source and not key.coarse
-            and bool(height % 2 or span % 2),
+def _sgs_cap(block_limit: int, shared: int, reserved: int, resident: int) -> int:
+    return min(block_limit, ((shared // resident - reserved) // 256) * 256)
+
+
+def _wider_readonly_layout(
+    launch: Launch, shape: tuple[int, int, int, int], active_warps: int, sms: int,
+    block_limit: int, shared: int, reserved: int,
+) -> tuple[Kernel, int, int] | None:
+    _, key, workers, _ = launch
+    _, height, _, modes = shape
+    # With an odd height, changing the span can move the scalar tail to
+    # another row and change which rows run the paired adjoint.
+    if not (
+        key.chunk and not key.coarse and not key.global_checkpoints and key.cache_source
+        and key.vector_weights and key.backward_batch2 and not (height % 2 or key.chunk % 2)
+    ):
+        return None
+    best = None
+    best_span = key.chunk
+    for warps in _SCAN_WARPS:
+        if warps <= key.warps or warps % key.warps or active_warps % warps:
+            continue
+        resident = active_warps // warps
+        if _ceil(workers, warps) * _ceil(modes, _WARP_SIZE) < 2 * sms * resident:
+            continue
+        cap = _sgs_cap(block_limit, shared, reserved, resident)
+        candidate = replace(
+            key, warps=warps, backward_readonly=True, backward_reduce_warps=key.warps,
         )
-        for vector in dict.fromkeys((key.vector_weights, False))
-        for span in dict.fromkeys(spans)
-    ]
+        threads = warps * _WARP_SIZE
+        max_span = min(height - 1, cap // (threads * 16)) & ~1
+        for span in range(max_span, best_span, -2):
+            candidate = replace(candidate, chunk=span)
+            smem = max(threads * 128, _sgs_smem(candidate, height))
+            if smem <= cap:
+                best, best_span = (candidate, smem, resident), span
+                break
+    return best
 
 
 @lru_cache(maxsize=512)
-def _plan_sgs(  # noqa: C901, PLR0912
-    device: int, launch: Launch, height: int, mode: str,
+def _plan_sgs(
+    device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
 ) -> Launch:
     plan, key, _, _ = launch
-    if key.shared_acc or not key.hidden8 or key.dtype.itemsize != 2 or key.pure_vertical:
+    _, height, _, _ = shape
+    if (
+        mode not in SGS_MODES[1:] or key.shared_acc or not key.hidden8
+        or key.dtype.itemsize != 2 or key.pure_vertical
+    ):
+        return launch
+    strict = _plan_sgs(device, launch, shape, "strict") if mode == "strict_ro" else launch
+    full = not key.chunk and key.cache_source
+    chunked = key.chunk and not key.coarse and key.cache_source and not key.global_checkpoints
+    eligible = full if mode == "strict" else strict.key.sgs or chunked
+    if not eligible:
         return launch
     target = _resident(device, key, plan.smem)
     if not target:
         return launch
-    _, block_limit, warp_limit = device_limits(device)
+    sms, block_limit, warp_limit = device_limits(device)
     shared, registers, reserved = _sgs_device_limits(device)
-    threads = key.warps * _WARP_SIZE
-    if target * key.warps > warp_limit or target * threads > registers:
+    active_warps = target * key.warps
+    if mode == "strict":
+        smem = plan.smem + height * key.warps * _WARP_SIZE * 8
+        candidate = replace(key, sgs=1)
+        if (
+            active_warps <= min(warp_limit, registers // _WARP_SIZE)
+            and smem <= _sgs_cap(block_limit, shared, reserved, target)
+            and _resident(device, candidate, smem) == target
+        ):
+            launch = launch._replace(plan=plan._replace(smem=smem, sgs_rows=height), key=candidate)
         return launch
-    cap = min(block_limit, ((shared // target - reserved) // 256) * 256)
-    row_bytes = threads * 8
-    minimum = threads * 128 if key.warps > 1 else 0
-    candidates = []
 
-    def add(candidate: Kernel, rows: int, storage: int) -> None:
-        smem = max(minimum, storage + rows * row_bytes)
-        if rows and smem <= cap:
-            candidate = replace(candidate, sgs=1 if rows == height else 2)
-            entry = (candidate, rows, smem)
-            if entry not in candidates:
-                candidates.append(entry)
-
-    # The strict policy retains even conservatively allocated baseline storage.
-    if mode not in {"chunked", "partial"} or key.cache_source:
-        add(key, height, plan.smem)
-    if mode != "strict":
-        strict_end = len(candidates)
-        max_span = cap // (threads * 16)
-        cached = _sgs_layouts(key, height, cache_source=True, max_span=max_span)
-        for layout in cached:
-            add(layout, height, _sgs_smem(layout, height))
-        cached_end = len(candidates)
-        if mode in {"nocsrc", "auto"}:
-            for layout in _sgs_layouts(key, height, cache_source=False, max_span=max_span):
-                add(layout, height, _sgs_smem(layout, height))
-        full_end = len(candidates)
-        if mode in {"partial", "auto"}:
-            partial = []
-            for layout in cached:
-                storage = _sgs_smem(layout, height)
-                rows = min(height, (cap - storage) // row_bytes)
-                if key.coarse:
-                    rows &= ~1
-                if 0 < rows < height:
-                    partial.append((rows, layout, storage))
-            for rows, layout, storage in sorted(partial, key=lambda entry: -entry[0]):
-                add(layout, rows, storage)
-        # Reserve a driver probe for each feasible policy in priority order.
-        groups = (
-            candidates[:strict_end], candidates[strict_end:cached_end],
-            candidates[cached_end:full_end], candidates[full_end:],
-        )
-        primary = [group[0] for group in groups if group]
-        remaining = (entry for group in groups for entry in group if entry not in primary)
-        candidates = [*primary, *remaining]
-
-    for candidate, rows, smem in candidates[:3]:
-        if _resident(device, candidate, smem) == target:
+    readonly = replace(strict.key, backward_readonly=True)
+    if not strict.key.backward_readonly and _resident(device, readonly, strict.plan.smem) == target:
+        strict = strict._replace(key=readonly)
+    wider = _wider_readonly_layout(launch, shape, active_warps, sms, block_limit, shared, reserved)
+    if wider is not None:
+        candidate, smem, resident = wider
+        if _resident(device, candidate, smem) == resident:
             return launch._replace(
-                plan=plan._replace(
-                    smem=smem, chunk=candidate.chunk or height,
-                    cache_source=candidate.cache_source, full_trajectory=not candidate.chunk,
-                    global_checkpoints=candidate.global_checkpoints, sgs_rows=rows,
-                ),
+                plan=plan._replace(warps=candidate.warps, chunk=candidate.chunk, smem=smem),
                 key=candidate,
             )
-    return launch
+    return strict
 
 
 def _plan_launch(
@@ -2558,7 +2548,7 @@ def _plan_launch(
         ))
     mode = os.environ.get("LNET_SCAN_SGS", "off")
     if vertical and backward and mode in SGS_MODES[1:]:
-        return _plan_sgs(device, launch, height, mode)
+        return _plan_sgs(device, launch, shape, mode)
     return launch
 
 
@@ -2948,7 +2938,7 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
             ct.c_longlong(states.stride(0) if pure else 0),
             ct.c_longlong(
                 gs.stride(0) * (1 + int(compact))
-                if pure and gs is not None else launch.plan.sgs_rows,
+                if pure and gs is not None else 0,
             ),
         ),
     )

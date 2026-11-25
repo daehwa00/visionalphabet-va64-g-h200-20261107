@@ -489,7 +489,12 @@ def _reference_vscan(
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(("h", "w", "m", "coarse"), [(7, 13, 1, False), (28, 56, 48, True)])
-def test_fake_shapes_and_autograd(dtype: torch.dtype, h: int, w: int, m: int, coarse: bool) -> None:
+@pytest.mark.parametrize("mode", scans.SGS_MODES)
+def test_fake_shapes_and_autograd(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, w: int, m: int,
+    coarse: bool, mode: str,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_SGS", mode)
     with FakeTensorMode():
         px, py, r, i, aux, path = _inputs(h, w, m, 5, dtype, "cpu", batch=2)
         states = scans.horizontal_forward(px, r, i)
@@ -657,6 +662,25 @@ def _pipeline(
 
 
 _compiled_pipeline = torch.compile(_pipeline, fullgraph=True, dynamic=True)
+
+
+@pytest.mark.parametrize("mode", scans.SGS_MODES)
+def test_sgs_aot_eager(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    monkeypatch.setenv("LNET_SCAN_SGS", mode)
+    args = _inputs(4, 6, 3, 8, torch.bfloat16, "cpu")
+    px, py, real, imag, _, path = args
+    params = [real, imag, *px, *py, *path]
+
+    def loss(px, py, real, imag, auxiliary, path):
+        states = torch.stack(bidirectional_product_scan_reference(tuple(px), (real, imag)))
+        vr, vi = _reference_vscan(py, states, auxiliary, path, coarse=False)
+        return vr.sum() + vi.sum()
+
+    run = torch.compile(loss, backend="aot_eager", fullgraph=True)
+    value = run(*args)
+    gradients = torch.autograd.grad(value, params)
+    assert torch.isfinite(value)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 def _compare_pipeline(
@@ -1284,49 +1308,55 @@ def test_odd_coarse_bf16_reference_rounding_and_tail() -> None:
     assert abs(autograd_dbo[0, 0] - dy.float().sum()) > 5e-4 + 2e-3
 
 
-@pytest.mark.parametrize(("coarse", "compact"), [(False, False), (True, False), (True, True)])
-def test_sgs_partial_row_prefix(
-    monkeypatch: pytest.MonkeyPatch, coarse: bool, compact: bool,
+@pytest.mark.parametrize("allow_wider", [False, True])
+def test_sgs_readonly_preserves_occupancy_and_partial_order(
+    monkeypatch: pytest.MonkeyPatch, allow_wider: bool,
 ) -> None:
-    height = 73
+    shape = (1024, 56, 56, 160)
     key = scans.Kernel(
-        torch.bfloat16, 4, backward=True, vertical=True, coarse=coarse, hidden8=True,
-        chunk=14, cache_weights=True, cache_source=True, cache_line=True, compact=compact,
-        odd_coarse_backward=coarse, odd_compact_width=compact, global_checkpoints=True,
+        torch.bfloat16, 2, backward=True, vertical=True, hidden8=True, chunk=14,
+        cache_weights=True, cache_source=True, vector_weights=True, backward_batch2=True,
     )
-    plan = scans.ScanPlan(4, scans._sgs_smem(key, height), 14, global_checkpoints=True)
-    base = scans.Launch(plan, key, 128, 32)
-    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 195 * 1024, 64))
-    monkeypatch.setattr(scans, "_sgs_device_limits", lambda _: (392 * 1024, 65536, 1024))
-    calls = []
+    plan = scans.ScanPlan(2, 57344, 14, cache_weights=True, cache_source=True)
+    base = scans.Launch(plan, key, 1690, 845)
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_sgs_device_limits", lambda _: (228 * 1024, 65536, 1024))
+    probes = []
 
     def resident(_, candidate, smem):
-        calls.append((candidate, smem))
-        return 2
+        probes.append((candidate, smem))
+        return 4 if candidate.warps == 2 else 2 if allow_wider else 0
 
     monkeypatch.setattr(scans, "_resident", resident)
     scans._plan_sgs.cache_clear()
     try:
-        result = scans._plan_sgs(0, base, height, "partial")
-        storage = scans._sgs_smem(result.key, height)
-        rows = (195 * 1024 - storage) // (4 * 32 * 8)
-        if coarse:
-            rows &= ~1
-        assert 0 < result.plan.sgs_rows == rows < height
-        assert result.plan.smem == storage + rows * 4 * 32 * 8
-        assert result.key.cache_source
-        assert not result.key.global_checkpoints
-        assert not result.plan.global_checkpoints
-        assert result.key.compact == compact
-        assert result.key.sgs == 2
+        assert scans._plan_sgs(0, base, shape, "off") == base
+        assert scans._plan_sgs(0, base, shape, "strict") == base
+        result = scans._plan_sgs(0, base, shape, "strict_ro")
+        assert result.key.backward_readonly
         assert result[2:] == base[2:]
-        assert len(calls) <= 4
-        source = scans._kernel_source(result.key)
-        assert "#define SGS_PARTIAL 1" in source
-        assert source.count("if (y >= sgs_rows)") == 2
-        assert source.count("pos_grad[I(y) * THREADS]") == 2
-        if coarse:
-            assert "y + 1 < c.H" in source
+        assert len(probes) == 3
+        if allow_wider:
+            assert result.key == replace(
+                key, warps=4, chunk=20, backward_readonly=True, backward_reduce_warps=2,
+            )
+            assert result.plan.smem == scans._sgs_smem(result.key, shape[1])
+            source = scans._kernel_source(result.key)
+            assert "row += I(worker / 2) * fields * M + m;" in source
+            assert "(threadIdx.x / 32) % 2 == 0 && active" in source
+            assert "k < 2; ++k) sum += staged" in source
+        else:
+            assert result == base._replace(key=replace(key, backward_readonly=True))
+        assert scans._plan_sgs(0, base, shape, "strict_ro") == result
+        assert len(probes) == 3
+
+        small = base._replace(workers=112, partials=56)
+        result = scans._plan_sgs(0, small, (2, *shape[1:]), "strict_ro")
+        assert result == small._replace(key=replace(key, backward_readonly=True))
+
+        odd = base._replace(key=replace(key, backward_batch_tail=True))
+        result = scans._plan_sgs(0, odd, (1024, 57, 56, 160), "strict_ro")
+        assert result == odd._replace(key=replace(odd.key, backward_readonly=True))
     finally:
         scans._plan_sgs.cache_clear()
 
@@ -1337,53 +1367,59 @@ def test_sgs_strict_and_probe_limit(monkeypatch: pytest.MonkeyPatch) -> None:
         cache_weights=True, cache_source=True, cache_line=True, vector_weights=True,
     )
     height = 14
+    shape = (1024, height, 14, 160)
     base = scans.Launch(scans.ScanPlan(4, scans._sgs_smem(key, height), height), key, 128, 32)
     monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
     monkeypatch.setattr(scans, "_sgs_device_limits", lambda _: (228 * 1024, 65536, 1024))
     calls = []
-    allowed = True
 
+    @scans.cache
     def resident(_, candidate, smem):
-        calls.append(smem)
-        return 2 if allowed or not candidate.sgs else 1
+        calls.append((candidate, smem))
+        return 1 if candidate.backward_readonly else 2
 
     monkeypatch.setattr(scans, "_resident", resident)
     scans._plan_sgs.cache_clear()
     try:
-        result = scans._plan_sgs(0, base, height, "strict")
+        result = scans._plan_sgs(0, base, shape, "strict")
         assert result.plan.sgs_rows == height
         assert result.key == replace(key, sgs=1)
         assert result.plan.smem == base.plan.smem + height * 4 * 32 * 8
-        assert len(calls) == 2
-        calls.clear()
-        allowed = False
-        assert scans._plan_sgs(0, base, height, "auto") == base
-        assert len(calls) == 4
+        assert scans._plan_sgs(0, base, shape, "strict_ro") == result
+        assert len(calls) == 3
+        source = scans._kernel_source(result.key)
+        assert "SGS_PARTIAL" not in source
+        assert source.count("pos_grad[I(y) * THREADS]") == 2
     finally:
         scans._plan_sgs.cache_clear()
 
 
 def test_scan_micro_selection() -> None:
-    totals = {"off": 12.0, "strict": 11.86, "chunked": 11.8, "nocsrc": 11.5}
+    totals = {"off": 12.0, "strict": 11.86, "strict_ro": 11.8}
     assert best_mode(totals, {}) == "off"
-    assert best_mode(totals, {"strict": True}) == "off"
-    assert best_mode(totals, {"chunked": True, "nocsrc": False}) == "chunked"
-    assert best_mode(totals, {"chunked": True, "nocsrc": True}) == "nocsrc"
+    assert best_mode(totals, {"strict": True, "strict_ro": False}) == "off"
+    assert best_mode(totals, {"strict": True, "strict_ro": True}) == "strict_ro"
 
 
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    ("_label", "h", "w", "m", "coarse", "_calls"), [*MODEL_SHAPES, *EDGE_SHAPES],
+    ("label", "h", "w", "m", "coarse", "_calls"), [*MODEL_SHAPES, *EDGE_SHAPES],
 )
 def test_cuda_sgs_parity(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype,
-    _label: str, h: int, w: int, m: int, coarse: bool, _calls: int,
+    label: str, h: int, w: int, m: int, coarse: bool, _calls: int,
 ) -> None:
     torch.manual_seed(141)
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
-    inputs = make_inputs(2, h, w, m, coarse, dtype)
+    # Queue enough 56d CTAs to exercise widening on high-SM devices.
+    batch = 2
+    if label == "56d":
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        tiles = scans._ceil(m, scans._WARP_SIZE)
+        batch = max(batch, scans._ceil(16 * sms, w * tiles))
+    inputs = make_inputs(batch, h, w, m, coarse, dtype)
     for compact in ((False, True) if coarse else (False,)):
         monkeypatch.setenv("LNET_SCAN_SGS", "off")
         expected = scans.vertical_backward(*inputs, coarse, compact=compact)

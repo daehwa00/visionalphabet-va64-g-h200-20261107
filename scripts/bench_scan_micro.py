@@ -32,7 +32,10 @@ MODEL_SHAPES = (
 EDGE_SHAPES = (
     ("13x19x63c", 13, 19, 63, True, 1), ("9x11x34c", 9, 11, 34, True, 1),
     ("7x7x128c", 7, 7, 128, True, 1), ("1x1x1", 1, 1, 1, False, 1),
+    ("19x23x65d", 19, 23, 65, False, 1), ("37x17x97d", 37, 17, 97, False, 1),
+    ("64x21x95d", 64, 21, 95, False, 1),
 )
+EDGE_LABELS = {shape[0] for shape in EDGE_SHAPES}
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
@@ -77,10 +80,10 @@ def _time(inputs: Inputs, coarse: bool, warmup: int, iters: int) -> float:
     return statistics.median(start.elapsed_time(stop) for start, stop in events)
 
 
-def _plan(inputs: Inputs, coarse: bool) -> scans.Launch:
+def _plan(inputs: Inputs, coarse: bool, *, compact: bool) -> scans.Launch:
     launch = scans._plan_launch(
         inputs.states, tuple(inputs.states.shape[1:]), backward=True, vertical=True,
-        coarse=coarse, hidden=8, precise=False, compact=coarse, interleaved=(True, True),
+        coarse=coarse, hidden=8, precise=False, compact=compact, interleaved=(True, True),
     )
     if launch is None:
         raise RuntimeError("No fused vertical backward plan")
@@ -91,7 +94,7 @@ def _describe(launch: scans.Launch, device: int) -> dict[str, int | bool]:
     plan, key, _, _ = launch
     return {
         "warps": key.warps, "chunk": key.chunk, "csrc": key.cache_source,
-        "vecw": key.vector_weights, "sgs_rows": plan.sgs_rows, "smem": plan.smem,
+        "ro": key.backward_readonly, "vecw": key.vector_weights, "sgs_rows": plan.sgs_rows, "smem": plan.smem,
         "occupancy": key.warps * scans._resident(device, key, plan.smem),
     }
 
@@ -107,13 +110,18 @@ def _parity(
         shapes = EDGE_SHAPES if dtype_name == timing_dtype else (*MODEL_SHAPES, *EDGE_SHAPES)
         for label, h, w, m, coarse, _ in shapes:
             inputs = make_inputs(2, h, w, m, coarse, dtype)
-            os.environ["LNET_SCAN_SGS"] = "off"
-            expected = scans.vertical_backward(*inputs, coarse, compact=coarse)
-            for mode in modes[1:]:
-                os.environ["LNET_SCAN_SGS"] = mode
-                actual = scans.vertical_backward(*inputs, coarse, compact=coarse)
-                if not _equal(actual, expected):
-                    mismatches[mode].append(f"{dtype_name}/{label}")
+            for compact in (False, True) if coarse and label in EDGE_LABELS else (coarse,):
+                os.environ["LNET_SCAN_SGS"] = "off"
+                expected = scans.vertical_backward(*inputs, coarse, compact=compact)
+                samples = {_plan(inputs, coarse, compact=compact): True}
+                for mode in modes[1:]:
+                    os.environ["LNET_SCAN_SGS"] = mode
+                    launch = _plan(inputs, coarse, compact=compact)
+                    if launch not in samples:
+                        actual = scans.vertical_backward(*inputs, coarse, compact=compact)
+                        samples[launch] = _equal(actual, expected)
+                    if not samples[launch]:
+                        mismatches[mode].append(f"{dtype_name}/{label}/compact={compact}")
 
 
 def main() -> None:
@@ -147,7 +155,7 @@ def main() -> None:
             samples = {}
             for mode in modes:
                 os.environ["LNET_SCAN_SGS"] = mode
-                launch = _plan(inputs, coarse)
+                launch = _plan(inputs, coarse, compact=coarse)
                 if launch not in samples:
                     ms = _time(inputs, coarse, args.warmup, args.iters)
                     passed = True
