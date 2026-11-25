@@ -102,17 +102,20 @@ def parity(actual: torch.Tensor, expected: torch.Tensor, name: str) -> dict:
     else:
         atol, rtol = 0.0003, 0.001
     stats = []
+    mismatches = []
     epsilon = torch.finfo(torch.float32).eps
     for tile, reference in zip(actual.split(32), expected.split(32), strict=True):
         a, b = tile.float(), reference.float()
         error = (a - b).abs()
+        mismatches.append((tile != reference).sum())
         stats.append(torch.stack((error.amax(), (error / b.abs().clamp_min(epsilon)).amax(),
                                   (error / (atol + rtol * b.abs())).amax())))
     max_abs, max_rel, tolerance_ratio = torch.stack(stats).amax(dim=0).tolist()
+    mismatch_count = int(torch.stack(mismatches).sum().item())
     finite = all(math.isfinite(value) for value in (max_abs, max_rel, tolerance_ratio))
     return {"exact_match": finite and max_abs == 0, "max_abs": max_abs if finite else None,
             "max_rel": max_rel if finite else None, "tol_pass": finite and tolerance_ratio <= 1,
-            "atol": atol, "rtol": rtol}
+            "mismatch_count": mismatch_count, "atol": atol, "rtol": rtol}
 
 
 def shape_key(shape: Shape) -> str:
