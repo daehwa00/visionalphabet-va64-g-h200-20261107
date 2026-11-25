@@ -8,7 +8,12 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional
 
-from .fused_stem_ops import fused_conv_stem, fused_nhwc_layernorm_gelu, tiled_stem_enabled
+from .fused_stem_ops import (
+    STAGE0_CANDIDATES,
+    fused_conv_stem,
+    fused_nhwc_layernorm_gelu,
+    stem_stage0_mode,
+)
 from .model_w28c import model_cuda_supported
 
 _FUSED_FACTORIZED_READER_ENV = "LNET_FUSED_FACTORIZED_READER"
@@ -127,12 +132,17 @@ def _fused_stem_large_enough(inputs: Tensor, first: nn.Conv2d, second: nn.Conv2d
 
 
 def _fused_conv_stem_supported(
-    inputs: Tensor, conv: nn.Conv2d, *, tiled: bool = False,
+    inputs: Tensor, conv: nn.Conv2d, *, tiled: bool = False, allow_dx: bool = False,
 ) -> bool:
     mode = os.environ.get("LNET_FUSED_STEM_CONV", "auto")
     if mode not in ("auto", "off", "on"):
         raise ValueError("LNET_FUSED_STEM_CONV must be auto, off, or on")
-    if mode == "off" or not inputs.is_cuda or inputs.requires_grad or inputs.ndim != 4:
+    if (
+        mode == "off"
+        or not inputs.is_cuda
+        or (inputs.requires_grad and not allow_dx)
+        or inputs.ndim != 4
+    ):
         return False
     autocast = torch.is_autocast_enabled("cuda")
     dtype = torch.get_autocast_dtype("cuda") if autocast else inputs.dtype
@@ -164,17 +174,23 @@ def _fused_stem_block(
     *,
     nhwc_output: bool = False,
 ) -> Tensor:
-    tiled = (
-        not nhwc_output and inputs.is_cuda and conv.out_channels == 32 and tiled_stem_enabled()
+    mode = (
+        stem_stage0_mode()
+        if not nhwc_output and inputs.is_cuda and conv.out_channels == 32
+        else "off"
     )
-    use_tiled = tiled and _fused_conv_stem_supported(inputs, conv, tiled=True)
-    if not nhwc_output and (use_tiled or _fused_conv_stem_supported(inputs, conv)):
+    use_tiled = mode == "cuda_tiled" and _fused_conv_stem_supported(inputs, conv, tiled=True)
+    candidate = conv.in_channels == 3 and mode in STAGE0_CANDIDATES
+    if not nhwc_output and (
+        use_tiled or _fused_conv_stem_supported(inputs, conv, allow_dx=candidate)
+    ):
         dtype = (
             torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else inputs.dtype
         )
         return fused_conv_stem(
             inputs, conv.weight, conv.bias, norm.norm.weight, norm.norm.bias, norm.norm.eps, dtype,
             tiled_geometry=(*conv.stride, *conv.padding) if use_tiled else None,
+            mode=mode if candidate else "off",
         )
     hidden = functional.conv2d(
         inputs, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
