@@ -1238,6 +1238,70 @@ def test_scan_wave_alignment_respects_work_and_workspace() -> None:
     assert scans._align_workers(launch, 240, 3, 64).workers == 84
 
 
+def _even_vscan_inputs(
+    states: Tensor, aux: list[Tensor], coarse: bool,
+) -> tuple[Tensor, list[Tensor]]:
+    h, w = states.shape[2:4]
+    if not coarse or not (h % 2 or w % 2):
+        return states, aux
+    return torch.nn.functional.pad(states, (0, 0, 0, w % 2, 0, h % 2)), [
+        torch.nn.functional.pad(value, (0, 0, 0, size % 2), value=1.0)
+        for value, size in zip(aux, (w, h), strict=True)
+    ]
+
+
+def _even_vscan_oracle(
+    pole: list[Tensor], states: Tensor, aux: list[Tensor], path: list[Tensor],
+    grad: list[Tensor], coarse: bool, *, compact: bool = False,
+) -> list[Tensor]:
+    padded, padded_aux = _even_vscan_inputs(states, aux, coarse)
+    h, w = states.shape[2:4]
+    if coarse and (h % 2 or w % 2):
+        # The even oracle emits one extra pair with the added row. Its zero
+        # adjoint leaves the odd tail in the reverse recurrence only.
+        grad = [torch.nn.functional.pad(g, (0, 0, 0, w % 2, 0, h % 2)) for g in grad]
+    expected = scans.vertical_backward(pole, padded, padded_aux, path, *grad, coarse,
+                                       compact=compact)
+    expected[4] = expected[4][:, :, :h, :w // 2 if compact else w]
+    return expected
+
+
+def test_wave38a_odd_coarse_bf16_reference_rounding_and_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W37A", "warp_acc_k2")
+    dtype = torch.bfloat16
+    h, w, m = 7, 7, 1
+    y_tail = h - 1
+    pole = [torch.tensor([0.5]), torch.zeros(m), torch.ones(m), torch.zeros(m)]
+    aux = [torch.ones(2, size, m) for size in (w, h)]
+    path = [torch.zeros(s, requires_grad=True) for s in ((m, 8, 8), (m, 8), (m, 2, 8), (m, 2))]
+    states = torch.zeros(4, 1, h, w, m, dtype=dtype)
+    states[0, 0, y_tail, 1, 0] = 1  # Only the reverse selected states see this row.
+    with torch.no_grad():
+        path[0][0, 0, 2] = 1
+        path[2][0, 0, 0] = 1
+    out = scans._reference_vertical(pole, states, aux, path, coarse=True, epsilon=1e-6)
+    assert out[0][0, -1, 0, 0] != 0
+    padded, padded_aux = _even_vscan_inputs(states, aux, coarse=True)
+    out_pad = scans._reference_vertical(pole, padded, padded_aux, path, coarse=True, epsilon=1e-6)
+    for left, right in zip(out, out_pad, strict=True):
+        torch.testing.assert_close(left, right[:, :h // 2, :w // 2], atol=0, rtol=0)
+    masked = states.clone()
+    masked[:, :, y_tail] = 0
+    no_tail = scans._reference_vertical(pole, masked, aux, path, coarse=True, epsilon=1e-6)
+    assert torch.count_nonzero(no_tail[0]) == 0
+
+    dy = torch.zeros_like(out[0])
+    dy.flatten()[:3] = torch.tensor([0.5, 0.5, 2**-8], dtype=dtype)
+    (autograd_dbo,) = torch.autograd.grad(out[0], path[-1], dy)
+    # CUDA reduces the same BF16 dy in FP32 and only casts to the parameter
+    # dtype at the end. The eager oracle casts its BF16 sum to FP32 too late.
+    assert dy.float().sum().item() == 1 + 2**-8
+    assert autograd_dbo[0, 0].item() == 1
+    assert abs(autograd_dbo[0, 0] - dy.float().sum()) > 5e-4 + 2e-3
+
+
 @_cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("variant", tuple(scans._W37A_KERNELS))
@@ -1269,17 +1333,8 @@ def test_cuda_wave37a_parity(
     monkeypatch.setenv("LNET_SCAN_W37A", variant)
     actual = scans.vertical_backward(py, states, aux, path, *grad, coarse)
     assert recorded == [variant]
-    if coarse and (h % 2 or w % 2):
-        # The last row can affect the reverse recurrence. Use the full odd
-        # source for the reference and only truncate at coarse selection.
-        operands = [*py, states.requires_grad_(), *path]
-        out = scans._reference_vertical(py, states, aux, path, coarse, 1e-6)
-        expected = torch.autograd.grad(out, operands, grad)
-        for result, reference in zip(actual, expected, strict=True):
-            torch.testing.assert_close(result, reference, atol=5e-4, rtol=2e-3)
-        return
     monkeypatch.setenv("LNET_SCAN_W37A", "off")
-    expected = scans.vertical_backward(py, states, aux, path, *grad, coarse)
+    expected = _even_vscan_oracle(py, states, aux, path, grad, coarse)
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference, atol=5e-4, rtol=2e-3)
 
@@ -1513,6 +1568,37 @@ def test_wave37a_k4_chunk6_tail_layout(batch: int, vector: bool) -> None:
     assert visited == list(range(shape_h - 1, -1, -1))
 
 
+@pytest.mark.parametrize("warps", [2, 3, 4])
+def test_wave38a_cta_pole_staging_while_other_warps_scan(warps: int) -> None:
+    threads = warps * 32
+    source = scans._kernel_source(scans.Kernel(
+        torch.bfloat16, warps, backward=True, vertical=True, hidden8=True,
+        cache_source=True, wave37a="cta_acc_k2",
+    ))
+    assert "seg[threadIdx.x] = make_float4(da.r, da.i, dg.r, dg.i)" in source
+    assert "poles[i + k * 32 * 4]" in source
+
+    # Retire warp zero while every other warp still owns its trajectory slot.
+    live = torch.arange(threads * 4, dtype=torch.float32).reshape(threads, 4)
+    retired = live.clone()
+    gradient = torch.arange(threads * 4, dtype=torch.float32).reshape(threads, 4).neg()
+    retired[:32] = gradient[:32]
+    torch.testing.assert_close(retired[32:], live[32:], atol=0, rtol=0)
+
+    # The old field-major stores hit live slots even with just one early warp.
+    old = live.clone().flatten()
+    for field in range(4):
+        old[field * threads:field * threads + 32] = gradient[:32, field]
+    assert not torch.equal(old.reshape_as(live)[32:], live[32:])
+
+    retired[32:] = gradient[32:]
+    flat = retired.flatten()
+    for lane in range(32):
+        indices = 4 * lane + 4 * 32 * torch.arange(warps)[:, None] + torch.arange(4)
+        torch.testing.assert_close(flat[indices].sum(0), gradient[lane::32].sum(0),
+                                   atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("variant", ["warp_acc_single_gs", "cta_acc_single_gs"])
 def test_wave38a_single_gs_falls_back_for_tall_scan(
     monkeypatch: pytest.MonkeyPatch, variant: str,
@@ -1554,3 +1640,249 @@ def test_cuda_wave37a_k4_chunk6_tail(monkeypatch: pytest.MonkeyPatch, vector: bo
     expected = scans.vertical_backward(py, states, aux, path, *grad)
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference, atol=5e-4, rtol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("h", "m", "coarse", "active_warps"), [
+    (56, 160, False, 4), (13, 63, True, 3), (9, 34, True, 1),
+    (7, 128, True, 2), (1, 1, False, 1),
+])
+def test_wave39a_cpu_fragments(  # noqa: PLR0915
+    dtype: torch.dtype, h: int, m: int, coarse: bool, active_warps: int,
+) -> None:
+    rng = torch.Generator().manual_seed(138)
+
+    def sample(*shape: int) -> Tensor:
+        return (0.125 * torch.randn(shape, generator=rng)).to(dtype).float()
+
+    def rounded(x: Tensor) -> Tensor:
+        return x.to(dtype).float()
+
+    lane = torch.arange(32)
+    r = (lane // 4)[:, None] + torch.tensor([0, 0, 8, 8])
+    c = (lane % 4 * 2)[:, None] + torch.tensor([0, 1, 0, 1])
+    assert torch.equal((8 * r + c).flatten().sort().values, torch.arange(128))
+    # A and C share the layout for m16n8k8. Its B columns use the first two
+    # slots with coordinates reversed. m16n8k16 adds the second K half.
+    kr, n = c[:, :2], r[:, :2]
+    assert torch.equal((8 * kr + n).flatten().sort().values, torch.arange(64))
+    count = min(4, h // (1 + int(coarse)) % 4 or 4)
+    mask = (torch.arange(16) // 4 < active_warps) & (torch.arange(16) % 4 < count)
+    mode0 = (m - 1) // 32 * 32
+    valid = m - mode0
+    p = sample(32, 16, 8) * mask[:, None]
+    dy = sample(32, 16, 2) * mask[:, None]
+    p[valid:] = dy[valid:] = 0
+    wi, bi, wo, bo = sample(32, 8, 8), sample(32, 8), sample(32, 8, 2), sample(32, 2)
+
+    # Write in recurrence-lane order and load in the MMA lane order.
+    slots = (4 * torch.arange(16)[:, None, None] + torch.arange(4)[None, :, None]
+             + torch.arange(32)[None, None, :]) % 32
+    raw = p.to(dtype).view(torch.int16).to(torch.int64) & 0xFFFF
+    raw = raw.reshape(32, 16, 4, 2).permute(1, 2, 0, 3)
+    words = raw[..., 0] | (raw[..., 1] << 16)
+    staged = torch.empty_like(words).scatter_(2, slots, words)
+
+    def shared(rows: Tensor, cols: Tensor) -> Tensor:
+        indices = slots[rows, cols // 2, :]
+        pairs = staged[rows[..., None], cols[..., None] // 2, indices]
+        raw_halves = (pairs >> (16 * (cols[..., None] & 1))).to(torch.int16)
+        return raw_halves.view(dtype).float().permute(2, 0, 1)
+
+    a = shared(r, c)
+    banks = slots[r, c // 2, :]
+    assert all(torch.unique(banks[:, reg, mode]).numel() == 32
+               for reg in range(4) for mode in range(32))
+    b = wi[:, n, kr]
+    assert torch.equal(a, p[:, r, c])
+    assert torch.equal(b, wi[:, n, kr])
+    a_matrix, b_matrix = torch.empty_like(p), torch.empty_like(wi)
+    a_matrix[:, r, c], b_matrix[:, kr, n] = a, b
+    pre = a_matrix @ b_matrix
+    torch.testing.assert_close(pre, p @ wi.transpose(1, 2), atol=1e-5, rtol=1e-5)
+    z = rounded(rounded(pre) + bi[:, None])
+    sig = z.sigmoid()
+    act = rounded(z * sig)
+    dz = rounded(rounded(dy @ wo.transpose(1, 2)) * (sig * (1 + z * (1 - sig))))
+    dz_frag = dz[:, r, c]
+    reconstructed = torch.empty_like(dz)
+    reconstructed[:, r, c] = dz_frag
+    assert torch.equal(reconstructed, dz)
+    dp = reconstructed @ b_matrix.transpose(1, 2)
+    torch.testing.assert_close(dp, dz @ wi, atol=1e-5, rtol=1e-5)
+
+    dw = torch.zeros_like(wi)
+    for kc in (kr, kr + 8):
+        dz_t = torch.empty_like(wi)
+        dz_t[:, n, kr] = dz[:, kc, n]
+        pb = torch.empty_like(wi)
+        pb[:, kr, n] = shared(kc, n)
+        dw += dz_t @ pb
+    torch.testing.assert_close(dw, dz.transpose(1, 2) @ p, atol=1e-5, rtol=1e-5)
+    aux = torch.stack((dz, act * dy[..., 0, None], act * dy[..., 1, None]), dim=2)
+    row, feature = r[:, 0], c[:, 0]
+    aux_pair = aux[:, row] + aux[:, row + 8]
+    dbo_pair = dy[:, row] + dy[:, row + 8]
+    fields = torch.stack([
+        aux_pair[:, lane, field, feature + hidden]
+        for field in range(3) for hidden in range(2)
+    ] + [dbo_pair[..., 0], dbo_pair[..., 1]], dim=-1)
+
+    def butterfly(lo: Tensor, hi: Tensor, bit: int) -> Tensor:
+        upper = (lane & bit) != 0
+        return torch.where(upper, hi, lo) + torch.where(upper, lo, hi)[:, lane ^ bit]
+
+    level = [butterfly(fields[..., i], fields[..., i + 1], 4) for i in range(0, 8, 2)]
+    first, second = butterfly(*level[:2], 8), butterfly(*level[2:], 8)
+    result = butterfly(first, second, 16).reshape(32, 8, 4)
+    db = result[:, :2].transpose(1, 2).reshape(32, 8)
+    dwor = result[:, 2:4].transpose(1, 2).reshape(32, 8)
+    dwoi = result[:, 4:6].transpose(1, 2).reshape(32, 8)
+    torch.testing.assert_close(db, dz.sum(1), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(torch.stack((dwor, dwoi), dim=-1),
+                               act.transpose(1, 2) @ dy, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(result[:, 6:, 0], dy.sum(1), atol=1e-5, rtol=1e-5)
+    terms = act[..., None] * wo[:, None]
+    groups = terms.reshape(32, 16, 4, 2, 2).sum(-2)
+    out = rounded(rounded((groups[:, :, 0] + groups[:, :, 1]) +
+                         (groups[:, :, 2] + groups[:, :, 3])) + bo[:, None])
+    expected = rounded(rounded(act @ wo) + bo[:, None])
+    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+    assert torch.count_nonzero(dp[:, ~mask]) == 0
+    assert torch.count_nonzero(dw[valid:]) == 0
+
+
+@pytest.mark.parametrize("backward", [False, True])
+@pytest.mark.parametrize(("h", "w", "m", "coarse"), [*_W38A_PLAN_SHAPES, (1, 1, 1, False)])
+def test_wave39a_residency_probe_bound(
+    monkeypatch: pytest.MonkeyPatch, backward: bool, h: int, w: int, m: int, coarse: bool,
+) -> None:
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    probes = []
+
+    def resident(_device: int, key: scans.Kernel, smem: int) -> int:
+        probes.append((key, smem))
+        return 0
+
+    monkeypatch.setattr(scans, "_resident", resident)
+    key = scans.Kernel(
+        torch.bfloat16, 4, backward, vertical=True, coarse=coarse, hidden8=True,
+        cache_line=True, cache_weights=True, wave39a="wmma_bwd" if backward else "wmma_fwd",
+    )
+    scans._plan_wave39a.cache_clear()
+    try:
+        assert scans._plan_wave39a(0, key, (1024, h, w, m), 4096 * h * w * m) is None
+        assert 1 <= len(probes) <= 4
+    finally:
+        scans._plan_wave39a.cache_clear()
+
+
+@pytest.mark.parametrize("resident", [1, 2])
+def test_wave39a_legacy_sgs_keeps_residency(
+    monkeypatch: pytest.MonkeyPatch, resident: int,
+) -> None:
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_resident", lambda _, key, _smem: resident if key.wave39a else 2)
+    key = scans.Kernel(
+        torch.bfloat16, 4, backward=True, vertical=True, hidden8=True,
+        cache_line=True, cache_source=True, chunk=0,
+    )
+    launch = scans.Launch(scans.ScanPlan(4, 68608, 14), key, 48, 12)
+    candidate = scans._plan_legacy_sgs(0, launch, 14, odd_coarse=False)
+    if resident == 1:
+        assert candidate is None
+    else:
+        assert candidate.key.wave39a == "legacy_sgs"
+        assert candidate.plan.smem == 82944
+        assert (candidate.workers, candidate.partials) == (launch.workers, launch.partials)
+
+
+def test_wave39a_shape_event_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LNET_SCAN_W39A", "wmma_both")
+    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
+    monkeypatch.setattr(scans, "_resident", lambda *_: 3)
+    shape = (2, 13, 19, 63)
+    state = torch.empty((4, *shape), dtype=torch.bfloat16)
+    cuda_state = SimpleNamespace(
+        dtype=state.dtype, device=SimpleNamespace(index=0), is_cuda=True, numel=state.numel,
+    )
+    events = []
+    monkeypatch.setattr(scans, "_launch_kernel", lambda *args: events.append(args))
+    try:
+        launch = scans._plan_launch(
+            cuda_state, shape, backward=True, vertical=True, coarse=True, hidden=8,
+            precise=False, compact=True, interleaved=(True, False),
+        )
+        assert launch.key.wave39a == "wmma_bwd"
+        scans._dispatch(state, launch, ())
+        assert events == [(state, launch.key, 2 * launch.partials, launch.plan.smem, ())]
+    finally:
+        scans._plan_wave39a.cache_clear()
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_wave39a_empty_coarse_edge(
+    monkeypatch: pytest.MonkeyPatch, compact: bool,
+) -> None:
+    monkeypatch.setenv("LNET_SCAN_W39A", "wmma_both")
+    _, pole, real, _, aux, path = _inputs(1, 1, 1, 8, torch.bfloat16, "cpu")
+    states = torch.zeros(4, *real.shape, dtype=real.dtype)
+    out = scans._vscan(pole, states, aux, path, coarse=True, epsilon=1e-6, precise=True)
+    assert [tuple(t.shape) for t in out] == [(1, 0, 0, 1)] * 2
+    grads = scans._vscan(pole, states, aux, path, coarse=True, epsilon=1e-6, precise=False,
+                         grad=out, compact=compact)
+    assert grads[4].shape == (4, 1, 1, int(not compact), 1)
+    assert all(torch.count_nonzero(t) == 0 for t in grads)
+
+
+@_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("policy", ["wmma_bwd", "wmma_fwd", "legacy_sgs"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize(("h", "w", "m", "coarse"), [
+    (56, 56, 160, False), (56, 56, 160, True), (28, 28, 160, False),
+    (28, 28, 160, True), (14, 14, 160, False), (14, 14, 160, True), (7, 7, 128, False),
+    (13, 19, 63, False), (13, 19, 63, True), (9, 11, 34, False), (9, 11, 34, True),
+    (7, 7, 128, True), (1, 1, 1, False),
+])
+def test_cuda_wave39a_parity(
+    monkeypatch: pytest.MonkeyPatch, policy: str, dtype: torch.dtype, compact: bool,
+    h: int, w: int, m: int, coarse: bool, interleaved: bool,
+) -> None:
+    if compact and not coarse:
+        pytest.skip("Compact VScan stores the selected coarse columns")
+    torch.manual_seed(138)
+    _, py, real, _, aux, path = _inputs(h, w, m, 8, dtype, "cuda")
+    states = (torch.randn((4, *real.shape), device="cuda") * 0.1).to(dtype)
+    step = 1 + int(coarse)
+    grad = torch.randn((1, h // step, w // step, 2 * m), device="cuda", dtype=dtype) * 0.05
+    gr, gi = grad.split(m, dim=-1)
+    if not interleaved:
+        gr, gi = gr.contiguous(), gi.contiguous()
+    monkeypatch.setenv("LNET_SCAN_W39A", policy)
+    monkeypatch.setenv("LNET_SCAN_W37A", "off")
+    dispatch = scans._dispatch
+    recorded = []
+
+    def record(source: Tensor, launch: scans.Launch, args: tuple) -> None:
+        if launch.key.vertical:
+            recorded.append(launch.key.wave39a)
+        dispatch(source, launch, args)
+
+    monkeypatch.setattr(scans, "_dispatch", record)
+    result = scans._vscan(py, states, aux, path, coarse, 1e-6, precise=True, packed=interleaved)
+    if interleaved:
+        result = result.split(m, dim=-1)
+    actual = scans.vertical_backward(py, states, aux, path, gr, gi, coarse, compact=compact)
+    if policy in {"wmma_bwd", "wmma_fwd"}:
+        assert policy in recorded
+    monkeypatch.setenv("LNET_SCAN_W39A", "off")
+    padded, padded_aux = _even_vscan_inputs(states, aux, coarse)
+    expected_out = scans._vscan(py, padded, padded_aux, path, coarse, 1e-6, precise=True)
+    for value, ref in zip(result, expected_out, strict=True):
+        torch.testing.assert_close(value, ref[:, :h // step, :w // step], atol=5e-4, rtol=2e-3)
+    expected = _even_vscan_oracle(py, states, aux, path, [gr, gi], coarse, compact=compact)
+    for value, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, ref, atol=5e-4, rtol=2e-3)

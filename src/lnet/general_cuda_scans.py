@@ -20,6 +20,7 @@ import torch
 from torch import Tensor
 from torch._inductor import config as inductor_config
 
+from ._wave39a_vscan import CUDA as _W39A_CUDA
 from .cuda_nvrtc import (
     _check_cu,
     _check_nvrtc,
@@ -135,6 +136,8 @@ class Kernel:
     wave37a: str = ""
     odd_coarse_forward: bool = False
     wave38a_relaxed_regs: bool = False
+    wave39a: str = ""
+    odd_coarse_backward: bool = False
 
 
 class Launch(NamedTuple):
@@ -1461,6 +1464,8 @@ _W37A_KERNELS = {
 
 
 def _kernel_name(key: Kernel) -> str:
+    if key.wave39a:
+        return "vscan_" + key.wave39a
     if key.wave37a:
         return _W37A_KERNELS[key.wave37a][0]
     if key.projection:
@@ -1599,7 +1604,19 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
                 f"__launch_bounds__({threads})",
                 f"__launch_bounds__({threads}, {16 // key.warps})",
             )
-    return source + wrapper
+    return _wave39a_source(key, source, wrapper) if key.wave39a else source + wrapper
+
+
+def _wave39a_source(key: Kernel, source: str, wrapper: str) -> str:
+    wrapper = wrapper.replace("void scan(", f"void {_kernel_name(key)}(")
+    if key.wave39a == "legacy_sgs":
+        return _legacy_sgs_source(source, odd_coarse=key.odd_coarse_backward) + wrapper
+    slots = 3 if key.backward else 8
+    wrapper = wrapper.replace("__launch_bounds__(128)", f"__launch_bounds__(128, {slots})")
+    return (
+        source + _W39A_CUDA
+        + wrapper.replace("    vertical<", "    w39_vertical<")
+    )
 
 
 _W37A_PATH = r"""
@@ -1943,40 +1960,28 @@ def _wave37a_source(source: str, width: int, variant: str) -> str:
     begin = source.index("    if constexpr (BACKWARD) {\n        if constexpr (PURE && reduce)")
     end = source.index("\n}\ntemplate", begin)
     source = source[:begin] + r"""
-    auto* poles = reinterpret_cast<float*>(seg) + threadIdx.x;
-    if constexpr (!W38A_WARP) {
-        poles[0] = da.r;
-        poles[threads] = da.i;
-        poles[2 * threads] = dg.r;
-        poles[3 * threads] = dg.i;
-    }
+    // Each lane may retire independently. Only overwrite the float4 slot
+    // owned by this lane, since other warps can still be using seg.
+    seg[threadIdx.x] = make_float4(da.r, da.i, dg.r, dg.i);
+    const auto* poles = reinterpret_cast<const float*>(seg + threadIdx.x);
 #if W38A_WARP
-    // Every retired slot below belongs exclusively to its scan thread.
     const auto stage = [&](int field, int thread) {
         if (field < 4 * wide_rows)
             return reinterpret_cast<float*>(seg) + (field / 4 * threads + thread) * 4 + field % 4;
         field -= 4 * wide_rows;
         return reinterpret_cast<float*>(seg_src) + (field / 2 * threads + thread) * 2 + field % 2;
     };
-    seg[threadIdx.x] = make_float4(da.r, da.i, dg.r, dg.i);
     #pragma unroll
     for (int i = 0; i < 90 - W38A_SHARED_FIELDS; ++i)
         *stage(4 + i, threadIdx.x) = tail[i];
-    poles = reinterpret_cast<float*>(seg) + 4 * threadIdx.x;
 #endif
     __syncthreads();
     if (warp == 0 && m < M) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-#if W38A_WARP
             float sum = poles[i];
             #pragma unroll
             for (int k = 1; k < WARPS; ++k) sum += poles[i + k * 32 * 4];
-#else
-            float sum = poles[i * threads];
-            #pragma unroll
-            for (int k = 1; k < WARPS; ++k) sum += poles[i * threads + k * 32];
-#endif
             row[I(i) * M] = sum;
         }
 #if W38A_WARP
@@ -1999,8 +2004,20 @@ def _wave37a_source(source: str, width: int, variant: str) -> str:
     source = source.replace("        __syncthreads();\n    } else if constexpr (CACHE_WEIGHT",
                             "    } else if constexpr (CACHE_WEIGHT")
     source = source.replace("size, threads);\n        __syncthreads();", "size, threads);")
+    source = _odd_coarse_negative(source)
+    if single_gs:
+        source = _single_gs_column(source)
+    return (
+        f"#define W37A_K {width}\n#define W37A_REGW {int(register)}\n"
+        f"#define W38A_WARP {int(warp_acc)}\n#define W38A_SINGLE_GS {int(single_gs)}\n"
+        f"#define W38A_SHARED_FIELDS {_W38A_SHARED_FIELDS}\n"
+        + source
+    )
+
+
+def _odd_coarse_negative(source: str) -> str:
     source = source.replace("!COARSE || !(y & 1)", "!COARSE || (!(y & 1) && y + 1 < c.H)")
-    source = source.replace(
+    return source.replace(
         "if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);",
         r"""if constexpr (COARSE) {
                 clear_unused_columns<COMPACT>(c, y, gs);
@@ -2013,28 +2030,56 @@ def _wave37a_source(source: str, width: int, variant: str) -> str:
                 }
             }""",
     )
-    if single_gs:
-        start = source.index("void column_backward(")
-        end = source.index("#undef CACHED_SOURCE_AT", start)
-        column = source[start:end].replace(
-            "column_adjoint<false, COMPACT>(", "column_adjoint_positive<T, I, THREADS>(",
-        ).replace("da, dg, gs);", "da, dg, gs, pos_grad);")
-        column = column.replace(
-            "column_adjoint<true, COMPACT>(",
-            "column_adjoint_negative<T, I, COMPACT, THREADS>(",
-        )
-        source = source[:start] + column + source[end:]
-        source = source.replace(
-            "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
-            _W38A_SINGLE_GS
-            + "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
-        )
-    return (
-        f"#define W37A_K {width}\n#define W37A_REGW {int(register)}\n"
-        f"#define W38A_WARP {int(warp_acc)}\n#define W38A_SINGLE_GS {int(single_gs)}\n"
-        f"#define W38A_SHARED_FIELDS {_W38A_SHARED_FIELDS}\n"
-        + source
+
+
+def _single_gs_column(source: str) -> str:
+    start = source.index("void column_backward(")
+    end = source.index("#undef CACHED_SOURCE_AT", start)
+    column = source[start:end].replace(
+        "column_adjoint<false, COMPACT>(", "column_adjoint_positive<T, I, THREADS>(",
+    ).replace("da, dg, gs);", "da, dg, gs, pos_grad);")
+    column = column.replace(
+        "column_adjoint<true, COMPACT>(",
+        "column_adjoint_negative<T, I, COMPACT, THREADS>(",
     )
+    source = source[:start] + column + source[end:]
+    return source.replace(
+        "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
+        _W38A_SINGLE_GS
+        + "template<bool COMPACT, class T, class I>\n__device__ __forceinline__ void clear",
+    )
+
+
+def _legacy_sgs_source(source: str, *, odd_coarse: bool) -> str:
+    source = source.replace(
+        "int chunks, Complex& da, Complex& dg",
+        "int chunks, Complex& da, Complex& dg, Quad<T>* pos_grad",
+    ).replace(
+        "buf, stride, chunks, da, dg",
+        "buf, stride, chunks, da, dg, line_buf + "
+        "(CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x",
+    )
+    if not odd_coarse:
+        return _single_gs_column(source)
+    before = source.index("#ifdef BACKWARD_BATCH2", source.index("void column_backward("))
+    after = source.index("    adj_a = adj_b = {};", before)
+    reverse = source[before:after].replace("length - 1", "scan_end")
+    source = source[:before] + r"""
+        int scan_end = length - 1;
+        if constexpr (COARSE) {
+            if ((y0 + scan_end) % 2 == 0) {
+                const auto s = CACHED_SOURCE_AT(scan_end);
+                const auto next = neg;
+                neg = advance(neg, s, ar, gg);
+                column_adjoint<false, COMPACT>(
+                    c, y0 + scan_end, scan_end ? seg[(scan_end - 1) * THREADS] : before,
+                    s, {}, a, g, adj_a, adj_b, da, dg, gs);
+                if constexpr (full) seg[scan_end * THREADS] = next;
+                --scan_end;
+            }
+        }
+""" + reverse + source[after:]
+    return _single_gs_column(_odd_coarse_negative(source))
 
 
 def _compile_ptx(key: Kernel, capability: tuple[int, int]) -> ct.Array:
@@ -2156,7 +2201,8 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     with torch.cuda.device(device):
         _ensure_context(driver, device)
         if (
-            key.wave37a or key.batch_path or key.register_path or key.horizontal_unroll8
+            key.wave39a or key.wave37a or key.batch_path or key.register_path
+            or key.horizontal_unroll8
             or key.backward_batch2 or key.backward_readonly
             or (key.vertical and key.backward and key.chunk and key.cache_source)
         ):
@@ -2879,7 +2925,87 @@ def _plan_wave37a(  # noqa: C901
     return best[1] if best is not None else None
 
 
-def _plan_launch(
+def _wave39a_policy(dtype: torch.dtype, hidden: int, pure: bool) -> str:
+    if dtype.itemsize != 2 or hidden != _REGISTER_HIDDEN or pure:
+        return ""
+    token = os.environ.get("LNET_SCAN_W39A", "off")
+    return token if token in {"wmma_bwd", "wmma_fwd", "wmma_both", "legacy_sgs", "auto"} else ""
+
+
+@lru_cache(maxsize=256)
+def _plan_wave39a(
+    device: int, base: Kernel, shape: tuple[int, int, int, int], index_bound: int,
+) -> Launch | None:
+    sms, limit, _ = device_limits(device)
+    batch, height, width, modes = shape
+    warps, threads = 4, 128
+    step = 1 + int(base.coarse)
+    lines = batch * (width // step)
+    if not lines or height < step:
+        return None
+    tile = 11264 if base.backward else 8576
+    # MMA operands, results, dY and private dZ transposes, followed by weights.
+    common = tile + (88 if base.backward else 90) * 32 * 2 + (height // step) * threads * 8
+    budget = _scan_workspace_budget(device)
+    waves = _SHORT_VSCAN_WAVES if height <= _SHORT_SCAN else _VSCAN_WAVES
+    fields = 94 if base.backward else 0
+    workers = _workers(lines, modes, fields, warps, sms * 16 * waves, budget)
+    index32 = max(index_bound, 94 * _ceil(workers, warps) * modes) < 2**31
+    candidates = []
+    layouts = (
+        (0, True, False), (14, True, False), (14, False, False), (6, False, False),
+        (14, False, True), (6, False, True), (2, False, True),
+    ) if base.backward else ((0, False, False),)
+    for chunk, cache_source, global_ckpt in layouts:
+        if chunk and chunk >= height:
+            continue
+        span = chunk or height
+        smem = common
+        if base.backward:
+            rows = span + (0 if global_ckpt else _ceil(height, span) - 1)
+            smem += threads * (16 * rows + (8 * height if cache_source else 0))
+        if smem <= limit:
+            candidates.append((chunk, cache_source, global_ckpt, smem))
+    # Limit large tiles to two CTA slots and short tiles to three. Within
+    # that target favor source caching and a larger replay span.
+    target = 3 if height <= 14 else 2
+    candidates.sort(
+        key=lambda layout: (
+            min(target, (limit + 1024) // (layout[3] + 1024)), layout[1],
+            not layout[2], layout[0] == 0, layout[0],
+        ),
+        reverse=True,
+    )
+    for chunk, cache_source, global_ckpt, smem in candidates[:4]:
+        key = replace(base, warps=warps, chunk=chunk, index32=index32,
+                      cache_source=cache_source, global_checkpoints=global_ckpt)
+        resident = _resident(device, key, smem)
+        if resident and workers:
+            workers = min(workers, _ceil(sms * resident * waves, _ceil(modes, 32)) * warps)
+            return Launch(
+                ScanPlan(warps, smem, chunk or height, cache_weights=True, cache_line=True,
+                         full_trajectory=not chunk, cache_source=cache_source,
+                         global_checkpoints=global_ckpt),
+                key, workers, _ceil(workers, warps),
+            )
+    return None
+
+
+def _plan_legacy_sgs(
+    device: int, launch: Launch, height: int, *, odd_coarse: bool,
+) -> Launch | None:
+    plan, key, _, _ = launch
+    smem = plan.smem + height * plan.warps * _WARP_SIZE * 8
+    if key.shared_acc or smem > device_limits(device)[1]:
+        return None
+    single = replace(key, wave39a="legacy_sgs", odd_coarse_backward=odd_coarse)
+    resident = _resident(device, single, smem)
+    if resident and (odd_coarse or resident >= _resident(device, key, plan.smem)):
+        return launch._replace(plan=plan._replace(smem=smem), key=single)
+    return None
+
+
+def _plan_launch(  # noqa: C901, PLR0912
     source: Tensor,
     shape: tuple[int, int, int, int],
     *,
@@ -2904,7 +3030,23 @@ def _plan_launch(
         index_bound *= 4
     device = source.device.index or 0
     policy = _wave37a_policy(source.dtype, hidden, pure_vertical) if vertical else ""
+    wave39a = _wave39a_policy(source.dtype, hidden, pure_vertical) if vertical else ""
     odd_coarse = coarse and bool(shape[1] % 2 or shape[2] % 2)
+    direction = "wmma_bwd" if backward else "wmma_fwd"
+    if wave39a in {direction, "wmma_both", "auto"} or (
+        wave39a and odd_coarse and backward and compact and shape[2] % 2
+    ):
+        base = Kernel(
+            source.dtype, 4, backward=backward, vertical=True, coarse=coarse, hidden8=True,
+            cache_weights=True, cache_line=True, compact=compact,
+            real_interleaved=interleaved[0], imag_interleaved=interleaved[1],
+            precise=precise, wave39a=direction,
+        )
+        experimental = _plan_wave39a(device, base, shape, index_bound)
+        if experimental is not None:
+            return experimental
+    if wave39a and odd_coarse and backward and compact and shape[2] % 2:
+        return None  # The legacy compact layout requires an even width.
     if policy and backward:
         base = Kernel(
             source.dtype, 2, backward=True, vertical=True, coarse=coarse, hidden8=True,
@@ -2922,7 +3064,19 @@ def _plan_launch(
 
     if launch is not None and os.environ.get("LNET_GENERAL_SCAN_OPT", "auto") != "off":
         launch = _plan_scan_auto(device, launch, shape)
-    if policy and odd_coarse and launch is not None and not backward:
+    if backward and launch is not None and (
+        wave39a in {"legacy_sgs", "auto"} or (wave39a and odd_coarse)
+    ):
+        single = _plan_legacy_sgs(device, launch, shape[1], odd_coarse=odd_coarse)
+        if single is not None:
+            launch = single
+        elif odd_coarse:
+            base = Kernel(
+                source.dtype, 2, backward=True, vertical=True, coarse=coarse, hidden8=True,
+                compact=compact, real_interleaved=interleaved[0], imag_interleaved=interleaved[1],
+            )
+            return _plan_wave37a(device, base, shape, index_bound, "warp_acc_k2")
+    if (policy or wave39a) and odd_coarse and launch is not None and not backward:
         launch = launch._replace(key=replace(launch.key, odd_coarse_forward=True))
     return launch
 
@@ -2973,8 +3127,9 @@ def _vertical_inputs_ok(
     if [t.shape for t in auxiliary] != [(2, w, m), (2, h, m)] or path[0].ndim != 3:
         return False
     hidden = path[0].shape[1]
-    if coarse and (h % 2 or w % 2) and (
-        min(h, w) < 2 or not _wave37a_policy(states.dtype, hidden, pure=False)
+    if coarse and (h % 2 or w % 2) and not (
+        _wave39a_policy(states.dtype, hidden, pure=False)
+        or (min(h, w) >= 2 and _wave37a_policy(states.dtype, hidden, pure=False))
     ):
         return False
     return 0 < hidden < 2**31 and [t.shape for t in path] == [
@@ -3194,12 +3349,15 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     pure: bool = False,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     shape = tuple(states.shape[1:])
+    odd_compact = not pure and states.ndim == 5 and path and path[0].ndim == 3 and (
+        _wave39a_policy(states.dtype, path[0].shape[1], pure)
+    )
     if (
         not _shape_supported(shape)
         or not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
         or not _pole_ok(pole, states)
         or not 0 < epsilon < float("inf")
-        or (compact and (not coarse or shape[2] % 2))
+        or (compact and (not coarse or (shape[2] % 2 and not odd_compact)))
         or (pure and coarse and (shape[1] % 2 or shape[2] % 2))
     ):
         raise ValueError("Invalid vertical scan inputs")
@@ -3214,6 +3372,16 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     if grad is not None:
         gr, gi = _vertical_adjoints(grad, states, out_shape)
         interleaved = (not gr.is_contiguous(), not gi.is_contiguous())
+    if coarse and not (oh and ow):
+        if backward:
+            grad_shape = (4, b, h, ow if compact else w, m)
+            return [
+                *[torch.zeros_like(t) for t in pole], states.new_zeros(grad_shape),
+                *[torch.zeros_like(t) for t in path],
+            ]
+        if packed:
+            return states.new_empty((2, *out_shape) if planar else (b, oh, ow, 2 * m))
+        return states.new_empty(out_shape), states.new_empty(out_shape)
     if saved_features is not None and (
         grad is None
         or saved_features.shape != (8, b * oh * ow, m)
@@ -3222,7 +3390,10 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         or not saved_features.is_contiguous()
     ):
         raise ValueError("Invalid saved vertical features")
-    if not pure and not _wave37a_policy(states.dtype, hidden, pure):
+    if not pure and not (
+        _wave37a_policy(states.dtype, hidden, pure)
+        or _wave39a_policy(states.dtype, hidden, pure)
+    ):
         chunk = (
             _saved_backward_chunk(states, coarse)
             if saved_features is not None else _decoupled_chunk(states, coarse)
