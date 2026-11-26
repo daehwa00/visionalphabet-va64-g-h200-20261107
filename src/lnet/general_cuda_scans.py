@@ -109,6 +109,7 @@ class _Wave53Options:
     partial_shared_acc: bool = False
     horizontal_stream: bool = False
     vertical_w56: str = "off"
+    seg16: bool = False
     vertical_w55: str = "off"
     horizontal_nocs: bool = False
     horizontal_vec2: bool = False
@@ -1860,6 +1861,8 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             source = _quad_adjoint_source(source)
     if key.vertical_w55 != "off":
         source = _vertical_w55_source(source, key)
+    if key.seg16:
+        source = _seg16_source(source)
     return source + wrapper
 
 
@@ -3758,6 +3761,8 @@ W52A_MODES = (
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
 W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin", "w55_lockin")
+W57A_MODES = ("off", "v57_bwd_seg16_2chunk", "v57_bwd_seg16_1wave",
+              "v57_bwd_seg16_2wave", "v57_bwd_loww_only", "v57_bwd_seg16_loww")
 W56A_MODES = ("off", "v56_noround", "v56_bwd_hfma2_dw_l2", "v56_bwd_quad_hfma2", "v56_fwd_hiworker")
 W55A_MODES = ("off", "v55_bf16x2_predp", "v55_bf16x2_bf16w", "v55_bf16x2_chunkacc")
 H55_MODES = ("off", "h55_fwd_vec2_cached", "h55_bwd_vec2_nocs", "h55_bwd_vec2_half", "h55_bwd_bf16_nocs")
@@ -4516,6 +4521,98 @@ def _plan_w55(device: int, launch: Launch, shape: tuple, w55: str) -> Launch:
     return launch._replace(key=key, plan=plan)
 
 
+def _seg16_source(source: str) -> str:
+    # One packed snapshot per lane. Recurrences and the boundary stay in FP32.
+    source = source.replace("float4* seg, Quad<T>*", "Quad<T>* seg, Quad<T>*")
+    source = source.replace("auto* seg = shared", "auto* seg_base = shared")
+    source = source.replace(
+        "auto* ckpt = seg + (BACKWARD ? span * threads : 0);",
+        "auto* seg = reinterpret_cast<Quad<T>*>(seg_base);\n"
+        "    auto* ckpt = reinterpret_cast<float4*>(seg + span * threads);",
+    ).replace("ckpt + (BACKWARD && !GLOBAL_CKPT ? I(chunks - 1) * threads : 0)", "ckpt")
+    begin = source.index("void column_backward(")
+    end = source.index("#undef CACHED_SOURCE_AT", begin)
+    column = source[begin:end].replace("float4 pos{}, neg{};", "float4 pos{}, neg{}, boundary{};")
+    column = re.sub(r"ckpt\[I\(block(?: - 1)?\) \* ckpt_stride\]", "boundary", column)
+    column = column.replace("block * span", "block ? c.H - span : 0").replace(
+        "min(span, c.H - y0)", "full || block ? span : c.H - span"
+    )
+    column = re.sub(r"(seg\[[^\]]+\]) = ([^;]+);", r"\1 = Quad<T>::pack(\2);", column)
+    column = re.sub(r"(seg\[[^\]]+\])(?! =)", r"\1.unpack()", column)
+    return source[:begin] + column + source[end:]
+
+
+def _w57_mode(dtype: torch.dtype, hidden: int, device: int) -> str:
+    mode = _scan_mode("LNET_SCAN_W57A", W57A_MODES)
+    if (
+        mode != "off"
+        and hidden == _REGISTER_HIDDEN
+        and dtype in (torch.float16, torch.bfloat16)
+        and torch.cuda.get_device_capability(device) >= (8, 0)
+    ):
+        return mode
+    return "off"
+
+
+def _plan_w57(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+    _, h, w, m = shape
+    key = launch.key
+    if (
+        key.odd_coarse_backward
+        or h != w
+        or h not in (56, 28, 14, 7)
+        or m != (128 if h == 7 else 160)
+    ):
+        return launch
+    if mode != "v57_bwd_loww_only":
+        chunk = 48 if h == 56 else 0
+        key = replace(
+            key,
+            seg16=True,
+            warps=4,
+            chunk=chunk,
+            cache_source=True,
+            cache_weights=True,
+            vector_weights=True,
+            register_path=False,
+            vertical_w55="v55_bf16x2_bf16w",
+            global_checkpoints=False,
+            backward_batch2=True,
+            backward_batch_tail=bool(h % (2 * (1 + key.coarse))),
+        )
+        span = chunk or h
+        threads = key.warps * _WARP_SIZE
+        line_rows = h // (1 + key.coarse) if key.cache_line else 0
+        # NativeWeights plus packed source, snapshots, cached line and SGS gradient.
+        smem = 5632 + threads * 8 * (h + span + line_rows + launch.plan.sgs_rows)
+        if key.shared_acc or smem > device_limits(device)[1]:
+            return launch
+        group = key.backward_reduce_warps or key.warps
+        launch = launch._replace(
+            key=key,
+            partials=_ceil(launch.workers, group),
+            plan=launch.plan._replace(
+                warps=key.warps,
+                chunk=span,
+                full_trajectory=not chunk,
+                smem=smem,
+                cache_source=True,
+                cache_weights=True,
+                global_checkpoints=False,
+            ),
+        )
+    if mode != "v57_bwd_seg16_2chunk" and (
+        (h == 56 and not key.coarse) or (h == 28 and key.coarse)
+    ):
+        waves = 1 if mode == "v57_bwd_seg16_1wave" else 2
+        # Keep whole four-warp CTAs within the requested number of waves.
+        groups = device_limits(device)[0] * 2 * waves // _ceil(m, 32)
+        workers = min(launch.workers, max(1, groups) * key.warps)
+        group = key.backward_reduce_warps or key.warps
+        launch = launch._replace(workers=workers, partials=_ceil(workers, group))
+    return launch
+
+
 def _w56_mode(dtype: torch.dtype, hidden: int, device: int) -> str:
     mode = _scan_mode("LNET_SCAN_W56A", W56A_MODES)
     if (
@@ -4829,6 +4926,10 @@ def _plan_launch(  # noqa: C901, PLR0912
     w54 = _scan_mode("LNET_SCAN_W54A", W54A_MODES) if vertical else "off"
     w55 = _scan_mode("LNET_SCAN_W55A", W55A_MODES) if vertical else "off"
     w56 = _w56_mode(source.dtype, hidden, device) if vertical else "off"
+    w57 = (_w57_mode(source.dtype, hidden, device)
+           if vertical and backward and not (saved_trajectory or pure_vertical) else "off")
+    if w57 != "off":
+        wave53a = "w55_lockin"
     if wave53a == "w55_lockin":
         wave53a = "w53_lockin"
         if backward:
@@ -4881,6 +4982,8 @@ def _plan_launch(  # noqa: C901, PLR0912
                 and not (pure_vertical or saved_trajectory)
                 and torch.cuda.get_device_capability(device) >= (8, 0)):
             launch = _plan_w55(device, launch, shape, w55)
+            if w57 != "off":
+                return _plan_w57(device, launch, shape, w57)
             if w56 != "off":
                 return _plan_w56(device, launch, shape, w56)
             return launch
@@ -5208,7 +5311,9 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES)
     wave52a = "off" if pure else _wave52a_mode(states.element_size())
     w56 = _w56_mode(states.dtype, hidden, states.device.index or 0)
-    if w56 == _scan_mode("LNET_SCAN_W55A", W55A_MODES) == _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
+    w57 = (_w57_mode(states.dtype, hidden, states.device.index or 0)
+           if backward and not pure and trajectory is None and saved_features is None else "off")
+    if w57 == w56 == _scan_mode("LNET_SCAN_W55A", W55A_MODES) == _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
         (coarse and (h % 2 or w % 2))
         or (backward and saved_features is None and (
             mode != "off"
