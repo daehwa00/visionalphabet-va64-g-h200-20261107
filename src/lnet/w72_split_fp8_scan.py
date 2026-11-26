@@ -1,5 +1,5 @@
 # ruff: noqa: ANN001, ANN201, ANN202, ARG001, FBT001, FBT002, RUF059, S603, S607, SLF001
-"""Shape-selected SM90 split-plane E4M3 scans."""
+"""Shape-selected SM90 split-plane scans with E4M3 states and E5M2 adjoints."""
 
 import ctypes as ct
 import os
@@ -48,6 +48,8 @@ struct alignas(4) Fp8Quad {
 };
 static_assert(sizeof(Fp8Quad)==4);
 """
+# Both formats have the same packed layout and differ only in their PTX conversions.
+FP8 += FP8.replace("Fp8", "E5m2").replace("e4m3x2", "e5m2x2")
 
 
 def profile_name(key):
@@ -61,9 +63,20 @@ def _horizontal(key):
     src = w66.horizontal_source(key, 56, w66.ARM)
     src = src.replace("int M, int workers\n", "int M, int workers, const float* scales\n")
     src = src.replace("M, workers);", "M, workers, scales);")
-    src = src.replace("const Pair<T>*>(adj?grad:states)", "const Fp8Pair*>(adj?grad:states)")
+    # w66 passes literal booleans to both read helpers. Specialize their packed types.
+    src = re.sub(r"((?:get|fetch)\([^,]+,)(true|false),", r"\1std::bool_constant<\2>{},", src)
+    src = src.replace("bool adj,", "auto adj_tag,")
+    src = src.replace(
+        "int step=1+int(adj", "constexpr bool adj=decltype(adj_tag)::value; int step=1+int(adj"
+    )
+    src = src.replace(
+        "const Pair<T>*>(adj?grad:states)",
+        "const std::conditional_t<adj,E5m2Pair,Fp8Pair>*>(adj?grad:states)",
+    )
     src = src.replace("W/step,neg)].unpack()", "W/step,neg)].unpack(adj?scales[1]:1.f)")
-    src = src.replace("const uint2*>(words+", "const Fp8Quad*>(words+")
+    src = src.replace(
+        "const uint2*>(words+", "const std::conditional_t<adj,E5m2Quad,Fp8Quad>*>(words+"
+    )
     for lane, field in (("x", "a"), ("y", "b")):
         src = src.replace(
             f"reinterpret_cast<Pair<T>*>(&pair.{lane})->unpack()",
@@ -94,27 +107,28 @@ def _vertical(key):
     src = src.replace("xa,xb,x};", "xa,xb,x,scales[0],scales[1]};")
     src = src.replace("long long grad_plane\n", "long long grad_plane, const float* scales\n")
     src = src.replace("input_plane, grad_plane);", "input_plane, grad_plane, scales);")
-    src = src.replace("Pair<T>*>(gs)", "Fp8Pair*>(gs)")
+    src = src.replace("Pair<T>*>(gs)", "E5m2Pair*>(gs)")
     src = re.sub(r"(words\[i[ab]\])\.unpack\(\)", r"\1.unpack(c.inv)", src)
-    src = re.sub(r"Pair<T>::pack\((ds_[ab])\)", r"Fp8Pair::pack(\1,c.scale)", src)
+    src = re.sub(r"Pair<T>::pack\((ds_[ab])\)", r"E5m2Pair::pack(\1,c.scale)", src)
     src = src.replace("Quad<T>* seg_src", "Fp8Quad* seg_src").replace(
         "Quad<T>* source_cache", "Fp8Quad* source_cache"
     )
     src = src.replace(
         "auto* seg_src = reinterpret_cast<Quad<T>*>", "auto* seg_src = reinterpret_cast<Fp8Quad*>"
     )
-    src = src.replace("Quad<T>* g2,", "Fp8Quad* g2,")
+    src = src.replace("Quad<T>* g2,", "E5m2Quad* g2,")
     src = re.sub(r"(seg_src\[j \* THREADS\] = )Quad<T>", r"\1Fp8Quad", src)
     src = re.sub(
         r"(g2\[[^\]]+\] =\s*)(normalize_packed<T>\(.*?\));",
-        r"\1Fp8Quad::pack(\2.unpack(),c.scale);",
+        r"\1E5m2Quad::pack(\2.unpack(),c.scale);",
         src,
         flags=re.DOTALL,
     )
     src = src.replace("g2_stride].unpack()", "g2_stride].unpack(c.inv)")
     return src.replace(
         "buf, stride, chunks, da, dg",
-        "seg_src + I(H)*threads + threadIdx.x, I(threads), chunks, da, dg",
+        "reinterpret_cast<E5m2Quad*>(seg_src + I(H)*threads) + threadIdx.x, "
+        "I(threads), chunks, da, dg",
     )
 
 
@@ -192,7 +206,7 @@ def _upgrade_vertical(src, key, width, height, modes):
 def kernel_source(key, width, height, modes):
     src = _vertical(key) if key.vertical else _horizontal(key)
     pos = src.index("template<class T> struct alignas")
-    src = "#include <cuda_fp8.h>\n" + src[:pos] + FP8 + src[pos:]
+    src = "#include <cuda_fp8.h>\n#include <type_traits>\n" + src[:pos] + FP8 + src[pos:]
     if not (key.vertical and key.backward):
         pos = src.rindex(") {") + 3
         src = src[:pos] + f"\n H={height}; W={width}; M={modes};\n" + src[pos:]

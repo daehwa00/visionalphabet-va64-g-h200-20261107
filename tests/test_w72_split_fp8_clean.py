@@ -36,8 +36,15 @@ def test_56d_cubins(tmp_path) -> None:
         key = launch.key
         source = fp.kernel_source(key, w, w, m)
         assert fp.profile_name(key) in source
-        row = compile_source(source, tmp_path, fp.compile_flags(key, w), fp.profile_name(key))
+        folder = tmp_path / op
+        folder.mkdir()
+        flags = [*fp.compile_flags(key, w), "--keep", "--keep-dir", str(folder)]
+        row = compile_source(source, folder, flags, fp.profile_name(key))
         assert (row["stack"], row["LDL"], row["STL"]) == (0, 0, 0), (op, row)
+        (ptx_path,) = folder.glob("*.ptx")
+        ptx = ptx_path.read_text()
+        assert "e4m3x2" in ptx, op
+        assert ("e5m2x2" in ptx) == key.backward, op
         if op in ("VF", "HB"):
             assert launch.plan.cache_line
         if op == "VF":
@@ -163,9 +170,11 @@ def test_null_workspace(monkeypatch) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper")
 @pytest.mark.parametrize(("height", "coarse"), [(56, False), (56, True), (28, False), (28, True)])
-def test_compiled_training(monkeypatch, height, coarse) -> None:
+def test_compiled_training(monkeypatch, request, height, coarse) -> None:
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("requires Hopper")
+    torch._dynamo.reset()
+    request.addfinalizer(torch._dynamo.reset)
     for k, v in bench.lockin_arm_env("w57_lockin").items():
         monkeypatch.setenv(k, v)
     x, a, g, _, path = bench.reference_inputs(height, height, 160)
@@ -196,19 +205,26 @@ def test_compiled_training(monkeypatch, height, coarse) -> None:
     ref = run(*operands)
     compiled = torch.compile(run, fullgraph=True)
     monkeypatch.setenv("VA_W72_SPLIT_FP8", "1")
-    for factor in (1.0, 1e-5) if height == 56 and not coarse else (1.0,):
-        dy = torch.randn_like(ref) * factor
+    factors = (1.0, 1e-5) if height == 56 and not coarse else (1.0,)
+    gradients = [torch.randn_like(ref) * factor for factor in factors]
+    stream = torch.cuda.Stream()
+    for dy in gradients:
         expected = (ref, *torch.autograd.grad(ref, operands, dy, retain_graph=True))
 
         def step(dy=dy):
             out = compiled(*operands)
             return (out, *torch.autograd.grad(out, operands, dy))
 
-        step()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            step()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=stream):
             observed = step()
         graph.replay()
+        torch.cuda.synchronize()
         for lhs, rhs in zip(expected, observed, strict=True):
             assert torch.isfinite(rhs).all()
             assert bench.metrics(lhs, rhs)["rel_l2"] < 0.12
