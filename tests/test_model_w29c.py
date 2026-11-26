@@ -61,13 +61,9 @@ def test_auto_dispatch_fullgraph(device_type: str, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("LNET_MODEL_W28C", "off")
     monkeypatch.setenv("LNET_MODEL_W29C", "auto")
     if device_type == "cpu":
-        monkeypatch.setattr(
-            torch.cuda, "get_device_properties", lambda _: SimpleNamespace(major=10, minor=0),
-        )
+        monkeypatch.setattr(model_w29c, "model_cuda_supported", lambda device: device.type == "cuda")
     sample = torch.zeros(4, device=device_type)
-    supported = torch.cuda.get_device_capability(
-        sample.device if device_type == "cuda" else torch.device("cuda"),
-    ) >= (8, 0)
+    supported = device_type == "cpu" or torch.cuda.get_device_capability(sample.device) >= (8, 0)
 
     def run(x: Tensor) -> Tensor:
         device = x.device if x.is_cuda else torch.device("cuda")

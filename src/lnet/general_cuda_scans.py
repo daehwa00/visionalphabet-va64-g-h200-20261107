@@ -2958,7 +2958,7 @@ W51A_MODES = ("off", "fp32")
 SGS_MODES = ("off", "strict_ro")
 VFWD_MODES = ("off", "batch4_w2")
 W53A_MODES = ("off", "w57_lockin")
-HSCAN_MODES = ("off", "h55_lockin")
+HSCAN_MODES = ("off", "bwd_opt", "h55_lockin")
 
 
 def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
@@ -3569,6 +3569,8 @@ def _plan_launch(  # noqa: C901, PLR0912
     if not vertical:
         if mode == "off":
             return launch
+        if mode == "bwd_opt":
+            return _plan_hscan(device, launch, shape)
         base = _plan_h53(device, launch, shape)
         short_dense = not compact and width <= 8
         if source.dtype.itemsize == 2 and (

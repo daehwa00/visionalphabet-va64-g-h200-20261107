@@ -94,7 +94,6 @@ def make_reader(
 def set_mode(mode: str) -> None:
     execution, optimization, benchmark = MODES[mode]
     os.environ["LNET_READER_EXEC_MODE"] = execution
-    os.environ["VA_READER_OPT_MODE"] = optimization
     os.environ["LNET_READER_OPT"] = optimization
     torch.backends.cudnn.benchmark = benchmark
 

@@ -54,7 +54,7 @@ OPS = {
 }
 W43_MODES = {
     "vscan_bwd": "strict_ro",
-    "vscan_fwd": "batch4",
+    "vscan_fwd": "batch4_w2",
     "hscan_fwd": "bwd_opt",
     "hscan_bwd": "bwd_opt",
 }
@@ -434,31 +434,10 @@ def _combined_projection(report: dict) -> dict[str, float]:
     }
 
 
-def _e2e_case(data: Inputs, coarse: bool, mode: str) -> tuple[Callable, Callable]:
-    policy = scans._vscan_saved_policy(data.states, data.path, coarse, mode)
-
-    def forward() -> tuple[Tensor, Tensor, Tensor | None]:
-        if policy == "off":
-            r, i = scans.vertical_forward(
-                data.pole,
-                data.states,
-                data.gains,
-                data.path,
-                coarse,
-            )
-            return r, i, None
-        return scans._vertical_forward_saved(
-            data.pole,
-            data.states,
-            data.gains,
-            data.path,
-            coarse,
-            1e-6,
-            planar=False,
-            precise=True,
-            separate=True,
-            trajectory_policy=policy,
-        )
+def _e2e_case(data: Inputs, coarse: bool) -> tuple[Callable, Callable]:
+    def forward() -> tuple[Tensor, Tensor, None]:
+        r, i = scans.vertical_forward(data.pole, data.states, data.gains, data.path, coarse)
+        return r, i, None
 
     def backward(saved: Tensor | None) -> list[Tensor]:
         return scans.vertical_backward(
@@ -479,11 +458,10 @@ def _e2e_case(data: Inputs, coarse: bool, mode: str) -> tuple[Callable, Callable
 def _e2e_sample(
     data: Inputs,
     coarse: bool,
-    mode: str,
     args: argparse.Namespace,
     flush: Tensor | None,
 ) -> dict:
-    forward, backward = _e2e_case(data, coarse, mode)
+    forward, backward = _e2e_case(data, coarse)
 
     def full_step() -> list[Tensor]:
         _, _, saved = forward()
@@ -513,7 +491,7 @@ def _e2e_parity(shapes: tuple, modes: tuple[str, ...], batch: int) -> dict:
             outputs = {}
             expected = None
             for mode in modes:
-                forward, backward = _e2e_case(inputs, coarse, mode)
+                forward, backward = _e2e_case(inputs, coarse)
                 real, imag, trajectory = forward()
                 values = [real, imag, *backward(trajectory)]
                 if expected is None:
@@ -561,7 +539,7 @@ def _screen_e2e(args: argparse.Namespace, modes: tuple[str, ...], flush: Tensor 
         cases = {}
         for mode in modes:
             print(f"timing vscan {label} {mode}", flush=True)
-            result = _e2e_sample(data, coarse, mode, args, flush)
+            result = _e2e_sample(data, coarse, args, flush)
             cases[mode] = result
             saved_weighted[mode] += weight * result["saved_traj_gib"]
             weighted[mode] += weight * result["total_ms"]

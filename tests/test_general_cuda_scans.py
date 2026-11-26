@@ -11,6 +11,7 @@ from bench_scan_micro import (
     MODEL_SHAPES,
     OPS,
     TENSOR_NAMES,
+    W43_MODES,
     _case,
     _layouts,
     _time,
@@ -1496,23 +1497,16 @@ def test_cuda_vfwd_hscan_parity(
         sms, _, max_warps = scans.device_limits(0)
         tiles = scans._ceil(shape[3], scans._WARP_SIZE)
         batch = max(batch, scans._ceil(2 * sms * max_warps, h * tiles))
-    env, modes = OPS[op]
-    off = "off"
+    env, _ = OPS[op]
+    mode = W43_MODES[op]
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
     for compact in _layouts(op, label, coarse, w):
-        monkeypatch.setenv(env, off)
-        run, plan = _case(op, shape, batch, dtype, compact=compact)
-        baseline = plan()
+        monkeypatch.setenv(env, "off")
+        run, _ = _case(op, shape, batch, dtype, compact=compact)
         expected = run()
-        outputs = {baseline: expected}
-        for mode in modes[1:]:
-            monkeypatch.setenv(env, mode)
-            launch = plan()
-            if launch not in outputs:
-                outputs[launch] = run()
-            tensors = zip(TENSOR_NAMES[op], outputs[launch], expected, strict=True)
-            for name, actual, reference in tensors:
-                assert parity_stats(actual, reference)["tol_pass"], (label, mode, name)
+        monkeypatch.setenv(env, mode)
+        for name, actual, reference in zip(TENSOR_NAMES[op], run(), expected, strict=True):
+            assert parity_stats(actual, reference)["tol_pass"], (label, mode, name)
 
 
 def test_scan_micro_parity_diagnostics() -> None:

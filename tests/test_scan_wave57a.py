@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from h200.bench_h200 import lockin_arm_env
 from lnet import general_cuda_scans as scans
 
 SHAPES = [(h, coarse) for h in (56, 28, 14, 7) for coarse in (False, True) if h != 7 or not coarse]
@@ -99,7 +100,8 @@ def test_active_modes_and_legacy_off(monkeypatch, offline):
         "HSCAN": scans.HSCAN_MODES,
     }
     for option, modes in allowed.items():
-        assert modes == ("off", CONFIG[option])
+        expected = ("off", "bwd_opt", "h55_lockin") if option == "HSCAN" else ("off", CONFIG[option])
+        assert modes == expected
     names = ("LNET_SCAN_W52A", "LNET_SCAN_W51B", "LNET_SCAN_VSCAN_SAVED")
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -108,6 +110,19 @@ def test_active_modes_and_legacy_off(monkeypatch, offline):
     for name in names:
         monkeypatch.setenv(name, "off")
     assert plan(*args) == baseline
+
+
+@pytest.mark.parametrize("arm", ["w43_ref", "w57_lockin"])
+def test_lockin_preset_plans_all_slots(monkeypatch, offline, arm):
+    for name in CONFIG:
+        monkeypatch.delenv("LNET_SCAN_" + name, raising=False)
+    for name, value in lockin_arm_env(arm).items():
+        monkeypatch.setenv(name, value)
+    for dtype in (torch.bfloat16, torch.float16):
+        for h, coarse in SHAPES:
+            for vertical in (True, False):
+                for backward in (False, True):
+                    assert plan(dtype, h, h, 128 if h == 7 else 160, coarse, vertical, backward)
 
 
 @pytest.mark.parametrize("dtype", LAUNCH)
