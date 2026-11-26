@@ -21,7 +21,7 @@ from .model_w36b import inductor_norms_enabled
 
 def _wave56b_mode() -> str:
     mode = os.environ.get("LNET_MODEL_W56B", "off")
-    if mode not in ("off", "triton_hiocc", "cuda_vec8", "cuda_vec8_tanh"):
+    if mode not in ("off", "triton_hiocc", "cuda_vec8", "cuda_vec8_tanh", "swiglu_best"):
         raise ValueError(f"invalid LNET_MODEL_W56B={mode!r}")
     return mode
 
@@ -107,6 +107,8 @@ def _launch_swiglu(joint: Tensor, grad: Tensor, output: Tensor, *, backward: boo
 
 def packed_swiglu_vec2d(joint: Tensor) -> Tensor:
     mode = _wave56b_mode()
+    if mode == "swiglu_best":
+        mode = "off" if joint.shape[-1] // 2 <= 96 else "cuda_vec8_tanh"
     if mode == "off":
         return _off_swiglu(joint)
     return _tuned_swiglu(joint, mode)
@@ -132,7 +134,7 @@ def _swiglu_vec2d_backward(joint: Tensor, grad: Tensor) -> Tensor:
     mode = _wave56b_mode()
     if mode == "off":
         return _off_swiglu_backward(joint, grad)
-    return _tuned_swiglu_backward(joint, grad, mode)
+    return _tuned_swiglu_backward(joint, grad, "cuda_vec8_tanh" if mode == "swiglu_best" else mode)
 
 
 @triton_op("lnet::w29c_swiglu_backward", mutates_args=())
@@ -290,6 +292,9 @@ def _channel_rmsnorm_backward(
     x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *,
     need_dx: bool, need_dw: bool,
 ) -> tuple[Tensor, Tensor]:
+    sp = _wave57b_mode()
+    if sp != "off":
+        return _sp_rms(x, weight, inverse, grad, need_dx, need_dw, sp)
     mode = _wave56b_mode()
     if mode.startswith("cuda_vec8"):
         return _vec_rms(x, weight, inverse, grad, need_dx, need_dw, mode == "cuda_vec8_tanh")
@@ -309,20 +314,21 @@ def _hiocc_rms_bwd(x: Tensor, weight: Tensor, inverse: Tensor, grad: Tensor, *,
     return _launch_rms_bwd(x, weight, inverse, grad, need_dx, need_dw, True)
 
 
-def _launch_rms_bwd(x, weight, inverse, grad, need_dx, need_dw, hiocc):
+def _launch_rms_bwd(x, weight, inverse, grad, need_dx, need_dw, hiocc, single_pass=False):
     width = x.shape[-1]
     rows = x.numel() // width
     dx = x.new_empty(x.shape if need_dx else (0,))
     block_rows = 8 if hiocc else _rmsnorm_backward_rows(width)
     # Two CTAs per SM preserve the H200 launch geometry and bound the reduction.
-    sms = (_vec_sms(x.device.index) if x.is_cuda and (hiocc or _wave56b_mode() != "off")
+    sms = (_vec_sms(x.device.index) if x.is_cuda and (single_pass or hiocc or _wave56b_mode() != "off")
            else torch.cuda.get_device_properties(x.device).multi_processor_count)
-    ctas = min((6 if hiocc else 2) * sms, triton.cdiv(rows, block_rows))
+    ctas = min((4 if single_pass else 6 if hiocc else 2) * sms, triton.cdiv(rows, block_rows))
     partial = x.new_empty((ctas, width) if need_dw else (0,), dtype=torch.float32)
     wrap_triton(_rmsnorm_backward_kernel)[(ctas,)](
         x, weight, inverse, grad, dx, partial, rows, width, _row_pitch(x), _row_pitch(grad),
         block_rows, triton.next_power_of_2(width), need_dx, need_dw,
-        reduce_in_loop=hiocc, enable_fp_fusion=hiocc,
+        reduce_in_loop=hiocc, enable_fp_fusion=hiocc or single_pass,
+        **({"num_warps": 8 if width > 64 else 4} if single_pass else {}),
     )
     dw = partial.sum(0).to(weight.dtype) if need_dw else weight.new_empty((0,))
     return dx, dw
@@ -788,4 +794,131 @@ def _vec_sms(device):
 
 @_vec_rms.register_fake
 def _vec_rms_fake(x, w, inv, dy, dx, dw, tanh):
+    return x.new_empty(x.shape if dx else (0,)), w.new_empty(w.shape if dw else (0,))
+
+
+_W57_MODES = ("off", "triton_sp_4cta", "cuda_sp_vec8_2cta", "cuda_sp_vec8_4cta",
+              "cuda_sp_vec8_6cta")
+
+
+def _wave57b_mode():
+    mode = os.environ.get("LNET_MODEL_W57B_RMS", "off")
+    if mode not in _W57_MODES:
+        raise ValueError(f"invalid LNET_MODEL_W57B_RMS={mode!r}")
+    return mode
+
+
+_SP_BODY = r"""
+extern "C" __global__ void rms_sp(const uint4* x, const uint4* w, const float* inverse,
+        const uint4* dy, uint4* dx, float* partial, int rows, int xp, int yp) {
+    constexpr int groups = 256/G, packs = WIDTH/8;
+    int t = threadIdx.x, lane = t%G, group = t/G;
+    float weight[8], acc[8] = {};
+    if (DX && lane < packs) {
+        Pack raw;
+        raw.bits = w[lane];
+        #pragma unroll
+        for (int i=0; i<8; ++i) weight[i] = float(raw.v[i]);
+    }
+    for (int base=blockIdx.x*groups; base<rows; base+=gridDim.x*groups) {
+        int row = base+group;
+        bool active = row<rows && lane<packs;
+        float norm[8], scaled[8], proj=0.f;
+        float inv = row<rows ? inverse[row] : 0.f;
+        if (active) {
+            Pack a,b;
+            a.bits = x[row*xp+lane];
+            b.bits = dy[row*yp+lane];
+            #pragma unroll
+            for (int i=0; i<8; ++i) {
+                norm[i] = float(a.v[i])*inv;
+                float grad = float(b.v[i]);
+                if (DW) acc[i] += grad*norm[i];
+                if (DX) {
+                    scaled[i] = grad*weight[i];
+                    proj += scaled[i]*norm[i];
+                }
+            }
+        }
+        if (DX) {
+            #pragma unroll
+            for (int k=G/2; k; k/=2) proj += __shfl_xor_sync(0xffffffff,proj,k,G);
+            if (active) {
+                Pack out;
+                #pragma unroll
+                for (int i=0; i<8; ++i)
+                    out.v[i] = T((scaled[i]-norm[i]*(proj/WIDTH))*inv);
+                dx[row*packs+lane] = out.bits;
+            }
+        }
+    }
+    if (DW) {
+        __shared__ float scratch[groups*WIDTH];
+        if (lane<packs) {
+            #pragma unroll
+            for (int i=0; i<8; ++i) scratch[group*WIDTH+lane*8+i] = acc[i];
+        }
+        __syncthreads();
+        if (t<WIDTH/4) {
+            float4 sum = {};
+            #pragma unroll
+            for (int g=0; g<groups; ++g) {
+                float4 v = reinterpret_cast<float4*>(scratch+g*WIDTH)[t];
+                sum.x+=v.x; sum.y+=v.y; sum.z+=v.z; sum.w+=v.w;
+            }
+            reinterpret_cast<float4*>(partial+blockIdx.x*WIDTH)[t] = sum;
+        }
+    }
+}
+"""
+
+
+def _sp_group(width):
+    return 1 << (width // 8 - 1).bit_length()
+
+
+def _sp_source(dtype, width, dx, dw):
+    header = _VEC_SOURCE.partition("#if !RMS_KERNEL")[0]
+    return (f"#define SCALAR {_TYPES[dtype]}\n#define WIDTH {width}\n#define G {_sp_group(width)}\n"
+            f"#define DX {int(dx)}\n#define DW {int(dw)}\n" + header + _SP_BODY)
+
+
+@cache
+def _sp_module(device, dtype, width, dx, dw):
+    cap = torch.cuda.get_device_capability(device)
+    source = _sp_source(dtype, width, dx, dw)
+    module = _CudaModule(_compile_source((9, "0a") if cap == (9, 0) else cap, source), device)
+    module.load_function("rms_sp", 0)
+    return module
+
+
+@torch.library.custom_op("lnet::w57b_sp_rms", mutates_args=(), device_types="cuda")
+def _sp_rms(x: Tensor, w: Tensor, inv: Tensor, dy: Tensor, dx: bool,
+            dw: bool, mode: str) -> tuple[Tensor, Tensor]:
+    width = x.shape[-1]
+    xp, yp = _row_pitch(x), _row_pitch(dy)
+    if (mode == "triton_sp_4cta" or not (0 < width <= 256 and width % 8 == 0)
+            or not xp or not yp or xp % 8 or yp % 8 or w.dtype != x.dtype
+            or x.dtype not in (torch.bfloat16, torch.float16) or dy.dtype != x.dtype
+            or inv.dtype != torch.float32 or not inv.is_contiguous() or not w.is_contiguous()
+            or any(t.data_ptr() % 16 for t in (x, dy, w))):
+        return _launch_rms_bwd(x if xp else x.contiguous(), w.contiguous(), inv.contiguous(),
+                               dy if yp else dy.contiguous(), dx, dw, False, mode == "triton_sp_4cta")
+    rows = x.numel() // width
+    blocks = min(int(mode[-4]) * _vec_sms(x.device.index),
+                 triton.cdiv(rows, 256 // _sp_group(width)))
+    out = x.new_empty(x.shape if dx else (0,))
+    partial = inv.new_empty((blocks, width) if dw else (0,))
+    with torch.cuda.device(x.device):
+        module = _sp_module(x.device.index, x.dtype, width, dx, dw)
+        _ensure_context(module.driver, x.device.index)
+        args = [ct.c_void_p(t.data_ptr()) for t in (x, w, inv, dy, out, partial)]
+        args.extend(ct.c_int(n) for n in (rows, xp // 8, yp // 8))
+        module.launch("rms_sp", (blocks, 1, 1), (256, 1, 1), 0,
+                      torch.cuda.current_stream(x.device).cuda_stream, args)
+    return out, partial.sum(0).to(w.dtype) if dw else w.new_empty((0,))
+
+
+@_sp_rms.register_fake
+def _sp_fake(x, w, inv, dy, dx, dw, mode):
     return x.new_empty(x.shape if dx else (0,)), w.new_empty(w.shape if dw else (0,))
