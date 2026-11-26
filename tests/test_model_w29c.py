@@ -268,6 +268,16 @@ def test_representative_triton_launches_generate_ttir(monkeypatch: pytest.Monkey
     assert all("tt.func" in module for module in modules)
 
 
+@pytest.mark.parametrize("legacy", [None, "off"])
+def test_baseline_rms_forward(monkeypatch, legacy) -> None:
+    if legacy is None:
+        monkeypatch.delenv("LNET_NORM_W50_MODE", raising=False)
+    else:
+        monkeypatch.setenv("LNET_NORM_W50_MODE", legacy)
+    monkeypatch.setattr(model_w29c, "_triton_rmsnorm", lambda *args: args)
+    assert model_w29c.channel_rmsnorm(None, None, 1e-6, True) == (None, None, 1e-6, True)
+
+
 def test_row_pitch() -> None:
     tensor = torch.empty(3, 5, 17)
     assert _row_pitch(tensor) == 17
