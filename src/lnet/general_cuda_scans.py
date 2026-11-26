@@ -104,18 +104,13 @@ class ScanPlan(NamedTuple):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Wave53Options:
     # Keep the legacy positional constructor and vars(key) snapshot compatible.
-    backward_batch4: bool = False
-    backward_reload_source: bool = False
-    partial_shared_acc: bool = False
-    horizontal_stream: bool = False
     vertical_w56: str = "off"
     seg16: bool = False
     vertical_w55: str = "off"
-    horizontal_nocs: bool = False
     horizontal_vec2: bool = False
     path_bwd_pipe: int = 0
     horizontal_half_replay: bool = False
-    horizontal_compact2: bool = False
+    horizontal_dense_replay: bool = False
     horizontal_bf16_buf: bool = False
     horizontal_wave53: bool = False
 
@@ -153,7 +148,6 @@ class Kernel(_Wave53Options):
     backward_batch2: bool = False
     backward_batch_tail: bool = False
     backward_readonly: bool = False
-    saved_trajectory: int = 0
     sgs: int = 0  # 0: RMW, 1: full coverage
     backward_reduce_warps: int = 0
     odd_coarse_backward: bool = False
@@ -162,15 +156,14 @@ class Kernel(_Wave53Options):
     forward_readonly: bool = False
     horizontal_readonly: bool = False
     horizontal_unroll: int = 0
-    min_blocks: int = 0
-    horizontal_span: int = 0
-    backward_segment_source: bool = False
     fp32_path: bool = False
     tanh_gain: bool = False
     l2_single_write: bool = False
-    dw1_tile: int = 0
-    dw1_fp32: bool = False
 
+    @property
+    def horizontal_span(self) -> int:
+        """Use the ordinary chunk in the microbenchmark's launch description."""
+        return 0
 
 
 class Launch(NamedTuple):
@@ -1482,199 +1475,9 @@ __device__ void reduce_partials(const float* partial, void* dr, void* di, void* 
 
 """
 
-_SAVED_QUAD_CUDA = r"""
-__device__ unsigned int pair_bits(Pair<__half> p) {
-    const __half2_raw raw = p.value;
-    return raw.x | (static_cast<unsigned int>(raw.y) << 16);
-}
-
-__device__ unsigned int pair_bits(Pair<__nv_bfloat16> p) {
-    const __nv_bfloat162_raw raw = p.value;
-    return raw.x | (static_cast<unsigned int>(raw.y) << 16);
-}
-
-template<class T> __device__ Pair<T> unpack_pair_bits(unsigned int bits);
-template<> __device__ Pair<__half> unpack_pair_bits(unsigned int bits) {
-    return {__half2(__half2_raw{static_cast<unsigned short>(bits),
-                               static_cast<unsigned short>(bits >> 16)})};
-}
-template<> __device__ Pair<__nv_bfloat16> unpack_pair_bits(unsigned int bits) {
-    return {__nv_bfloat162(__nv_bfloat162_raw{static_cast<unsigned short>(bits),
-                                            static_cast<unsigned short>(bits >> 16)})};
-}
-
-template<class T, class I>
-__device__ __forceinline__ void store_saved_quad(void* base, I index, Quad<T> value) {
-    if constexpr (sizeof(T) == 2) {
-        reinterpret_cast<uint2*>(base)[index] = make_uint2(pair_bits(value.a), pair_bits(value.b));
-    } else {
-        reinterpret_cast<float4*>(base)[index] = value.unpack();
-    }
-}
-
-template<class T, class I>
-__device__ __forceinline__ float4 load_saved_quad(const void* base, I index) {
-    if constexpr (sizeof(T) == 2) {
-        const uint2 value = reinterpret_cast<const uint2*>(base)[index];
-        return Quad<T>{unpack_pair_bits<T>(value.x), unpack_pair_bits<T>(value.y)}.unpack();
-    } else {
-        return reinterpret_cast<const float4*>(base)[index];
-    }
-}
-"""
-
-_SAVED_TRAJECTORY_CUDA = r"""
-template<class T, class I, bool COARSE>
-__device__ __forceinline__ Column<T, I> saved_column(
-    const T* states, const float* vx, const float* vy,
-    I line, int b, int h, int w, int mcount, int m, float eps
-) {
-    const int ow = w / (1 + COARSE), oh = h / (1 + COARSE);
-    const I batch = line / ow;
-    const int x = line % ow, xa = COARSE ? 2 * x + 1 : x, xb = COARSE ? 2 * x : x;
-    const I base = batch * h * w * mcount + m;
-    const I plane = I(b) * h * w * mcount;
-    return {states, vy, base + I(xa) * mcount, base + I(xb) * mcount,
-            plane, plane, (batch * oh * ow + x) * mcount + m, I(b) * oh * ow * mcount,
-            h, w, mcount, ow, m, vx[I(xa) * mcount + m], vx[(I(w) + xb) * mcount + m], eps};
-}
-
-template<bool COARSE, bool RI, bool II, class T, class I, class Weights>
-__device__ __forceinline__ void saved_path_cell(
-    Column<T, I> c, int yo, const Quad<T>* trajectory, I start, I plane,
-    const T* gr, const T* gi,
-    Weights path, float* acc, float4& positive, Quad<T>& negative
-) {
-    const int yp = yo * (1 + COARSE) + COARSE, yn = yp - COARSE;
-    const I offset = c.cell(yo) - c.m;
-    const I stride = I(c.OW) * c.M;
-    const float2 gp = c.gain(yp, false), gn = c.gain(yn, true);
-    const auto p = load_saved_quad<T>(trajectory, start + yp * stride);
-    const auto n = load_saved_quad<T>(trajectory, plane + start + yn * stride);
-    const auto pos = Quad<T>::pack(
-        make_float4(p.x * gp.x, p.y * gp.x, p.z * gp.y, p.w * gp.y)).unpack();
-    const auto neg = Quad<T>::pack(
-        make_float4(n.x * gn.x, n.y * gn.x, n.z * gn.y, n.w * gn.y)).unpack();
-    float dp[8]{};
-    path_mlp<T, I, 8, false, true>(
-        pos, neg,
-        path, {}, make_float2(read(gr[offset * (1 + RI) + c.m]),
-                              read(gi[offset * (1 + II) + c.m])), acc, I(1), dp);
-    positive = normalize<T>(make_float4(dp[0], dp[4], dp[1], dp[5]), gp);
-    negative = normalize_packed<T>(make_float4(dp[2], dp[6], dp[3], dp[7]), gn);
-}
-
-template<class T, class I, bool COARSE, int WARPS, bool COMPACT, bool RI, bool II, int PASS>
-__device__ __forceinline__ void saved_backward(
-    const float* dr, const float* di, const float* gr_pole, const float* gi_pole,
-    const T* states, const float* vx, const float* vy,
-    const void* wi, const void* bi, const void* wo,
-    const T* gr, const T* gi, T* gs, float* partial,
-    const Quad<T>* trajectory, Quad<T>* dp,
-    int B, int H, int W, int M, int workers, int types, float eps
-) {
-    constexpr int threads = WARPS * 32;
-    constexpr int fields = PASS == 0 ? 94 : PASS == 1 ? 90 : 4;
-    extern __shared__ float4 shared[];
-    const int tiles = (M - 1) / 32 + 1, lane = threadIdx.x % 32;
-    const int group = blockIdx.x / tiles, mode0 = (blockIdx.x % tiles) * 32;
-    const int m = mode0 + lane, worker = group * WARPS + threadIdx.x / 32;
-    auto* weights = reinterpret_cast<T*>(shared);
-    if constexpr (PASS != 2) {
-        load_path_weights<T, I>(weights, wi, bi, wo, types, mode0, M, 8, threads);
-        __syncthreads();
-    }
-    float acc[PASS == 2 ? 1 : 90]{};
-    Complex da{}, dg{};
-    const int ow = W / (1 + COARSE), oh = H / (1 + COARSE);
-    const I stride = I(ow) * M, plane = I(B) * H * stride;
-    if (m < M && worker < workers) {
-        const auto path = path_weights<T, I, true>(weights, wi, bi, wo, types, m, 8, lane);
-        if constexpr (PASS == 1) {
-            for (I cell = worker; cell < I(B) * oh * ow; cell += workers) {
-                const I batch = cell / (oh * ow), x = cell % ow;
-                const int yo = cell / ow % oh;
-                const auto c = saved_column<T, I, COARSE>(
-                    states, vx, vy, batch * ow + x, B, H, W, M, m, eps);
-                float4 positive;
-                Quad<T> negative;
-                const I start = batch * H * stride + x * M + m;
-                saved_path_cell<COARSE, RI, II>(
-                    c, yo, trajectory, start, plane, gr, gi, path, acc,
-                    positive, negative);
-                store_saved_quad(dp, c.cell(yo), Quad<T>::pack(positive));
-                store_saved_quad(dp, c.feature_plane + c.cell(yo), negative);
-            }
-        } else {
-            const Complex a{dr[m], di[m]}, g{gr_pole[m], gi_pole[m]};
-            auto* negative_cache = weights + 88 * 32;
-            auto* cache = reinterpret_cast<Quad<T>*>(negative_cache) + threadIdx.x;
-            for (I line = worker; line < I(B) * ow; line += workers) {
-                const auto c = saved_column<T, I, COARSE>(
-                    states, vx, vy, line, B, H, W, M, m, eps);
-                const I start = (line / ow * H * ow + line % ow) * M + m;
-                Complex adj_a{}, adj_b{};
-                for (int y = H - 1; y >= 0; --y) {
-                    float4 positive{};
-                    if (!COARSE || (y & 1)) {
-                        const int yo = y / (1 + COARSE);
-                        if constexpr (PASS == 0) {
-                            Quad<T> negative;
-                            saved_path_cell<COARSE, RI, II>(
-                                c, yo, trajectory, start, plane, gr, gi, path, acc,
-                                positive, negative);
-                            cache[yo * threads] = negative;
-                        } else {
-                            positive = load_saved_quad<T>(dp, c.cell(yo));
-                        }
-                    }
-                    const auto prev = y
-                        ? load_saved_quad<T>(trajectory, start + (y - 1) * stride)
-                        : float4{};
-                    column_adjoint<false, COMPACT>(
-                        c, y, prev, c.source(y), positive, a, g, adj_a, adj_b, da, dg, gs);
-                }
-                adj_a = adj_b = {};
-                for (int y = 0; y < H; ++y) {
-                    float4 negative{};
-                    if (y / (1 + COARSE) < oh && (!COARSE || !(y & 1))) {
-                        const int yo = y / (1 + COARSE);
-                        if constexpr (PASS == 0) negative = cache[yo * threads].unpack();
-                        else negative = load_saved_quad<T>(dp, c.feature_plane + c.cell(yo));
-                    }
-                    const auto prev = y + 1 < H
-                        ? load_saved_quad<T>(
-                            trajectory, plane + start + (y + 1) * stride)
-                        : float4{};
-                    column_adjoint<true, COMPACT>(
-                        c, y, prev, c.source(y), negative, a.conj(), g.conj(),
-                        adj_a, adj_b, da, dg, gs);
-                    if constexpr (COARSE) clear_unused_columns<COMPACT>(c, y, gs);
-                }
-            }
-        }
-    }
-    // One independent partial row per warp avoids atomics and reduction scratch.
-    if (m < M && worker < workers) {
-        auto* row = partial + I(worker) * fields * M + m;
-        if constexpr (PASS != 1) {
-            row[0] = da.r; row[M] = da.i; row[2 * I(M)] = dg.r; row[3 * I(M)] = dg.i;
-            if constexpr (PASS == 0) row += 4 * I(M);
-        }
-        if constexpr (PASS != 2) {
-            #pragma unroll
-            for (int j = 0; j < 90; ++j) row[I(j) * M] = acc[j];
-        }
-    }
-}
-"""
-
 # NVRTC compilation and driver launch
 
 def _kernel_name(key: Kernel) -> str:  # noqa: PLR0911
-    if key.saved_trajectory:
-        return ("", "vscan_fwd_saved", "vscan_bwd_saved", "vscan_path_bwd",
-                "vscan_adj_bwd")[key.saved_trajectory]
     if key.sgs:
         return "vscan_sgs"
     if key.projection:
@@ -1731,13 +1534,10 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
             key.cache_line, key.shared_acc, key.precise,
         )
     )
-    minimum = f", {key.min_blocks}" if key.min_blocks else ""
     bounds = (
-        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE}{minimum})'
+        f'extern "C" __global__ __launch_bounds__({key.warps * _WARP_SIZE})'
         f" void {_kernel_name(key)}"
     )
-    if key.saved_trajectory > 1:
-        return _saved_backward_source(key, io, index, bounds)
     compact = str(key.compact).lower()
     layout = f"{str(key.real_interleaved).lower()}, {str(key.imag_interleaved).lower()}"
     if key.vertical:
@@ -1808,19 +1608,6 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
         source = "#define BACKWARD_BATCH2\n" + source
         if key.backward_batch_tail:
             source = "#define BACKWARD_BATCH_TAIL\n" + source
-    if key.backward_segment_source:
-        # Dense backward also reads the segment source in the paired adjoint
-        # and writes it during the negative replay.
-        source = source.replace(
-            "if constexpr (COARSE && !CACHE_SOURCE) seg_src",
-            "if constexpr (!CACHE_SOURCE) seg_src",
-        ).replace(
-            "c.source(y0 + j)", "c.packed_source(y0 + j).unpack()",
-        ).replace(
-            "const auto s = (COARSE || CACHE_SOURCE)\n"
-            "                ? CACHED_SOURCE_AT(j) : c.source(y);",
-            "const auto s = CACHED_SOURCE_AT(j);",
-        )
     if key.vertical and (key.backward_readonly or key.forward_readonly):
         source = (
             source.replace("states[ia]", "__ldg(states + ia)")
@@ -1844,319 +1631,18 @@ extern "C" __global__ __launch_bounds__({key.warps * 32}) void {_kernel_name(key
     if key.sgs or key.l2_single_write:
         source = _sgs_source(source, persistent=key.l2_single_write)
     if key.path_bwd_pipe and key.fp32_path and key.tanh_gain and key.backward_batch2 and key.hidden8:
-        source = _pipelined_adjoint(source, key.path_bwd_pipe)
+        source = _pipelined_adjoint(source)
     if key.fp32_path:
         source = _fp32_path_source(source)
     if key.tanh_gain:
         source = _tanh_gain_source(source)
     if key.backward_reduce_warps:
         source = _grouped_vscan_source(source, key.backward_reduce_warps)
-    if key.saved_trajectory:
-        source = _with_saved_quads(_saved_forward_source(source))
-    if key.dw1_tile:
-        source = _tiled_dw1_source(source, key)
-    if key.backward_reload_source:
-        source = _vertical_wave54_source(source, key)
-        if key.backward_batch4:
-            source = _quad_adjoint_source(source)
     if key.vertical_w55 != "off":
         source = _vertical_w55_source(source, key)
     if key.seg16:
         source = _seg16_source(source)
     return source + wrapper
-
-
-_FLUSH_DW1 = """
-template<class T, class I, int THREADS>
-__device__ __forceinline__ void flush_dw1(
-    const Pair<T>* tile, int count, float* dw1, int M
-) {
-    // One 32-bit word per lane in every tile plane.
-    #pragma unroll 1
-    for (int j = 0; j < 8; ++j) {
-        float acc[8];
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) acc[k] = dw1[I(8 * j + k) * M];
-        #pragma unroll 1
-        for (int t = 0; t < count; ++t) {
-            const auto* row = tile + t * 8 * THREADS;
-            const auto z = row[(4 + j / 2) * THREADS].unpack();
-            const float dz = j & 1 ? z.i : z.r;
-            #pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const auto p = row[k * THREADS].unpack();
-                acc[2 * k] = __fmaf_rn(dz, p.r, acc[2 * k]);
-                acc[2 * k + 1] = __fmaf_rn(dz, p.i, acc[2 * k + 1]);
-            }
-        }
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) dw1[I(8 * j + k) * M] = acc[k];
-    }
-}
-"""
-
-
-def _tiled_dw1_source(source: str, key: Kernel) -> str:
-    start = source.index("template<class T, class I, int HIDDEN, bool PRECISE, bool BACKWARD")
-    end = source.index("template<class T, class I, int HIDDEN, bool PRECISE, int K", start)
-    path = source[start:end].replace("int SHARED_HIDDEN = 0", "int THREADS").replace(
-        "float2 path_mlp(", "float2 path_mlp_tiled(",
-    ).replace(
-        "float* shared_dwi = nullptr, int shared_stride = 0", "Pair<T>* tile",
-    ).replace("8 * SHARED_HIDDEN", "64")
-    path = path.replace(
-        "    Sum<PRECISE> out_r, out_i;",
-        """    #pragma unroll
-    for (int k = 0; k < 4; ++k) tile[k * THREADS] = Pair<T>::pack({p[2*k], p[2*k+1]});
-    float dz_even = 0;
-    Sum<PRECISE> out_r, out_i;""",
-    ).replace(
-        "            #pragma unroll\n            for (int k = 0; k < 8; ++k) {",
-        """            if (j & 1) tile[(4 + j / 2) * THREADS] = Pair<T>::pack({dz_even, dz});
-            else dz_even = dz;
-            #pragma unroll
-            for (int k = 0; k < 8; ++k) {""",
-    ).replace(
-        "                if (j < SHARED_HIDDEN) "
-        "shared_dwi[(8 * j + k) * shared_stride] += dz * p[k];\n"
-        "                else partial[(8 * (I(j) - SHARED_HIDDEN) + k) "
-        "* partial_stride] += dz * p[k];",
-        "",
-    )
-    if key.dw1_fp32:
-        path = path.replace("rounded<T>", "rounded<float>")
-    source = source[:end] + path + _FLUSH_DW1 + source[end:]
-    source = _sgs_source(source)
-    source = source.replace("T* gs, Quad<T>* pos_grad", "T*, Quad<T>* pos_grad, I pos_stride")
-    source = source.replace("const Quad<T>* pos_grad", "const Quad<T>* pos_grad, I pos_stride")
-    source = source.replace("pos_grad[I(y) * THREADS]", "pos_grad[I(y) * pos_stride]")
-    source = source.replace("gs, pos_grad);", "gs, pos_grad, g2_stride);")
-    source = source.replace(
-        "Complex& dg, Quad<T>* pos_grad\n",
-        "Complex& dg, Quad<T>* pos_grad, Pair<T>* tile, float* dw1\n",
-    )
-    source = source.replace(
-        "line_buf + (CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x",
-        "buf + I(oh) * stride, reinterpret_cast<Pair<T>*>(seg_src) + threadIdx.x, row + 4 * I(M)",
-    )
-    before = source.index("void column_backward(")
-    after = source.index("#undef CACHED_SOURCE_AT", before)
-    column = source[before:after].replace(
-        "source_cache[(j) * THREADS].unpack()", "c.source(y0 + (j))",
-    ).replace(
-        "        Quad<T>* source_cache = seg_src + (CACHE_SOURCE ? I(y0) * THREADS : 0);\n", "",
-    ).replace("source_cache[j * THREADS].unpack()", "c.source(y0 + j)")
-    column = "\n".join(
-        line for line in column.split("\n")
-        if "seg_src[" not in line
-    ).replace(
-        "#if !defined(BACKWARD_BATCH2) || defined(BACKWARD_BATCH_TAIL)",
-        "#if !defined(BACKWARD_BATCH2) || defined(BACKWARD_BATCH_TAIL)"
-        "\n        int tile_count = 0;",
-    ).replace(
-        "else path_mlp<T, I, HIDDEN, false, true>(",
-        "else path_mlp_tiled<T, I, HIDDEN, false, true, THREADS>(",
-    ).replace(
-        "acc, acc_stride, dp);", "acc, acc_stride, dp, tile + tile_count * 8 * THREADS);",
-    ).replace(
-        "            if constexpr (full) {\n                // The positive adjoint",
-        f"""            if (++tile_count == {key.dw1_tile}) {{
-                flush_dw1<T, I, THREADS>(tile, tile_count, dw1, c.M);
-                tile_count = 0;
-            }}
-            if constexpr (full) {{
-                // The positive adjoint""",
-    ).replace(
-        "        }\n#endif\n    }\n\n    adj_a",
-        "        }\n        if (tile_count) flush_dw1<T, I, THREADS>(tile, tile_count, dw1, c.M);"
-        "\n#endif\n    }\n\n    adj_a",
-    )
-    source = source[:before] + column + source[after:]
-    return source.replace(
-        "constexpr bool reduce = (PURE || SHARED_ACC || register_acc) && WARPS > 1;",
-        "constexpr bool reduce = false;",
-    ).replace(
-        "float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};",
-        "float local_acc[26]{};",
-    ).replace(
-        "            acc = local_acc;",
-        """            acc = local_acc;
-            if (active) {
-                #pragma unroll 1
-                for (int j = 0; j < 64; ++j) row[(4 + I(j)) * M] = 0;
-            }""",
-        1,
-    ).replace(
-        "for (int j = 0; j < 11 * HIDDEN + 2; ++j) row[(4 + I(j)) * M] = local_acc[j];",
-        "for (int j = 0; j < 26; ++j) row[(68 + I(j)) * M] = local_acc[j];",
-    )
-
-
-def _with_saved_quads(source: str) -> str:
-    start = source.index("template<class T, class I>\nstruct Column {")
-    return source[:start] + _SAVED_QUAD_CUDA + source[start:]
-
-
-def _saved_forward_source(source: str) -> str:
-    start = source.index("    const auto path = [&]", source.index("void vertical("))
-    end = source.index("template<class T, class I, int WARPS, int HIDDEN", start)
-    forward = source[start:end]
-    # Add one vector store after each recurrence update, including coarse
-    # rows that are not sampled by the projection but feed the pole adjoint.
-    forward, stores = re.subn(
-        r"(state = advance_forward<REGISTER_PATH && VECTOR_WEIGHTS>\(\s*"
-        r"state, c.source\(([^)]+)\), ([^;]+)\);)",
-        lambda match: match[0] + "\n" + " " * 24
-        + "store_saved_quad(global_checkpoints, "
-        + ("I(B) * H * ow * M + " if "conj" in match[3] else "")
-        + "((b * H + (" + match[2] + ")) * ow + x) * M + m, Quad<T>::pack(state));",
-        forward,
-    )
-    # Read the positive trajectory as the reverse pass projects each cell.
-    # The saved buffer replaces the temporary normalized line cache.
-    forward, caches = re.subn(
-        r"\s*if \(!COARSE \|\| \(y & 1\)\) \{\s*"
-        r"buf\[I\(COARSE \? y / 2 : y\) \* stride\] =\s*"
-        r"normalize_packed<T>\(state, c.gain\(y, false\)\);\s*\}",
-        "",
-        forward,
-    )
-    if stores not in (4, 5) or caches != 1:
-        raise RuntimeError("Unexpected vertical forward trajectory template")
-    positive = (
-        "normalize<T>(load_saved_quad<T>(global_checkpoints, "
-        "((b * H + y + int(COARSE)) * ow + x) * M + m), "
-        "c.gain(y + int(COARSE), false))"
-    )
-    forward = forward.replace(
-        "buf[I(COARSE ? y / 2 : y) * stride].unpack()", positive,
-    ).replace("buf[I(yo) * stride].unpack()", positive)
-    return source[:start] + forward + source[end:]
-
-
-def _saved_backward_source(key: Kernel, io: str, index: str, bounds: str) -> str:
-    flags = ", ".join(str(flag).lower() for flag in (
-        key.compact, key.real_interleaved, key.imag_interleaved,
-    ))
-    source = _odd_compact_source(_CUDA_SOURCE) if key.odd_compact_width else _CUDA_SOURCE
-    return _with_saved_quads(source) + _SAVED_TRAJECTORY_CUDA + f"""
-{bounds}(
-    const float* dr, const float* di, const float* decay_gr, const float* decay_gi,
-    const {io}* states, const float* vx, const float* vy,
-    const void* wi, const void* bi, const void* wo,
-    const {io}* gr, const {io}* gi, {io}* gs, float* partial,
-    const Quad<{io}>* trajectory, Quad<{io}>* dp,
-    int B, int H, int W, int M, int workers, int types, float eps
-) {{
-    saved_backward<{io}, {index}, {str(key.coarse).lower()}, {key.warps}, {flags},
-                   {key.saved_trajectory - 2}>(
-        dr, di, decay_gr, decay_gi, states, vx, vy, wi, bi, wo, gr, gi, gs, partial,
-        trajectory, dp, B, H, W, M, workers, types, eps);
-}}
-"""
-
-
-def _quad_adjoint_source(source: str) -> str:
-    start = source.index("void path_adjoint_pair(")
-    end = source.index("#endif", source.index("if constexpr (full) {",
-                                              source.index("path_adjoint_pair<T")))
-    quad = source[start:end]
-    for field in ("(&p)", "(&dy)", "(&dp)", "pre", " p", " dp", "dy", "gp_c",
-                  "gn_c", "next", "next_even"):
-        quad = quad.replace(field + "[2]", field + "[4]")
-    quad = quad.replace("cell < 2", "cell < 4").replace("i < 2", "i < 4")
-    quad = quad.replace("2 * step", "4 * step").replace(
-        "pre[1] = __fmaf_rn(weights[k], p[1][k], pre[1]);",
-        "\n".join(f"            pre[{i}] = __fmaf_rn(weights[k], p[{i}][k], pre[{i}]);"
-                  for i in (1, 2, 3)),
-    )
-    return source[:start] + quad.replace("path_adjoint_pair", "path_adjoint_quad") + source[end:]
-
-
-def _vertical_wave54_source(source: str, key: Kernel) -> str:
-    source = source.replace("static_assert(!full || CACHE_SOURCE);", "").replace(
-        "#define CACHED_SOURCE_AT(j) source_cache[(j) * THREADS].unpack()",
-        "#define CACHED_SOURCE_AT(j) c.source(y0 + (j))",
-    ).replace("I(CACHE_SOURCE ? H : span) * threads", "0")
-    source = "\n".join(line for line in source.split("\n") if "seg_src[j * THREADS] =" not in line)
-    start = source.index("    __device__ float4 source(int y) const {")
-    end = source.index("    __device__ float2 gain", start)
-    source = source[:start] + """    __device__ float4 source(int y) const {
-        return packed_source(y).unpack();
-    }
-
-""" + source[end:]
-    if not key.shared_acc:
-        return source.replace("BACKWARD && HIDDEN && !SHARED_ACC;", "false;")
-    head = 64 if key.partial_shared_acc else 90
-    source = source.replace("SHARED_ACC ? fields * threads", f"SHARED_ACC ? {head} * threads")
-    start = source.index("            for (I j = 4; j < fields;")
-    end = source.index("\n        }", start)
-    source = source[:start] + f"            for (int j=0; j<{head}; ++j) acc[j*threads]=0;" + source[end:]
-    start = source.index("            acc -= 4 * threads;")
-    end = source.index("        } else if (active)", start)
-    # The weight tile is dead once every warp finishes its last line.
-    reduction = """
-            __syncthreads();
-            float* poles = reinterpret_cast<float*>(shared) + threadIdx.x;
-            poles[0]=da.r; poles[threads]=da.i; poles[2*threads]=dg.r; poles[3*threads]=dg.i;
-            __syncthreads();
-            if (warp == 0 && m < M) {
-                for (int j=0; j<4+HEAD; ++j) {
-                    float* field = j<4 ? poles+j*threads : acc+(j-4)*threads;
-                    float sum = field[0];
-                    for (int k=1; k<WARPS; ++k) sum += field[k*32];
-                    row[I(j)*M] = sum;
-                }
-            }
-"""
-    if key.partial_shared_acc:
-        reduction += """
-            #pragma unroll
-            for (int j=0; j<26; ++j) {
-                __syncthreads();
-                poles[0]=local_tail[j];
-                __syncthreads();
-                if (warp==0 && m<M) {
-                    float sum=poles[0];
-                    for (int k=1; k<WARPS; ++k) sum+=poles[k*32];
-                    row[I(68+j)*M]=sum;
-                }
-            }
-"""
-    source = source[:start] + reduction.replace("HEAD", str(head)) + source[end:]
-    if key.partial_shared_acc:
-        source = source.replace("float* acc = acc_base", "float local_tail[26]{}; float* acc = acc_base")
-        source = source.replace("T* gs, float* acc, I acc_stride,", "T* gs, float* acc, float* tail, I acc_stride,")
-        source = source.replace("acc, acc_stride, (seg", "acc, local_tail, acc_stride, (seg")
-        source = source.replace("float* acc, I stride, float (&dp)", "float* acc, float* tail, I stride, float (&dp)")
-        source = source.replace("path, acc, acc_stride, dp);", "path, acc, tail, acc_stride, dp);")
-        for offset in (64,72,80):
-            source = source.replace(f"acc[({offset} + j) * stride]", f"tail[{offset-64}+j]")
-        source = source.replace("acc[88 * stride]", "tail[24]").replace("acc[89 * stride]", "tail[25]")
-        source = source.replace("else path_mlp<T, I, HIDDEN, false, true>(",
-                                "else path_mlp<T, I, HIDDEN, false, true, 8>(")
-        source = source.replace("                acc, acc_stride, dp);", "                tail, I(1), dp, acc, THREADS);")
-    return source
-
-
-_STREAM_STORES = r"""
-template<class V> __device__ void stream_store(V* dst, V value) {
-#if __CUDA_ARCH__ >= 700
-    if constexpr (sizeof(V)==2)
-        asm volatile("st.global.cs.b16 [%0], %1;" :: "l"(dst), "h"(__builtin_bit_cast(unsigned short,value)) : "memory");
-    else
-        asm volatile("st.global.cs.b32 [%0], %1;" :: "l"(dst), "r"(__builtin_bit_cast(unsigned,value)) : "memory");
-#else
-    *dst=value;
-#endif
-}
-template<class T, class I>
-__device__ void store_complex_cs(T* dst, I off, I plane, Complex z) {
-    stream_store(dst+off,write<T>(z.r));
-    stream_store(dst+off+plane,write<T>(z.i));
-}
-"""
 
 
 def _vertical_w55_source(source: str, key: Kernel) -> str:
@@ -2320,183 +1806,13 @@ template<class T> struct NativeWeights {
             begin = source.index("void " + name + "(")
             end = source.index("\n}", begin)
             source = source[:begin] + source[begin:end].replace("rounded<T>(", "(") + source[end:]
-    if key.vertical_w56 == "v56_bwd_quad_hfma2":
-        source = _w56_quad_source(source)
-    if key.vertical_w56 == "v56_bwd_hfma2_dw_l2":
-        source = _w56_partial_source(source)
-    if (key.vertical_w55 == W55A_MODES[3] or key.vertical_w56 == "v56_bwd_hfma2_dw_l2") and key.backward:
-        marker = "float* acc, float* tail, I stride, float (&dp)"
-        source = source.replace(marker, "Pair<T>* dw_chunk, " + marker)
-        source = source.replace(
-            "path, acc, tail, acc_stride, dp);", "path, dw_chunk, acc, tail, acc_stride, dp);"
-        )
-        marker = "        Quad<T>* source_cache"
-        source = source.replace(marker, "        Pair<T> dw_chunk[64]{};\n" + marker, 1)
-        marker = "                acc[(8 * j + k) * stride] += dz * p[cell][k];"
-        begin = source.index("void path_adjoint_pair(")
-        source = source[:begin] + source[begin:].replace(marker, guard(marker, ""), 1)
-        marker = "        auto dz2=P::pack(dzs[0],dzs[1]);"
-        source = source.replace(
-            marker,
-            marker
-            + r"""
-        #pragma unroll
-        for (int k=0;k<8;++k) {
-            auto &v=dw_chunk[8*j+k].value;
-            v=P::fma(dz2,p2[k],v);
-        }
-""",
-        )
-        # Flush after the paired loop and before any scalar remainder.
-        begin = source.index("path_adjoint_pair<T, I>(p, dy")
-        off = source.index("#if !defined(BACKWARD_BATCH2)", begin)
-        source = (
-            source[:off]
-            + r"""
-        #pragma unroll
-        for (int k=0;k<64;++k) {
-            auto v=dw_chunk[k].unpack();
-            acc[k*acc_stride]+=v.r+v.i;
-        }
-"""
-            + source[off:]
-        )
     return source
-
-
-def _w56_partial_source(source: str) -> str:
-    source = source.replace(
-        "constexpr bool reduce = (PURE || SHARED_ACC || register_acc) && WARPS > 1;",
-        "constexpr bool reduce = false;",
-    )
-    source = source.replace(
-        "float local_acc[register_acc ? 11 * HIDDEN + 2 : 1]{};", "float local_tail[26]{};"
-    )
-    source = source.replace(
-        "acc = local_acc;",
-        """acc = row + 4 * I(M);
-            if (active) {
-                #pragma unroll 1
-                for (int k=0;k<64;++k) acc[I(k)*M]=0;
-            }""",
-        1,
-    )
-    source = source.replace("register_acc ? 1 : SHARED_ACC ? threads : M", "M")
-    source = source.replace("row, local_acc, da", "row, local_tail, da")
-    source = source.replace(
-        "j < 11 * HIDDEN + 2; ++j) row[(4 + I(j)) * M] = local_acc[j]",
-        "j < 26; ++j) row[(68 + I(j)) * M] = local_tail[j]",
-    )
-    source = source.replace(
-        "T* gs, float* acc, I acc_stride,", "T* gs, float* acc, float* tail, I acc_stride,"
-    )
-    source = source.replace("acc, acc_stride, (seg", "acc, local_tail, acc_stride, (seg")
-    source = source.replace(
-        "float* acc, I stride, float (&dp)", "float* acc, float* tail, I stride, float (&dp)"
-    )
-    source = source.replace("path, acc, acc_stride, dp);", "path, acc, tail, acc_stride, dp);")
-    for offset in (64, 72, 80):
-        source = source.replace(f"acc[({offset} + j) * stride]", f"tail[{offset - 64}+j]")
-    source = source.replace("acc[88 * stride]", "tail[24]").replace("acc[89 * stride]", "tail[25]")
-    return source.replace(
-        "else path_mlp<T, I, HIDDEN, false, true>(", "else path_mlp<T, I, HIDDEN, false, true, 8>("
-    ).replace("                acc, acc_stride, dp);", "                tail, I(1), dp, acc, c.M);")
-
-
-_W56_QUAD = r"""
-#if __CUDA_ARCH__ >= 800
-template<class T, class I, class Weights>
-__device__ __forceinline__ void path_adjoint_quad(
-    const float (&p)[4][8], const float2 (&dy)[4], Weights path,
-    float* acc, I stride, float (&dp)[4][8]
-) {
-    using P = Half2<T>;
-    typename P::V packed[2][8], grad[2][8];
-    #pragma unroll
-    for (int pair = 0; pair < 2; ++pair) {
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            packed[pair][k] = P::pack(p[2 * pair][k], p[2 * pair + 1][k]);
-            grad[pair][k] = P::splat(0);
-        }
-    }
-    #pragma unroll
-    for (int cell = 0; cell < 4; ++cell) {
-        acc[88 * stride] += dy[cell].x;
-        acc[89 * stride] += dy[cell].y;
-    }
-    #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        uint4 row = reinterpret_cast<const uint4*>(path.cache)[32 * j + path.lane];
-        typename P::V weights[8], a = P::splat(0), b = P::splat(0);
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            T w = reinterpret_cast<const T*>(&row)[k];
-            weights[k] = Pair<T>::from(w, w).value;
-            a = P::fma(weights[k], packed[0][k], a);
-            b = P::fma(weights[k], packed[1][k], b);
-        }
-        float pre[4] = {P::unpack_lo(a), P::unpack_hi(a), P::unpack_lo(b), P::unpack_hi(b)};
-        float dz[4];
-        float bias = path.bias(j), wr = path.output(j), wi = path.output(8 + j);
-        #pragma unroll
-        for (int cell = 0; cell < 4; ++cell) {
-            float z = pre[cell] + bias;
-            float sig = fast_sigmoid_tanh(z), act = z * sig;
-            dz[cell] = (dy[cell].x * wr + dy[cell].y * wi) * __fmaf_rn(-act, sig, sig + act);
-            acc[(64 + j) * stride] += dz[cell];
-            acc[(72 + j) * stride] += dy[cell].x * act;
-            acc[(80 + j) * stride] += dy[cell].y * act;
-            #pragma unroll
-            for (int k = 0; k < 8; ++k)
-                acc[(8 * j + k) * stride] += dz[cell] * p[cell][k];
-        }
-        auto da = P::pack(dz[0], dz[1]), db = P::pack(dz[2], dz[3]);
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            grad[0][k] = P::fma(da, weights[k], grad[0][k]);
-            grad[1][k] = P::fma(db, weights[k], grad[1][k]);
-        }
-    }
-    #pragma unroll
-    for (int pair = 0; pair < 2; ++pair) {
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            dp[2 * pair][k] = P::unpack_lo(grad[pair][k]);
-            dp[2 * pair + 1][k] = P::unpack_hi(grad[pair][k]);
-        }
-    }
-}
-#endif
-"""
-
-
-def _w56_quad_source(source: str) -> str:
-    start = source.index("void path_adjoint_pair(")
-    end = source.index("\n}\n#endif", start) + 2
-    source = source[:end] + _W56_QUAD + source[end:]
-    a = source.index("        for (; end >= 2 * step")
-    body = source.index("            float p[2][8]", a)
-    b = source.index("\n#endif\n#if !defined(BACKWARD_BATCH2)", body)
-    declarations, iteration = source[body:b].split("            #pragma unroll", 1)
-    loop = (
-        declarations.replace("[2]", "[4]")
-        + "            #pragma unroll"
-        + iteration.replace("i < 2", "i < 4").replace("path_adjoint_pair", "path_adjoint_quad")
-    )
-    return (
-        source[:a]
-        + "        for (; end >= 4 * step - 1; end -= 4 * step) {\n"
-        + loop
-        + "\n"
-        + source[a:]
-    )
 
 
 def _horizontal_vec2_source(kernel: str) -> str:
     start = kernel.index("template<class T, class I, int WARPS")
     body = kernel.index("    const I stride_r", start)
-    return _STREAM_STORES + kernel[start:body] + r"""
+    return kernel[start:body] + r"""
     constexpr int threads=32*WARPS;
     extern __shared__ float4 shared[];
     const int warp=threadIdx.x/32, lane=threadIdx.x%32, tiles=(M+63)/64;
@@ -2511,7 +1827,7 @@ def _horizontal_vec2_source(kernel: str) -> str:
     };
     auto store2=[](T* dst, float x, float y) {
         auto value=Pair<T>::pack({x,y});
-        stream_store(reinterpret_cast<unsigned*>(dst),*reinterpret_cast<const unsigned*>(&value));
+        *reinterpret_cast<unsigned*>(dst)=*reinterpret_cast<const unsigned*>(&value);
     };
     if (m<M && worker<workers) {
         Complex a[2]={{dr[m],di[m]},{dr[m+1],di[m+1]}};
@@ -2622,14 +1938,10 @@ __device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
 }
 """
         kernel = helper + kernel
-    if key.horizontal_half_replay or key.horizontal_compact2:
+    if key.horizontal_dense_replay:
         kernel = _horizontal_wave53_source(kernel, key)
-    if key.horizontal_span:
-        kernel = _horizontal_chunk_source(kernel, key.horizontal_span)
-    if key.horizontal_vec2 and key.horizontal_nocs:
-        vector = _horizontal_vec2_source(kernel).removeprefix(_STREAM_STORES)
-        vector = vector.replace("stream_store(reinterpret_cast<unsigned*>(dst),*reinterpret_cast<const unsigned*>(&value));",
-                                "*reinterpret_cast<unsigned*>(dst)=*reinterpret_cast<const unsigned*>(&value);")
+    if key.horizontal_vec2:
+        vector = _horizontal_vec2_source(kernel)
         if key.cache_line and not key.backward:
             vector = vector.replace(
                 "if (!BACKWARD || pass) inputs(x,r,i);",
@@ -2645,35 +1957,7 @@ __device__ Complex load_complex_readonly(const T* p, I offset, I stride) {
                         i=reinterpret_cast<Pair<T>*>(&v.y)->unpack();
                     }""",
             )
-        if key.horizontal_half_replay:
-            vector = vector.replace("pass<2", "pass<4").replace(
-                "t<W;++t", "t<(pass==0?W:pass==1?W-W/2:W/2);++t"
-            )
-            vector = vector.replace(
-                "int x=pass?W-1-t:t;",
-                """
-                    const bool reverse=pass&1;
-                    int x=pass==0?t:pass==1?W-1-t:pass==2?t:W/2-1-t;""",
-            )
-            a = vector.index("                    I off=base")
-            b = vector.index("            }\n        }", a)
-            loop = re.sub(r"\bpass\b", "reverse", vector[a:b])
-            loop = loop.replace("I(x/(1+COMPACT))*threads", "I(pass<2?max(0,x-W/2):x)*threads")
-            loop = loop.replace("if (!reverse &&", "if (!reverse && (pass!=0 || x>=W/2) &&")
-            vector = vector[:a] + loop + vector[b:]
-            vector = vector.replace(
-                "                #pragma unroll 4",
-                "                if (pass==2) { right[0]={}; right[1]={}; }\n                #pragma unroll 4",
-            )
         return source[:start] + vector + source[end:]
-    if key.horizontal_nocs and key.horizontal_bf16_buf:
-        kernel = kernel.replace("Pair<float>::pack(right)", "Pair<__nv_bfloat16>::pack(right)")
-    if key.horizontal_stream:
-        if key.horizontal_vec2:
-            return source[:start] + _horizontal_vec2_source(kernel) + source[end:]
-        kernel = _STREAM_STORES + kernel.replace("store_complex(out,", "store_complex_cs(out,")
-        if key.horizontal_bf16_buf:
-            kernel = kernel.replace("Pair<float>::pack(right)", "Pair<__nv_bfloat16>::pack(right)")
     if key.horizontal_unroll and not key.backward:
         for loop in ("for (int x = 0;", "for (int x = W - 1;"):
             pragma = "#pragma unroll BACKWARD_UNROLL\n                "
@@ -2696,27 +1980,7 @@ def _horizontal_wave53_source(kernel: str, key: Kernel) -> str:
                     i -= M; oi -= 2*M; ir -= step_r; ii -= step_i;
                 };
 """
-    if key.compact:
-        # Compact adjoints are defined on even-width input pairs.
-        loop = """
-                #pragma unroll BACKWARD_UNROLL
-                for (int k = 0; k < W/2; ++k) {
-                    right = a * right + load_complex_readonly(grad,
-                        2 * grad_plane + grad_base + I(k)*M, grad_plane);
-                    buf[I(k)*stride] = Pair<float>::pack(right);
-                    right = a * right;
-                }
-                I gi = grad_base + I(W/2-1)*M;
-                #pragma unroll BACKWARD_UNROLL
-                for (int k = W/2-1; k >= 0; --k, gi -= M) {
-                    const auto even = buf[I(k)*stride].unpack();
-                    left = a.conj() * left + load_complex_readonly(grad, gi, grad_plane);
-                    consume(2*k+1, a*even);
-                    left = a.conj()*left;
-                    consume(2*k, even);
-                }"""
-    else:
-        loop = """
+    loop = """
                 const int half = HALF_REPLAY ? W/2 : 0;
                 #pragma unroll BACKWARD_UNROLL
                 for (int x = 0; x < W; ++x) {
@@ -2751,44 +2015,6 @@ def _horizontal_wave53_source(kernel: str, key: Kernel) -> str:
                   "reinterpret_cast<Pair<__nv_bfloat16>*>(shared) + threadIdx.x;\n"
                   + kernel[finish:])
     return kernel.replace("BUF_TYPE", dtype)
-
-
-def _horizontal_chunk_source(kernel: str, span: int) -> str:
-    # Save the right recurrence at segment boundaries and replay one segment
-    # at a time. The left and negative recurrences keep their original order.
-    start = kernel.index("                #pragma unroll BACKWARD_UNROLL")
-    reverse = kernel.index("                #pragma unroll BACKWARD_UNROLL", start + 1)
-    update = kernel[kernel.index("                    const I i", start):kernel.index(
-        "                    // Odd compact", start,
-    )]
-    descending = kernel[reverse:].replace("x = W - 1; x >= 0;", "x = end - 1; x >= begin;", 1)
-    descending = descending.replace(
-        "buf[I(x / (1 + COMPACT))", "buf[I((x - begin) / (1 + COMPACT))",
-    )
-    descending = descending.replace(
-        "                }\n            }",
-        "                }\n                }\n            }", 1,
-    )
-    return kernel[:start] + f"""
-                constexpr int span = {span};
-                constexpr int slots = span / (1 + COMPACT);
-                for (int x = 0; x < W; ++x) {{
-{update}
-                    if (x % span == span - 1 && x + 1 < W)
-                        buf[I(slots + x / span) * stride] = Pair<float>::pack(right);
-                }}
-                for (int segment = (W - 1) / span; segment >= 0; --segment) {{
-                    const int begin = segment * span;
-                    const int end = begin + min(span, W - begin);
-                    right = segment
-                        ? buf[I(slots + segment - 1) * stride].unpack() : Complex{{}};
-                    #pragma unroll BACKWARD_UNROLL
-                    for (int x = begin; x < end; ++x) {{
-{update}
-                        if (!COMPACT || !(x & 1))
-                            buf[I((x - begin) / (1 + COMPACT)) * stride] = Pair<float>::pack(right);
-                    }}
-""" + descending
 
 
 _SGS_ADJOINT = r"""
@@ -2855,7 +2081,7 @@ def _odd_coarse_backward_source(source: str) -> str:
     return _odd_coarse_negative(source)
 
 
-def _pipelined_adjoint(source: str, pipe: int) -> str:
+def _pipelined_adjoint(source: str) -> str:
     start = source.index("    #pragma unroll\n    for (int j", source.index("void path_adjoint_pair("))
     end = source.index("\n}\n#endif", start)
     original = source[start:end]
@@ -2881,8 +2107,7 @@ def _pipelined_adjoint(source: str, pipe: int) -> str:
         for (int cell = 0; cell < 2; ++cell) {
             const float z = zs[cell], sig = ss[cell];
 """ + update + "    };"
-    if pipe == 1:
-        loop = """
+    loop = """
     float w[2][8], z[2][2], sig[2][2];
     load_w(0, w[0]);
     preactivate(0, w[0], z[0]);
@@ -2898,27 +2123,6 @@ def _pipelined_adjoint(source: str, pipe: int) -> str:
             for (int c = 0; c < 2; ++c) sig[next][c] = fast_sigmoid_tanh(z[next][c]);
         }
         apply(j, w[cur], z[cur], sig[cur]);
-    }"""
-    else:
-        loop = """
-    #pragma unroll
-    for (int jb = 0; jb < 8; jb += 4) {
-        float z[4][2], sig[4][2], w[8];
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            load_w(jb+i, w);
-            preactivate(jb+i, w, z[i]);
-        }
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll
-            for (int c = 0; c < 2; ++c) sig[i][c] = fast_sigmoid_tanh(z[i][c]);
-        }
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            load_w(jb+i, w);
-            apply(jb+i, w, z[i], sig[i]);
-        }
     }"""
     return source[:start] + helpers + loop + source[end:]
 
@@ -3060,9 +2264,6 @@ def _odd_compact_source(source: str) -> str:
 
 
 def _effective_kernel(key: Kernel, capability: tuple[int, int]) -> Kernel:
-    if key.dw1_tile and capability < (9, 0):
-        # Ampere and Ada need more room than Hopper for the packed adjoint.
-        return replace(key, min_blocks=min(key.min_blocks, 12 // key.warps))
     if (
         (key.horizontal_unroll8 or key.horizontal_unroll) and capability >= (9, 0)
         and key.warps == 1 and (key.real_interleaved or key.imag_interleaved)
@@ -3193,7 +2394,7 @@ def _resident(device: int, key: Kernel, smem: int) -> int:
     with torch.cuda.device(device):
         _ensure_context(driver, device)
         if (
-            key.dw1_tile or key.sgs or key.l2_single_write or key.batch_path or key.register_path
+            key.sgs or key.l2_single_write or key.batch_path or key.register_path
             or key.horizontal_unroll8
             or key.backward_batch2 or key.backward_readonly
             or key.forward_readonly or key.horizontal_readonly or key.horizontal_unroll
@@ -3753,24 +2954,11 @@ def _plan_scan_auto(
     return launch
 
 
-W51A_MODES = ("off", "fp32", "l2", "fp32_l2", "fp32_hiocc")
-W51B_MODES = ("off", "tiled_dw", "tiled_dw_fp32")
-W52A_MODES = (
-    "off", "tanh_gain", "tanh_gain_smemw", "l2_floor_g2", "l2_floor_sw", "combo_g2", "combo_sw",
-)
-SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
-VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
-W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin", "w55_lockin", "w57_lockin")
-W57A_MODES = ("off", "v57_bwd_seg16_2chunk", "v57_bwd_seg16_1wave",
-              "v57_bwd_seg16_2wave", "v57_bwd_loww_only", "v57_bwd_seg16_loww")
-W56A_MODES = ("off", "v56_noround", "v56_bwd_hfma2_dw_l2", "v56_bwd_quad_hfma2", "v56_fwd_hiworker")
-W55A_MODES = ("off", "v55_bf16x2_predp", "v55_bf16x2_bf16w", "v55_bf16x2_chunkacc")
-H55_MODES = ("off", "h55_fwd_vec2_cached", "h55_bwd_vec2_nocs", "h55_bwd_vec2_half", "h55_bwd_bf16_nocs")
-W54A_MODES = ("off", "v54_sacc_aw12", "v54_psacc_aw12", "v54_gacc_aw12", "v54_sacc_b4")
-H54_MODES = ("off", "h54_fwd_nocache", "h54_fwd_vec2", "h54_bwd_bf16_all",
-             "h54_bwd_bf16_half", "h54_bwd_vec2", "h54_combo_vec2")
-H53_MODES = ("h53_ro_all", "h53_compact2", "h53_bf16_buf", "h53_l2_scratch", "h53_lockin")
-HSCAN_MODES = ("off", "bwd_opt", "bwd_opt_ch4", "bwd_opt_w2") + H53_MODES + ("h55_lockin",)
+W51A_MODES = ("off", "fp32")
+SGS_MODES = ("off", "strict_ro")
+VFWD_MODES = ("off", "batch4_w2")
+W53A_MODES = ("off", "w57_lockin")
+HSCAN_MODES = ("off", "h55_lockin")
 
 
 def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
@@ -3778,10 +2966,6 @@ def _scan_mode(env: str, allowed: tuple[str, ...]) -> str:
     if mode not in allowed:
         raise ValueError(f"{env}={mode!r}; allowed modes: {', '.join(allowed)}")
     return mode
-
-
-def _wave52a_mode(itemsize: int) -> str:
-    return _scan_mode("LNET_SCAN_W52A", W52A_MODES) if itemsize == 2 else "off"
 
 
 @cache
@@ -3802,7 +2986,7 @@ def _sgs_smem(key: Kernel, height: int) -> int:
     threads = key.warps * _WARP_SIZE
     span = key.chunk or height
     checkpoints = 0 if key.global_checkpoints else (height - 1) // span
-    source_rows = span if key.coarse or key.backward_segment_source else 0
+    source_rows = span if key.coarse else 0
     if key.cache_source:
         source_rows = height
     line_rows = height // (1 + key.coarse) if key.cache_line else 0
@@ -3862,14 +3046,14 @@ def _plan_sgs(
     plan, key, _, _ = launch
     _, height, _, _ = shape
     if (
-        mode not in SGS_MODES[1:] or key.shared_acc or not key.hidden8
+        mode != "strict_ro" or key.shared_acc or not key.hidden8
         or key.dtype.itemsize != 2 or key.pure_vertical
     ):
         return launch
-    strict = _plan_sgs(device, launch, shape, "strict") if mode != "strict" else launch
+    strict = launch
     full = not key.chunk and key.cache_source
     chunked = key.chunk and key.cache_source and not key.global_checkpoints
-    eligible = full or (mode != "strict" and chunked)
+    eligible = full or chunked
     if not eligible:
         return launch
     target = _resident(device, key, plan.smem)
@@ -3878,7 +3062,7 @@ def _plan_sgs(
     sms, block_limit, warp_limit = device_limits(device)
     shared, registers, reserved = _sgs_device_limits(device)
     active_warps = target * key.warps
-    if mode == "strict":
+    if full:
         smem = plan.smem + height * key.warps * _WARP_SIZE * 8
         candidate = replace(key, sgs=1)
         if (
@@ -3886,8 +3070,7 @@ def _plan_sgs(
             and smem <= _sgs_cap(block_limit, shared, reserved, target)
             and _resident(device, candidate, smem) == target
         ):
-            launch = launch._replace(plan=plan._replace(smem=smem, sgs_rows=height), key=candidate)
-        return launch
+            strict = launch._replace(plan=plan._replace(smem=smem, sgs_rows=height), key=candidate)
 
     readonly = replace(strict.key, backward_readonly=True)
     if not strict.key.backward_readonly and _resident(device, readonly, strict.plan.smem) == target:
@@ -3942,11 +3125,11 @@ def _plan_vfwd(device: int, launch: Launch, height: int, mode: str) -> Launch:
 
 @lru_cache(maxsize=512)
 def _plan_hscan(
-    device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
+    device: int, launch: Launch, shape: tuple[int, int, int, int],
 ) -> Launch:
     plan, key, _, _ = launch
     width = shape[2]
-    if mode == "off" or not key.backward or key.warps > 3 or width <= 2 * plan.chunk:
+    if not key.backward or key.warps > 3 or width <= 2 * plan.chunk:
         return launch
     base_occupancy = key.warps * _resident(device, key, plan.smem)
     if base_occupancy < 24:
@@ -3993,77 +3176,21 @@ def _launch_bound(device: int, warps: int, smem: int, target: int) -> int:
     return 0
 
 
-def _structural_sgs(  # noqa: C901
-    device: int, base: Launch, shape: tuple[int, ...], mode: str,
-) -> Launch:
-    _, height, _, modes = shape
-    key = base.key
-    if not (
-        key.hidden8 and key.backward_readonly and key.cache_source
-        and not (key.global_checkpoints or key.shared_acc or key.odd_coarse_backward)
-    ):
-        return base
-    occupancy = _active_warps(device, base)
-    if not occupancy:
-        return base
-    group = key.backward_reduce_warps or key.warps
-    span = key.chunk
-    segment_mode = mode == "strict_ro_seg2"
-    if segment_mode:
-        pair_rows = (1 + key.coarse) * (1 + key.backward_batch2)
-        span = _ceil(height, 2 * pair_rows) * pair_rows
-        if not key.chunk or span <= key.chunk or span >= height or key.chunk % pair_rows:
-            return base
-    minimum = occupancy + (not segment_mode)
-    best, score = base, None
-    for warps in (2, 3, 4, 6, 8, 1):
-        if warps % group:
-            continue
-        source_options = (True,) if key.cache_line or not key.chunk else (True, False)
-        for cache_source in source_options:
-            candidate = replace(
-                key, warps=warps, chunk=span, cache_source=cache_source,
-                backward_segment_source=not cache_source and not key.coarse,
-                backward_reduce_warps=group if warps != group else 0,
-            )
-            smem = max(warps * _WARP_SIZE * 128, _sgs_smem(candidate, height))
-            if key.sgs:
-                smem += height * warps * _WARP_SIZE * 8
-            trial = base._replace(
-                key=candidate, plan=base.plan._replace(
-                    warps=warps, chunk=span or base.plan.chunk,
-                    smem=smem, cache_source=cache_source,
-                ),
-            )
-            blocks = _launch_bound(device, warps, smem, minimum)
-            if not blocks:
-                continue
-            active = 0 if trial == base else _structural_probe(device, trial, modes, minimum)
-            if not segment_mode and not active:
-                trial = trial._replace(key=replace(candidate, min_blocks=blocks))
-                active = _structural_probe(device, trial, modes, minimum)
-            if active and (score is None or (active, cache_source, -smem) > score):
-                best, score = trial, (active, cache_source, -smem)
-    return best
-
-
 def _structural_vfwd(
-    device: int, launch: Launch, base: Launch, shape: tuple[int, ...], mode: str,
+    device: int, launch: Launch, base: Launch, shape: tuple[int, ...],
 ) -> Launch:
     _, height, _, modes = shape
-    capped = mode == "batch4_hiocc"
     seed = launch if launch.key.cache_weights else base
     key = seed.key
-    register_batch4 = key.register_path and key.batch_path and not key.register_batch2
     if not (
         key.hidden8 and base.key.forward_readonly and height // (1 + key.coarse) >= 4
-        and (key.cache_weights or (capped and register_batch4))
+        and key.cache_weights
     ):
         return base
     occupancy = _active_warps(device, base)
     if not occupancy:
         return base
-    minimum = occupancy + capped
+    minimum = occupancy
     weight_itemsize = 4 if key.vector_weights else key.dtype.itemsize
     weights = 11 * _REGISTER_HIDDEN * _WARP_SIZE * weight_itemsize if key.cache_weights else 0
     best, score = base, None
@@ -4080,78 +3207,10 @@ def _structural_vfwd(
         trial = base._replace(
             key=candidate, plan=seed.plan._replace(warps=warps, smem=smem),
         )
-        bounds = (0,)
-        if capped:
-            extra = _launch_bound(device, warps, smem, (blocks + 1) * warps)
-            bounds = (extra, blocks) if extra else (blocks,)
-        for bound in bounds:
-            probe = trial._replace(key=replace(candidate, min_blocks=bound))
-            active = _structural_probe(device, probe, modes, minimum)
-            if active and (score is None or (active, warps) > score):
-                best, score = probe, (active, warps)
+        active = _structural_probe(device, trial, modes, minimum)
+        if active and (score is None or (active, warps) > score):
+            best, score = trial, (active, warps)
     return best
-
-
-def _structural_hscan(device: int, base: Launch, shape: tuple[int, ...], mode: str) -> Launch:
-    _, _, width, modes = shape
-    key = base.key
-    if not (key.backward and key.cache_line and key.dtype.itemsize == 2 and width > 2 * key.chunk):
-        return base
-    if key.chunk // 2 < (1 + key.compact) or key.chunk // 2 % (1 + key.compact):
-        return base
-    occupancy = _active_warps(device, base)
-    _, _, max_warps = device_limits(device)
-    if not 0 < occupancy < max_warps * 3 // 8:
-        return base
-    # A smaller cache can help only when shared memory blocks the next CTA.
-    if _launch_bound(device, key.warps, base.plan.smem, occupancy + 1):
-        return base
-    narrower = mode == "bwd_opt_w2"
-    warps = 2 if narrower else key.warps
-    minimum = occupancy + (not narrower)
-    best, score = base, None
-    for span in ((0, key.chunk // 2) if narrower else (key.chunk // 2,)):
-        slots = (
-            span // (1 + key.compact) + (width - 1) // span
-            if span else width // (1 + key.compact)
-        )
-        smem = warps * _WARP_SIZE * max(16 if warps > 1 else 0, 8 * slots)
-        for unroll in (4, 8):
-            trial = base._replace(
-                key=replace(key, warps=warps, horizontal_span=span, horizontal_readonly=True,
-                            horizontal_unroll=unroll),
-                plan=base.plan._replace(warps=warps, smem=smem),
-                partials=_ceil(base.workers, warps),
-            )
-            active = _structural_probe(device, trial, modes, minimum)
-            if active and (score is None or (active, not span) > score):
-                best, score = trial, (active, not span)
-    return best
-
-
-@lru_cache(maxsize=512)
-def _plan_structural(device: int, launch: Launch, shape: tuple[int, ...], mode: str) -> Launch:
-    if not launch.key.vertical:
-        base = _plan_hscan(device, launch, shape, "bwd_opt")
-        return _structural_hscan(device, base, shape, mode)
-    if launch.key.backward:
-        base = _plan_sgs(device, launch, shape, "strict_ro")
-        return _structural_sgs(device, base, shape, mode)
-    base = _plan_vfwd(device, launch, shape[1], "batch4")
-    return _structural_vfwd(device, launch, base, shape, mode)
-
-
-def _persistent_workers(
-    lines: int, rows: int, height: int, modes: int, itemsize: int,
-    warps: int, sms: int, resident: int, budget: int, checkpoint_rows: int = 0,
-) -> tuple[int, bool]:
-    tiles = _ceil(modes, _WARP_SIZE)
-    workers = min(_ceil(lines, warps), _ceil(sms * resident, tiles)) * warps
-    quad_bytes = workers * modes * 4 * itemsize
-    scan_bytes = rows * quad_bytes + checkpoint_rows * workers * modes * 16
-    if scan_bytes > budget:
-        return 0, False
-    return workers, bool(height and scan_bytes + height * quad_bytes <= budget)
 
 
 def _persistent_workers_floor(
@@ -4172,11 +3231,10 @@ def _persistent_workers_floor(
 
 
 @lru_cache(maxsize=512)
-def _plan_w52a(device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str) -> Launch:
+def _lockin_weights(device: int, launch: Launch, shape: tuple, gain: bool, floor: bool, smem_weights: bool) -> Launch:
     plan, key, old_workers, _ = launch
     b, h, w, m = shape
-    key = replace(key, fp32_path=True, tanh_gain=mode.startswith(("tanh_gain", "combo")))
-    smem_weights = mode in ("tanh_gain_smemw", "combo_g2", "combo_sw")
+    key = replace(key, fp32_path=True, tanh_gain=gain)
     if key.register_path and not key.backward and smem_weights:
         rows = h // (1 + key.coarse)
         line_bytes = rows * key.warps * _WARP_SIZE * 4 * key.dtype.itemsize * plan.cache_line
@@ -4196,7 +3254,7 @@ def _plan_w52a(device: int, launch: Launch, shape: tuple[int, int, int, int], mo
             old_workers = workers
             launch = launch._replace(workers=workers, partials=workers)
     launch = launch._replace(plan=plan, key=key)
-    if not mode.startswith(("l2_floor", "combo")) or plan.cache_line:
+    if not floor or plan.cache_line:
         return launch
     resident = _resident(device, key, plan.smem)
     sms, _, _ = device_limits(device)
@@ -4208,7 +3266,7 @@ def _plan_w52a(device: int, launch: Launch, shape: tuple[int, int, int, int], mo
     )
     if not 0 < workers < old_workers:
         return launch
-    if single and mode.endswith("_sw"):
+    if single:
         candidate = replace(key, l2_single_write=True)
         if _resident(device, candidate, plan.smem) >= resident:
             key = candidate
@@ -4217,7 +3275,7 @@ def _plan_w52a(device: int, launch: Launch, shape: tuple[int, int, int, int], mo
     return Launch(plan, key, workers, workers // group if reduce else workers)
 
 
-def _plan_w53a(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+def _plan_w53a(device: int, launch: Launch, shape: tuple) -> Launch:
     key = launch.key
     height = shape[1]
     floor = (
@@ -4226,46 +3284,32 @@ def _plan_w53a(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
         or (key.backward and not key.coarse and 24 <= height < 48)
     )
     smemw = not key.backward and not key.coarse and 24 <= height < 48
-    winner = "combo_sw" if floor else "tanh_gain_smemw" if smemw else "tanh_gain"
-    if mode == "w53_lockin" and key.backward:
-        if (not key.coarse and height >= 48) or (key.coarse and height <= 16):
-            winner = "fp32"
-        elif 24 <= height < 48:
-            mode = "w52_best_swpipe"
-    launch = _plan_w52a(device, launch, shape, winner)
+    gain = not (key.backward and ((not key.coarse and height >= 48) or (key.coarse and height <= 16)))
+    launch = _lockin_weights(device, launch, shape, gain, floor, smemw or floor)
     if key.backward_batch2 and key.hidden8 and key.backward:
-        pipe = {"w52_best_swpipe": 1, "w52_best_pipe4": 2}.get(mode, 0)
+        pipe = int(24 <= height < 48)
         launch = launch._replace(key=replace(launch.key, path_bwd_pipe=pipe))
     return launch
 
 
 @lru_cache(maxsize=512)
-def _plan_h53(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+def _plan_h53(device: int, launch: Launch, shape: tuple) -> Launch:
     plan, key, old_workers, _ = launch
     if not key.backward:
         return launch
     b, h, width, modes = shape
     long_dense = width >= 48 and not key.compact
-    if mode == "h53_lockin":
-        if long_dense:
-            # Reuse the measured dense pointer-stepping loop for both dtypes.
-            mode = "h53_bf16_buf"
-        elif (key.compact and width >= 48) or (not key.compact and 24 <= width < 48):
-            return _plan_hscan(device, launch, shape, "bwd_opt")
-        else:
-            mode = "h53_ro_all"
-    scratch = long_dense and mode == "h53_l2_scratch"
-    bf16 = long_dense and key.cache_line and mode == "h53_bf16_buf" and key.dtype == torch.bfloat16
-    half = long_dense and key.cache_line and not (scratch or bf16)
-    warps = 2 if scratch else key.warps
+    if (key.compact and width >= 48) or (not key.compact and 24 <= width < 48):
+        return _plan_hscan(device, launch, shape)
+    bf16 = long_dense and key.cache_line and key.dtype == torch.bfloat16
+    half = long_dense and key.cache_line and not bf16
+    warps = key.warps
     smem = plan.smem
-    if scratch:
-        smem = warps * 32 * 16
-    elif half or bf16:
+    if half or bf16:
         smem = max(16, width * 4 if bf16 else (width - width // 2) * 8) * warps * 32
-    candidate = replace(key, warps=warps, cache_line=key.cache_line and not scratch,
+    candidate = replace(key, warps=warps, cache_line=key.cache_line,
                         horizontal_wave53=True, horizontal_readonly=True, horizontal_half_replay=half,
-                        horizontal_bf16_buf=bf16, horizontal_compact2=mode != "h53_ro_all")
+                        horizontal_bf16_buf=bf16, horizontal_dense_replay=long_dense)
     baseline = _active_warps(device, launch)
     for unroll in (8, 4):
         candidate = replace(candidate, horizontal_unroll=unroll)
@@ -4283,8 +3327,6 @@ def _plan_h53(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
     lines = b * h
     wave = max(1, device_limits(device)[0] * (active // warps) // tiles) * warps
     limit = min(old_workers, lines, 2 * wave)
-    if scratch and not trial.key.cache_line:
-        limit = min(limit, (32 << 20) // (width * modes * 8))
     if limit <= 0:
         return launch
     if lines <= 2 * limit:
@@ -4296,115 +3338,27 @@ def _plan_h53(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
     workers = min(workers, limit)
     return trial._replace(workers=workers, partials=_ceil(workers, warps))
 
-
 @lru_cache(maxsize=512)
-def _plan_w54(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
-    key = launch.key
-    b, h, w, m = shape
-    if (
-        not (key.backward and key.hidden8 and key.index32)
-        or key.pure_vertical
-        or key.odd_coarse_backward
-    ):
-        return launch
-    shared = mode != "v54_gacc_aw12"
-    partial = mode == "v54_psacc_aw12"
-    # The coarse four-cell adjoint needs 254–255 registers on SM90.
-    quad = mode == "v54_sacc_b4" and not key.coarse
-    step = 1 + key.coarse
-    # The scalar tail of global accumulation exceeded the SM90 register budget.
-    if not shared and h % (2 * step):
-        return launch
-    candidates = []
-    for warps in ((4,) if quad else (4, 3)):
-        spans = set(range(2 * step, min(h, 20) + 1, 2 * step))
-        if h <= 14:
-            spans.add(h)
-        if quad:
-            spans = {min(8, h)}
-        for span in spans:
-            chunk = 0 if span == h else span
-            fields = (64 if partial else 90) if shared else 0
-            smem = 11264 + warps * 32 * (16 * span + 4 * fields)
-            if smem > (76458 if warps == 4 else 57088):
-                continue
-            k = replace(
-                key,
-                warps=warps,
-                chunk=chunk,
-                backward_reduce_warps=0,
-                shared_acc=shared,
-                partial_shared_acc=partial,
-                backward_reload_source=True,
-                backward_segment_source=False,
-                global_checkpoints=True,
-                cache_source=False,
-                cache_line=False,
-                cache_weights=True,
-                vector_weights=True,
-                backward_readonly=True,
-                fp32_path=True,
-                tanh_gain=True,
-                backward_batch2=True,
-                backward_batch4=quad,
-                path_bwd_pipe=0,
-                backward_batch_tail=bool(h % ((4 if quad else 2) * step)),
-                sgs=0,
-                l2_single_write=False,
-                min_blocks=0,
-            )
-            plan = ScanPlan(warps, smem, chunk, True, True, False, shared, chunk == 0)
-            candidates.append((span, warps, k, plan))
-    for _, warps, k, plan in sorted(candidates, reverse=True):
-        resident = _resident(device, k, plan.smem)
-        if resident * warps < 12:
-            continue
-        wave = max(1, device_limits(device)[0] * resident // _ceil(m, 32)) * warps
-        workers = min(b * (w // step), 2 * wave, launch.workers)
-        if not shared:
-            workers = min(workers, (36 << 20) // (94 * m * 4))
-        if workers:
-            return Launch(plan, k, workers, _ceil(workers, warps) if shared else workers)
-    return launch
-
-
-@lru_cache(maxsize=512)
-def _plan_h54(device: int, launch: Launch, shape: tuple, mode: str, aligned: bool) -> Launch:
-    base = _plan_h53(device, launch, shape, "h53_lockin")
+def _plan_h54(device: int, base: Launch, shape: tuple, aligned: bool) -> Launch:
     key = base.key
-    if (
-        key.backward
-        and "_fwd_" in mode
-        or not key.backward
-        and "_bwd_" in mode
-    ):
+    _, _, width, modes = shape
+    if not aligned or modes % 2:
         return base
-    _, _, width, m = shape
-    vec = "vec2" in mode and aligned and m % 2 == 0
-    nocs = mode in H55_MODES
-    if nocs and "vec2" in mode and not vec:
-        return base
-    if mode == "h55_bwd_bf16_nocs" and width < (48 if key.compact else 24):
-        return base
-    cached = key.backward or (nocs and width >= 24)
-    half = key.backward and mode.endswith("half") and width >= 48 and not key.compact
-    narrow = key.backward and (vec or width >= (48 if key.compact else 24))
-    saved = (width + 1) // 2 if half else width // (1 + key.compact)
-    smem = 128 * max(16, saved * (8 if vec or not narrow else 4)) if key.backward else 0
+    cached = key.backward or width >= 24
+    saved = width // (1 + key.compact)
+    smem = 128 * max(16, saved * 8) if key.backward else 0
     if cached and not key.backward:
         smem = 128 * width * 8
     k = replace(
         key,
         warps=4,
-        horizontal_stream=not nocs,
-        horizontal_nocs=nocs,
-        horizontal_vec2=vec,
+        horizontal_vec2=True,
         horizontal_wave53=key.backward,
         horizontal_readonly=True,
-        horizontal_unroll=1 if narrow and key.compact and not vec else 4,
-        horizontal_compact2=narrow and not vec,
-        horizontal_half_replay=half,
-        horizontal_bf16_buf=narrow,
+        horizontal_unroll=4,
+        horizontal_dense_replay=False,
+        horizontal_half_replay=False,
+        horizontal_bf16_buf=key.backward,
         cache_line=cached,
     )
     if smem > device_limits(device)[1] or not _resident(device, k, smem):
@@ -4421,61 +3375,10 @@ def _plan_h54(device: int, launch: Launch, shape: tuple, mode: str, aligned: boo
 def _plan_w55(device: int, launch: Launch, shape: tuple, w55: str) -> Launch:
     height = shape[1]
     backward, coarse = launch.key.backward, launch.key.coarse
-    if w55 == W55A_MODES[3] and launch.key.dtype == torch.float16:
-        w55 = W55A_MODES[2]
-    if w55 == W55A_MODES[3] and backward and not launch.key.odd_coarse_backward:
-        key = launch.key
-        span = height if height <= 14 else (12 if coarse else 14)
-        chunk = 0 if span == height else span
-        smem = 5632 + 128 * (16 * span + 64 * 4)
-        key = replace(
-            key,
-            vertical_w55=w55,
-            warps=4,
-            chunk=chunk,
-            backward_reduce_warps=0,
-            shared_acc=True,
-            partial_shared_acc=True,
-            backward_reload_source=True,
-            backward_segment_source=False,
-            global_checkpoints=True,
-            cache_source=False,
-            cache_line=False,
-            cache_weights=True,
-            vector_weights=True,
-            backward_readonly=True,
-            fp32_path=True,
-            tanh_gain=True,
-            backward_batch2=True,
-            backward_batch_tail=bool(height % (2 * (1 + coarse))),
-            path_bwd_pipe=0,
-            sgs=0,
-            l2_single_write=False,
-            min_blocks=0,
-        )
-        plan = ScanPlan(
-            4,
-            smem,
-            chunk,
-            cache_weights=True,
-            global_checkpoints=True,
-            shared_acc=True,
-            full_trajectory=chunk == 0,
-        )
-        scratch = _scratch_per_worker(
-            plan, height, vertical=True, coarse=coarse, backward=True, itemsize=2
-        )
-        per_worker = shape[3] * (scratch + 94 * 4 // 4)
-        workers = min(launch.workers, _scan_workspace_budget(device) // per_worker)
-        if workers and smem <= device_limits(device)[1] and _resident(device, key, smem):
-            return Launch(plan, key, workers, _ceil(workers, 4))
-        w55 = W55A_MODES[2]
-    elif w55 == W55A_MODES[3] and backward:
-        w55 = W55A_MODES[2]
     key = replace(launch.key, vertical_w55=w55, path_bwd_pipe=0, tanh_gain=True)
     savings = (
         5632
-        if w55 != W55A_MODES[1]
+        if w55 != "v55_bf16x2_predp"
         and key.cache_weights
         and key.vector_weights
         and not key.register_path
@@ -4485,8 +3388,7 @@ def _plan_w55(device: int, launch: Launch, shape: tuple, w55: str) -> Launch:
     if not backward and key.register_path:
         # The register-resident weight tile competes with packed preactivations.
         # Cache it once per CTA. A two-cell batch leaves one scalar tail at seven cells.
-        size = 11264 if w55 == W55A_MODES[1] else 5632
-        smem = plan.smem + size
+        smem = plan.smem + 5632
         cached = replace(key, register_path=False, cache_weights=True, vector_weights=True,
                          register_batch2=(height // (1 + coarse) == 7))
         if smem <= device_limits(device)[1] and _resident(device, cached, smem):
@@ -4502,7 +3404,7 @@ def _plan_w55(device: int, launch: Launch, shape: tuple, w55: str) -> Launch:
                     (height % (2 * step)) or ((key.chunk or height) % (2 * step))
                 ),
             )
-    if w55 != W55A_MODES[1] and key.cache_weights and not key.register_path:
+    if w55 != "v55_bf16x2_predp" and key.cache_weights and not key.register_path:
         key = replace(key, vector_weights=True)
         if backward and not coarse and height == 56 and key.cache_source:
             baseline_aw = _active_warps(device, launch)
@@ -4540,18 +3442,6 @@ def _seg16_source(source: str) -> str:
     column = re.sub(r"(seg\[[^\]]+\]) = ([^;]+);", r"\1 = Quad<T>::pack(\2);", column)
     column = re.sub(r"(seg\[[^\]]+\])(?! =)", r"\1.unpack()", column)
     return source[:begin] + column + source[end:]
-
-
-def _w57_mode(dtype: torch.dtype, hidden: int, device: int) -> str:
-    mode = _scan_mode("LNET_SCAN_W57A", W57A_MODES)
-    if (
-        mode != "off"
-        and hidden == _REGISTER_HIDDEN
-        and dtype in (torch.float16, torch.bfloat16)
-        and torch.cuda.get_device_capability(device) >= (8, 0)
-    ):
-        return mode
-    return "off"
 
 
 def _plan_w57(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
@@ -4601,31 +3491,16 @@ def _plan_w57(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
                 global_checkpoints=False,
             ),
         )
-    if mode != "v57_bwd_seg16_2chunk" and (
-        (h == 56 and not key.coarse) or (h == 28 and key.coarse)
-    ):
-        waves = 1 if mode == "v57_bwd_seg16_1wave" else 2
+    if mode == "v57_bwd_loww_only" and h == 28 and key.coarse:
         # Keep whole four-warp CTAs within the requested number of waves.
-        groups = device_limits(device)[0] * 2 * waves // _ceil(m, 32)
+        groups = device_limits(device)[0] * 4 // _ceil(m, 32)
         workers = min(launch.workers, max(1, groups) * key.warps)
         group = key.backward_reduce_warps or key.warps
         launch = launch._replace(workers=workers, partials=_ceil(workers, group))
     return launch
 
 
-def _w56_mode(dtype: torch.dtype, hidden: int, device: int) -> str:
-    mode = _scan_mode("LNET_SCAN_W56A", W56A_MODES)
-    if (
-        mode != "off"
-        and hidden == 8
-        and dtype in (torch.bfloat16, torch.float16)
-        and torch.cuda.get_device_capability(device) >= (8, 0)
-    ):
-        return mode
-    return "off"
-
-
-def _plan_w56(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
+def _plan_w56(device: int, launch: Launch, shape: tuple) -> Launch:
     b, h, w, m = shape
     key = launch.key
     if key.odd_coarse_backward:
@@ -4638,228 +3513,7 @@ def _plan_w56(device: int, launch: Launch, shape: tuple, mode: str) -> Launch:
             key = replace(key, register_path=False, cache_weights=True, vector_weights=True,
                           batch_path=True, register_batch2=h // (1 + key.coarse) == 7)
             launch = launch._replace(plan=launch.plan._replace(cache_weights=True, smem=smem))
-    if mode == "v56_fwd_hiworker" and not key.backward and not key.coarse and h == 56:
-        resident = _resident(device, key, launch.plan.smem)
-        tiles = _ceil(m, 32)
-        workers = min(b * w, _ceil(device_limits(device)[0] * resident, tiles) * key.warps)
-        launch = launch._replace(workers=max(workers, launch.workers))
-    packed_dw = mode == "v56_bwd_hfma2_dw_l2" and key.dtype == torch.bfloat16
-    quad = mode == "v56_bwd_quad_hfma2"
-    if not key.backward or not (packed_dw or quad):
-        return launch._replace(key=key)
-
-    # Lock the tested chunk/cache layout independently of the baseline
-    # planner's device-specific choice of warp count and checkpoint span.
-    if model_shape:
-        chunk = (20 if quad or key.coarse else 22) if h == 56 else 0
-        cache_line = h <= 14 or (h == 28 and key.coarse)
-        persistent = (h == 56 and key.coarse) or (h == 28 and not key.coarse)
-        key = replace(
-            key,
-            warps=4,
-            chunk=chunk,
-            cache_source=True,
-            cache_weights=True,
-            cache_line=cache_line,
-            vector_weights=True,
-            global_checkpoints=False,
-            shared_acc=False,
-            backward_batch2=True,
-            backward_reduce_warps=0,
-            backward_batch_tail=bool((chunk or h) % (2 * (1 + key.coarse))),
-            backward_segment_source=False,
-            sgs=int(h <= 14),
-            l2_single_write=persistent,
-            min_blocks=0,
-            fp32_path=True,
-            register_path=False,
-        )
-        smem = _sgs_smem(key, h) - 5632 + key.sgs * h * 128 * 8
-        if smem + (94 * 4 * 128 if quad else 0) > device_limits(device)[1]:
-            return launch._replace(key=replace(launch.key, vertical_w56="v56_noround"))
-        workers = launch.workers
-        if not cache_line:
-            scratch_per_worker = (h // (1 + key.coarse) + h * persistent) * m * 8
-            workers = min(workers, max(1, _scan_workspace_budget(device) // scratch_per_worker))
-        launch = launch._replace(
-            plan=ScanPlan(
-                4,
-                smem,
-                chunk or h,
-                cache_weights=True,
-                cache_line=cache_line,
-                full_trajectory=not chunk,
-                cache_source=True,
-                sgs_rows=h * key.sgs,
-            ),
-            workers=workers,
-            partials=_ceil(workers, 4),
-        )
-    if key.backward_batch2 and key.cache_source and not key.shared_acc:
-        if packed_dw:
-            # Each warp owns a row. Keep the full 94-field workspace within 44 MiB.
-            workers = min(launch.workers, (44 << 20) // (94 * m * 4))
-            if workers:
-                launch = launch._replace(workers=workers, partials=workers)
-                key = replace(key, vertical_w56=mode, backward_reduce_warps=0)
-        elif key.cache_weights and key.vector_weights:
-            # Shared FP32 accumulators leave registers for both adjoint chains.
-            smem = launch.plan.smem + 94 * 4 * 32 * key.warps
-            if smem <= device_limits(device)[1]:
-                key = replace(
-                    key,
-                    vertical_w56=mode,
-                    backward_batch_tail=True,
-                    shared_acc=True,
-                    backward_reduce_warps=0,
-                )
-                launch = launch._replace(
-                    plan=launch.plan._replace(shared_acc=True, smem=smem),
-                    partials=_ceil(launch.workers, key.warps),
-                )
     return launch._replace(key=key)
-
-
-def _fp32_hiocc(
-    device: int, launch: Launch, shape: tuple[int, int, int, int], budget: int,
-) -> Launch:
-    key = launch.key
-    if key.backward or not key.hidden8 or not key.fp32_path:
-        return launch
-    b, height, width, modes = shape
-    step = 1 + key.coarse
-    rows, lines = height // step, b * (width // step)
-    tiles = _ceil(modes, _WARP_SIZE)
-    sms, block_limit, _ = device_limits(device)
-    shared, _, reserved = _sgs_device_limits(device)
-    best, score = launch, (0, 0, 0)
-    weight_bytes = 11 * _REGISTER_HIDDEN * _WARP_SIZE * 4
-    for warps in (2, 4):
-        cta_bytes = rows * warps * modes * 4 * key.dtype.itemsize
-        max_groups = budget // cta_bytes if cta_bytes else 0
-        if not max_groups:
-            continue
-        # Reserve dynamic SMEM to bound residency only when all naturally
-        # resident CTAs would overflow the L2 budget. Each resident CTA can
-        # still receive work without oversubscribing scratch.
-        cta_cap = max_groups * tiles // sms
-        smem = weight_bytes
-        if max_groups < _ceil(lines, warps):
-            if not cta_cap:
-                continue
-            smem = max(smem, _ceil(shared // (cta_cap + 1) + 1 - reserved, 256) * 256)
-        if smem > block_limit:
-            continue
-        for width in (2, 4):
-            if rows < width:
-                continue
-            candidate = replace(
-                key, warps=warps, cache_weights=True, cache_line=False,
-                vector_weights=True, batch_path=True, register_path=False,
-                register_batch2=width == 2, min_blocks=0,
-            )
-            plan = launch.plan._replace(
-                warps=warps, smem=smem, cache_line=False, cache_weights=True,
-            )
-            trial = launch._replace(key=candidate, plan=plan)
-            active = _active_warps(device, trial)
-            rank = (active, width, warps)
-            if active and rank > score:
-                best, score = trial, rank
-    return best
-
-
-@lru_cache(maxsize=512)
-def _plan_w51a(
-    device: int, launch: Launch, shape: tuple[int, int, int, int], mode: str,
-) -> Launch:
-    if mode == "off" or not launch.key.vertical or launch.key.pure_vertical:
-        return launch
-    b, h, w, m = shape
-    key = launch.key
-    if mode.startswith("fp32") and key.dtype.itemsize == 2:
-        launch = launch._replace(key=replace(key, fp32_path=True))
-    if mode == "fp32":
-        return launch
-    budget = _l2_size(device) * 3 // 4
-    fallback = launch
-    if mode == "fp32_hiocc":
-        launch = _fp32_hiocc(device, launch, shape, budget)
-    plan, key, old_workers, _ = launch
-    if plan.cache_line:
-        return launch
-    sms, _, _ = device_limits(device)
-    resident = _resident(device, key, plan.smem)
-    if not resident:
-        return launch
-    step = 1 + key.coarse
-    checkpoint_rows = (h - 1) // plan.chunk if plan.global_checkpoints else 0
-    workers, single = _persistent_workers(
-        b * (w // step), h // step, h if key.backward and not key.sgs else 0,
-        m, key.dtype.itemsize, key.warps, sms, resident, budget, checkpoint_rows,
-    )
-    if single:
-        candidate = replace(key, l2_single_write=True)
-        if _resident(device, candidate, plan.smem) >= resident:
-            key = candidate
-    if not workers or (
-        launch is fallback and workers > _ceil(old_workers, key.warps) * key.warps
-    ):
-        return fallback
-    group = key.backward_reduce_warps or key.warps
-    reduce = key.backward and (key.shared_acc or key.hidden8)
-    partials = workers // group if reduce else workers
-    return Launch(plan, key, workers, partials)
-
-
-def _w51b_key(
-    base: Kernel, warps: int, chunk: int, tile: int, minimum: int, mode: str,
-) -> Kernel:
-    return replace(
-        base, warps=warps, chunk=chunk, dw1_tile=tile, dw1_fp32=mode == "tiled_dw_fp32",
-        min_blocks=minimum, cache_weights=True, vector_weights=True, cache_source=False,
-        cache_line=False, global_checkpoints=False, shared_acc=False,
-        backward_batch2=False, backward_batch_tail=False, backward_readonly=False,
-        backward_segment_source=False, backward_reduce_warps=0,
-    )
-
-
-def _w51b_smem(key: Kernel, height: int) -> int:
-    weights = 11 * 8 * 32 * 4
-    boundaries = (height - 1) // key.chunk
-    per_lane = 16 * (key.chunk + boundaries) + 32 * key.dw1_tile
-    return weights + key.warps * 32 * per_lane
-
-
-def _w51b_workspace(height: int, coarse: bool, modes: int) -> int:
-    return modes * (94 * 4 + (height + height // (1 + coarse)) * 8)
-
-
-@lru_cache(maxsize=128)
-def _plan_w51b(
-    device: int, base: Launch, shape: tuple[int, ...], mode: str,
-) -> Launch:
-    batch, height, width, modes = shape
-    if mode == "off" or height < 8 or not base.key.hidden8 or base.key.dtype.itemsize != 2:
-        return base
-    sms, limit, _ = device_limits(device)
-    tiles = _ceil(modes, 32)
-    budget = _l2_size(device) * 7 // 8 // _w51b_workspace(height, base.key.coarse, modes)
-    lines = batch * (width // (1 + base.key.coarse))
-    for target in (16, 12):
-        for warps, tile in ((4, 8), (4, 4), (8, 4)):
-            key = _w51b_key(base.key, warps, 8, tile, _ceil(target, warps), mode)
-            smem = _w51b_smem(key, height)
-            if smem > limit or not _launch_bound(device, warps, smem, target):
-                continue
-            resident = _resident(device, key, smem)
-            if resident * warps < target:
-                continue
-            workers = min(lines, _ceil(sms * resident, tiles) * warps, budget)
-            if workers <= 0:
-                continue
-            return Launch(ScanPlan(warps, smem, 8, cache_weights=True), key, workers, workers)
-    return base
 
 
 def _plan_launch(  # noqa: C901, PLR0912
@@ -4875,7 +3529,6 @@ def _plan_launch(  # noqa: C901, PLR0912
     interleaved: tuple[bool, bool] = (False, False),
     transposed: tuple[bool, bool] = (False, False),
     pure_vertical: bool = False,
-    saved_trajectory: bool = False,
     aligned: bool = True,
 ) -> Launch | None:
     if vertical and backward:
@@ -4913,95 +3566,44 @@ def _plan_launch(  # noqa: C901, PLR0912
             odd_compact_width=backward and compact and bool(width % 2),
             backward_batch2=False, backward_batch_tail=False,
         ))
-    wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES) if vertical else "off"
-    wave53a = (
-        _scan_mode("LNET_SCAN_W53A", W53A_MODES)
-        if vertical and source.dtype.itemsize == 2 and not (pure_vertical or saved_trajectory)
-        else "off"
-    )
-    wave52a = (
-        _wave52a_mode(source.dtype.itemsize)
-        if vertical and not (pure_vertical or saved_trajectory) else "off"
-    )
-    w54 = _scan_mode("LNET_SCAN_W54A", W54A_MODES) if vertical else "off"
-    w55 = _scan_mode("LNET_SCAN_W55A", W55A_MODES) if vertical else "off"
-    w56 = _w56_mode(source.dtype, hidden, device) if vertical else "off"
-    w57 = (_w57_mode(source.dtype, hidden, device)
-           if vertical and backward and not (saved_trajectory or pure_vertical) else "off")
-    if wave53a == "w57_lockin":
-        wave53a = "w55_lockin"
-        if hidden == _REGISTER_HIDDEN and torch.cuda.get_device_capability(device) >= (8, 0):
-            if backward:
-                if height >= 48 or (coarse and height <= 16):
-                    w57 = "v57_bwd_seg16_2chunk"
-                elif coarse:
-                    w57 = "v57_bwd_loww_only"
-            elif height < (48 if coarse else 24):
-                w56 = "v56_noround"
-    if w57 != "off":
-        wave53a = "w55_lockin"
-    if wave53a == "w55_lockin":
-        wave53a = "w53_lockin"
-        if backward:
-            w55 = "v55_bf16x2_predp" if not coarse and height <= 8 else "v55_bf16x2_bf16w"
-        elif (coarse and height >= 48) or (not coarse and 24 <= height < 48):
-            w55 = "v55_bf16x2_bf16w"
-    if w56 != "off" and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
-        w55 = "v55_bf16x2_bf16w"
-    if (w54 != "off" or w55 != "off") and source.dtype.itemsize == 2 and not (saved_trajectory or pure_vertical):
-        wave53a = "w53_lockin"
-    if vertical and backward and not (pure_vertical or saved_trajectory) and mode in (
-        "off", "strict_ro",
-    ) and wave52a == wave53a == "off":
-        wave51b = _scan_mode("LNET_SCAN_W51B", W51B_MODES)
-        if wave51b != "off":
-            candidate = _plan_w51b(device, launch, shape, wave51b)
-            if candidate.key.dw1_tile:
-                return candidate
-            if wave51a == "fp32_hiocc":
-                wave51a = "fp32"
-    if not vertical and source.dtype.itemsize == 2:
-        h55 = _scan_mode("LNET_SCAN_H55", H55_MODES)
-        if h55 != "off":
-            return _plan_h54(device, launch, shape, h55, aligned)
-        h54 = _scan_mode("LNET_SCAN_H54", H54_MODES)
-        if h54 != "off":
-            return _plan_h54(device, launch, shape, h54, aligned)
-    if mode == "h55_lockin":
-        short_dense = not compact and width <= 8
-        if source.dtype in (torch.float16, torch.bfloat16):
-            if not backward and (width >= 48 or short_dense):
-                return _plan_h54(device, launch, shape, "h55_fwd_vec2_cached", aligned)
-            if backward and ((compact and width >= 48) or short_dense):
-                return _plan_h54(device, launch, shape, "h55_bwd_vec2_nocs", aligned)
-        mode = "h53_lockin"
-    if mode in H53_MODES:
-        return _plan_h53(device, launch, shape, mode)
-    if mode not in ("off", "strict", "strict_ro", "batch4", "bwd_opt"):
-        launch = _plan_structural(device, launch, shape, mode)
-    elif mode != "off":
-        if not vertical:
-            return _plan_hscan(device, launch, shape, mode)
-        if backward:
-            launch = _plan_sgs(device, launch, shape, mode)
-        else:
-            launch = _plan_vfwd(device, launch, height, mode)
-    if wave53a != "off":
-        launch = _plan_w53a(device, launch, shape, wave53a)
-        if (w55 != "off" and launch.key.hidden8 and launch.key.index32
-                and not (pure_vertical or saved_trajectory)
-                and torch.cuda.get_device_capability(device) >= (8, 0)):
-            launch = _plan_w55(device, launch, shape, w55)
-            if w57 != "off":
-                return _plan_w57(device, launch, shape, w57)
-            if w56 != "off":
-                return _plan_w56(device, launch, shape, w56)
+    if not vertical:
+        if mode == "off":
             return launch
-        return launch if w54 == "off" else _plan_w54(device, launch, shape, w54)
-    if wave52a != "off":
-        # Both waves tune the same fused kernel and scratch allocation.
-        return _plan_w52a(device, launch, shape, wave52a)
-    return launch if wave51a == "off" else _plan_w51a(device, launch, shape, wave51a)
+        base = _plan_h53(device, launch, shape)
+        short_dense = not compact and width <= 8
+        if source.dtype.itemsize == 2 and (
+            (not backward and (width >= 48 or short_dense))
+            or (backward and ((compact and width >= 48) or short_dense))
+        ):
+            return _plan_h54(device, base, shape, aligned)
+        return base
+    if mode == "strict_ro":
+        launch = _plan_sgs(device, launch, shape, mode)
+    elif mode == "batch4_w2":
+        base = _plan_vfwd(device, launch, height, mode)
+        launch = _structural_vfwd(device, launch, base, shape)
+    fp32 = _scan_mode("LNET_SCAN_W51A", W51A_MODES) == "fp32"
+    if pure_vertical or source.dtype.itemsize != 2:
+        return launch
+    if _scan_mode("LNET_SCAN_W53A", W53A_MODES) == "off":
+        return launch._replace(key=replace(launch.key, fp32_path=True)) if fp32 else launch
+    launch = _plan_w53a(device, launch, shape)
+    if not (launch.key.hidden8 and launch.key.index32 and torch.cuda.get_device_capability(device) >= (8, 0)):
+        return launch
+    if backward:
+        weights = "v55_bf16x2_predp" if not coarse and height <= 8 else "v55_bf16x2_bf16w"
+        launch = _plan_w55(device, launch, shape, weights)
+        if height >= 48 or (coarse and height <= 16):
+            return _plan_w57(device, launch, shape, "v57_bwd_seg16_2chunk")
+        if coarse:
+            return _plan_w57(device, launch, shape, "v57_bwd_loww_only")
+        return launch
+    if not coarse and height >= 48:
+        return launch
+    launch = _plan_w55(device, launch, shape, "v55_bf16x2_bf16w")
+    if height < (48 if coarse else 24):
+        return _plan_w56(device, launch, shape)
+    return launch
 
 
 # Custom ops and public API
@@ -5211,8 +3813,8 @@ def _hscan(
     launch = _plan_launch(
         real, shape, backward=backward, vertical=False, coarse=False, hidden=0, precise=False,
         compact=compact,
-        aligned=_vec2_aligned(real, imag, states, adjoints)
-                if any(os.getenv(v, "off") != "off" for v in ("LNET_SCAN_H54","LNET_SCAN_H55")) else True,
+        aligned=(os.getenv("LNET_SCAN_HSCAN", "off") != "h55_lockin"
+                 or _vec2_aligned(real_input, imag_input, states, adjoints)),
         **layout,
     )
     if launch is None:
@@ -5274,7 +3876,6 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     saved_features: Tensor | None = None,
     state_grad: Tensor | None = None,
     pure: bool = False,
-    trajectory: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor] | list[Tensor]:
     shape = tuple(states.shape[1:])
     if (
@@ -5319,17 +3920,9 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
     ):
         raise ValueError("Invalid saved vertical features")
     wave51a = _scan_mode("LNET_SCAN_W51A", W51A_MODES)
-    wave52a = "off" if pure else _wave52a_mode(states.element_size())
-    w56 = _w56_mode(states.dtype, hidden, states.device.index or 0)
-    w57 = (_w57_mode(states.dtype, hidden, states.device.index or 0)
-           if backward and not pure and trajectory is None and saved_features is None else "off")
-    if w57 == w56 == _scan_mode("LNET_SCAN_W55A", W55A_MODES) == _scan_mode("LNET_SCAN_W54A", W54A_MODES) == "off" and wave51a == wave52a == "off" and trajectory is None and not pure and not (
+    if wave51a == "off" and not pure and not (
         (coarse and (h % 2 or w % 2))
-        or (backward and saved_features is None and (
-            mode != "off"
-            or (hidden == 8 and h >= 8 and states.element_size() == 2
-                and _scan_mode("LNET_SCAN_W51B", W51B_MODES) != "off")
-        ))
+        or (backward and saved_features is None and mode != "off")
     ):
         chunk = (
             _saved_backward_chunk(states, coarse)
@@ -5354,20 +3947,9 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         compact=compact,
         interleaved=interleaved,
         pure_vertical=pure,
-        saved_trajectory=trajectory is not None,
     )
     if launch is None:
         raise RuntimeError("Vertical CUDA scan is ineligible")
-    if trajectory is not None:
-        plan, base, _, _ = launch
-        line_bytes = oh * plan.warps * 32 * 4 * states.element_size() if plan.cache_line else 0
-        plan = plan._replace(cache_line=False, smem=plan.smem - line_bytes)
-        key = replace(
-            base, saved_trajectory=1, cache_line=False, l2_single_write=False, fp32_path=False,
-            index32=base.index32 and trajectory.numel() // 4 < 2**31,
-        )
-        launch = launch._replace(plan=plan, key=key)
-        checkpoints = trajectory
     if backward:
         if pure:
             gr, gi = features, None
@@ -5400,9 +3982,9 @@ def _vscan(  # noqa: C901, PLR0912, PLR0915
         gr = gi = gs = partial = None
     # Keep g2 and the optional positive adjoints in disjoint row ranges of
     # one workspace. A persistent worker reuses both ranges on its next line.
-    positive_rows = h if launch.key.l2_single_write or launch.key.dw1_tile else 0
+    positive_rows = h if launch.key.l2_single_write else 0
     scratch = (
-        None if launch.plan.cache_line or trajectory is not None else
+        None if launch.plan.cache_line else
         states.new_empty((oh + positive_rows, launch.workers, m, 4))
     )
     inputs = (
@@ -5482,8 +4064,6 @@ def _should_save_vscan(states: Tensor, coarse: bool) -> bool:
     if not states.is_cuda or policy not in {"saved", "test_saved"}:
         return False
     if _scan_mode("LNET_SCAN_W51A", W51A_MODES) != "off":
-        return False
-    if _wave52a_mode(states.element_size()) != "off":
         return False
     vram = _total_vram(states.device)
     if policy == "saved" and vram < 48 * 1024**3:
@@ -5812,111 +4392,12 @@ def _fake_vforward_packed(
     return states.new_empty((2, *shape, m) if planar else (*shape, 2 * m))
 
 
-VSCAN_SAVED_MODES = ("off", "saved_fused", "saved_split", "auto_vram")
-
-
-def _trajectory_shape(states: Tensor, coarse: bool, split: bool) -> tuple[int, ...]:
-    _, b, h, w, m = states.shape
-    shape = (2, b, h, w // (1 + coarse), m, 4)
-    # Keep the selected backward schedule in the tensor metadata saved by autograd.
-    return (1, *shape) if split else shape
-
-
 def _vscan_saved_policy(
     states: Tensor, path: list[Tensor], coarse: bool, mode: str | None = None,
 ) -> str:
-    if mode is None:
-        mode = _scan_mode("LNET_SCAN_VSCAN_SAVED", VSCAN_SAVED_MODES)
-    # #854: saved_fused/saved_split cost +13.03/+16.33 ms on H200 and failed BF16 decay-grad parity.
-    if mode in ("off", "auto_vram") or not states.is_cuda or not path or path[0].shape[1] != 8:
-        return "off"
-    if _scan_mode("LNET_SCAN_W51A", W51A_MODES) != "off":
-        return "off"
-    if _wave52a_mode(states.element_size()) != "off":
-        return "off"
-    _, _, h, w, _ = states.shape
-    oh, ow = h // (1 + coarse), w // (1 + coarse)
-    if not (oh and ow):
-        return "off"
-    return mode
+    """Compatibility hook used by the product pipeline and microbenchmark."""
+    return "off"
 
-
-def _vscan_trajectory_backward(
-    pole: list[Tensor],
-    states: Tensor,
-    auxiliary: list[Tensor],
-    path: list[Tensor],
-    grad: tuple[Tensor, Tensor],
-    coarse: bool,
-    epsilon: float,
-    compact: bool,
-    trajectory: Tensor,
-) -> list[Tensor]:
-    split = trajectory.ndim == 7
-    if (
-        not _vertical_inputs_ok(states, auxiliary, path, coarse=coarse)
-        or not _pole_ok(pole, states)
-        or (compact and not coarse) or not 0 < epsilon < float("inf")
-        or trajectory.shape != _trajectory_shape(states, coarse, split)
-        or trajectory.dtype != states.dtype or trajectory.device != states.device
-        or not trajectory.is_contiguous() or path[0].shape[1] != 8
-    ):
-        raise ValueError("Invalid saved vertical trajectory")
-    _, b, h, w, m = states.shape
-    oh, ow = h // (1 + coarse), w // (1 + coarse)
-    gr, gi = _vertical_adjoints(grad, states, (b, oh, ow, m))
-    gs = states.new_empty((4, b, h, ow if compact else w, m))
-    dp = states.new_empty((2, b, oh, ow, m, 4)) if split else None
-    inputs = (
-        *(p.float().contiguous() for p in pole),
-        states.contiguous(),
-        *(t.float().contiguous() for t in auxiliary),
-        *(p.contiguous() for p in path[:3]),
-        gr, gi, gs,
-    )
-    device = states.device.index or 0
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    tiles = _ceil(m, 32)
-    reduced = []
-    narrow_index = max(states.numel(), trajectory.numel() // 4) < 2**31
-    for variant, count, fields in (
-        ((3, b * oh * ow, 90), (4, b * ow, 4)) if split else ((2, b * ow, 94),)
-    ):
-        # Wide coarse adjoints use the two-warp schedule to avoid local spills.
-        warps = 2 if variant == 4 and coarse and not narrow_index else 4
-        weight_bytes = 88 * 32 * states.element_size() if variant != 4 else 0
-        smem = weight_bytes
-        if variant == 2:
-            per_warp = oh * 32 * 4 * states.element_size()
-            while warps * per_warp + weight_bytes > device_limits(device)[1] and warps > 1:
-                warps //= 2
-            smem += warps * per_warp
-            if smem > device_limits(device)[1]:
-                return vertical_backward(
-                    pole, states, auxiliary, path, gr, gi, coarse, epsilon, compact,
-                )
-        workers = min(count, _ceil(sms * 8, tiles) * warps)
-        partial = states.new_empty((workers, fields, m), dtype=torch.float32)
-        index32 = narrow_index and partial.numel() < 2**31
-        key = Kernel(
-            states.dtype, warps, backward=True, vertical=True, coarse=coarse,
-            hidden8=True, compact=compact, index32=index32,
-            min_blocks=3 if variant == 3 and index32 and not coarse else 0,
-            real_interleaved=not gr.is_contiguous(), imag_interleaved=not gi.is_contiguous(),
-            odd_compact_width=compact and bool(w % 2), saved_trajectory=variant,
-        )
-        _launch_kernel(
-            states, key, tiles * _ceil(workers, warps), smem,
-            (*map(_ptr, (*inputs, partial, trajectory, dp)),
-             *map(ct.c_int, (b, h, w, m, workers, _scalar_types(path))), ct.c_float(epsilon)),
-        )
-        if variant == 2:
-            reduced = _reduce_partials(partial, [*pole, *path], 8)
-        elif variant == 3:
-            reduced.extend(_reduce_partials(partial, path, 8, projection=True))
-        else:
-            reduced[:0] = _reduce_partials(partial, pole)
-    return [*reduced[:4], gs, *reduced[4:]]
 
 
 @torch.library.custom_op("lnet::general_vscan_backward", mutates_args=())
@@ -5932,11 +4413,6 @@ def vertical_backward(
     compact: bool = False,
     saved_features: Tensor | None = None,
 ) -> list[Tensor]:
-    if saved_features is not None and saved_features.ndim in (6, 7):
-        return _vscan_trajectory_backward(
-            pole, states, auxiliary, path, (grad_real, grad_imag), coarse, epsilon, compact,
-            saved_features,
-        )
     out = _vscan(
         pole, states, auxiliary, path, coarse, epsilon, False, (grad_real, grad_imag),  # noqa: FBT003
         compact=compact, saved_features=saved_features,
@@ -5984,20 +4460,7 @@ def _vertical_forward_saved(
     step = 2 if coarse else 1
     shape = (b, h // step, w // step, m)
     if trajectory_policy != "off":
-        if trajectory_policy not in ("saved_fused", "saved_split") or not (shape[1] and shape[2]):
-            raise ValueError("Invalid vertical trajectory policy or shape")
-        trajectory = states.new_empty(
-            _trajectory_shape(states, coarse, trajectory_policy == "saved_split"),
-        )
-        out = _vscan(
-            pole, states, auxiliary, path, coarse, epsilon, precise,
-            packed=not separate, planar=planar, trajectory=trajectory,
-        )
-        if isinstance(out, tuple):
-            return *out, trajectory
-        if isinstance(out, Tensor):
-            return out, states.new_empty((0,)), trajectory
-        raise TypeError("Expected saved scan outputs")
+        raise ValueError("Unsupported trajectory policy")
     with torch.autocast(device_type="cuda", enabled=False):
         features = _vscan(
             pole, states.contiguous(), auxiliary, path, coarse, epsilon, precise, pure=True,
@@ -6037,10 +4500,7 @@ def _fake_vertical_forward_saved(
     return (
         states.new_empty(shape if separate else ((2, *shape) if planar else (*shape[:-1], 2 * m))),
         states.new_empty(shape if separate else (0,)),
-        states.new_empty((8, b * (h // step) * (w // step), m)) if trajectory_policy == "off"
-        else states.new_empty(
-            _trajectory_shape(states, coarse, trajectory_policy == "saved_split"),
-        ),
+        states.new_empty((8, b * (h // step) * (w // step), m)),
     )
 
 
@@ -6133,11 +4593,10 @@ def vertical_forward(
     precise: bool = True,
     mode: str = "cuda",
 ) -> tuple[Tensor, Tensor]:
-    policy = _vscan_saved_policy(states, path, coarse) if mode == "cuda" else "off"
-    if mode == "cuda" and (policy != "off" or _should_save_vscan(states, coarse)):
+    if mode == "cuda" and _should_save_vscan(states, coarse):
         real, imag, _ = _vertical_forward_saved(
             pole, states, auxiliary, path, coarse, epsilon,
-            planar=False, precise=precise, separate=True, trajectory_policy=policy,
+            planar=False, precise=precise, separate=True,
         )
         return real, imag
     return _vertical_forward(pole, states, auxiliary, path, coarse, epsilon, precise, mode)

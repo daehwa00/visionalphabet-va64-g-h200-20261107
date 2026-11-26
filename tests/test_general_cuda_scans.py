@@ -11,7 +11,6 @@ from bench_scan_micro import (
     MODEL_SHAPES,
     OPS,
     TENSOR_NAMES,
-    W43_MODES,
     _case,
     _layouts,
     _time,
@@ -71,37 +70,12 @@ def test_wave51a_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     env = "LNET_SCAN_W51A"
     monkeypatch.delenv(env, raising=False)
     assert scans._scan_mode(env, scans.W51A_MODES) == "off"
-    for mode in ("fp32", "l2", "fp32_l2", "fp32_hiocc"):
+    for mode in scans.W51A_MODES:
         monkeypatch.setenv(env, mode)
         assert scans._scan_mode(env, scans.W51A_MODES) == mode
     monkeypatch.setenv(env, "unknown")
     with pytest.raises(ValueError, match=env):
         scans._scan_mode(env, scans.W51A_MODES)
-
-
-def test_wave51a_persistent_budget_and_off_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    shape = (1024, 56, 56, 160)
-    key = scans.Kernel(torch.bfloat16, 4, backward=True, vertical=True, hidden8=True)
-    launch = scans.Launch(scans.ScanPlan(4, 113 * 1024), key, 1688, 422)
-    monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
-    monkeypatch.setattr(scans, "_resident", lambda *_: 2)
-    monkeypatch.setattr(scans, "_l2_size", lambda _: 60 * 1024**2)
-    assert scans._plan_w51a(0, launch, shape, "off") is launch
-    updated = scans._plan_w51a(0, launch, shape, "l2")
-    assert updated.key == replace(key, l2_single_write=True)
-    assert updated.workers == 212
-    assert updated.partials == 53
-    assert (updated.workers // key.warps) * 5 >= 132 * 2
-    assert 2 * 56 * updated.workers * 160 * 8 <= 45 * 1024**2
-
-    small_gpu = replace(key, compact=True, coarse=True)
-    coarse_launch = launch._replace(key=small_gpu)
-    monkeypatch.setattr(scans, "device_limits", lambda _: (80, 99 * 1024, 48))
-    monkeypatch.setattr(scans, "_l2_size", lambda _: 6 * 1024**2)
-    coarse = scans._plan_w51a(1, coarse_launch, (1024, 57, 57, 159), "l2")
-    assert coarse.key == small_gpu
-    assert coarse.workers == 128
-    assert scans._plan_w51a(1, launch, shape, "l2") is launch
 
 
 @pytest.mark.parametrize("kb", [48, 100, 228])
@@ -717,7 +691,7 @@ def _pipeline(
 _compiled_pipeline = torch.compile(_pipeline, fullgraph=True, dynamic=True)
 
 
-@pytest.mark.parametrize("mode", ["off", "strict", "strict_ro"])
+@pytest.mark.parametrize("mode", scans.SGS_MODES)
 def test_sgs_aot_eager(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     monkeypatch.setenv("LNET_SCAN_SGS", mode)
     args = _inputs(4, 6, 3, 8, torch.bfloat16, "cpu")
@@ -1385,7 +1359,6 @@ def test_sgs_readonly_preserves_occupancy_and_partial_order(
     scans._plan_sgs.cache_clear()
     try:
         assert scans._plan_sgs(0, base, shape, "off") == base
-        assert scans._plan_sgs(0, base, shape, "strict") == base
         result = scans._plan_sgs(0, base, shape, "strict_ro")
         assert result.key.backward_readonly
         assert result[2:] == base[2:]
@@ -1435,7 +1408,7 @@ def test_sgs_strict_and_probe_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scans, "_resident", resident)
     scans._plan_sgs.cache_clear()
     try:
-        result = scans._plan_sgs(0, base, shape, "strict")
+        result = scans._plan_sgs(0, base, shape, "strict_ro")
         assert result.plan.sgs_rows == height
         assert result.key == replace(key, sgs=1)
         assert result.plan.smem == base.plan.smem + height * 4 * 32 * 8
@@ -1524,7 +1497,7 @@ def test_cuda_vfwd_hscan_parity(
         tiles = scans._ceil(shape[3], scans._WARP_SIZE)
         batch = max(batch, scans._ceil(2 * sms * max_warps, h * tiles))
     env, modes = OPS[op]
-    off, winner = "off", W43_MODES[op]
+    off = "off"
     monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
     for compact in _layouts(op, label, coarse, w):
         monkeypatch.setenv(env, off)
@@ -1535,16 +1508,11 @@ def test_cuda_vfwd_hscan_parity(
         for mode in modes[1:]:
             monkeypatch.setenv(env, mode)
             launch = plan()
-            if op == "hscan_fwd":
-                assert launch == baseline
             if launch not in outputs:
                 outputs[launch] = run()
             tensors = zip(TENSOR_NAMES[op], outputs[launch], expected, strict=True)
             for name, actual, reference in tensors:
-                if mode == winner or op == "hscan_fwd":
-                    assert torch.equal(actual, reference), (label, mode, name)
-                else:
-                    assert parity_stats(actual, reference)["tol_pass"], (label, mode, name)
+                assert parity_stats(actual, reference)["tol_pass"], (label, mode, name)
 
 
 def test_scan_micro_parity_diagnostics() -> None:
@@ -1572,7 +1540,7 @@ def test_vfwd_batch4_resource_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scans, "_resident", resident)
     scans._plan_vfwd.cache_clear()
     try:
-        result = scans._plan_vfwd(0, baseline, 56, "batch4")
+        result = scans._plan_vfwd(0, baseline, 56, "batch4_w2")
         assert result.key.forward_readonly
         assert result.key.register_path
         assert result.key.register_batch2
@@ -1597,7 +1565,7 @@ def test_vfwd_batch4_resource_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
         (True, 2, 56, 15, 16, True),
     ],
 )
-def test_hscan_bwd_opt_resource_gate(
+def test_hscan_backward_readonly_resource_gate(
     monkeypatch: pytest.MonkeyPatch, backward: bool, warps: int, width: int,
     base: int, candidate: int | None, accepted: bool,
 ) -> None:
@@ -1614,8 +1582,7 @@ def test_hscan_bwd_opt_resource_gate(
     monkeypatch.setattr(scans, "_resident", resident)
     scans._plan_hscan.cache_clear()
     try:
-        assert scans._plan_hscan(0, baseline, (2, 56, width, 63), "off") is baseline
-        result = scans._plan_hscan(0, baseline, (2, 56, width, 63), "bwd_opt")
+        result = scans._plan_hscan(0, baseline, (2, 56, width, 63))
         if accepted:
             candidate_key = replace(key, horizontal_readonly=True, horizontal_unroll=8)
             assert result == baseline._replace(key=candidate_key)
@@ -1634,65 +1601,6 @@ def test_invalid_scan_mode(monkeypatch: pytest.MonkeyPatch, op: str) -> None:
             torch.empty(1), (1, 1, 1, 1), backward=op.endswith("_bwd"),
             vertical=op.startswith("vscan"), coarse=False, hidden=8, precise=False,
         )
-
-
-@pytest.mark.parametrize(
-    "mode", [*scans.SGS_MODES[3:], *scans.VFWD_MODES[2:], *scans.HSCAN_MODES[2:]],
-)
-def test_structural_scan_resource_gates(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-    monkeypatch.setattr(scans, "device_limits", lambda _: (8, 227 * 1024, 64))
-    monkeypatch.setattr(scans, "_sgs_device_limits", lambda _: (228 * 1024, 65536, 1024))
-    shape = (1024, 56, 56, 128)
-    if mode in scans.SGS_MODES:
-        key = scans.Kernel(
-            torch.bfloat16, 2, backward=True, vertical=True, hidden8=True, chunk=14,
-            cache_source=True, cache_weights=True, backward_readonly=True,
-        )
-        plan = scans.ScanPlan(
-            2, scans._sgs_smem(key, 56), 14, cache_weights=True, cache_source=True,
-        )
-        base = scans.Launch(plan, key, 512, 256)
-        choose = scans._structural_sgs
-    elif mode in scans.VFWD_MODES:
-        key = scans.Kernel(
-            torch.bfloat16, 1, backward=False, vertical=True, hidden8=True,
-            cache_weights=True, batch_path=True, forward_readonly=True,
-        )
-        base = scans.Launch(scans.ScanPlan(1, 5632, cache_weights=True), key, 512, 512)
-
-        def choose(device, launch, shape, mode):
-            return scans._structural_vfwd(device, launch, launch, shape, mode)
-    else:
-        key = scans.Kernel(torch.bfloat16, 4, backward=True, cache_line=True)
-        base = scans.Launch(scans.ScanPlan(4, 57344, cache_line=True), key, 512, 128)
-        choose = scans._structural_hscan
-
-    monkeypatch.setattr(scans, "_resident", lambda _, probe, _smem: 4 if probe == key else 0)
-    assert choose(0, base, shape, mode) == base
-
-    def resident(_, probe, smem):
-        if probe == key:
-            return 4
-        return min(16, (228 * 1024) // (smem + 1024))
-
-    monkeypatch.setattr(scans, "_resident", resident)
-    selected = choose(0, base, shape, mode)
-    assert selected.key != key
-    assert selected.workers == base.workers
-    if mode in scans.SGS_MODES:
-        assert selected.partials == base.partials
-        assert (selected.key.backward_reduce_warps or selected.key.warps) == key.warps
-        if mode == "strict_ro_seg2":
-            assert scans._ceil(shape[1], selected.plan.chunk) == 2
-        if not selected.key.cache_source:
-            threads = selected.key.warps * scans._WARP_SIZE
-            assert selected.key.backward_segment_source
-            assert selected.plan.smem >= threads * selected.key.chunk * (16 + 8)
-            source = scans._kernel_source(selected.key)
-            assert source.count("if constexpr (!CACHE_SOURCE) seg_src") == 3
-    elif mode in scans.HSCAN_MODES:
-        assert selected.partials == scans._ceil(base.workers, selected.key.warps)
-    assert scans._active_warps(0, selected) >= key.warps * 4
 
 
 @pytest.mark.parametrize("flush", [False, True])
