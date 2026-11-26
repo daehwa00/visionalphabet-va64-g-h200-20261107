@@ -12,6 +12,7 @@ import torch
 from torch import Tensor
 from torch.library import triton_op
 
+from . import w66_split_bf16_scan as w66
 from .general_cuda_scans import (
     _general_vertical_inputs,
     _should_save_vscan,
@@ -1187,7 +1188,10 @@ def _run_packed_cuda_forward(
     pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
-    horizontal_storage = _packed_horizontal_forward(pole_x, source)
+    split = w66.enabled(source[0], path, epilogue, kind, path_swiglu)
+    horizontal_storage = (
+        w66.hforward(list(pole_x), *source) if split else _packed_horizontal_forward(pole_x, source)
+    )
     auxiliary = static_product_scan_auxiliary(
         pole_x,
         pole_y,
@@ -1195,6 +1199,17 @@ def _run_packed_cuda_forward(
         epsilon=epsilon,
         gain_kind=kind,
     )
+
+    if split:
+        args = (list(pole_y), source[0], horizontal_storage, list(auxiliary[:2]), path,
+                epilogue == "coarse_path")
+        if packed_output:
+            primary = w66.vforward(*args, planar_output, epsilon)
+            secondary = primary.new_empty((0,))
+        else:
+            primary, secondary = w66.vforward_planes(*args, epsilon)
+        descriptor = primary.new_empty((0,), dtype=torch.float32)
+        return primary, secondary, descriptor, ([] if recompute else [horizontal_storage])
 
     if general_scans_enabled(forward=True):
         operands = _general_vertical_inputs(
@@ -1301,6 +1316,18 @@ def _run_packed_cuda_backward(
     pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
+    # Retained storage identifies its producer even if the process environment changes.
+    split = (horizontal_states[0].dtype == torch.uint32 if horizontal_states
+             else w66.enabled(source[0], path, epilogue, kind, path_swiglu))
+    if split:
+        states = horizontal_states[0] if horizontal_states else w66.hforward(list(pole_x), *source)
+        tables = static_product_scan_auxiliary(
+            pole_x, pole_y, source[0], epsilon=epsilon, gain_kind=kind,
+        )
+        if grad_real.ndim == 5:
+            grad_real, grad_imag = grad_real.squeeze(-2), grad_imag.squeeze(-2)
+        return w66.scan_backward(list(pole_x), list(pole_y), *source, states, list(tables[:2]),
+                                 path, grad_real, grad_imag, epilogue == "coarse_path", epsilon)
     saved_features = None
     if horizontal_states and horizontal_states[-1].ndim in (3, 6, 7):
         *horizontal_states, saved_features = horizontal_states

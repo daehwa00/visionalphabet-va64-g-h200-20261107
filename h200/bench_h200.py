@@ -1,3 +1,4 @@
+# ruff: noqa: PLC0415 -- load torch only after applying arm environment
 """Measure one H200 reference or lock-in arm."""
 
 import argparse
@@ -46,6 +47,12 @@ BUCKETS = (
 )
 
 
+def profile_bucket(name: str) -> str:
+    bucket = (name.removeprefix("va_profile_").split("__", 1)[0]
+              if name.startswith("va_profile_") else runner.kernel_bucket(name))
+    return bucket if bucket in BUCKETS else "other"
+
+
 def profile_step(step: Callable) -> dict:
     import torch
 
@@ -62,13 +69,7 @@ def profile_step(step: Callable) -> dict:
         if event.device_type != torch.autograd.DeviceType.CUDA:
             continue
         elapsed = event.self_device_time_total / 1000
-        bucket = (
-            event.key.removeprefix("va_profile_").split("__", 1)[0]
-            if event.key.startswith("va_profile_")
-            else runner.kernel_bucket(event.key)
-        )
-        if bucket not in buckets:
-            bucket = "other"
+        bucket = profile_bucket(event.key)
         buckets[bucket] += elapsed
         kernels.append({
             "name": event.key, "count": event.count, "self_cuda_ms": elapsed, "bucket": bucket,
@@ -146,6 +147,8 @@ def lockin_arm_env(name: str) -> dict[str, str]:
     arm = name.removesuffix("_rev")
     if arm == "w43_ref":
         return REFERENCE_ENV.copy()
+    if arm == "w66_lockin":
+        return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1"}
     if arm == "w57_lockin":
         return LOCKIN_ENV.copy()
     raise ValueError(f"Unknown arm {name!r}")
@@ -153,12 +156,14 @@ def lockin_arm_env(name: str) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    arms = ("w43_ref", "w57_lockin")
+    arms = ("w43_ref", "w57_lockin", "w66_lockin")
     parser.add_argument("--arm", required=True, choices=(*arms, *(arm + "_rev" for arm in arms)))
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     env = lockin_arm_env(args.arm)
+    if "VA_W66_SPLIT_BF16" not in env:
+        os.environ.pop("VA_W66_SPLIT_BF16", None)
     os.environ.update(env)
     return measure_arm(args.out, profile=args.profile, arm_env_keys=tuple(env))
 
