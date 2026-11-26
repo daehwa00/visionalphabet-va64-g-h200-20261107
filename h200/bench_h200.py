@@ -13,6 +13,9 @@ def lockin_arm_env(name: str) -> dict[str, str]:
     if mode == REF:
         return {**arm_env(REF), "LNET_SCAN_W52A": "off", "LNET_SCAN_W53A": "off",
                 "LNET_FUSED_STEM_CONV": "auto"}
+    if mode == "w57_lockin":
+        return {**lockin_arm_env("w55_lockin"), "LNET_SCAN_W53A": mode,
+                "LNET_MODEL_W56B": "swiglu_vec8_tanh", "LNET_MODEL_W57B_RMS": "cuda_sp_vec8_4cta"}
     if mode == "w55_lockin":
         return {**lockin_arm_env("w53_lockin"), "LNET_SCAN_W53A": mode,
                 "LNET_SCAN_HSCAN": "h55_lockin"}
@@ -25,7 +28,7 @@ def lockin_arm_env(name: str) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    arms = (REF, "w53_lockin", "w55_lockin")
+    arms = (REF, "w53_lockin", "w55_lockin", "w57_lockin")
     parser.add_argument("--arm", required=True, choices=(*arms, *(arm + "_rev" for arm in arms)))
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")

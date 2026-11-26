@@ -3760,7 +3760,7 @@ W52A_MODES = (
 )
 SGS_MODES = ("off", "strict", "strict_ro", "strict_ro_hiocc", "strict_ro_seg2")
 VFWD_MODES = ("off", "batch4", "batch4_w2", "batch4_hiocc")
-W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin", "w55_lockin")
+W53A_MODES = ("off", "w52_best", "w52_best_swpipe", "w52_best_pipe4", "w53_lockin", "w55_lockin", "w57_lockin")
 W57A_MODES = ("off", "v57_bwd_seg16_2chunk", "v57_bwd_seg16_1wave",
               "v57_bwd_seg16_2wave", "v57_bwd_loww_only", "v57_bwd_seg16_loww")
 W56A_MODES = ("off", "v56_noround", "v56_bwd_hfma2_dw_l2", "v56_bwd_quad_hfma2", "v56_fwd_hiworker")
@@ -4928,6 +4928,16 @@ def _plan_launch(  # noqa: C901, PLR0912
     w56 = _w56_mode(source.dtype, hidden, device) if vertical else "off"
     w57 = (_w57_mode(source.dtype, hidden, device)
            if vertical and backward and not (saved_trajectory or pure_vertical) else "off")
+    if wave53a == "w57_lockin":
+        wave53a = "w55_lockin"
+        if hidden == _REGISTER_HIDDEN and torch.cuda.get_device_capability(device) >= (8, 0):
+            if backward:
+                if height >= 48 or (coarse and height <= 16):
+                    w57 = "v57_bwd_seg16_2chunk"
+                elif coarse:
+                    w57 = "v57_bwd_loww_only"
+            elif height < (48 if coarse else 24):
+                w56 = "v56_noround"
     if w57 != "off":
         wave53a = "w55_lockin"
     if wave53a == "w55_lockin":

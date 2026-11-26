@@ -21,7 +21,7 @@ from .model_w36b import inductor_norms_enabled
 
 def _wave56b_mode() -> str:
     mode = os.environ.get("LNET_MODEL_W56B", "off")
-    if mode not in ("off", "triton_hiocc", "cuda_vec8", "cuda_vec8_tanh", "swiglu_best"):
+    if mode not in ("off", "triton_hiocc", "cuda_vec8", "cuda_vec8_tanh", "swiglu_best", "swiglu_vec8_tanh"):
         raise ValueError(f"invalid LNET_MODEL_W56B={mode!r}")
     return mode
 
@@ -107,7 +107,9 @@ def _launch_swiglu(joint: Tensor, grad: Tensor, output: Tensor, *, backward: boo
 
 def packed_swiglu_vec2d(joint: Tensor) -> Tensor:
     mode = _wave56b_mode()
-    if mode == "swiglu_best":
+    if mode == "swiglu_vec8_tanh":
+        mode = "cuda_vec8_tanh"
+    elif mode == "swiglu_best":
         mode = "off" if joint.shape[-1] // 2 <= 96 else "cuda_vec8_tanh"
     if mode == "off":
         return _off_swiglu(joint)
@@ -134,7 +136,9 @@ def _swiglu_vec2d_backward(joint: Tensor, grad: Tensor) -> Tensor:
     mode = _wave56b_mode()
     if mode == "off":
         return _off_swiglu_backward(joint, grad)
-    return _tuned_swiglu_backward(joint, grad, "cuda_vec8_tanh" if mode == "swiglu_best" else mode)
+    if mode in ("swiglu_best", "swiglu_vec8_tanh"):
+        mode = "cuda_vec8_tanh"
+    return _tuned_swiglu_backward(joint, grad, mode)
 
 
 @triton_op("lnet::w29c_swiglu_backward", mutates_args=())

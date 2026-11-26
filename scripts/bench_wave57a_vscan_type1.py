@@ -20,7 +20,9 @@ VERTICAL = ("w55_lockin", *scans.W57A_MODES[1:5])
 def configure(mode: str) -> None:
     configure_base("w55_lockin")
     os.environ["LNET_SCAN_W56A"] = "off"
-    os.environ["LNET_SCAN_W57A"] = "off" if mode == "w55_lockin" else mode
+    if mode == "w57_lockin":
+        os.environ["LNET_SCAN_W53A"] = mode
+    os.environ["LNET_SCAN_W57A"] = "off" if mode in ("w55_lockin", "w57_lockin") else mode
 
 
 def check_mode(mode: str, batch: int, limit: float = 0.035) -> dict:

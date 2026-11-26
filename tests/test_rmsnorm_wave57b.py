@@ -154,3 +154,45 @@ def test_swiglu_best(monkeypatch):
         assert ops.packed_swiglu_vec2d(joint) == ("off" if width <= 96 else "cuda_vec8_tanh")
         assert ops._swiglu_vec2d_backward(joint, joint) == "cuda_vec8_tanh"
     assert ops._channel_rmsnorm_backward(None, None, None, None, need_dx=True, need_dw=True) == "off"
+
+
+def test_lockin_dispatch(monkeypatch):
+    monkeypatch.setenv("LNET_MODEL_W56B", "swiglu_vec8_tanh")
+    monkeypatch.setattr(ops, "_tuned_swiglu", lambda joint, mode: mode)
+    monkeypatch.setattr(ops, "_tuned_swiglu_backward", lambda joint, grad, mode: mode)
+    monkeypatch.setattr(ops, "_off_rms_bwd", lambda *args, **kwargs: "off")
+    monkeypatch.setattr(ops, "_sp_rms", lambda *args: args[-1])
+    monkeypatch.setattr(ops, "_vec_rms", lambda *args: pytest.fail("two-pass RMSNorm"))
+    for rms in ("off", "cuda_sp_vec8_4cta"):
+        monkeypatch.setenv("LNET_MODEL_W57B_RMS", rms)
+        assert ops.packed_swiglu_vec2d(None) == "cuda_vec8_tanh"
+        assert ops._swiglu_vec2d_backward(None, None) == "cuda_vec8_tanh"
+        assert ops._channel_rmsnorm_backward(None, None, None, None, need_dx=True, need_dw=True) == rms
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype,tol", [(torch.bfloat16, 0.035), (torch.float16, 0.01)])
+def test_lockin_device(monkeypatch, dtype, tol):
+    joint = torch.randn(64, 192, device="cuda", dtype=dtype)
+    grad = torch.randn_like(joint[:, :96]).contiguous()
+    weight = torch.randn(96, device="cuda", dtype=dtype)
+
+    def run():
+        x = ops.packed_swiglu_vec2d(joint)
+        inv = (x.float().square().mean(-1, keepdim=True) + 1e-6).rsqrt()
+        dx, dw = ops._channel_rmsnorm_backward(x, weight, inv, grad, need_dx=True, need_dw=True)
+        return x, ops._swiglu_vec2d_backward(joint, dx), dw
+
+    monkeypatch.setenv("LNET_MODEL_W56B", "off")
+    monkeypatch.setenv("LNET_MODEL_W57B_RMS", "off")
+    reference = run()
+    monkeypatch.setenv("LNET_MODEL_W56B", "swiglu_vec8_tanh")
+    monkeypatch.setenv("LNET_MODEL_W57B_RMS", "cuda_sp_vec8_4cta")
+    eager = run()
+    assert max(errors(eager, reference)) <= tol
+    assert max(errors(torch.compile(run, fullgraph=True)(), eager)) <= tol
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    assert max(errors(captured, eager)) <= tol
