@@ -311,3 +311,97 @@ def test_production_fake_pipeline(monkeypatch, separate, recompute):
         assert [s.dtype for s in saved] == ([] if recompute else [torch.uint32])
         for grad, source in zip(grads, [*inputs, *path], strict=True):
             assert (grad.shape, grad.stride(), grad.dtype) == (source.shape, source.stride(), source.dtype)
+
+
+def test_ablation17_scan_graphs(monkeypatch):
+    from run_va_eight_ablations import build_variant
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from lnet import complex_scan_stage, product_scan_pipeline, same_resolution_depth
+
+    for key, value in bench.lockin_arm_env("w57_lockin").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    model = build_variant("17-p1-nr4-1024d-v3").backbone
+    targets = []
+
+    def backend(graph, _inputs):
+        targets.extend(node.target for node in graph.graph.nodes if node.op == "call_function")
+        return graph.forward
+
+    # Substitute only the CPU reference scan math. Keep the model's reader,
+    # poles, path parameters, dispatch, and Dynamo registrations in the loop.
+    def reference(inputs, path, epilogue, _epsilon, kind, path_swiglu, planar_output):
+        assert planar_output
+        drive = inputs[8]
+        n, h, w, channels = drive.shape
+        modes = channels // 2
+        assert drive.dtype == torch.bfloat16
+        assert (epilogue, kind, path_swiglu, len(path), path[0].shape) == (
+            expected_epilogue,
+            0,
+            False,
+            4,
+            (160, 8, 8),
+        )
+        assert (h, w, modes) == (resolution, resolution, 160)
+        if epilogue == "coarse_path":
+            h, w = h // 2, w // 2
+        return drive.new_empty((2, n, h, w, modes)), drive.new_empty((0,))
+
+    monkeypatch.setattr(product_scan_pipeline, "_packed_reference", reference)
+    for module, name in (
+        (same_resolution_depth, "run_product_scan_path_collapse_planes_packed"),
+        (complex_scan_stage, "run_product_scan_coarse_path_collapse_planes_packed"),
+    ):
+        monkeypatch.setattr(
+            module,
+            name,
+            torch.compile(getattr(module, name), backend=backend, fullgraph=True, dynamic=False),
+        )
+
+    for flag in ("0", "1"):
+        monkeypatch.setenv("VA_W66_SPLIT_BF16", flag)
+        target = getattr(
+            torch.ops.lnet, "product_scan_pipeline_planes_v1" + ("_w66" if flag == "1" else "")
+        ).default
+        for resolution, stage in ((56, model.stage1), (28, model.stage2)):
+            block = model.same_resolution_blocks[str(resolution)]
+            state = torch.zeros((1, resolution, resolution, 2 * block.modes), dtype=torch.bfloat16)
+            for expected_epilogue in ("full16", "coarse_path"):
+                targets.clear()
+                with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+                    if expected_epilogue == "full16":
+                        state = block(state)
+                        path = block.path_collapse.packed_parameters()
+                    else:
+                        stage(state, emit_descriptor=False)
+                        path = stage.quadrant_path_mode_combiner.packed_parameters()
+                assert target in targets
+                with FakeTensorMode():
+                    real = torch.empty(
+                        (1024, resolution, resolution, 160), device="cuda", dtype=torch.bfloat16
+                    )
+                    assert fp.enabled(real, path, expected_epilogue, 0, swiglu=False) == (
+                        flag == "1"
+                    )
+
+
+def test_storage_graph_target(monkeypatch):
+    from lnet.product_scan_pipeline import run_product_scan_path_collapse_pipeline_packed
+
+    drive = torch.zeros((1, 2, 2, 4))
+    pole = (torch.ones((1, 1, 1, 2)),) * 4
+    path = tuple(torch.zeros(s) for s in ((2, 8, 8), (2, 8), (2, 2, 8), (2, 2)))
+    for flag in ("0", "1"):
+        monkeypatch.setenv("VA_W66_SPLIT_BF16", flag)
+        result = torch._dynamo.explain(run_product_scan_path_collapse_pipeline_packed)(
+            pole,
+            pole,
+            drive,
+            path,
+            gain_normalization="pointwise",
+        )
+        name = "product_scan_pipeline_storage_v2" + ("_w66" if flag == "1" else "")
+        assert result.graph_count == 1
+        assert getattr(torch.ops.lnet, name).default in result.ops_per_graph[0]

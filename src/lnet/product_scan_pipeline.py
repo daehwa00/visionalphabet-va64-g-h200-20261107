@@ -6,6 +6,8 @@ from __future__ import annotations
 # The composition boundary intentionally uses package-private primitive ops so
 # their intermediate autograd contexts do not retain horizontal scan states.
 # pyright: reportPrivateUsage=false
+import os
+from functools import partial
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import torch
@@ -1402,8 +1404,7 @@ def _run_packed_cuda_backward(
     return [*horizontal_gradients[:4], *vertical[:4], packed_gradient, *vertical[8:]]
 
 
-@triton_op("lnet::product_scan_pipeline_storage_v2", mutates_args={})
-def _packed_pipeline_op(
+def _packed_pipeline_op_impl(
     inputs: list[Tensor],
     path: list[Tensor],
     epilogue: str,
@@ -1433,6 +1434,18 @@ def _packed_pipeline_op(
     return [packed, descriptor, *saved]
 
 
+_packed_pipeline_op = triton_op(
+    "lnet::product_scan_pipeline_storage_v2",
+    _packed_pipeline_op_impl,
+    mutates_args={},
+)
+_packed_pipeline_op_w66 = triton_op(
+    "lnet::product_scan_pipeline_storage_v2_w66",
+    _packed_pipeline_op_impl,
+    mutates_args={},
+)
+
+
 def _setup_packed_context(
     ctx: _PackedAutogradContext,
     inputs: tuple[list[Tensor], list[Tensor], str, float, int, bool, bool, bool],
@@ -1448,8 +1461,7 @@ def _setup_packed_context(
     ctx.save_for_backward(*tensors, *path, output[1], *output[2:])
 
 
-@triton_op("lnet::product_scan_pipeline_storage_backward_v2", mutates_args={})
-def _packed_pipeline_backward_op(
+def _packed_pipeline_backward_op_impl(
     inputs: list[Tensor],
     path: list[Tensor],
     horizontal_states: list[Tensor],
@@ -1488,9 +1500,23 @@ def _packed_pipeline_backward_op(
     )
 
 
+_packed_pipeline_backward_op = triton_op(
+    "lnet::product_scan_pipeline_storage_backward_v2",
+    _packed_pipeline_backward_op_impl,
+    mutates_args={},
+)
+_packed_pipeline_backward_op_w66 = triton_op(
+    "lnet::product_scan_pipeline_storage_backward_v2_w66",
+    _packed_pipeline_backward_op_impl,
+    mutates_args={},
+)
+
+
 def _packed_pipeline_backward(
     ctx: _PackedAutogradContext,
     output_gradients: list[Tensor | None],
+    *,
+    w66_variant: bool = False,
 ) -> tuple[list[Tensor], list[Tensor], None, None, None, None, None, None]:
     saved = ctx.saved_tensors
     inputs = list(saved[:9])
@@ -1548,7 +1574,10 @@ def _packed_pipeline_backward(
             for value, gradient in zip(differentiable, computed, strict=True)
         ]
     else:
-        result = _packed_pipeline_backward_op(
+        backward_op = (
+            _packed_pipeline_backward_op_w66 if w66_variant else _packed_pipeline_backward_op
+        )
+        result = backward_op(
             inputs,
             path,
             horizontal,
@@ -1569,10 +1598,14 @@ torch.library.register_autograd(
     _packed_pipeline_backward,
     setup_context=_setup_packed_context,
 )
+torch.library.register_autograd(
+    "lnet::product_scan_pipeline_storage_v2_w66",
+    partial(_packed_pipeline_backward, w66_variant=True),
+    setup_context=_setup_packed_context,
+)
 
 
-@triton_op("lnet::product_scan_pipeline_planes_v1", mutates_args={})
-def _packed_pipeline_planes_op(
+def _packed_pipeline_planes_op_impl(
     inputs: list[Tensor],
     path: list[Tensor],
     epilogue: str,
@@ -1602,6 +1635,18 @@ def _packed_pipeline_planes_op(
     return [real, imag, descriptor, *saved]
 
 
+_packed_pipeline_planes_op = triton_op(
+    "lnet::product_scan_pipeline_planes_v1",
+    _packed_pipeline_planes_op_impl,
+    mutates_args={},
+)
+_packed_pipeline_planes_op_w66 = triton_op(
+    "lnet::product_scan_pipeline_planes_v1_w66",
+    _packed_pipeline_planes_op_impl,
+    mutates_args={},
+)
+
+
 def _setup_packed_planes_context(
     ctx: _PackedAutogradContext,
     inputs: tuple[list[Tensor], list[Tensor], str, float, int, bool, bool],
@@ -1618,8 +1663,7 @@ def _setup_packed_planes_context(
     ctx.save_for_backward(*tensors, *path, output[2], *output[3:])
 
 
-@triton_op("lnet::product_scan_pipeline_planes_backward_v1", mutates_args={})
-def _packed_pipeline_planes_backward_op(
+def _packed_pipeline_planes_backward_op_impl(
     inputs: list[Tensor],
     path: list[Tensor],
     horizontal_states: list[Tensor],
@@ -1649,9 +1693,23 @@ def _packed_pipeline_planes_backward_op(
     )
 
 
+_packed_pipeline_planes_backward_op = triton_op(
+    "lnet::product_scan_pipeline_planes_backward_v1",
+    _packed_pipeline_planes_backward_op_impl,
+    mutates_args={},
+)
+_packed_pipeline_planes_backward_op_w66 = triton_op(
+    "lnet::product_scan_pipeline_planes_backward_v1_w66",
+    _packed_pipeline_planes_backward_op_impl,
+    mutates_args={},
+)
+
+
 def _packed_pipeline_planes_backward(
     ctx: _PackedAutogradContext,
     output_gradients: list[Tensor | None],
+    *,
+    w66_variant: bool = False,
 ) -> tuple[list[Tensor], list[Tensor], None, None, None, None, None]:
     saved = ctx.saved_tensors
     inputs = list(saved[:9])
@@ -1695,7 +1753,11 @@ def _packed_pipeline_planes_backward(
             for value, gradient in zip(differentiable, computed, strict=True)
         ]
     else:
-        result = _packed_pipeline_planes_backward_op(
+        backward_op = (
+            _packed_pipeline_planes_backward_op_w66
+            if w66_variant else _packed_pipeline_planes_backward_op
+        )
+        result = backward_op(
             inputs,
             path,
             horizontal,
@@ -1716,6 +1778,15 @@ torch.library.register_autograd(
     _packed_pipeline_planes_backward,
     setup_context=_setup_packed_planes_context,
 )
+torch.library.register_autograd(
+    "lnet::product_scan_pipeline_planes_v1_w66",
+    partial(_packed_pipeline_planes_backward, w66_variant=True),
+    setup_context=_setup_packed_planes_context,
+)
+
+
+def _w66_requested() -> bool:
+    return os.environ.get("VA_W66_SPLIT_BF16") == "1"
 
 
 def run_product_scan_pipeline_packed(
@@ -1737,7 +1808,8 @@ def run_product_scan_pipeline_packed(
         raise ValueError(f"unsupported scan memory policy: {memory_policy}")
     if not emit_descriptor and epilogue != "coarse":
         raise ValueError("descriptor omission requires the coarse epilogue")
-    output = _packed_pipeline_op(
+    op = _packed_pipeline_op_w66 if _w66_requested() else _packed_pipeline_op
+    output = op(
         [*pole_x, *pole_y, source_packed],
         [],
         epilogue if emit_descriptor else "coarse_no_descriptor",
@@ -1766,7 +1838,8 @@ def run_product_scan_path_collapse_pipeline_packed(
     _packed_source_coordinates(source_packed)
     if memory_policy not in {"retain", "recompute"}:
         raise ValueError(f"unsupported scan memory policy: {memory_policy}")
-    return _packed_pipeline_op(
+    op = _packed_pipeline_op_w66 if _w66_requested() else _packed_pipeline_op
+    return op(
         [*pole_x, *pole_y, source_packed],
         list(parameters),
         "full16",
@@ -1793,7 +1866,8 @@ def run_product_scan_path_collapse_planes_packed(
     _packed_source_coordinates(source_packed)
     if memory_policy not in {"retain", "recompute"}:
         raise ValueError(f"unsupported scan memory policy: {memory_policy}")
-    outputs = _packed_pipeline_planes_op(
+    op = _packed_pipeline_planes_op_w66 if _w66_requested() else _packed_pipeline_planes_op
+    outputs = op(
         [*pole_x, *pole_y, source_packed],
         list(parameters),
         "full16",
@@ -1839,7 +1913,8 @@ def run_product_scan_coarse_path_collapse_packed(
     _validate_coarse_cuda_drive(source_packed, gain_normalization)
     if source_packed.shape[1] % 2 or source_packed.shape[2] % 2:
         raise ValueError("coarse path collapse requires even spatial dimensions")
-    return _packed_pipeline_op(
+    op = _packed_pipeline_op_w66 if _w66_requested() else _packed_pipeline_op
+    return op(
         [*pole_x, *pole_y, source_packed], list(parameters), "coarse_path",
         epsilon, gain_kind(gain_normalization), memory_policy == "recompute", False, planar_output,
     )[0]
@@ -1862,7 +1937,8 @@ def run_product_scan_coarse_path_collapse_planes_packed(
     _validate_coarse_cuda_drive(source_packed, gain_normalization)
     if source_packed.shape[1] % 2 or source_packed.shape[2] % 2:
         raise ValueError("coarse path collapse requires even spatial dimensions")
-    outputs = _packed_pipeline_planes_op(
+    op = _packed_pipeline_planes_op_w66 if _w66_requested() else _packed_pipeline_planes_op
+    outputs = op(
         [*pole_x, *pole_y, source_packed],
         list(parameters),
         "coarse_path",
