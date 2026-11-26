@@ -934,42 +934,6 @@ def _tensor_core_patch(  # noqa: ANN202
 
 
 @triton.jit
-def _stage0_row_patch(  # noqa: ANN202
-    x, row, H: tl.constexpr, W: tl.constexpr, M: tl.constexpr, CL: tl.constexpr,
-):
-    oh: tl.constexpr = (H + 1) // 2
-    ow: tl.constexpr = (W + 1) // 2
-    batch = row // oh
-    iy = 2 * (row % oh) - 1
-    # Stage each physical row with contiguous lanes. The gather then assembles
-    # overlapping windows from this CTA-local tile without rereading global x.
-    row_size: tl.constexpr = W * 3 if CL else W
-    pitch: tl.constexpr = triton.next_power_of_2(row_size)
-    size: tl.constexpr = pitch * (4 if CL else 16)
-    lane = tl.arange(0, size)
-    line = lane // pitch
-    col = lane % pitch
-    if CL:
-        y = iy + line
-        address = (batch * H + y) * row_size + col
-        lines: tl.constexpr = 3
-    else:
-        y = iy + line % 3
-        address = ((batch * 3 + line // 3) * H + y) * W + col
-        lines: tl.constexpr = 9
-    tile = tl.load(x + address, (line < lines) & (y >= 0) & (y < H) & (col < row_size), 0)
-
-    element = tl.arange(0, M * 32)
-    k = element % 32
-    ox = element // 32
-    ix = 2 * ox - 1 + k % 3
-    index = (k // 3 % 3) * pitch + 3 * ix + k // 9 if CL else (k // 3) * pitch + ix
-    valid = (k < 27) & (ox < ow) & (ix >= 0) & (ix < W)
-    patch = tl.gather(tile, tl.where(valid, index, 0), axis=0)
-    return tl.reshape(tl.where(valid, patch, 0), (M, 32))
-
-
-@triton.jit
 def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
     X,
     KERNEL,
@@ -991,9 +955,7 @@ def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
     BWD: tl.constexpr,
     M: tl.constexpr,
     K: tl.constexpr,
-    TILE_REDUCE: tl.constexpr,
     CHW: tl.constexpr,
-    ROW: tl.constexpr,
 ):
     k = tl.arange(0, K)
     c = tl.arange(0, CO)
@@ -1006,30 +968,16 @@ def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
         bias = tl.load(CB + c)
     if BWD:
         dw = tl.full((K, CO), 0, tl.float32)
-        if TILE_REDUCE:
-            dg = tl.full((M, CO), 0, tl.float32)
-            db = tl.full((M, CO), 0, tl.float32)
-            if BIAS:
-                dc = tl.full((M, CO), 0, tl.float32)
-        else:
-            dg = tl.full((CO,), 0, tl.float32)
-            db = tl.full((CO,), 0, tl.float32)
-            if BIAS:
-                dc = tl.full((CO,), 0, tl.float32)
-    ow: tl.constexpr = (W + 1) // 2
-    end: tl.constexpr = N // ow if ROW else N
-    step: tl.constexpr = 1 if ROW else M
-    stride = tl.num_programs(0) * step if BWD else end
-    for start in range(worker * step, end, stride):
-        if ROW:
-            pixel = start * ow + m
-            live = m < ow
-            a = _stage0_row_patch(X, start, H, W, M, CL)
-        else:
-            pixel = start + m
-            live = pixel < N
-            offset, valid = _tensor_core_patch(pixel, k, H, W, CI, CL, CHW)
-            a = tl.load(X + offset, valid & live[:, None], 0)
+        dg = tl.full((M, CO), 0, tl.float32)
+        db = tl.full((M, CO), 0, tl.float32)
+        if BIAS:
+            dc = tl.full((M, CO), 0, tl.float32)
+    stride = tl.num_programs(0) * M if BWD else N
+    for start in range(worker * M, N, stride):
+        pixel = start + m
+        live = pixel < N
+        offset, valid = _tensor_core_patch(pixel, k, H, W, CI, CL, CHW)
+        a = tl.load(X + offset, valid & live[:, None], 0)
         values = tl.dot(a, weights).to(X.dtype.element_ty).to(tl.float32)
         if BIAS:
             values += bias[None, :]
@@ -1057,26 +1005,20 @@ def stem_conv_tensor_stages(  # noqa: ANN201, C901, PLR0912, PLR0915
                 - norm * (tl.sum(projected * norm, 1)[:, None] / CO)
             ) * inv[:, None]
             dw = tl.dot(tl.trans(a), v.to(X.dtype.element_ty), dw)
-            if TILE_REDUCE:
-                dg += grad * norm
-                db += grad
-                if BIAS:
-                    dc += v
-            else:
-                dg += tl.sum(grad * norm, 0)
-                db += tl.sum(grad, 0)
-                if BIAS:
-                    dc += tl.sum(v, 0)
+            dg += grad * norm
+            db += grad
+            if BIAS:
+                dc += v
         else:
             tl.store(Y + output_offsets, affine * cdf, live[:, None])
     if BWD:
         fields: tl.constexpr = 9 * CI + 2 + BIAS
         dst = PART + worker * fields * CO
         tl.store(dst + k[:, None] * CO + c[None, :], dw, k[:, None] < 9 * CI)
-        tl.store(dst + 9 * CI * CO + c, tl.sum(dg, 0) if TILE_REDUCE else dg)
-        tl.store(dst + (9 * CI + 1) * CO + c, tl.sum(db, 0) if TILE_REDUCE else db)
+        tl.store(dst + 9 * CI * CO + c, tl.sum(dg, 0))
+        tl.store(dst + (9 * CI + 1) * CO + c, tl.sum(db, 0))
         if BIAS:
-            tl.store(dst + (9 * CI + 2) * CO + c, tl.sum(dc, 0) if TILE_REDUCE else dc)
+            tl.store(dst + (9 * CI + 2) * CO + c, tl.sum(dc, 0))
 
 
 @triton.jit
@@ -1132,7 +1074,6 @@ def _launch_tensor_core_stem(
     backward: bool,
     block: int = 32,
     warps: int = 4,
-    tile_reduce: bool = True,
     mode: str = "off",
 ) -> None:
     ci, h, width = x.shape[1:]
@@ -1160,22 +1101,16 @@ def _launch_tensor_core_stem(
         backward,
         block,
         triton.next_power_of_2(ci * 9),
-        tile_reduce,
         mode != "off",
-        mode == "triton_row_coalesced",
         num_warps=warps,
-        **({"num_stages": 2} if backward and mode in _V3_CONFIG else {}),
+        num_stages=2 if backward and mode in _V3_CONFIG else 3,
     )
 
 
 def _tensor_core_tiles(x: Tensor, mode: str, *, backward: bool) -> tuple[int, int]:
     ow = (x.shape[3] + 1) // 2
     rows = x.shape[0] * ((x.shape[2] + 1) // 2)
-    if mode == "triton_row_coalesced":
-        return triton.next_power_of_2(ow), rows
-    block = (64 if backward else 32) if mode == "off" else 128
-    if mode in _V3_CONFIG:
-        block = _V3_CONFIG[mode][2 if backward else 0]
+    block = _V3_CONFIG[mode][2 if backward else 0] if mode != "off" else (64 if backward else 32)
     return block, triton.cdiv(rows * ow, block)
 
 
@@ -1249,7 +1184,7 @@ def _tensor_core_conv_backward(
 ) -> None:
     block, tiles = _tensor_core_tiles(x, mode, backward=True)
     config = _V3_CONFIG.get(mode)
-    limit = config[4] if config else (1024 if mode == "off" else 528)
+    limit = config[4] if config else 1024
     workers = min(limit, tiles)
     ci, co = x.shape[1], g.numel()
     fields = ci * 9 + 2 + int(cb is not None)
@@ -1268,7 +1203,6 @@ def _tensor_core_conv_backward(
         workers,
         backward=True,
         block=block,
-        tile_reduce=mode == "off" or config is not None,
         warps=config[3] if config else 4,
         mode=mode,
     )
@@ -1377,72 +1311,6 @@ def _conv_autograd(
 _conv_forward.register_autograd(_conv_autograd, setup_context=_conv_save)
 
 
-@torch.library.custom_op("va_stem::stage0_cudnn_conv", mutates_args=(), device_types="cuda")
-def _stage0_cudnn_conv(x: Tensor, w: Tensor, bias: Tensor | None) -> Tensor:
-    result = functional.conv2d(x, w, bias, stride=2, padding=1)
-    return result.contiguous(memory_format=torch.channels_last)
-
-
-@_stage0_cudnn_conv.register_fake
-def _stage0_cudnn_conv_fake(x: Tensor, w: Tensor, bias: Tensor | None) -> Tensor:  # noqa: ARG001
-    shape = (x.shape[0], w.shape[0], (x.shape[2] + 1) // 2, (x.shape[3] + 1) // 2)
-    return torch.empty(shape, dtype=x.dtype, device=x.device, memory_format=torch.channels_last)
-
-
-@torch.library.custom_op("va_stem::stage0_cudnn_grad", mutates_args=(), device_types="cuda")
-def _stage0_cudnn_grad(
-    dy: Tensor, x: Tensor, w: Tensor, needs_dx: bool, needs_dw: bool, needs_dc: bool,
-) -> tuple[Tensor, Tensor, Tensor]:
-    dx, dw, dc = torch.ops.aten.convolution_backward.default(
-        dy, x, w, [w.shape[0]] if needs_dc else None, [2, 2], [1, 1],
-        [1, 1], False, [0, 0], 1, (needs_dx, needs_dw, needs_dc),  # noqa: FBT003
-    )
-    empty = x.new_empty(0)
-    return (
-        dx.contiguous(memory_format=torch.channels_last) if needs_dx else empty,
-        dw.contiguous(memory_format=torch.channels_last) if needs_dw else x.new_empty(0),
-        dc if needs_dc else x.new_empty(0),
-    )
-
-
-@_stage0_cudnn_grad.register_fake
-def _stage0_cudnn_grad_fake(
-    dy: Tensor,  # noqa: ARG001
-    x: Tensor, w: Tensor, needs_dx: bool, needs_dw: bool, needs_dc: bool,
-) -> tuple[Tensor, Tensor, Tensor]:
-    return (
-        torch.empty_like(x, memory_format=torch.channels_last) if needs_dx else x.new_empty(0),
-        torch.empty_like(w) if needs_dw else x.new_empty(0),
-        x.new_empty(w.shape[0] if needs_dc else 0),
-    )
-
-
-def _stage0_cudnn_save(ctx, inputs, output) -> None:  # noqa: ARG001
-    x, w, _ = inputs
-    ctx.save_for_backward(x, w)
-
-
-def _stage0_cudnn_autograd(ctx, dy: Tensor) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
-    x, w = ctx.saved_tensors
-    needs_dx, needs_dw, needs_dc = ctx.needs_input_grad
-    dx, dw, dc = _stage0_cudnn_grad(dy, x, w, needs_dx, needs_dw, needs_dc)
-    return dx if needs_dx else None, dw if needs_dw else None, dc if needs_dc else None
-
-
-_stage0_cudnn_conv.register_autograd(_stage0_cudnn_autograd, setup_context=_stage0_cudnn_save)
-
-
-def _stage0_cudnn_fused(
-    x: Tensor, w: Tensor, cb: Tensor | None, gamma: Tensor, beta: Tensor,
-    eps: float, dtype: torch.dtype,
-) -> Tensor:
-    weight = w.to(dtype=dtype, memory_format=torch.channels_last)
-    values = _stage0_cudnn_conv(x.to(dtype), weight, cb.to(dtype) if cb is not None else None)
-    pixels = values.permute(0, 2, 3, 1).contiguous()
-    result = fused_nhwc_layernorm_gelu(pixels, gamma, beta, eps, nchw=False, output_dtype=dtype)
-    return result.permute(0, 3, 1, 2)
-
-
 def fused_conv_stem(
     inputs: Tensor,
     weight: Tensor,
@@ -1456,9 +1324,15 @@ def fused_conv_stem(
     mode: str = "off",
 ) -> Tensor:
     """Run the small-input stem with Wave 21C rounding boundaries."""
-    mode = resolve_stage0_candidate(mode, needs_dx=inputs.requires_grad, width=inputs.shape[3])
-    if mode == "cudnn_fused":
-        return _stage0_cudnn_fused(inputs, weight, conv_bias, gamma, beta, eps, dtype)
+    if tiled_geometry is not None:
+        raise ValueError("Stage 0 requires the standard convolution geometry")
+    if inputs.requires_grad and mode != "off":
+        # The parameter-gradient-only Triton kernel delegates input gradients to ATen.
+        values = functional.conv2d(inputs.to(dtype), weight.to(dtype=dtype, memory_format=torch.channels_last),
+                                   conv_bias.to(dtype) if conv_bias is not None else None, stride=2, padding=1)
+        pixels = values.permute(0, 2, 3, 1).contiguous()
+        return fused_nhwc_layernorm_gelu(pixels, gamma, beta, eps, nchw=False,
+                                         output_dtype=dtype).permute(0, 3, 1, 2)
     co, ci = weight.shape[:2]
     order = (1, 2, 3, 0) if mode != "off" else (2, 3, 1, 0)
     packed = weight.to(dtype).permute(order).reshape(9 * ci, co).contiguous()
@@ -1470,311 +1344,20 @@ def fused_conv_stem(
         conv_bias.float().contiguous() if conv_bias is not None else None,
         eps,
     )
-    if tiled_geometry is None:
-        y, _ = _conv_forward(*args, mode)
-    else:
-        y, _ = _tiled_forward(*args, *tiled_geometry)
+    y, _ = _conv_forward(*args, mode)
     return y.permute(0, 3, 1, 2)
-
-
-# Four warps share a 4x8 tile. Each lane owns one output channel and its
-# weight-gradient accumulators throughout the persistent backward loop.
-_TILED_CONV_CUDA = r"""
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-using T = SCALAR;
-constexpr int th = SH <= 4 ? 4 : 1, tw = SW <= 4 ? 8 : 1;
-constexpr int hh = (th - 1) * SH + 3, hw = (tw - 1) * SW + 3;
-constexpr int taps = 9 * CI, fields = taps + 2 + HAS_BIAS;
-
-__device__ __forceinline__ float warp_sum(float v) {
-    #pragma unroll
-    for (int offset = 16; offset; offset /= 2)
-        v += __shfl_xor_sync(0xffffffff, v, offset);
-    return v;
-}
-
-template<bool Backward>
-__device__ __forceinline__ void tiled(
-    const T* x, const T* w, const float* g, const float* b, const float* cb,
-    const T* dy, T* y, float2* stats, float* partial,
-    int h, int wi, int oh, int ow, long long n, float eps, int ph, int pw
-) {
-    __shared__ float halo[hh * hw * CI];
-    __shared__ float weights[taps][32];
-    __shared__ float scratch[4][32];
-    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    for (int i = tid; i < taps * 32; i += 128)
-        weights[i / 32][i % 32] = float(w[i]);
-    const float gamma = g[lane], beta = b[lane];
-    const float bias = HAS_BIAS ? cb[lane] : 0.f;
-    float dw[taps] = {}, dg = 0.f, db = 0.f, dc = 0.f;
-    const int tiles_h = (oh + th - 1) / th, tiles_w = (ow + tw - 1) / tw;
-    const int image_tiles = tiles_h * tiles_w;
-    const long long tiles = n / (static_cast<long long>(oh) * ow) * image_tiles;
-    for (long long tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
-        const long long batch = tile / image_tiles;
-        const int local = tile % image_tiles;
-        const int row = local / tiles_w * th, col = local % tiles_w * tw;
-        for (int i = tid; i < hh * hw * CI; i += 128) {
-            const int r = SH * row - ph + i / (hw * CI);
-            const int s = SW * col - pw + i / CI % hw;
-            const int ci = i % CI;
-            const long long offset = CHANNELS_LAST
-                ? ((batch * h + r) * wi + s) * CI + ci
-                : ((batch * CI + ci) * h + r) * wi + s;
-            halo[i] = r >= 0 && s >= 0 && r < h && s < wi ? float(x[offset]) : 0.f;
-        }
-        __syncthreads();
-        for (int p = warp; p < th * tw; p += 4) {
-            const int r = row + p / tw, s = col + p % tw;
-            if (r >= oh || s >= ow) continue;
-            const long long pixel = (batch * oh + r) * ow + s;
-            const int origin = (SH * (p / tw) * hw + SW * (p % tw)) * CI;
-            float value = 0.f;
-            #pragma unroll
-            for (int k = 0; k < taps; ++k) {
-                const int offset = (k / (3 * CI) * hw + k / CI % 3) * CI + k % CI;
-                value = fmaf(halo[origin + offset], weights[k][lane], value);
-            }
-            value = float(T(value)) + bias;
-            float mean, inverse;
-            if constexpr (Backward) {
-                const float2 stat = stats[pixel];
-                mean = stat.x;
-                inverse = stat.y;
-            } else {
-                mean = warp_sum(value) / 32.f;
-                const float centered = value - mean;
-                inverse = rsqrtf(warp_sum(centered * centered) / 32.f + eps);
-                if (lane == 0) stats[pixel] = make_float2(mean, inverse);
-            }
-            const float norm = (value - mean) * inverse;
-            const float affine = fmaf(norm, gamma, beta);
-            const float cdf = .5f * (1.f + erff(affine * .7071067811865476f));
-            if constexpr (Backward) {
-                const float grad = float(dy[pixel * 32 + lane])
-                    * (cdf + affine * .3989422804014327f * expf(-.5f * affine * affine));
-                const float projected = grad * gamma;
-                const float delta = (projected - warp_sum(projected) / 32.f
-                    - norm * (warp_sum(projected * norm) / 32.f)) * inverse;
-                dg = fmaf(grad, norm, dg);
-                db += grad;
-                dc += delta;
-                const float rounded = float(T(delta));
-                #pragma unroll
-                for (int k = 0; k < taps; ++k) {
-                    const int offset = (k / (3 * CI) * hw + k / CI % 3) * CI + k % CI;
-                    dw[k] = fmaf(halo[origin + offset], rounded, dw[k]);
-                }
-            } else {
-                y[pixel * 32 + lane] = T(affine * cdf);
-            }
-        }
-        __syncthreads();
-    }
-    if constexpr (Backward) {
-        #pragma unroll
-        for (int k = 0; k < fields; ++k) {
-            scratch[warp][lane] = k < taps ? dw[k] : (k == taps ? dg : (k == taps + 1 ? db : dc));
-            __syncthreads();
-            if (warp == 0)
-                partial[(blockIdx.x * fields + k) * 32 + lane] =
-                    (scratch[0][lane] + scratch[1][lane]) + (scratch[2][lane] + scratch[3][lane]);
-            __syncthreads();
-        }
-    }
-}
-
-extern "C" __global__ void stem_tiled_forward(
-    const T* x, const T* w, const float* g, const float* b, const float* cb,
-    T* y, float2* stats, int h, int wi, int oh, int ow, long long n, float eps, int ph, int pw
-) {
-    tiled<false>(x, w, g, b, cb, nullptr, y, stats, nullptr, h, wi, oh, ow, n, eps, ph, pw);
-}
-
-extern "C" __global__ void stem_tiled_backward(
-    const T* x, const T* w, const float* g, const float* b, const float* cb,
-    const T* dy, float2* stats, float* partial,
-    int h, int wi, int oh, int ow, long long n, float eps, int ph, int pw
-) {
-    tiled<true>(x, w, g, b, cb, dy, nullptr, stats, partial, h, wi, oh, ow, n, eps, ph, pw);
-}
-
-extern "C" __global__ void stem_tiled_reduce(
-    const float* partial, T* dw, float* dg, float* db, float* dc, int workers
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= fields * 32) return;
-    float sum = 0.f;
-    for (int j = 0; j < workers; ++j)
-        sum += partial[j * fields * 32 + i];
-    const int k = i / 32, c = i % 32;
-    if (k < taps) dw[i] = T(sum);
-    else if (k == taps) dg[c] = sum;
-    else if (k == taps + 1) db[c] = sum;
-    else if constexpr (HAS_BIAS) dc[c] = sum;
-}
-"""
-
-
-def _compile_tiled_stem_ptx(
-    capability: tuple[int, int], dtype: torch.dtype, ci: int,
-    channels_last: bool, has_bias: bool, sh: int = 2, sw: int = 2,
-) -> ct.Array:
-    header = (
-        f"#define SCALAR {_TYPES[dtype]}\n#define CI {ci}\n"
-        f"#define CHANNELS_LAST {int(channels_last)}\n#define HAS_BIAS {int(has_bias)}\n"
-        f"#define SH {sh}\n#define SW {sw}\n"
-    )
-    return _compile_source(capability, header + _TILED_CONV_CUDA)
-
-
-@cache
-def _tiled_stem_module(
-    device: int, dtype: torch.dtype, ci: int,
-    channels_last: bool, has_bias: bool, sh: int, sw: int,
-) -> _CudaModule:
-    image = _compile_tiled_stem_ptx(
-        torch.cuda.get_device_capability(device), dtype, ci, channels_last, has_bias, sh, sw
-    )
-    module = _CudaModule(image, device)
-    for name in ("stem_tiled_forward", "stem_tiled_backward", "stem_tiled_reduce"):
-        module.load_function(name, 0)
-    return module
 
 
 # Forward rows/warps, backward rows/warps, persistent worker limit.
 _V3_CONFIG = {
     "triton_v3_m64_w4": (128, 4, 64, 4, 1056),
-    "triton_v3_m32_w4": (128, 4, 32, 4, 2112),
-    "triton_v3_m32_w4_4k": (128, 4, 32, 4, 4224),
-    "triton_v3_m64_w8": (128, 4, 64, 8, 1056),
-    "triton_v3_m128_w8": (128, 8, 128, 8, 1056),
-    "triton_v3_m64_2k": (256, 8, 64, 4, 2112),
 }
-STAGE0_CANDIDATES = ("cudnn_fused", "triton_row_coalesced", "triton_tuned_v2", *_V3_CONFIG)
+STAGE0_CANDIDATES = tuple(_V3_CONFIG)
 
 
 def stem_stage0_mode() -> str:
     mode = os.environ.get("LNET_STEM_STAGE0_MODE", "off")
-    modes = ("off", "cuda_tiled", "auto", *STAGE0_CANDIDATES)
+    modes = ("off", *STAGE0_CANDIDATES)
     if mode not in modes:
         raise ValueError(f"LNET_STEM_STAGE0_MODE must be one of {', '.join(modes)}")
     return mode
-
-
-def tiled_stem_enabled() -> bool:
-    # #854: the tiled stage-0 stem cost +6.31 ms on H200.
-    return stem_stage0_mode() == "cuda_tiled"
-
-
-def resolve_stage0_candidate(mode: str, *, needs_dx: bool, width: int) -> str:
-    if mode in STAGE0_CANDIDATES[1:] and needs_dx:
-        return "cudnn_fused"
-    if mode == "triton_row_coalesced" and not 31 < width <= 256:
-        return "triton_tuned_v2"
-    return mode
-
-
-def _tiled_stem_shape(x: Tensor, sh: int, sw: int, ph: int, pw: int) -> tuple:
-    oh = (x.shape[2] + 2 * ph - 3) // sh + 1
-    ow = (x.shape[3] + 2 * pw - 3) // sw + 1
-    return x.shape[0], oh, ow, 32
-
-
-def _tiled_stem_setup(
-    x: Tensor, cb: Tensor | None, eps: float, sh: int, sw: int, ph: int, pw: int,
-) -> tuple:
-    batch, oh, ow, _ = _tiled_stem_shape(x, sh, sw, ph, pw)
-    device = x.device.index or 0
-    module = _tiled_stem_module(
-        device, x.dtype, x.shape[1], x.is_contiguous(memory_format=torch.channels_last),
-        cb is not None, sh, sw,
-    )
-    _ensure_context(module.driver, device)
-    tiles = batch * triton.cdiv(oh, 4 if sh <= 4 else 1) * triton.cdiv(ow, 8 if sw <= 4 else 1)
-    sizes = (
-        ct.c_int(x.shape[2]), ct.c_int(x.shape[3]), ct.c_int(oh), ct.c_int(ow),
-        ct.c_longlong(batch * oh * ow), ct.c_float(eps), ct.c_int(ph), ct.c_int(pw),
-    )
-    return module, torch.cuda.current_stream(x.device).cuda_stream, tiles, sizes
-
-
-@torch.library.custom_op("va_stem::tiled_forward", mutates_args=(), device_types="cuda")
-def _tiled_forward(
-    x: Tensor, w: Tensor, g: Tensor, b: Tensor, cb: Tensor | None,
-    eps: float, sh: int, sw: int, ph: int, pw: int,
-) -> tuple[Tensor, Tensor]:
-    y, stats = _tiled_forward_fake(x, w, g, b, cb, eps, sh, sw, ph, pw)
-    if y.numel():
-        with torch.cuda.device(x.device):
-            module, stream, tiles, sizes = _tiled_stem_setup(x, cb, eps, sh, sw, ph, pw)
-            _launch(
-                module, stream, "stem_tiled_forward", min(tiles, _MAX_FORWARD_BLOCKS),
-                (x, w, g, b, cb, y, stats), *sizes,
-            )
-    return y, stats
-
-
-@_tiled_forward.register_fake
-def _tiled_forward_fake(
-    x: Tensor, w: Tensor, g: Tensor, b: Tensor, cb: Tensor | None,  # noqa: ARG001
-    eps: float, sh: int, sw: int, ph: int, pw: int,  # noqa: ARG001
-) -> tuple[Tensor, Tensor]:
-    shape = _tiled_stem_shape(x, sh, sw, ph, pw)
-    return x.new_empty(shape), x.new_empty((*shape[:-1], 2), dtype=torch.float32)
-
-
-@torch.library.custom_op("va_stem::tiled_backward", mutates_args=(), device_types="cuda")
-def _tiled_backward(
-    x: Tensor, w: Tensor, g: Tensor, b: Tensor, cb: Tensor | None,
-    dy: Tensor, stats: Tensor, eps: float, sh: int, sw: int, ph: int, pw: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    if not dy.numel():
-        return (
-            torch.zeros_like(w), torch.zeros_like(g), torch.zeros_like(b),
-            torch.zeros_like(cb) if cb is not None else g.new_empty(0),
-        )
-    dw, dg, db, dc = _conv_backward_fake(x, w, g, b, cb, dy, stats, eps)
-    with torch.cuda.device(x.device):
-        module, stream, tiles, sizes = _tiled_stem_setup(x, cb, eps, sh, sw, ph, pw)
-        workers = min(tiles, 1024)
-        fields = 9 * x.shape[1] + 2 + int(cb is not None)
-        partial = g.new_empty((workers, fields, 32))
-        _launch(
-            module, stream, "stem_tiled_backward", workers,
-            (x, w, g, b, cb, dy, stats, partial), *sizes,
-        )
-        _launch(
-            module, stream, "stem_tiled_reduce", triton.cdiv(fields * 32, _THREADS),
-            (partial, dw, dg, db, dc), ct.c_int(workers),
-        )
-    return dw, dg, db, dc
-
-
-@_tiled_backward.register_fake
-def _tiled_backward_fake(
-    x: Tensor, w: Tensor, g: Tensor, b: Tensor, cb: Tensor | None,
-    dy: Tensor, stats: Tensor, eps: float, sh: int, sw: int, ph: int, pw: int,  # noqa: ARG001
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    return _conv_backward_fake(x, w, g, b, cb, dy, stats, eps)
-
-
-def _tiled_save(ctx, inputs, output) -> None:
-    x, w, g, b, cb, *ctx.geometry = inputs
-    _, stats = output
-    ctx.mark_non_differentiable(stats)
-    ctx.set_materialize_grads(False)
-    ctx.save_for_backward(x, w, g, b, cb, stats)
-
-
-def _tiled_autograd(ctx, dy: Tensor | None, dstats: Tensor | None) -> tuple:  # noqa: ARG001
-    if dy is None:
-        return (None,) * 10
-    x, w, g, b, cb, stats = ctx.saved_tensors
-    dw, dg, db, dc = _tiled_backward(x, w, g, b, cb, dy.contiguous(), stats, *ctx.geometry)
-    return None, dw, dg, db, dc if cb is not None else None, None, None, None, None, None
-
-
-_tiled_forward.register_autograd(_tiled_autograd, setup_context=_tiled_save)

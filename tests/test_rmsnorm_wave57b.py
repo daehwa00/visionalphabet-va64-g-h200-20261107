@@ -6,11 +6,18 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from bench_wave56b_pointwise_type1 import errors
 from lnet import model_w29c as ops
 
 
 FLAGS = ((True, True), (True, False), (False, True))
+
+
+def errors(actual, reference):
+    return [
+        ((x.float() - y.float()).norm() / y.float().norm().clamp_min(1e-12)).item()
+        for x, y in zip(actual, reference, strict=True)
+    ]
+
 
 
 def test_dispatch(monkeypatch):
@@ -142,31 +149,16 @@ def test_device(monkeypatch, mode, dtype, tol):
                 assert max(errors(captured, actual)) <= tol
 
 
-def test_swiglu_best(monkeypatch):
-    monkeypatch.setenv("LNET_MODEL_W56B", "swiglu_best")
-    monkeypatch.delenv("LNET_MODEL_W57B_RMS", raising=False)
-    monkeypatch.setattr(ops, "_off_swiglu", lambda x: "off")
-    monkeypatch.setattr(ops, "_tuned_swiglu", lambda x, mode: mode)
-    monkeypatch.setattr(ops, "_tuned_swiglu_backward", lambda x, grad, mode: mode)
-    monkeypatch.setattr(ops, "_off_rms_bwd", lambda *args, **kwargs: "off")
-    for width in (96, 144, 192, 384):
-        joint = torch.empty(1, 2 * width)
-        assert ops.packed_swiglu_vec2d(joint) == ("off" if width <= 96 else "cuda_vec8_tanh")
-        assert ops._swiglu_vec2d_backward(joint, joint) == "cuda_vec8_tanh"
-    assert ops._channel_rmsnorm_backward(None, None, None, None, need_dx=True, need_dw=True) == "off"
-
-
 def test_lockin_dispatch(monkeypatch):
     monkeypatch.setenv("LNET_MODEL_W56B", "swiglu_vec8_tanh")
-    monkeypatch.setattr(ops, "_tuned_swiglu", lambda joint, mode: mode)
-    monkeypatch.setattr(ops, "_tuned_swiglu_backward", lambda joint, grad, mode: mode)
+    monkeypatch.setattr(ops, "_tuned_swiglu", lambda joint: "forward")
+    monkeypatch.setattr(ops, "_vec_swiglu", lambda joint, grad, backward: backward)
     monkeypatch.setattr(ops, "_off_rms_bwd", lambda *args, **kwargs: "off")
     monkeypatch.setattr(ops, "_sp_rms", lambda *args: args[-1])
-    monkeypatch.setattr(ops, "_vec_rms", lambda *args: pytest.fail("two-pass RMSNorm"))
     for rms in ("off", "cuda_sp_vec8_4cta"):
         monkeypatch.setenv("LNET_MODEL_W57B_RMS", rms)
-        assert ops.packed_swiglu_vec2d(None) == "cuda_vec8_tanh"
-        assert ops._swiglu_vec2d_backward(None, None) == "cuda_vec8_tanh"
+        assert ops.packed_swiglu_vec2d(None) == "forward"
+        assert ops._swiglu_vec2d_backward(None, None) is True
         assert ops._channel_rmsnorm_backward(None, None, None, None, need_dx=True, need_dw=True) == rms
 
 

@@ -1,33 +1,177 @@
 """Stage 0 launch geometry, offline Hopper compilation and CUDA selftests."""
 
+from __future__ import annotations
+
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 
-import bench_wave53b_stem_type1 as bench
 import pytest
 import torch
-from bench_wave52b_stem_type1 import reference_gradients
-from bench_wave53b_stem_type1 import DTYPES, LAYOUTS, MODES, check_case, check_large_reductions
+from torch import Tensor, nn
+from torch.nn import functional
 
 from lnet import fused_stem_ops as stem
+from lnet.fused_stem_ops import STAGE0_CANDIDATES, stem_conv_tensor_reduce
 from lnet.image_layers import LayerNorm2d, _fused_stem_block
 
-V3 = MODES[2:]
+MODES = ("off", *STAGE0_CANDIDATES)
+DTYPES = (torch.bfloat16, torch.float16)
+LAYOUTS = {"nchw": torch.contiguous_format, "channels_last": torch.channels_last}
+
+
+def stem_case(
+    shape: tuple[int, int, int, int],
+    layout: torch.memory_format,
+    dtype: torch.dtype,
+    *,
+    needs_dx: bool,
+) -> tuple[Tensor, nn.Conv2d, LayerNorm2d, Tensor]:
+    torch.manual_seed(185)
+    x = torch.randn(shape, device="cuda").to(dtype).contiguous(memory_format=layout)
+    x.requires_grad_(needs_dx)
+    conv = nn.Conv2d(3, 32, 3, stride=2, padding=1, device="cuda")
+    norm = LayerNorm2d(32).cuda()
+    dy = torch.randn_like(x[:, :1, ::2, ::2].expand(-1, 32, -1, -1))
+    return x, conv, norm, dy
+
+
+def stem_forward(conv: nn.Conv2d, norm: LayerNorm2d, dtype: torch.dtype) -> Callable:
+    def forward(x: Tensor) -> Tensor:
+        with torch.autocast("cuda", dtype=dtype):
+            return _fused_stem_block(x, conv, norm)
+
+    return forward
+
+
+def stem_parameters(
+    x: Tensor, conv: nn.Conv2d, norm: LayerNorm2d,
+) -> tuple[Tensor, ...]:
+    params = (conv.weight, norm.norm.weight, norm.norm.bias)
+    if conv.bias is not None:
+        params += (conv.bias,)
+    return (*params, x) if x.requires_grad else params
+
+
+def reference_gradients(
+    x: Tensor, conv: nn.Conv2d, norm: LayerNorm2d, dy: Tensor,
+) -> tuple[Tensor, ...]:
+    x_fp32 = x.detach().float().requires_grad_(x.requires_grad)
+    z = functional.conv2d(x_fp32, conv.weight, conv.bias, stride=2, padding=1)
+    z = functional.layer_norm(
+        z.permute(0, 2, 3, 1), (32,), norm.norm.weight, norm.norm.bias, norm.norm.eps,
+    )
+    y = functional.gelu(z).permute(0, 3, 1, 2)
+    grads = torch.autograd.grad(y, stem_parameters(x_fp32, conv, norm), dy.float())
+    return (y.detach(), *grads)
+
+
+def run_step(
+    forward: Callable, x: Tensor, params: tuple[Tensor, ...], dy: Tensor,
+) -> tuple[Tensor, ...]:
+    y = forward(x)
+    grads = torch.autograd.grad(y, params, dy)
+    return (y.detach(), *grads)
+
+
+def graph_finite(fn: Callable[[], tuple[Tensor, ...]]) -> bool:
+    torch.cuda.synchronize()
+    warmup = torch.cuda.Stream()
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            # Drop each warmup result before capture on this stream.
+            fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=warmup):
+        result = fn()
+    graph.replay()
+    torch.cuda.synchronize()
+    return all(bool(t.isfinite().all()) for t in result)
+
+
+def check_large_reductions() -> None:
+    # Integer-valued FP32 partials have an exact sum for all worker counts.
+    for workers in (1056,):
+        for bias in (False, True):
+            fields = 29 + int(bias)
+            partial = torch.randint(-2, 3, (workers, fields, 32), device="cuda").float()
+            dw = partial.new_empty((27, 32), dtype=torch.bfloat16)
+            dg, db, dc = (partial.new_empty(32) for _ in range(3))
+            stem_conv_tensor_reduce[(fields,)](partial, dw, dg, db, dc, 3, 32, bias, workers, 256)
+            ref = partial.sum(0)
+            torch.testing.assert_close(dw, ref[:27].to(dw.dtype), rtol=0, atol=0)
+            torch.testing.assert_close(dg, ref[27], rtol=0, atol=0)
+            torch.testing.assert_close(db, ref[28], rtol=0, atol=0)
+            if bias:
+                torch.testing.assert_close(dc, ref[29], rtol=0, atol=0)
+
+
+def check_case(
+    layout: torch.memory_format, dtype: torch.dtype, *, needs_dx: bool, bias: bool
+) -> dict:
+    x, conv, norm, dy = stem_case((4, 3, 33, 63), layout, dtype, needs_dx=needs_dx)
+    if not bias:
+        conv.bias = None
+    forward = stem_forward(conv, norm, dtype)
+    params = stem_parameters(x, conv, norm)
+    x_ref = x.detach().float().requires_grad_(needs_dx)
+    z = functional.conv2d(x_ref, conv.weight, conv.bias, stride=2, padding=1)
+    z = functional.layer_norm(
+        z.permute(0, 2, 3, 1), (32,), norm.norm.weight, norm.norm.bias, norm.norm.eps
+    )
+    y = functional.gelu(z).permute(0, 3, 1, 2)
+    ref_params = stem_parameters(x_ref, conv, norm)
+    ref_grads = torch.autograd.grad(y, ref_params, dy.float())
+    expected = (y.detach(), *ref_grads)
+    del y, z, x_ref, ref_grads, ref_params
+    eager = run_step(forward, x, params, dy)
+    names = ["y", "dw", "dg", "db"] + (["dc"] if bias else []) + (["dx"] if needs_dx else [])
+
+    def check_relative_l2(actual, reference, limit, comparison):
+        errors = {
+            name: float((a.float() - r.float()).norm() / r.float().norm().clamp_min(1e-8))
+            for name, a, r in zip(names, actual, reference, strict=True)
+        }
+        if not all(v < limit for v in errors.values()):
+            raise AssertionError(f"{comparison} (limit {limit}): {errors}")
+        return errors
+
+    limit = 0.04 if dtype == torch.bfloat16 else 0.008
+    errors = check_relative_l2(eager, expected, limit, "eager vs FP32")
+    torch._dynamo.reset()
+    compiled_aot = torch.compile(forward, backend="aot_eager", fullgraph=True)
+    torch.testing.assert_close(run_step(compiled_aot, x, params, dy), eager)
+    if x.is_cuda:
+        compiled = torch.compile(forward, fullgraph=True)
+        compiled_outputs = run_step(compiled, x, params, dy)
+        check_relative_l2(compiled_outputs, expected, limit, "Inductor vs FP32")
+        eager_limit = 0.015 if dtype == torch.bfloat16 else 0.005
+        check_relative_l2(compiled_outputs, eager, eager_limit, "Inductor vs eager")
+        del compiled_outputs
+    if not graph_finite(lambda: run_step(forward, x, params, dy)):
+        raise AssertionError("Nonfinite CUDA Graph replay")
+    return {
+        "dtype": str(dtype),
+        "needs_dx": needs_dx,
+        "bias": bias,
+        "relative_l2": errors,
+        "compile_fullgraph": True,
+        "cuda_graph_finite": True,
+    }
+
+
+V3 = STAGE0_CANDIDATES
 
 
 @pytest.mark.parametrize("mode", V3)
 def test_config(mode, monkeypatch) -> None:
     monkeypatch.setenv("LNET_STEM_STAGE0_MODE", mode)
     assert stem.stem_stage0_mode() == mode
-    for width in (223, 224):
-        assert stem.resolve_stage0_candidate(mode, needs_dx=False, width=width) == mode
-        assert stem.resolve_stage0_candidate(mode, needs_dx=True, width=width) == "cudnn_fused"
     x = torch.empty((1024, 3, 224, 224), device="meta")
     f, fw, b, bw, workers = stem._V3_CONFIG[mode]
-    assert workers in (1056, 2112, 4224)
-    assert fw in (4, 8)
-    assert bw in (4, 8)
+    assert (f, fw, b, bw, workers) == (128, 4, 64, 4, 1056)
     for backward, block in ((False, f), (True, b)):
         assert stem._tensor_core_tiles(x, mode, backward=backward) == (
             block,
@@ -41,8 +185,8 @@ def test_cpu_check_case_has_no_grad_fn_at_capture(monkeypatch) -> None:
     norm = LayerNorm2d(32)
     dy = torch.randn(1, 32, 3, 4)
     assert all(t.grad_fn is None for t in reference_gradients(x, conv, norm, dy))
-    monkeypatch.setattr(bench, "stem_case", lambda *args, **kwargs: (x, conv, norm, dy))
-    monkeypatch.setattr(bench, "stem_forward", lambda *_: lambda v: _fused_stem_block(v, conv, norm))
+    monkeypatch.setattr(sys.modules[__name__], "stem_case", lambda *args, **kwargs: (x, conv, norm, dy))
+    monkeypatch.setattr(sys.modules[__name__], "stem_forward", lambda *_: lambda v: _fused_stem_block(v, conv, norm))
     captures = []
 
     def capture_probe(step):
@@ -54,7 +198,7 @@ def test_cpu_check_case_has_no_grad_fn_at_capture(monkeypatch) -> None:
         captures.append(True)
         return True
 
-    monkeypatch.setattr(bench, "graph_finite", capture_probe)
+    monkeypatch.setattr(sys.modules[__name__], "graph_finite", capture_probe)
     check_case(torch.contiguous_format, torch.float32, needs_dx=True, bias=True)
     assert captures == [True]
 
@@ -66,10 +210,10 @@ def test_cpu_check_case_compile_parity(dtype, scenario, monkeypatch):
     conv = torch.nn.Conv2d(3, 32, 3, stride=2, padding=1)
     norm = LayerNorm2d(32)
     dy = torch.ones(1, 32, 3, 4)
-    monkeypatch.setattr(bench, "stem_case", lambda *args, **kwargs: (x, conv, norm, dy))
+    monkeypatch.setattr(sys.modules[__name__], "stem_case", lambda *args, **kwargs: (x, conv, norm, dy))
     # Exercise the CUDA-only decision with CPU operators and controlled FP32 dw differences.
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda tensor: tensor is x))
-    monkeypatch.setattr(bench, "stem_forward", lambda *_: lambda v: _fused_stem_block(v, conv, norm))
+    monkeypatch.setattr(sys.modules[__name__], "stem_forward", lambda *_: lambda v: _fused_stem_block(v, conv, norm))
     backends = []
     eager_limit = 0.015 if dtype == torch.bfloat16 else 0.005
     ref_limit = 0.04 if dtype == torch.bfloat16 else 0.008
@@ -83,7 +227,7 @@ def test_cpu_check_case_compile_parity(dtype, scenario, monkeypatch):
         backend = "eager"
         if isinstance(forward, tuple):
             forward, backend = forward
-        y, dw, *rest = run_step(forward, *args)
+        y, dw, *rest = original_step(forward, *args)
         shift = ref_limit - eager_limit / 4 if scenario == "expected" else 0
         if backend == "aot_eager" and scenario == "aot":
             shift += eager_limit / 2
@@ -91,10 +235,10 @@ def test_cpu_check_case_compile_parity(dtype, scenario, monkeypatch):
             shift += eager_limit * (1.25 if scenario == "eager" else 0.5)
         return (y, dw * (1 + shift), *rest)
 
-    run_step = bench.run_step
+    original_step = run_step
     monkeypatch.setattr(torch, "compile", compile_probe)
-    monkeypatch.setattr(bench, "run_step", step)
-    monkeypatch.setattr(bench, "graph_finite", lambda _: True)
+    monkeypatch.setattr(sys.modules[__name__], "run_step", step)
+    monkeypatch.setattr(sys.modules[__name__], "graph_finite", lambda _: True)
     if scenario == "pass":
         check_case(torch.contiguous_format, dtype, needs_dx=False, bias=True)
     else:
@@ -171,17 +315,14 @@ def test_sm90_stage(mode, bwd, cl, bias, tmp_path) -> None:
             b if bwd else f,
             32,
             True,
-            True,
-            False,
         ],
         bw if bwd else fw,
         2 if bwd else 3,
         tmp_path,
-        (24, 12) if bwd and bias and mode == "triton_v3_m128_w8" else (0, 0),
     )
 
 
-@pytest.mark.parametrize("workers", [1024, 1056, 2112, 4224])
+@pytest.mark.parametrize("workers", [1024, 1056])
 @pytest.mark.parametrize("bias", [False, True])
 def test_sm90_reduce(workers, bias, tmp_path) -> None:
     _compile(

@@ -7,8 +7,16 @@ import pytest
 import torch
 from torch.nn import functional
 
-from lnet.fused_stem_ops import fused_nhwc_layernorm_gelu
+from lnet.fused_stem_ops import fused_nhwc_layernorm_gelu, stem_stage0_mode
 from lnet.image_layers import ModeScaledTwoConvStem, _fused_stem_enabled, _fused_stem_large_enough
+
+
+def test_stage0_policy(monkeypatch) -> None:
+    monkeypatch.delenv("LNET_STEM_STAGE0_MODE", raising=False)
+    assert stem_stage0_mode() == "off"
+    monkeypatch.setenv("LNET_STEM_STAGE0_MODE", "unknown")
+    with pytest.raises(ValueError, match="LNET_STEM_STAGE0_MODE"):
+        stem_stage0_mode()
 
 
 def test_fused_stem_default_and_opt_out(monkeypatch) -> None:
