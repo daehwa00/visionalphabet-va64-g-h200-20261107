@@ -15,6 +15,7 @@ from torch import Tensor
 from torch.library import triton_op
 
 from . import w66_split_bf16_scan as w66
+from . import w72_split_fp8_scan as w72
 from .general_cuda_scans import (
     _general_vertical_inputs,
     _should_save_vscan,
@@ -53,6 +54,7 @@ from .product_scan_ops import (
     _product_scan_full16_op,
     _product_scan_path_collapse_backward_op,
     _product_scan_path_collapse_op,
+    select_split_scan_op,
     triton_product_scan_coarse4,
     triton_product_scan_descriptor4,
     triton_product_scan_full16,
@@ -1183,6 +1185,7 @@ def _run_packed_cuda_forward(
     recompute: bool,
     path_swiglu: bool,
     *,
+    fp8: bool = False,
     packed_output: bool,
     planar_output: bool,
     squeeze_collapsed: bool,
@@ -1190,9 +1193,11 @@ def _run_packed_cuda_forward(
     pole_x = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[:4]))
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
-    split = w66.enabled(source[0], path, epilogue, kind, path_swiglu)
+    scan = w72 if fp8 else w66
+    split = fp8 or w66.enabled(source[0], path, epilogue, kind, path_swiglu)
     horizontal_storage = (
-        w66.hforward(list(pole_x), *source) if split else _packed_horizontal_forward(pole_x, source)
+        scan.hforward(list(pole_x), *source) if split
+        else _packed_horizontal_forward(pole_x, source)
     )
     auxiliary = static_product_scan_auxiliary(
         pole_x,
@@ -1206,10 +1211,10 @@ def _run_packed_cuda_forward(
         args = (list(pole_y), source[0], horizontal_storage, list(auxiliary[:2]), path,
                 epilogue == "coarse_path")
         if packed_output:
-            primary = w66.vforward(*args, planar_output, epsilon)
+            primary = scan.vforward(*args, planar_output, epsilon)
             secondary = primary.new_empty((0,))
         else:
-            primary, secondary = w66.vforward_planes(*args, epsilon)
+            primary, secondary = scan.vforward_planes(*args, epsilon)
         descriptor = primary.new_empty((0,), dtype=torch.float32)
         return primary, secondary, descriptor, ([] if recompute else [horizontal_storage])
 
@@ -1312,6 +1317,7 @@ def _run_packed_cuda_backward(
     kind: int,
     path_swiglu: bool,
     *,
+    fp8: bool = False,
     packed_output: bool,
     planar_output: bool,
 ) -> list[Tensor]:
@@ -1319,16 +1325,17 @@ def _run_packed_cuda_backward(
     pole_y = cast("tuple[Tensor, Tensor, Tensor, Tensor]", tuple(inputs[4:8]))
     source = _packed_source_coordinates(inputs[8])
     # Retained storage identifies its producer even if the process environment changes.
-    split = (horizontal_states[0].dtype == torch.uint32 if horizontal_states
+    scan = w72 if fp8 else w66
+    split = fp8 or (horizontal_states[0].dtype == torch.uint32 if horizontal_states
              else w66.enabled(source[0], path, epilogue, kind, path_swiglu))
     if split:
-        states = horizontal_states[0] if horizontal_states else w66.hforward(list(pole_x), *source)
+        states = horizontal_states[0] if horizontal_states else scan.hforward(list(pole_x), *source)
         tables = static_product_scan_auxiliary(
             pole_x, pole_y, source[0], epsilon=epsilon, gain_kind=kind,
         )
         if grad_real.ndim == 5:
             grad_real, grad_imag = grad_real.squeeze(-2), grad_imag.squeeze(-2)
-        return w66.scan_backward(list(pole_x), list(pole_y), *source, states, list(tables[:2]),
+        return scan.scan_backward(list(pole_x), list(pole_y), *source, states, list(tables[:2]),
                                  path, grad_real, grad_imag, epilogue == "coarse_path", epsilon)
     saved_features = None
     if horizontal_states and horizontal_states[-1].ndim in (3, 6, 7):
@@ -1404,44 +1411,53 @@ def _run_packed_cuda_backward(
     return [*horizontal_gradients[:4], *vertical[:4], packed_gradient, *vertical[8:]]
 
 
-def _packed_pipeline_op_impl(
-    inputs: list[Tensor],
-    path: list[Tensor],
-    epilogue: str,
-    epsilon: float,
-    kind: int,
-    recompute: bool,
-    path_swiglu: bool,
-    planar_output: bool,
-) -> list[Tensor]:
-    """Produce one packed output allocation; hidden outputs support retain policy."""
-    if not inputs[8].is_cuda:
-        return list(_packed_reference(
-            inputs, path, epilogue, epsilon, kind, path_swiglu, planar_output,
-        ))
-    packed, _, descriptor, saved = _run_packed_cuda_forward(
-        inputs,
-        path,
-        epilogue,
-        epsilon,
-        kind,
-        recompute,
-        path_swiglu,
-        packed_output=True,
-        planar_output=planar_output,
-        squeeze_collapsed=False,
-    )
-    return [packed, descriptor, *saved]
+def _make_packed_pipeline_op_impl(fp8: bool) -> Callable[..., list[Tensor]]:
+    def _packed_pipeline_op_impl(
+        inputs: list[Tensor],
+        path: list[Tensor],
+        epilogue: str,
+        epsilon: float,
+        kind: int,
+        recompute: bool,
+        path_swiglu: bool,
+        planar_output: bool,
+    ) -> list[Tensor]:
+        """Produce one packed output allocation; hidden outputs support retain policy."""
+        if not fp8 and not inputs[8].is_cuda:
+            return list(_packed_reference(
+                inputs, path, epilogue, epsilon, kind, path_swiglu, planar_output,
+            ))
+        packed, _, descriptor, saved = _run_packed_cuda_forward(
+            inputs,
+            path,
+            epilogue,
+            epsilon,
+            kind,
+            recompute,
+            path_swiglu,
+            fp8=fp8,
+            packed_output=True,
+            planar_output=planar_output,
+            squeeze_collapsed=False,
+        )
+        return [packed, descriptor, *saved]
+
+    return _packed_pipeline_op_impl
 
 
 _packed_pipeline_op = triton_op(
     "lnet::product_scan_pipeline_storage_v2",
-    _packed_pipeline_op_impl,
+    _make_packed_pipeline_op_impl(False),
     mutates_args={},
 )
 _packed_pipeline_op_w66 = triton_op(
     "lnet::product_scan_pipeline_storage_v2_w66",
-    _packed_pipeline_op_impl,
+    _make_packed_pipeline_op_impl(False),
+    mutates_args={},
+)
+_packed_pipeline_op_w72_fp8 = triton_op(
+    "lnet::product_scan_pipeline_storage_v2_w72_fp8",
+    _make_packed_pipeline_op_impl(True),
     mutates_args={},
 )
 
@@ -1461,53 +1477,62 @@ def _setup_packed_context(
     ctx.save_for_backward(*tensors, *path, output[1], *output[2:])
 
 
-def _packed_pipeline_backward_op_impl(
-    inputs: list[Tensor],
-    path: list[Tensor],
-    horizontal_states: list[Tensor],
-    descriptor: Tensor,
-    grad_packed: Tensor,
-    grad_descriptor: Tensor,
-    epilogue: str,
-    epsilon: float,
-    kind: int,
-    path_swiglu: bool,
-    planar_output: bool,
-) -> list[Tensor]:
-    modes = inputs[8].shape[-1] // 2
-    # Incoming gradients may have zero strides (e.g. sum); materialize only those.
-    grad_packed = grad_packed.contiguous()
-    if planar_output:
-        grad_real, grad_imag = grad_packed[0], grad_packed[1]
-    else:
-        grad_real, grad_imag = grad_packed[..., :modes], grad_packed[..., modes:]
-    if path:
-        grad_real, grad_imag = grad_real.unsqueeze(-2), grad_imag.unsqueeze(-2)
-    return _run_packed_cuda_backward(
-        inputs,
-        path,
-        horizontal_states,
-        descriptor,
-        grad_real,
-        grad_imag,
-        grad_descriptor,
-        epilogue,
-        epsilon,
-        kind,
-        path_swiglu,
-        packed_output=True,
-        planar_output=planar_output,
-    )
+def _make_packed_pipeline_backward_op_impl(fp8: bool) -> Callable[..., list[Tensor]]:
+    def _packed_pipeline_backward_op_impl(
+        inputs: list[Tensor],
+        path: list[Tensor],
+        horizontal_states: list[Tensor],
+        descriptor: Tensor,
+        grad_packed: Tensor,
+        grad_descriptor: Tensor,
+        epilogue: str,
+        epsilon: float,
+        kind: int,
+        path_swiglu: bool,
+        planar_output: bool,
+    ) -> list[Tensor]:
+        modes = inputs[8].shape[-1] // 2
+        # Incoming gradients may have zero strides (e.g. sum); materialize only those.
+        grad_packed = grad_packed.contiguous()
+        if planar_output:
+            grad_real, grad_imag = grad_packed[0], grad_packed[1]
+        else:
+            grad_real, grad_imag = grad_packed[..., :modes], grad_packed[..., modes:]
+        if path:
+            grad_real, grad_imag = grad_real.unsqueeze(-2), grad_imag.unsqueeze(-2)
+        return _run_packed_cuda_backward(
+            inputs,
+            path,
+            horizontal_states,
+            descriptor,
+            grad_real,
+            grad_imag,
+            grad_descriptor,
+            epilogue,
+            epsilon,
+            kind,
+            path_swiglu,
+            fp8=fp8,
+            packed_output=True,
+            planar_output=planar_output,
+        )
+
+    return _packed_pipeline_backward_op_impl
 
 
 _packed_pipeline_backward_op = triton_op(
     "lnet::product_scan_pipeline_storage_backward_v2",
-    _packed_pipeline_backward_op_impl,
+    _make_packed_pipeline_backward_op_impl(False),
     mutates_args={},
 )
 _packed_pipeline_backward_op_w66 = triton_op(
     "lnet::product_scan_pipeline_storage_backward_v2_w66",
-    _packed_pipeline_backward_op_impl,
+    _make_packed_pipeline_backward_op_impl(False),
+    mutates_args={},
+)
+_packed_pipeline_backward_op_w72_fp8 = triton_op(
+    "lnet::product_scan_pipeline_storage_backward_v2_w72_fp8",
+    _make_packed_pipeline_backward_op_impl(True),
     mutates_args={},
 )
 
@@ -1517,6 +1542,7 @@ def _packed_pipeline_backward(
     output_gradients: list[Tensor | None],
     *,
     w66_variant: bool = False,
+    fp8: bool = False,
 ) -> tuple[list[Tensor], list[Tensor], None, None, None, None, None, None]:
     saved = ctx.saved_tensors
     inputs = list(saved[:9])
@@ -1547,7 +1573,7 @@ def _packed_pipeline_backward(
         grad_packed = source.new_zeros(shape)
     if grad_descriptor is None:
         grad_descriptor = torch.zeros_like(descriptor)
-    if not source.is_cuda:
+    if not fp8 and not source.is_cuda:
         differentiable = [value.detach().requires_grad_() for value in (*inputs, *path)]
         with torch.enable_grad():
             packed, desc = _packed_reference(
@@ -1575,6 +1601,7 @@ def _packed_pipeline_backward(
         ]
     else:
         backward_op = (
+            _packed_pipeline_backward_op_w72_fp8 if fp8 else
             _packed_pipeline_backward_op_w66 if w66_variant else _packed_pipeline_backward_op
         )
         result = backward_op(
@@ -1603,46 +1630,60 @@ torch.library.register_autograd(
     partial(_packed_pipeline_backward, w66_variant=True),
     setup_context=_setup_packed_context,
 )
+torch.library.register_autograd(
+    "lnet::product_scan_pipeline_storage_v2_w72_fp8",
+    partial(_packed_pipeline_backward, fp8=True),
+    setup_context=_setup_packed_context,
+)
 
 
-def _packed_pipeline_planes_op_impl(
-    inputs: list[Tensor],
-    path: list[Tensor],
-    epilogue: str,
-    epsilon: float,
-    kind: int,
-    recompute: bool,
-    path_swiglu: bool,
-) -> list[Tensor]:
-    """Produce separate contiguous real and imaginary planes directly."""
-    if not inputs[8].is_cuda:
-        planar, descriptor = _packed_reference(
-            inputs, path, epilogue, epsilon, kind, path_swiglu, True,
+def _make_packed_pipeline_planes_op_impl(fp8: bool) -> Callable[..., list[Tensor]]:
+    def _packed_pipeline_planes_op_impl(
+        inputs: list[Tensor],
+        path: list[Tensor],
+        epilogue: str,
+        epsilon: float,
+        kind: int,
+        recompute: bool,
+        path_swiglu: bool,
+    ) -> list[Tensor]:
+        """Produce separate contiguous real and imaginary planes directly."""
+        if not fp8 and not inputs[8].is_cuda:
+            planar, descriptor = _packed_reference(
+                inputs, path, epilogue, epsilon, kind, path_swiglu, True,
+            )
+            return [planar[0].clone(), planar[1].clone(), descriptor]
+        real, imag, descriptor, saved = _run_packed_cuda_forward(
+            inputs,
+            path,
+            epilogue,
+            epsilon,
+            kind,
+            recompute,
+            path_swiglu,
+            fp8=fp8,
+            packed_output=False,
+            planar_output=False,
+            squeeze_collapsed=True,
         )
-        return [planar[0].clone(), planar[1].clone(), descriptor]
-    real, imag, descriptor, saved = _run_packed_cuda_forward(
-        inputs,
-        path,
-        epilogue,
-        epsilon,
-        kind,
-        recompute,
-        path_swiglu,
-        packed_output=False,
-        planar_output=False,
-        squeeze_collapsed=True,
-    )
-    return [real, imag, descriptor, *saved]
+        return [real, imag, descriptor, *saved]
+
+    return _packed_pipeline_planes_op_impl
 
 
 _packed_pipeline_planes_op = triton_op(
     "lnet::product_scan_pipeline_planes_v1",
-    _packed_pipeline_planes_op_impl,
+    _make_packed_pipeline_planes_op_impl(False),
     mutates_args={},
 )
 _packed_pipeline_planes_op_w66 = triton_op(
     "lnet::product_scan_pipeline_planes_v1_w66",
-    _packed_pipeline_planes_op_impl,
+    _make_packed_pipeline_planes_op_impl(False),
+    mutates_args={},
+)
+_packed_pipeline_planes_op_w72_fp8 = triton_op(
+    "lnet::product_scan_pipeline_planes_v1_w72_fp8",
+    _make_packed_pipeline_planes_op_impl(True),
     mutates_args={},
 )
 
@@ -1663,44 +1704,53 @@ def _setup_packed_planes_context(
     ctx.save_for_backward(*tensors, *path, output[2], *output[3:])
 
 
-def _packed_pipeline_planes_backward_op_impl(
-    inputs: list[Tensor],
-    path: list[Tensor],
-    horizontal_states: list[Tensor],
-    descriptor: Tensor,
-    grad_real: Tensor,
-    grad_imag: Tensor,
-    grad_descriptor: Tensor,
-    epilogue: str,
-    epsilon: float,
-    kind: int,
-    path_swiglu: bool,
-) -> list[Tensor]:
-    return _run_packed_cuda_backward(
-        inputs,
-        path,
-        horizontal_states,
-        descriptor,
-        grad_real,
-        grad_imag,
-        grad_descriptor,
-        epilogue,
-        epsilon,
-        kind,
-        path_swiglu,
-        packed_output=False,
-        planar_output=False,
-    )
+def _make_packed_pipeline_planes_backward_op_impl(fp8: bool) -> Callable[..., list[Tensor]]:
+    def _packed_pipeline_planes_backward_op_impl(
+        inputs: list[Tensor],
+        path: list[Tensor],
+        horizontal_states: list[Tensor],
+        descriptor: Tensor,
+        grad_real: Tensor,
+        grad_imag: Tensor,
+        grad_descriptor: Tensor,
+        epilogue: str,
+        epsilon: float,
+        kind: int,
+        path_swiglu: bool,
+    ) -> list[Tensor]:
+        return _run_packed_cuda_backward(
+            inputs,
+            path,
+            horizontal_states,
+            descriptor,
+            grad_real,
+            grad_imag,
+            grad_descriptor,
+            epilogue,
+            epsilon,
+            kind,
+            path_swiglu,
+            fp8=fp8,
+            packed_output=False,
+            planar_output=False,
+        )
+
+    return _packed_pipeline_planes_backward_op_impl
 
 
 _packed_pipeline_planes_backward_op = triton_op(
     "lnet::product_scan_pipeline_planes_backward_v1",
-    _packed_pipeline_planes_backward_op_impl,
+    _make_packed_pipeline_planes_backward_op_impl(False),
     mutates_args={},
 )
 _packed_pipeline_planes_backward_op_w66 = triton_op(
     "lnet::product_scan_pipeline_planes_backward_v1_w66",
-    _packed_pipeline_planes_backward_op_impl,
+    _make_packed_pipeline_planes_backward_op_impl(False),
+    mutates_args={},
+)
+_packed_pipeline_planes_backward_op_w72_fp8 = triton_op(
+    "lnet::product_scan_pipeline_planes_backward_v1_w72_fp8",
+    _make_packed_pipeline_planes_backward_op_impl(True),
     mutates_args={},
 )
 
@@ -1710,6 +1760,7 @@ def _packed_pipeline_planes_backward(
     output_gradients: list[Tensor | None],
     *,
     w66_variant: bool = False,
+    fp8: bool = False,
 ) -> tuple[list[Tensor], list[Tensor], None, None, None, None, None]:
     saved = ctx.saved_tensors
     inputs = list(saved[:9])
@@ -1730,7 +1781,7 @@ def _packed_pipeline_planes_backward(
         grad_imag = source.new_zeros(plane_shape)
     if grad_descriptor is None:
         grad_descriptor = torch.zeros_like(descriptor)
-    if not source.is_cuda:
+    if not fp8 and not source.is_cuda:
         differentiable = [value.detach().requires_grad_() for value in (*inputs, *path)]
         with torch.enable_grad():
             planar, _ = _packed_reference(
@@ -1754,6 +1805,7 @@ def _packed_pipeline_planes_backward(
         ]
     else:
         backward_op = (
+            _packed_pipeline_planes_backward_op_w72_fp8 if fp8 else
             _packed_pipeline_planes_backward_op_w66
             if w66_variant else _packed_pipeline_planes_backward_op
         )
@@ -1781,6 +1833,11 @@ torch.library.register_autograd(
 torch.library.register_autograd(
     "lnet::product_scan_pipeline_planes_v1_w66",
     partial(_packed_pipeline_planes_backward, w66_variant=True),
+    setup_context=_setup_packed_planes_context,
+)
+torch.library.register_autograd(
+    "lnet::product_scan_pipeline_planes_v1_w72_fp8",
+    partial(_packed_pipeline_planes_backward, fp8=True),
     setup_context=_setup_packed_planes_context,
 )
 
@@ -1838,7 +1895,10 @@ def run_product_scan_path_collapse_pipeline_packed(
     _packed_source_coordinates(source_packed)
     if memory_policy not in {"retain", "recompute"}:
         raise ValueError(f"unsupported scan memory policy: {memory_policy}")
-    op = _packed_pipeline_op_w66 if _w66_requested() else _packed_pipeline_op
+    op = select_split_scan_op(
+        source_packed, parameters, "full16", gain_kind(gain_normalization), path_swiglu,
+        _packed_pipeline_op, _packed_pipeline_op_w66, _packed_pipeline_op_w72_fp8,
+    )
     return op(
         [*pole_x, *pole_y, source_packed],
         list(parameters),
@@ -1866,7 +1926,11 @@ def run_product_scan_path_collapse_planes_packed(
     _packed_source_coordinates(source_packed)
     if memory_policy not in {"retain", "recompute"}:
         raise ValueError(f"unsupported scan memory policy: {memory_policy}")
-    op = _packed_pipeline_planes_op_w66 if _w66_requested() else _packed_pipeline_planes_op
+    op = select_split_scan_op(
+        source_packed, parameters, "full16", gain_kind(gain_normalization), path_swiglu,
+        _packed_pipeline_planes_op,
+        _packed_pipeline_planes_op_w66, _packed_pipeline_planes_op_w72_fp8,
+    )
     outputs = op(
         [*pole_x, *pole_y, source_packed],
         list(parameters),
@@ -1913,7 +1977,10 @@ def run_product_scan_coarse_path_collapse_packed(
     _validate_coarse_cuda_drive(source_packed, gain_normalization)
     if source_packed.shape[1] % 2 or source_packed.shape[2] % 2:
         raise ValueError("coarse path collapse requires even spatial dimensions")
-    op = _packed_pipeline_op_w66 if _w66_requested() else _packed_pipeline_op
+    op = select_split_scan_op(
+        source_packed, parameters, "coarse_path", gain_kind(gain_normalization), False,
+        _packed_pipeline_op, _packed_pipeline_op_w66, _packed_pipeline_op_w72_fp8,
+    )
     return op(
         [*pole_x, *pole_y, source_packed], list(parameters), "coarse_path",
         epsilon, gain_kind(gain_normalization), memory_policy == "recompute", False, planar_output,
@@ -1937,7 +2004,11 @@ def run_product_scan_coarse_path_collapse_planes_packed(
     _validate_coarse_cuda_drive(source_packed, gain_normalization)
     if source_packed.shape[1] % 2 or source_packed.shape[2] % 2:
         raise ValueError("coarse path collapse requires even spatial dimensions")
-    op = _packed_pipeline_planes_op_w66 if _w66_requested() else _packed_pipeline_planes_op
+    op = select_split_scan_op(
+        source_packed, parameters, "coarse_path", gain_kind(gain_normalization), False,
+        _packed_pipeline_planes_op,
+        _packed_pipeline_planes_op_w66, _packed_pipeline_planes_op_w72_fp8,
+    )
     outputs = op(
         [*pole_x, *pole_y, source_packed],
         list(parameters),

@@ -13,13 +13,14 @@ from __future__ import annotations
 # pyright: reportGeneralTypeIssues=false, reportMissingParameterType=false
 # pyright: reportPrivateUsage=false, reportUnknownLambdaType=false
 import os
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 import triton
 from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
+from . import w72_split_fp8_scan as w72
 from .general_cuda_scans import (
     general_scans_enabled,
     try_general_vertical_backward,
@@ -50,6 +51,22 @@ from .triton_product_scan_kernels import (
     _product_scan_coarse4_associative_backward_kernel,
     _product_scan_coarse4_associative_forward_kernel,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from torch._library.custom_ops import CustomOpDef
+
+
+def select_split_scan_op(
+    packed: Tensor, path: Sequence[Tensor], epilogue: str, kind: int, swiglu: bool,
+    standard: CustomOpDef, bf16: CustomOpDef, fp8: CustomOpDef,
+) -> CustomOpDef:
+    if os.environ.get("VA_W72_SPLIT_FP8") == "1":
+        real = packed[..., : packed.shape[-1] // 2]
+        return fp8 if w72.enabled(real, path, epilogue, kind, swiglu) else standard
+    return bf16 if os.environ.get("VA_W66_SPLIT_BF16") == "1" else standard
+
 
 FORWARD_LAUNCH_NAME = "product_scan_coarse4_forward"
 FULL16_FORWARD_LAUNCH_NAME = "product_scan_full16_forward"

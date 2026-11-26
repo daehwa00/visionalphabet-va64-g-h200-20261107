@@ -16,7 +16,7 @@ import torch
 from bench_wave66_split_bf16 import OPS, SHAPES, VARIANTS, fp, scans
 
 
-def offline_plans():
+def offline_plans(shapes=SHAPES[:2]):
     from contextlib import ExitStack
 
     with ExitStack() as stack:
@@ -54,7 +54,7 @@ def offline_plans():
         for name, fn in limits.items():
             stack.enter_context(patch.object(scans, name, fn))
         stack.enter_context(patch.object(torch.cuda, "get_device_capability", lambda _: (9, 0)))
-        for label, h, w, m, c in SHAPES[:2]:
+        for label, h, w, m, c in shapes:
             for op, v, b in OPS:
                 src = SimpleNamespace(
                     dtype=torch.bfloat16,
@@ -76,7 +76,7 @@ def offline_plans():
                 yield label, op, w, m, launch
 
 
-def compile_source(src, folder, flags):
+def compile_source(src, folder, flags, symbol=None):
     name = hashlib.sha256(src.encode()).hexdigest()[:24]
     path = folder / (name + ".cu")
     path.write_text(src)
@@ -94,8 +94,12 @@ def compile_source(src, folder, flags):
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode:
         raise RuntimeError(proc.stderr)
-    sass = subprocess.check_output(["cuobjdump", "-sass", str(path) + ".cubin"], text=True)
+    select = ["-fun", symbol] if symbol else []
+    sass = subprocess.check_output(["cuobjdump", *select, "-sass", str(path) + ".cubin"], text=True)
     resource = subprocess.check_output(["cuobjdump", "-res-usage", str(path) + ".cubin"], text=True)
+
+    if symbol:
+        resource = resource.split(f"Function {symbol}:", 1)[1].splitlines()[1]
 
     def res(field):
         return int(re.search(rf"\b{field}:(\d+)", resource)[1])
@@ -314,77 +318,11 @@ def test_production_fake_pipeline(monkeypatch, separate, recompute):
 
 
 def test_ablation17_scan_graphs(monkeypatch):
-    from run_va_eight_ablations import build_variant
-    from torch._subclasses.fake_tensor import FakeTensorMode
+    from test_w66_split_bf16_scan import model_scan_graph
 
-    from lnet import complex_scan_stage, product_scan_pipeline, same_resolution_depth
-
-    for key, value in bench.lockin_arm_env("w57_lockin").items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
-    model = build_variant("17-p1-nr4-1024d-v3").backbone
-    targets = []
-
-    def backend(graph, _inputs):
-        targets.extend(node.target for node in graph.graph.nodes if node.op == "call_function")
-        return graph.forward
-
-    # Substitute only the CPU reference scan math. Keep the model's reader,
-    # poles, path parameters, dispatch, and Dynamo registrations in the loop.
-    def reference(inputs, path, epilogue, _epsilon, kind, path_swiglu, planar_output):
-        assert planar_output
-        drive = inputs[8]
-        n, h, w, channels = drive.shape
-        modes = channels // 2
-        assert drive.dtype == torch.bfloat16
-        assert (epilogue, kind, path_swiglu, len(path), path[0].shape) == (
-            expected_epilogue,
-            0,
-            False,
-            4,
-            (160, 8, 8),
-        )
-        assert (h, w, modes) == (resolution, resolution, 160)
-        if epilogue == "coarse_path":
-            h, w = h // 2, w // 2
-        return drive.new_empty((2, n, h, w, modes)), drive.new_empty((0,))
-
-    monkeypatch.setattr(product_scan_pipeline, "_packed_reference", reference)
-    for module, name in (
-        (same_resolution_depth, "run_product_scan_path_collapse_planes_packed"),
-        (complex_scan_stage, "run_product_scan_coarse_path_collapse_planes_packed"),
-    ):
-        monkeypatch.setattr(
-            module,
-            name,
-            torch.compile(getattr(module, name), backend=backend, fullgraph=True, dynamic=False),
-        )
-
-    for flag in ("0", "1"):
-        monkeypatch.setenv("VA_W66_SPLIT_BF16", flag)
-        target = getattr(
-            torch.ops.lnet, "product_scan_pipeline_planes_v1" + ("_w66" if flag == "1" else "")
-        ).default
-        for resolution, stage in ((56, model.stage1), (28, model.stage2)):
-            block = model.same_resolution_blocks[str(resolution)]
-            state = torch.zeros((1, resolution, resolution, 2 * block.modes), dtype=torch.bfloat16)
-            for expected_epilogue in ("full16", "coarse_path"):
-                targets.clear()
-                with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
-                    if expected_epilogue == "full16":
-                        state = block(state)
-                        path = block.path_collapse.packed_parameters()
-                    else:
-                        stage(state, emit_descriptor=False)
-                        path = stage.quadrant_path_mode_combiner.packed_parameters()
-                assert target in targets
-                with FakeTensorMode():
-                    real = torch.empty(
-                        (1024, resolution, resolution, 160), device="cuda", dtype=torch.bfloat16
-                    )
-                    assert fp.enabled(real, path, expected_epilogue, 0, swiglu=False) == (
-                        flag == "1"
-                    )
+    ops = model_scan_graph(monkeypatch, fp8=False, bf16=False)
+    assert len(ops) == 11
+    assert all(name.endswith(("planes_v1.default", "storage_v2.default")) for name, _, _ in ops)
 
 
 def test_storage_graph_target(monkeypatch):
