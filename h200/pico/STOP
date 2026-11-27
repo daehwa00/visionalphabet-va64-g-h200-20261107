@@ -1,0 +1,2 @@
+# Write STOP on a non-comment line to gracefully halt the H200 run after the current epoch.
+running

@@ -21,6 +21,7 @@ import imagenet100_data_runtime as data_runtime
 import numpy as np
 import torch
 from alphabet_model_builder import model_config as default_model_config
+from h200_telemetry import Telemetry
 from torch import Tensor, nn
 from torch.nn import functional
 from torch.nn.utils import parametrize
@@ -462,6 +463,12 @@ def train_epoch(
                 )
             (loss / group_size).backward()
             group_complete = group_offset + 1 == group_size or batch_index + 1 == batch_count
+            if not group_complete and group_offset == 0 and device.type == "cuda":
+                # AccumulateGrad can adopt buffers owned by the compiled backward.
+                # Keep the accumulated gradients alive across the next graph step.
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad = parameter.grad.clone()
             if group_complete:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -469,6 +476,7 @@ def train_epoch(
         correct_terms.append(logits.argmax(dim=-1).eq(targets).sum())
         for name, value in active_diagnostics.items():
             diagnostics.setdefault(name, []).append(value.detach() * targets.numel())
+        del output, logits, loss, active_diagnostics
         count += targets.numel()
     result = {
         "loss": float(torch.stack(loss_terms).double().sum()) / count,
@@ -734,9 +742,9 @@ def _run_job(
     root: Path,
     contract: dict[str, Any],
     **kwargs: Any,
-) -> None:
+) -> bool | None:
     with ExitStack() as cleanup:
-        _run_job_with_loaders(root, contract, cleanup, **kwargs)
+        return _run_job_with_loaders(root, contract, cleanup, **kwargs)
 
 
 def _run_job_with_loaders(
@@ -751,7 +759,7 @@ def _run_job_with_loaders(
     device: torch.device,
     bindings: RunnerBindings,
     stop_after_epoch: int | None = None,
-) -> None:
+) -> bool | None:
     result_path = root / "results" / f"{variant}__seed{seed}.json"
     if result_path.exists():
         return
@@ -842,6 +850,11 @@ def _run_job_with_loaders(
     )
     runtime = _build_runtime(model, recipe)
     channels_last = bool(recipe.get("channels_last", False))
+    telemetry = Telemetry(
+        f"{variant}-seed{seed}", recipe["epochs"],
+        torch.cuda.get_device_name(device) if cuda_devices else device.type,
+    )
+    telemetry.report("started", start_epoch, global_step)
 
     def evaluate_epoch(eval_model, engine, *, dual: bool) -> dict[str, float]:
         options = {"dual_eval": dual} if bindings.calibrated_validation else {}
@@ -872,6 +885,9 @@ def _run_job_with_loaders(
         started = time.perf_counter()
 
         def observe_batch(batch_number, loss_terms, samples, current_epoch=epoch_number):
+            if global_step == 0 and batch_number == min(gradient_accumulation_steps, len(train_loader)):
+                print(f"epoch={current_epoch} first optimizer step completed", flush=True)
+                telemetry.report("first_step", current_epoch, 1)
             if batch_number % recipe["progress_every"] == 0:
                 print(
                     f"epoch={current_epoch} batch={batch_number} samples={samples} loss={float(torch.stack(loss_terms).sum()) / samples:.5f}",
@@ -989,6 +1005,7 @@ def _run_job_with_loaders(
         history.append(row)
         _reconcile_history(history_path, variant, seed, history)
         print(json.dumps(row), flush=True)
+        remote_stop = telemetry.should_stop(epoch_number, global_step, row)
         if wandb_run is not None:
             metrics = {
                 "epoch": row["epoch"],
@@ -1006,7 +1023,9 @@ def _run_job_with_loaders(
             wandb_run.log(metrics, step=epoch + 1)
         if not step_schedule:
             scheduler.step()
-        if not (early_stop or final_epoch or epoch_number % recipe["checkpoint_every"] == 0):
+        if not (
+            remote_stop or early_stop or final_epoch or epoch_number % recipe["checkpoint_every"] == 0
+        ):
             continue
         if ema is not None:
             ema.sync_buffers(model)
@@ -1032,10 +1051,14 @@ def _run_job_with_loaders(
                 **(ema.checkpoint() if ema is not None else {}),
             },
         )
-        if early_stop:
+        if remote_stop or early_stop:
+            event = "stopped_by_kill_switch" if remote_stop else "stopped"
+            if remote_stop:
+                print(f"H200 kill switch requested at epoch {epoch_number}. Saved {checkpoint_path}", flush=True)
+            telemetry.report(event, epoch_number, global_step, row)
             if wandb_run is not None:
                 wandb_run.finish()
-            return
+            return remote_stop
     if final_validation is None:
         # A final training checkpoint can exist without completed exports.
         final_validation = evaluate_epoch(model, runtime, dual=True)
@@ -1148,6 +1171,7 @@ def _run_job_with_loaders(
             "history": history,
         },
     )
+    telemetry.report("finished", recipe["epochs"], global_step, history[-1] if history else None)
     if wandb_run is not None:
         wandb_run.summary["final_validation_accuracy"] = final_validation["accuracy"]
         wandb_run.summary["final_validation_cross_entropy"] = final_validation["cross_entropy"]
@@ -1174,7 +1198,7 @@ def main(bindings: RunnerBindings) -> None:
     device = torch.device("cuda")
     for variant in args.variants:
         for seed in args.run_seeds:
-            _run_job(
+            stopped = _run_job(
                 args.root,
                 contract,
                 variant=variant,
@@ -1185,6 +1209,8 @@ def main(bindings: RunnerBindings) -> None:
                 bindings=bindings,
                 stop_after_epoch=args.stop_after_epoch,
             )
+            if stopped:
+                return
     summary = bindings.summarize(args.root, contract)
     if summary is not None:
         print(json.dumps(summary, indent=2, sort_keys=True))

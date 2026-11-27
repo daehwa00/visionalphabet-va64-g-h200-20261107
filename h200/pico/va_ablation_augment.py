@@ -232,6 +232,12 @@ def train_epoch(
                 )
             (loss / group_size).backward()
             group_complete = group_offset + 1 == group_size or batch_index + 1 == batch_count
+            if not group_complete and group_offset == 0 and device.type == "cuda":
+                # AccumulateGrad can adopt buffers owned by the compiled backward.
+                # Keep the accumulated gradients alive across the next graph step.
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad = parameter.grad.clone()
             if group_complete:
                 gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 if track_gradients:
@@ -241,6 +247,7 @@ def train_epoch(
         correct_terms.append(logits.argmax(dim=-1).eq(targets).sum())
         for name, value in active_diagnostics.items():
             diagnostics.setdefault(name, []).append(value.detach() * targets.numel())
+        del output, logits, loss, active_diagnostics
         count += targets.numel()
         if observe_batch is not None:
             observe_batch(batch_index + 1, loss_terms, count)
