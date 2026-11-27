@@ -167,6 +167,7 @@ class _FourStageBackbone(ComplexScanBackbone):
         config: ComplexScanConfig,
         excitation_modes: tuple[int, ...],
         poles: tuple[int, int, int, int],
+        post_hidden_ratio: float,
     ) -> None:
         nn.Module.__init__(self)
         width = 2 * excitation_modes[0]
@@ -219,7 +220,7 @@ class _FourStageBackbone(ComplexScanBackbone):
                     pole_modes,
                     input_modes,
                     output_modes,
-                    post_hidden=round(POST_HIDDEN_RATIO * output_modes),
+                    post_hidden=round(post_hidden_ratio * output_modes),
                 )
                 stage.quadrant_path_mode_combiner = PathOnlyCollapse(
                     pole_modes, path_hidden=PATH_HIDDEN
@@ -263,8 +264,9 @@ def _build_backbone(
     excitation_modes: tuple[int, ...],
     poles: tuple[int, int, int, int],
     depth: tuple[int, int, int, int],
+    post_hidden_ratio: float,
 ) -> PackedVA128Backbone:
-    source = _FourStageBackbone(config, excitation_modes, poles)
+    source = _FourStageBackbone(config, excitation_modes, poles, post_hidden_ratio)
     blocks = {}
     extras = {}
     for name, resolution, width, pole_modes, count in zip(
@@ -284,7 +286,7 @@ def _build_backbone(
                 reader_rank=READER_RANK,
                 kernel_size=KERNEL_SIZE,
                 pole_template=stage,
-                post_hidden=round(POST_HIDDEN_RATIO * width),
+                post_hidden=round(post_hidden_ratio * width),
             )
             block.path_collapse = PathOnlyCollapse(pole_modes, path_hidden=PATH_HIDDEN)
             stage_blocks.append(block)
@@ -306,6 +308,7 @@ def build_dw_terminal_rmsnorm(
     channels: tuple[int, int, int, int] = DEFAULT_CHANNELS,
     poles: tuple[int, int, int, int] = DEFAULT_POLES,
     depth: tuple[int, int, int, int] = DEFAULT_DEPTH,
+    post_hidden_ratio: float = POST_HIDDEN_RATIO,
     normalize: bool = False,
     factorized_reader: bool = False,
     forward_vertical_only: bool = False,
@@ -313,7 +316,7 @@ def build_dw_terminal_rmsnorm(
 ) -> VisionAlphabetIN100:
     """Build VA-Ablation-10-dw-terminal-rmsnorm with a terminal affine head."""
     active_config = config if config is not None else model_config()
-    backbone = _build_backbone(active_config, tuple(c // 2 for c in channels), poles, depth)
+    backbone = _build_backbone(active_config, tuple(c // 2 for c in channels), poles, depth, post_hidden_ratio)
     for module in backbone.modules():
         if isinstance(module, FactorizedComplexConv2dReader):
             module.execution_mode = "factorized_triton"
