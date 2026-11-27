@@ -19,6 +19,7 @@ from . import complex_scan_transitions as _transitions
 from . import complex_scan_types as _contracts
 from . import path_cffn as _path_cffn
 from . import product_scan_contracts as _product_scan_contracts
+from .capture_safe_orthogonal import CaptureSafeMatrixExpOrthogonal
 from .complex_scan_stage import (
     ComplexScanStage as _ComplexScanStage,
 )
@@ -120,7 +121,7 @@ _UNTRACED_FLAG = "_alphabet_untraced_parametrization"
 
 
 def untraced_parametrizations_(module: nn.Module) -> int:
-    """Force a compile graph break around every parametrization, in place.
+    """Force compile graph breaks around parametrizations that need eager execution.
 
     Returns the number of parametrizations marked.  The computation is
     unchanged -- this only tells Dynamo not to trace into it.
@@ -143,6 +144,8 @@ def untraced_parametrizations_(module: nn.Module) -> int:
         for entry in cast("nn.ModuleDict", child.parametrizations).values():
             # A ParametrizationList holds its steps as ordinary child modules.
             for step in entry.children():
+                if isinstance(step, CaptureSafeMatrixExpOrthogonal):
+                    continue
                 if getattr(step, _UNTRACED_FLAG, False):
                     continue
                 object.__setattr__(step, "forward", torch.compiler.disable(step.forward))

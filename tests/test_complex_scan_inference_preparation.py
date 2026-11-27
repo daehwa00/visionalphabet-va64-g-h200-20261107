@@ -10,6 +10,7 @@ from torch import Tensor, nn
 from torch.nn.utils import parametrize
 from torch.nn.utils.parametrizations import orthogonal
 
+from alphabet.capture_safe_orthogonal import replace_matrix_exp_orthogonal_
 from alphabet.complex_scan import (
     ComplexScanBackbone,
     ComplexScanConfig,
@@ -177,6 +178,24 @@ def test_untraced_parametrizations_keeps_the_constraint_and_is_idempotent() -> N
     # Only Dynamo tracing changes; the parametrization and its value stay.
     assert parametrize.is_parametrized(linear, "weight")
     torch.testing.assert_close(linear.weight, realized, rtol=0.0, atol=0.0)
+
+
+def test_capture_safe_parametrization_survives_fullgraph_training_preparation() -> None:
+    linear = _orthogonal_linear()
+    assert replace_matrix_exp_orthogonal_(linear)
+    assert untraced_parametrizations_(linear) == 0
+
+    inputs = torch.randn(3, 8)
+    compiled = torch.compile(linear, backend="aot_eager", fullgraph=True, dynamic=False)
+    original = linear.parametrizations.weight.original
+    expected = linear(inputs)
+    actual = compiled(inputs)
+    expected_grad, = torch.autograd.grad(expected.sum(), original)
+    actual_grad, = torch.autograd.grad(actual.sum(), original)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual_grad, expected_grad, rtol=0.0, atol=0.0)
+    assert torch.count_nonzero(actual_grad)
 
 
 def test_prepare_for_compiled_training_changes_no_value_or_gradient() -> None:

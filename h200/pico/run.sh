@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-root=/app/output/in1k-va-pico-v11-600-opt-20261127
+root=/app/output/in1k-va-pico-v11-600-opt-20261127-fullgraph-fix
 mkdir -p "$root/logs"
 exec > >(tee -a "$root/logs/launch-$(date -u +%Y%m%dT%H%M%SZ).log") 2>&1
 exec 9>"$root/train.lock"
