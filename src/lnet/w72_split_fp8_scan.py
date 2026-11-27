@@ -52,10 +52,11 @@ static_assert(sizeof(Fp8Quad)==4);
 FP8 += FP8.replace("Fp8", "E5m2").replace("e4m3x2", "e5m2x2")
 
 
-def profile_name(key):
+def profile_name(key, height=56):
     axis = "vscan" if key.vertical else "hscan"
     direction = "bwd" if key.backward else "fwd"
-    return f"va_profile_{axis}_{direction}__w72_split_fp8"
+    suffix = "w74_small_fp8" if height in (7, 14) else "w72_split_fp8"
+    return f"va_profile_{axis}_{direction}__{suffix}"
 
 
 def _horizontal(key):
@@ -96,7 +97,7 @@ def _horizontal(key):
 
 
 def _vertical(key):
-    # Keep the original column_adjoint path, whose positive store and negative RMW use gs.
+    # The large-layer tile uses the two-pass column adjoint schedule.
     raw = with_fields(key, sgs=0, l2_single_write=False) if key.backward else key
     src = w66.vertical_source(raw)
     src = src.replace("Quad<T> packed_source(", "Fp8Quad packed_source(")
@@ -132,11 +133,32 @@ def _vertical(key):
     )
 
 
+def _configure_small(launch):
+    if not launch.key.backward:
+        return launch
+    key = with_fields(
+        launch.key,
+        sgs=1,
+        chunk=0,
+        seg16=True,
+        cache_line=True,
+        cache_source=True,
+        shared_acc=False,
+        global_checkpoints=False,
+        l2_single_write=False,
+    )
+    return launch._replace(
+        key=key, plan=launch.plan._replace(chunk=0, cache_line=True, global_checkpoints=False)
+    )
+
+
 def configure(launch, height):
+    if height in (7, 14):
+        return _configure_small(launch)
     key = launch.key
     if key.backward:
         if height != 56:
-            return launch
+            return launch._replace(plan=launch.plan._replace(smem=_tile_shared_bytes(key, height)))
         key = with_fields(
             key,
             chunk=0,
@@ -159,7 +181,7 @@ def configure(launch, height):
             vertical_w55="v55_bf16x2_bf16w",
             register_path=False,
         )
-        smem = 5632 + 1536 * height
+        smem = _tile_shared_bytes(key, height)
         return launch._replace(
             key=key,
             partials=(launch.workers + 3) // 4,
@@ -203,30 +225,162 @@ def _upgrade_vertical(src, key, width, height, modes):
     return src[:pos] + f"\n H={height}; W={width}; M={modes};\n" + src[pos:]
 
 
+def _small_vertical(key):
+    src = w66.vertical_source(key)
+    src = src.replace("Quad<T> packed_source(", "Fp8Quad packed_source(")
+    src = src.replace("const Pair<T>*>(states)", "const Fp8Pair*>(states)")
+    if not key.backward:
+        return src
+    if not (key.sgs and key.cache_line and key.seg16 and key.cache_source):
+        raise ValueError("expected cached SGS plan")
+    src = src.replace("int xa,xb,x;", "int xa,xb,x; float scale,inv;")
+    src = src.replace("xa,xb,x};", "xa,xb,x,scales[0],scales[1]};")
+    src = src.replace("long long grad_plane\n", "long long grad_plane, const float* scales\n")
+    src = src.replace("input_plane, grad_plane);", "input_plane, grad_plane, scales);")
+    src = src.replace("Pair<T>*>(gs)", "E5m2Pair*>(gs)")
+    for slot, field in (("ia", "a"), ("ib", "b")):
+        src = w66.replace(
+            src,
+            f"(ACCUMULATE ? words[{slot}].unpack() : positive.{field}.unpack())",
+            f"positive.{field}.unpack()",
+        )
+        src = w66.replace(
+            src,
+            f"words[{slot}]=Pair<T>::pack(ds_{field});",
+            f"words[{slot}]=E5m2Pair::pack(ds_{field},c.scale);",
+        )
+    src = src.replace("Quad<T>* seg", "Fp8Quad* seg")
+    src = src.replace(
+        "reinterpret_cast<Quad<T>*>(seg_base)", "reinterpret_cast<Fp8Quad*>(seg_base)"
+    )
+    src = src.replace(
+        "auto* seg_src = reinterpret_cast<Quad<T>*>", "auto* seg_src = reinterpret_cast<Fp8Quad*>"
+    )
+    src = src.replace("Quad<T>* source_cache", "Fp8Quad* source_cache")
+    src = re.sub(r"(seg(?:_src)?\[[^\]]+\] = )Quad<T>::pack", r"\1Fp8Quad::pack", src)
+    src = src.replace("Quad<T>* g2,", "E5m2Quad* g2,")
+    src = re.sub(
+        r"(g2\[[^\]]+\] =\s*)(normalize_packed<T>\(.*?\));",
+        r"\1E5m2Quad::pack(\2.unpack(),c.scale);",
+        src,
+        flags=re.DOTALL,
+    )
+    src = src.replace("g2_stride].unpack()", "g2_stride].unpack(c.inv)")
+    return w66.replace(
+        src,
+        "buf, stride, chunks, da, dg, line_buf + (CACHE_LINE ? I(oh) * threads : 0) + threadIdx.x",
+        "reinterpret_cast<E5m2Quad*>(line_buf)+threadIdx.x, I(threads), chunks, da, dg, "
+        "reinterpret_cast<Quad<T>*>(reinterpret_cast<E5m2Quad*>(line_buf)+I(oh)*threads)+threadIdx.x",
+    )
+
+
+def _fp16x2_hidden(src):
+    start = src.index(
+        "        #pragma unroll\n        for (int t = 0; t < K; ++t) {\n            float pre = 0;"
+    )
+    anchor = src.index("const float wr = path.output(j), wj =", src.index("void path_mlp_batch"))
+    packed = src.find("#if __CUDA_ARCH__", anchor, start)
+    if packed >= 0:
+        start = packed
+    end = src.index("            pre = ((pre) + b);", start)
+    src = (
+        src[:start]
+        + """
+        static_assert(K%2==0);
+        #pragma unroll
+        for (int pair=0;pair<K;pair+=2) {
+            auto v=__floats2half2_rn(0.f,0.f);
+            #pragma unroll
+            for (int k=0;k<8;++k)
+                v=__hfma2(__floats2half2_rn(weights[k],weights[k]),__floats2half2_rn(p[pair][k],p[pair+1][k]),v);
+            auto z=__half22float2(v);
+            #pragma unroll
+            for (int lane=0;lane<2;++lane) {
+            int t=pair+lane;
+            float pre=lane?z.y:z.x;
+"""
+        + src[end:]
+    )
+    return src.replace("out_i[t].add(wj * act);", "out_i[t].add(wj * act);\n            }", 1)
+
+
+def _dq_tile(src, key, height):
+    rows = 46 if height == 56 and not key.coarse else height
+    src = src.replace("Quad<T> positive = {}", "E5m2Quad positive = {}")
+    for field in ("a", "b"):
+        src = src.replace(f"positive.{field}.unpack()", f"positive.{field}.unpack(c.inv)")
+    begin = src.index("void column_adjoint(")
+    end = src.index("\n}", begin) + 2
+    store = f"""
+        if constexpr (REVERSE)
+            write_column_gradient<true, COMPACT>(c, y, ds, gs, tile[y * {32 * key.warps}]);
+        else tile[y * {32 * key.warps}] = E5m2Quad::pack(ds, c.scale);
+    """
+    default = "write_column_gradient<REVERSE, COMPACT, REVERSE>(c, y, ds, gs);"
+    if rows < height:
+        store = f"if (y < {rows}) {{ {store} }} else {{ {default} }}"
+    helper = src[begin:end].replace("T* gs\n", "T* gs, E5m2Quad* tile\n").replace(default, store)
+    src = src[:begin] + helper + src[end:]
+    pattern = r"(column_adjoint<(?:true|false), COMPACT>\([^;]+?), gs\);"
+    offset = height // (1 + key.coarse)
+    src, count = re.subn(pattern, rf"\1, gs, g2 + {offset} * THREADS);", src)
+    if count != 5:
+        raise ValueError("unexpected column adjoint schedule")
+    return src
+
+
 def kernel_source(key, width, height, modes):
-    src = _vertical(key) if key.vertical else _horizontal(key)
+    small = height in (7, 14)
+    vertical_source = _small_vertical if small else _vertical
+    src = vertical_source(key) if key.vertical else _horizontal(key)
     pos = src.index("template<class T> struct alignas")
     src = "#include <cuda_fp8.h>\n#include <type_traits>\n" + src[:pos] + FP8 + src[pos:]
-    if not (key.vertical and key.backward):
+    if not key.vertical or (key.backward if small else not key.backward):
         pos = src.rindex(") {") + 3
         src = src[:pos] + f"\n H={height}; W={width}; M={modes};\n" + src[pos:]
     entry_key = (
-        with_fields(key, sgs=0, l2_single_write=False) if key.vertical and key.backward else key
+        with_fields(key, sgs=0, l2_single_write=False)
+        if key.vertical and key.backward and not small
+        else key
     )
-    src = w66.replace(src, f" void {scans._kernel_name(entry_key)}(", f" void {profile_name(key)}(")
-    if key.vertical:
+    src = w66.replace(
+        src, f" void {scans._kernel_name(entry_key)}(", f" void {profile_name(key, height)}("
+    )
+    if key.vertical and not small:
         src = _upgrade_vertical(src, key, width, height, modes)
+        if key.backward:
+            src = _dq_tile(src, key, height)
+        elif height == 56 and not key.coarse:
+            src = _fp16x2_hidden(src)
     return src + SCALE_KERNEL if key.vertical and key.backward else src
+
+
+def _small_shared_bytes(launch, height):
+    k = launch.key
+    if not (k.vertical and k.backward):
+        return launch.plan.smem
+    weights = (
+        11 * 8 * 32 * (4 if k.vector_weights and k.vertical_w55 != "v55_bf16x2_bf16w" else 2)
+        if k.cache_weights
+        else 0
+    )
+    return weights + k.warps * 32 * (16 * height + 4 * (height // (1 + k.coarse)))
+
+
+def _tile_shared_bytes(key, height):
+    if key.chunk or key.warps != 4 or not (key.cache_source and key.cache_weights and key.seg16):
+        raise ValueError("expected the cached four-warp vertical tile plan")
+    rows = 46 if height == 56 and not key.coarse else height
+    segment = 4 if height == 56 else 8
+    return 5632 + 32 * key.warps * (
+        height * (segment + 4) + 4 * (height // (1 + key.coarse) + rows)
+    )
 
 
 def shared_bytes(launch, height):
     key = launch.key
-    if key.vertical and key.backward and height != 56:
-        if not (key.cache_source and not key.shared_acc and (key.seg16 or not key.chunk)):
-            raise ValueError("Wave 71 requires the Wave 57 packed trajectory preset")
-        return 5632 + key.warps * 32 * (
-            8 * height + (8 if key.seg16 else 16) * (key.chunk or height)
-        )
+    if key.vertical and key.backward and height in (7, 14):
+        return _small_shared_bytes(launch, height)
     return launch.plan.smem
 
 
@@ -283,7 +437,7 @@ def _function(device, key, width, height, modes, smem):
         module, fn = ct.c_void_p(), ct.c_void_p()
         scans._check_cu(driver.cuModuleLoadData(ct.byref(module), image), "load packed cubin")
         scans._check_cu(
-            driver.cuModuleGetFunction(ct.byref(fn), module, profile_name(key).encode()),
+            driver.cuModuleGetFunction(ct.byref(fn), module, profile_name(key, height).encode()),
             "get packed function",
         )
         scans._configure_smem(driver, fn, smem)
@@ -342,6 +496,8 @@ def _dispatch(real, launch, width, args, scale_args=()):
 def _check_source(real):
     if real.ndim != 4 or not real.is_cuda or real.dtype != torch.bfloat16:
         raise ValueError("expected CUDA BF16 [B,H,W,M] source")
+    if real.shape[1:] not in ((56, 56, 160), (28, 28, 160), (14, 14, 160), (7, 7, 128)):
+        raise ValueError("unsupported packed scan shape")
     if torch.cuda.get_device_capability(real.device) != (9, 0):
         raise ValueError("packed kernels require SM90a")
 
@@ -366,6 +522,17 @@ def _words(real, width):
         device=real.device,
         dtype=torch.int16,
     )
+
+
+def _cached_horizontal(launch, w):
+    if not launch.key.cache_line:
+        threads = launch.key.warps * 32
+        smem = max(launch.plan.smem, w * threads * (8 if launch.key.horizontal_vec2 else 4))
+        launch = launch._replace(
+            key=with_fields(launch.key, cache_line=True),
+            plan=launch.plan._replace(cache_line=True, smem=smem),
+        )
+    return launch
 
 
 def horizontal(pole, r, i, states=None, adjoints=None, compact=False, scales=None):
@@ -409,13 +576,8 @@ def horizontal(pole, r, i, states=None, adjoints=None, compact=False, scales=Non
     )
     # Short rows may use a register-only Wave 57 launch which reloads inputs.
     # Use the identical cached template for the return sweep in that case.
-    if not backward and not launch.key.cache_line:
-        threads = launch.key.warps * 32
-        smem = max(launch.plan.smem, w * threads * (8 if launch.key.horizontal_vec2 else 4))
-        launch = launch._replace(
-            key=with_fields(launch.key, cache_line=True),
-            plan=launch.plan._replace(cache_line=True, smem=smem),
-        )
+    if not backward:
+        launch = _cached_horizontal(launch, w)
     partial = scratch = None
     if backward:
         _check_storage(r, states, w)
@@ -462,6 +624,8 @@ def vertical(
 ):
     _check_source(r)
     b, h, w, m = r.shape
+    if h == 7 and coarse:
+        raise ValueError("unsupported coarse 7x7 scan")
     _check_storage(r, states, w)
     logical = r.unsqueeze(0).expand(4, -1, -1, -1, -1)
     if (
@@ -555,12 +719,21 @@ def enabled(real, path, epilogue, kind, swiglu):
         os.environ.get("VA_W72_SPLIT_FP8") == "1"
         and real.dtype == torch.bfloat16
         and real.ndim == 4
-        and real.shape[1:] in ((56, 56, 160), (28, 28, 160))
+        and (
+            real.shape[1:] in ((56, 56, 160), (28, 28, 160))
+            or (
+                os.environ.get("VA_W74_SMALL_FP8", "1") == "1"
+                and (
+                    real.shape[1:] == (14, 14, 160)
+                    or (real.shape[1:] == (7, 7, 128) and epilogue == "full16")
+                )
+            )
+        )
         and epilogue in ("full16", "coarse_path")
         and kind == 0
         and not swiglu
         and len(path) == 4
-        and path[0].shape == (160, 8, 8)
+        and path[0].shape == (real.shape[-1], 8, 8)
         and scans.general_scans_enabled(forward=True)
         and _is_hopper(real)
     )

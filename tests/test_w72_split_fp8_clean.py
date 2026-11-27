@@ -15,6 +15,7 @@ from lnet import w72_split_fp8_scan as fp
 
 
 def test_model_graph(monkeypatch) -> None:
+    monkeypatch.setenv("VA_W74_SMALL_FP8", "0")
     ops = model_scan_graph(monkeypatch, fp8=True)
     assert [(shape, ep) for name, shape, ep in ops if name.endswith("_w72_fp8.default")] == [
         ((56, 56), "full16"),
@@ -58,7 +59,7 @@ def test_56d_cubins(tmp_path) -> None:
         if op == "VB":
             assert key.chunk == 0
             assert not launch.plan.global_checkpoints
-            assert fp.shared_bytes(launch, w) == 91648
+            assert fp.shared_bytes(launch, w) == 115200
         return op
 
     with concurrent.futures.ThreadPoolExecutor(4) as pool:
@@ -80,7 +81,7 @@ def test_28_vertical_winners() -> None:
         launch = fp.configure(launch, w)
         if op == "VB":
             assert launch.key.chunk == 0
-            assert fp.shared_bytes(launch, w) == 62976
+            assert fp.shared_bytes(launch, w) == (77312 if label == "28d" else 70144)
         else:
             assert launch.plan.cache_line
             src = fp.kernel_source(launch.key, w, w, m)
@@ -97,6 +98,10 @@ def test_saved_storage() -> None:
 
 @pytest.mark.parametrize("planes", [False, True])
 def test_aot_retained_state(planes) -> None:
+    check_joint_state(planes, 56, 160, "full16")
+
+
+def check_joint_state(planes, h, m, epilogue) -> None:
     class Loss(torch.nn.Module):
         def forward(self, *args: torch.Tensor):
             op = (
@@ -107,7 +112,7 @@ def test_aot_retained_state(planes) -> None:
             outputs = op(
                 list(args[:9]),
                 list(args[9:]),
-                "full16",
+                epilogue,
                 1e-6,
                 0,
                 recompute=False,
@@ -117,15 +122,15 @@ def test_aot_retained_state(planes) -> None:
             return (outputs[0].sum(),)
 
     with FakeTensorMode():
-        args = [torch.empty(1, 1, 1, 160, requires_grad=True) for _ in range(8)]
+        args = [torch.empty(1, 1, 1, m, requires_grad=True) for _ in range(8)]
         args += [
             torch.empty(shape, dtype=torch.bfloat16, requires_grad=True)
             for shape in (
-                (1, 56, 56, 320),
-                (160, 8, 8),
-                (160, 8),
-                (160, 2, 8),
-                (160, 2),
+                (1, h, h, 2 * m),
+                (m, 8, 8),
+                (m, 8),
+                (m, 2, 8),
+                (m, 2),
             )
         ]
         graph, _ = aot_export_module(Loss(), tuple(args), trace_joint=True, output_loss_index=0)
@@ -136,23 +141,30 @@ def test_aot_retained_state(planes) -> None:
         n for n in graph.graph.nodes if n.target == torch.ops.lnet.w72_fp8_scan_backward.default
     )
     assert saved.meta["val"].dtype == torch.int16
+    assert saved.meta["val"].shape == (1, m // 32, 2, h, h, 32)
     assert backward.args[4] is saved
 
 
 def test_null_workspace(monkeypatch) -> None:
-    plans = {op: plan for shape, op, _, _, plan in offline_plans() if shape == "56d"}
+    check_workspace(monkeypatch, bench.SHAPES[0])
+
+
+def check_workspace(monkeypatch, shape) -> None:
+    monkeypatch.setattr(fp.scans, "device_limits", lambda _: (132, 227 << 10, 64))
+    _, h, w, m, coarse = shape
+    plans = {op: plan for _, op, _, _, plan in offline_plans([shape])}
     monkeypatch.setattr(fp, "_check_source", lambda *_: None)
     monkeypatch.setattr(fp.scans, "_reduce_partials", lambda _, params, *_args: params)
-    r = torch.empty(1, 56, 56, 160, dtype=torch.bfloat16)
-    pole = [torch.empty(160)] * 4
-    aux = [torch.empty(2, 56, 160)] * 2
-    path = [torch.empty(s) for s in ((160, 8, 8), (160, 8), (160, 2, 8), (160, 2))]
+    r = torch.empty(1, h, w, m, dtype=torch.bfloat16)
+    pole = [torch.empty(m)] * 4
+    aux = [torch.empty(2, h, m)] * 2
+    path = [torch.empty(s) for s in ((m, 8, 8), (m, 8), (m, 2, 8), (m, 2))]
     seen = []
 
     def capture(_, launch, _width, args, scale_args=()):
         scratch = (args[17], args[18]) if launch.key.vertical else (args[10],)
         assert all(ptr.value is None for ptr in scratch)
-        seen.append(fp.profile_name(launch.key))
+        seen.append(fp.profile_name(launch.key, h))
         assert bool(scale_args) == (launch.key.vertical and launch.key.backward)
 
     def plan(*_: object, vertical, backward, **__: object):
@@ -161,23 +173,28 @@ def test_null_workspace(monkeypatch) -> None:
     monkeypatch.setattr(fp, "_dispatch", capture)
     monkeypatch.setattr(fp.scans, "_plan_launch", plan)
     states = fp.horizontal(pole, r, r)
-    fp.vertical(pole, r, states, aux, path, coarse=False)
-    grad = fp.vertical(pole, r, states, aux, path, coarse=False, grad=(r, r))
+    fp.vertical(pole, r, states, aux, path, coarse=coarse)
+    out = r[:, :h // (1 + coarse), :w // (1 + coarse)].contiguous()
+    grad = fp.vertical(pole, r, states, aux, path, coarse=coarse, grad=(out, out))
     assert grad[4].dtype == torch.int16
-    fp.horizontal(pole, r, r, states=states, adjoints=grad[4], scales=grad[-1])
+    fp.horizontal(pole, r, r, states=states, adjoints=grad[4], scales=grad[-1], compact=coarse)
     assert len(set(seen)) == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper")
 @pytest.mark.parametrize(("height", "coarse"), [(56, False), (56, True), (28, False), (28, True)])
 def test_compiled_training(monkeypatch, request, height, coarse) -> None:
+    check_compiled_training(monkeypatch, request, height, coarse)
+
+
+def check_compiled_training(monkeypatch, request, height, coarse, *, planes=False) -> None:
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("requires Hopper")
     torch._dynamo.reset()
     request.addfinalizer(torch._dynamo.reset)
     for k, v in bench.lockin_arm_env("w57_lockin").items():
         monkeypatch.setenv(k, v)
-    x, a, g, _, path = bench.reference_inputs(height, height, 160)
+    x, a, g, _, path = bench.reference_inputs(height, height, 128 if height == 7 else 160)
     drive = torch.cat((x.real, x.imag), -1).detach().bfloat16().requires_grad_()
     pole = [
         p.detach().reshape(1, 1, 1, -1).contiguous().requires_grad_()
@@ -191,8 +208,12 @@ def test_compiled_training(monkeypatch, request, height, coarse) -> None:
         else pipeline.run_product_scan_path_collapse_pipeline_packed
     )
 
+    if planes:
+        fn = (pipeline.run_product_scan_coarse_path_collapse_planes_packed if coarse
+              else pipeline.run_product_scan_path_collapse_planes_packed)
+
     def run(*args: torch.Tensor):
-        return fn(
+        output = fn(
             tuple(args[:4]),
             tuple(args[:4]),
             args[4],
@@ -201,11 +222,13 @@ def test_compiled_training(monkeypatch, request, height, coarse) -> None:
             memory_policy="retain",
         )
 
+        return torch.cat(output, -1) if planes else output
+
     monkeypatch.setenv("VA_W72_SPLIT_FP8", "0")
     ref = run(*operands)
     compiled = torch.compile(run, fullgraph=True)
     monkeypatch.setenv("VA_W72_SPLIT_FP8", "1")
-    factors = (1.0, 1e-5) if height == 56 and not coarse else (1.0,)
+    factors = (1.0, 1e-5) if height in (14, 56) and not coarse else (1.0,)
     gradients = [torch.randn_like(ref) * factor for factor in factors]
     stream = torch.cuda.Stream()
     for dy in gradients:

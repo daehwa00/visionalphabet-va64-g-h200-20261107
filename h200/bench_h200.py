@@ -147,6 +147,9 @@ def lockin_arm_env(name: str) -> dict[str, str]:
     arm = name.removesuffix("_rev")
     if arm == "w43_ref":
         return REFERENCE_ENV.copy()
+    if arm == "w74_fp8_lockin":
+        return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1", "VA_W72_SPLIT_FP8": "1",
+                "LNET_READER_EXEC_MODE": "dense_nhwc_hybrid"}
     if arm == "w66_lockin":
         return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1"}
     if arm == "w57_lockin":
@@ -156,14 +159,17 @@ def lockin_arm_env(name: str) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    arms = ("w43_ref", "w57_lockin", "w66_lockin")
+    arms = ("w43_ref", "w57_lockin", "w66_lockin", "w74_fp8_lockin")
     parser.add_argument("--arm", required=True, choices=(*arms, *(arm + "_rev" for arm in arms)))
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     env = lockin_arm_env(args.arm)
-    if "VA_W66_SPLIT_BF16" not in env:
-        os.environ.pop("VA_W66_SPLIT_BF16", None)
+    if "VA_W72_SPLIT_FP8" not in env:
+        os.environ.pop("VA_W74_SMALL_FP8", None)
+    for flag in ("VA_W66_SPLIT_BF16", "VA_W72_SPLIT_FP8"):
+        if flag not in env:
+            os.environ.pop(flag, None)
     os.environ.update(env)
     return measure_arm(args.out, profile=args.profile, arm_env_keys=tuple(env))
 

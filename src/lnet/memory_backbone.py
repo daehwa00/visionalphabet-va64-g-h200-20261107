@@ -444,6 +444,9 @@ class FactorizedMemoryReader(nn.Module):
         mode = os.environ.get(_READER_EXEC_MODE_ENV, "off")
         if mode in {"", "off"}:
             return self.execution_mode
+        if mode == "dense_nhwc_hybrid":
+            small = source.shape[1:3] in ((14, 14), (7, 7))
+            return "dense_nhwc_inductor" if small else "dense_nhwc"
         if mode == "auto_roofline":
             if not source.is_cuda:
                 return self.execution_mode

@@ -65,6 +65,8 @@ def select_split_scan_op(
     if os.environ.get("VA_W72_SPLIT_FP8") == "1":
         real = packed[..., : packed.shape[-1] // 2]
         return fp8 if w72.enabled(real, path, epilogue, kind, swiglu) else standard
+    if packed.shape[1:3] in ((14, 14), (7, 7)):
+        return standard
     return bf16 if os.environ.get("VA_W66_SPLIT_BF16") == "1" else standard
 
 

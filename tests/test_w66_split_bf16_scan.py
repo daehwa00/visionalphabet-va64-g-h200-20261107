@@ -24,6 +24,7 @@ def model_scan_graph(monkeypatch, *, fp8, bf16=True) -> list:
 
     monkeypatch.setattr(product_scan_pipeline, "_packed_reference", reference)
     model = build_variant("17-p1-nr4-1024d-v3").eval()
+    assert len(list(model.parameters())) == 193
     graphs = []
 
     def backend(graph, _inputs):
@@ -45,4 +46,6 @@ def model_scan_graph(monkeypatch, *, fp8, bf16=True) -> list:
 def test_ablation17_scan_graphs(monkeypatch) -> None:
     ops = model_scan_graph(monkeypatch, fp8=False)
     assert len(ops) == 11, ops
-    assert all(name.endswith("_w66.default") for name, _, _ in ops)
+    assert [shape for name, shape, _ in ops if name.endswith("_w66.default")] == [
+        (56, 56), (56, 56), (28, 28), (28, 28),
+    ]
