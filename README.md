@@ -13,10 +13,14 @@ values take precedence. A CPU device or unavailable CUDA leaves the environment 
 
 | Compute capability | Reader | Horizontal scan | Hopper split flags |
 | --- | --- | --- | --- |
-| 9.0 and later (H100/H200 preset) | Dense NHWC | hopper_specialized | Enabled |
+| 9.0 (H100/H200) | Dense NHWC | hopper_specialized | BF16 split |
+| Later than 9.0 (Blackwell) | Dense NHWC | optimized_backward | Omitted |
 | 8.9 (RTX 4090, L40S), 8.0 (A100) | Dense NHWC | optimized_backward | Omitted |
 | Other pre-8.9 (including RTX 3080 Ti, 8.6) | Factorized | optimized_backward | Omitted |
 
+On Hopper, `--arm auto` defaults to BF16 split (~137 ms on H200, cosine
+0.99997–1.00000 against FP32). Set `ALPHABET_ALLOW_FP8=1` or select
+`--arm hopper_fp8_resident` for FP8 split with resident weights (~123.3–123.7 ms).
 The SM90a split operators additionally require an SM90 device. Fixed benchmark arms
 are `reference`, `bf16_compiled`, `hopper_bf16_split`, `hopper_fp8_split`, and
 `hopper_fp8_resident`. Append `_rev` to select the reverse-order arm.

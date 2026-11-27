@@ -1,6 +1,7 @@
 """Parity, layout handling, and capture for the kernels."""
 
 import ast
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,7 @@ from torch import Tensor
 from torch._higher_order_ops.triton_kernel_wrap import generate_ttir
 from torch.nn import functional
 from triton.backends.compiler import GPUTarget
-from triton.compiler.compiler import make_backend
+from triton.backends.nvidia.compiler import CUDAOptions
 
 from alphabet import tiled_swiglu_rmsnorm
 from alphabet.memory_backbone import ChannelRMSNorm
@@ -208,8 +209,8 @@ def test_triton_launch_signatures() -> None:
                 args = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
                 signatures[node.name] = [arg.arg for arg in args]
 
-    target = GPUTarget("cuda", 90, 32)
-    backend_options = vars(make_backend(target).parse_options({}))
+    # CUDA parse_options accepts the declared dataclass fields across Triton versions.
+    backend_options = {field.name for field in fields(CUDAOptions)}
     launches = 0
     errors = []
     for path, tree in trees.items():

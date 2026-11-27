@@ -6,6 +6,8 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, MutableMapping
+
     import torch
 
 REFERENCE_ENV = {
@@ -46,20 +48,26 @@ def gpu_policy_environment() -> dict[str, str]:
     return {key: os.environ[key] for key in keys if key in os.environ}
 
 
-def recommended_gpu_env(capability: tuple[int, int] | None) -> dict[str, str]:
+def recommended_gpu_env(
+    capability: tuple[int, int] | None, *, allow_fp8: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     if capability is None:
         return {}
     if capability == (9, 0):
-        return {**COMPILED_ENV, **_SPLIT}
-    env = {**COMPILED_ENV, "ALPHABET_HORIZONTAL_SCAN_MODE": "optimized_backward"}
+        if allow_fp8 is None:
+            allow_fp8 = (os.environ if env is None else env).get("ALPHABET_ALLOW_FP8") == "1"
+        split = _SPLIT if allow_fp8 else {"ALPHABET_SCAN_SPLIT_BF16": "1"}
+        return {**COMPILED_ENV, **split}
+    policy = {**COMPILED_ENV, "ALPHABET_HORIZONTAL_SCAN_MODE": "optimized_backward"}
     if capability > (9, 0):
-        env["ALPHABET_COMPILER_FEATURES"] = "cuda_graphs,max_autotune_pointwise"
+        policy["ALPHABET_COMPILER_FEATURES"] = "cuda_graphs,max_autotune_pointwise"
     if capability != (8, 0) and capability < (8, 9):
-        env.update(
+        policy.update(
             ALPHABET_READER_MODE="off",
             ALPHABET_COMPILER_FEATURES="cuda_graphs,max_autotune_pointwise",
         )
-    return env
+    return policy
 
 
 def device_capability(device: torch.device | str | int | None = None) -> tuple[int, int] | None:
@@ -75,11 +83,45 @@ def device_capability(device: torch.device | str | int | None = None) -> tuple[i
 
 def apply_gpu_policy(
     device: torch.device | str | int | None = None, *, overwrite: bool = False,
+    allow_fp8: bool | None = None, env: MutableMapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Apply defaults and return the effective values for the selected preset."""
-    env = recommended_gpu_env(device_capability(device))
-    if overwrite and env:
-        for key in _SPLIT.keys() - env.keys():
-            os.environ.pop(key, None)
-        os.environ.update(env)
-    return {key: os.environ.setdefault(key, value) for key, value in env.items()}
+    target = os.environ if env is None else env
+    policy = recommended_gpu_env(device_capability(device), allow_fp8=allow_fp8, env=target)
+    if overwrite and policy:
+        for key in _SPLIT.keys() - policy.keys():
+            target.pop(key, None)
+        target.update(policy)
+    return {key: target.setdefault(key, value) for key, value in policy.items()}
+
+
+def benchmark_arm_env(name: str) -> dict[str, str]:
+    arm = name.removesuffix("_rev")
+    if arm == "auto":
+        return recommended_gpu_env(device_capability())
+    if arm == "reference":
+        return REFERENCE_ENV.copy()
+    if arm == "hopper_fp8_resident":
+        return recommended_gpu_env((9, 0), allow_fp8=True)
+    if arm == "hopper_fp8_split":
+        return {
+            **COMPILED_ENV,
+            "ALPHABET_SCAN_SPLIT_BF16": "1",
+            "ALPHABET_SCAN_SPLIT_FP8": "1",
+            "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS": "0",
+        }
+    if arm == "hopper_bf16_split":
+        return {**COMPILED_ENV, "ALPHABET_SCAN_SPLIT_BF16": "1"}
+    if arm == "bf16_compiled":
+        return COMPILED_ENV.copy()
+    raise ValueError(f"Unknown arm {name!r}")
+
+
+def apply_fixed_arm(arm: str) -> dict[str, str]:
+    env = benchmark_arm_env(arm)
+    if "ALPHABET_SCAN_SPLIT_FP8" not in env:
+        os.environ.pop("ALPHABET_SCAN_SMALL_SPATIAL_FP8", None)
+    for flag in _SPLIT.keys() - env.keys():
+        os.environ.pop(flag, None)
+    os.environ.update(env)
+    return env

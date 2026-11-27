@@ -6,6 +6,7 @@ import bench_split_bf16_scan as bench
 from test_split_bf16_model import compile_source, cubin_resources, offline_plans
 
 from alphabet import split_fp8_scan as fp
+from h200.bench_h200 import benchmark_arm_env
 
 SMEM = {
     "56d": 115200, "56c": 104448, "28d": 77312, "28c": 70144,
@@ -14,8 +15,8 @@ SMEM = {
 
 
 def test_cubins(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("ALPHABET_SCAN_SPLIT_FP8", "1")
-    monkeypatch.delenv("ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS", raising=False)
+    for key, value in benchmark_arm_env("hopper_fp8_resident").items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(fp.scans, "device_limits", lambda _: (132, 227 << 10, 64))
     jobs = list(offline_plans(bench.SHAPES, plane_gradients=True))
 

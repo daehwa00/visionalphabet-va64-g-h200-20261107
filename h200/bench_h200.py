@@ -8,12 +8,11 @@ from pathlib import Path
 from time import perf_counter
 
 from alphabet.gpu_policy import (
-    COMPILED_ENV,
     REFERENCE_ENV,
+    apply_fixed_arm,
     apply_gpu_policy,
-    device_capability,
+    benchmark_arm_env,  # noqa: F401 -- public benchmark preset lookup
     gpu_policy_environment,
-    recommended_gpu_env,
 )
 from h200 import runner
 
@@ -121,28 +120,6 @@ def measure_arm(
     return 0
 
 
-def benchmark_arm_env(name: str) -> dict[str, str]:
-    arm = name.removesuffix("_rev")
-    if arm == "auto":
-        return recommended_gpu_env(device_capability())
-    if arm == "reference":
-        return REFERENCE_ENV.copy()
-    if arm == "hopper_fp8_resident":
-        return recommended_gpu_env((9, 0))
-    if arm == "hopper_fp8_split":
-        return {
-            **COMPILED_ENV,
-            "ALPHABET_SCAN_SPLIT_BF16": "1",
-            "ALPHABET_SCAN_SPLIT_FP8": "1",
-            "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS": "0",
-        }
-    if arm == "hopper_bf16_split":
-        return {**COMPILED_ENV, "ALPHABET_SCAN_SPLIT_BF16": "1"}
-    if arm == "bf16_compiled":
-        return COMPILED_ENV.copy()
-    raise ValueError(f"Unknown arm {name!r}")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     arms = (
@@ -169,17 +146,7 @@ def main() -> int:
         apply_gpu_policy(device=device)
         keys = tuple(gpu_policy_environment())
         return measure_arm(args.out, profile=args.profile, arm_env_keys=keys)
-    env = benchmark_arm_env(args.arm)
-    if "ALPHABET_SCAN_SPLIT_FP8" not in env:
-        os.environ.pop("ALPHABET_SCAN_SMALL_SPATIAL_FP8", None)
-    for flag in (
-        "ALPHABET_SCAN_SPLIT_BF16",
-        "ALPHABET_SCAN_SPLIT_FP8",
-        "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS",
-    ):
-        if flag not in env:
-            os.environ.pop(flag, None)
-    os.environ.update(env)
+    env = apply_fixed_arm(args.arm)
     return measure_arm(args.out, profile=args.profile, arm_env_keys=tuple(env))
 
 

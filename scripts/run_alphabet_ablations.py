@@ -238,7 +238,11 @@ def main() -> None:
     from alphabet.complex_scan_config import ComplexScanConfig
 
     args = runtime.parse_args(variants=VARIANTS, seeds=SEEDS)
-    if os.environ.get("ALPHABET_AUTO_GPU_POLICY") == "1":
+    if args.arm in ("hopper_fp8_resident", "hopper_bf16_split"):
+        from alphabet.gpu_policy import apply_fixed_arm
+
+        apply_fixed_arm(args.arm)
+    elif args.arm == "auto" or os.environ.get("ALPHABET_AUTO_GPU_POLICY") == "1":
         from alphabet.gpu_policy import apply_gpu_policy
 
         apply_gpu_policy(device=args.device)

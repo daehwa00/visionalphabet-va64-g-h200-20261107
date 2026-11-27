@@ -8,6 +8,7 @@ import alphabet_imagenet100_runtime as runtime
 import pytest
 import run_alphabet_ablations as ablations
 import torch
+from test_split_bf16_scan import trace_model_scans
 
 from alphabet import gpu_policy, product_scan_ops
 from h200 import bench_h200
@@ -26,21 +27,13 @@ from h200 import bench_h200
     ],
 )
 def test_recommendation(capability, reader, scan, tma, split) -> None:
-    env = gpu_policy.recommended_gpu_env(capability)
-    expected = {
-        **bench_h200.benchmark_arm_env("hopper_fp8_split"),
-        "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS": "1",
-    }
+    env = gpu_policy.recommended_gpu_env(capability, allow_fp8=False)
+    expected = bench_h200.benchmark_arm_env("hopper_bf16_split")
     expected.update(
         ALPHABET_READER_MODE=reader, ALPHABET_HORIZONTAL_SCAN_MODE=scan
     )
     if not split:
-        for flag in (
-            "ALPHABET_SCAN_SPLIT_BF16",
-            "ALPHABET_SCAN_SPLIT_FP8",
-            "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS",
-        ):
-            del expected[flag]
+        del expected["ALPHABET_SCAN_SPLIT_BF16"]
     if not tma:
         expected["ALPHABET_COMPILER_FEATURES"] = "cuda_graphs,max_autotune_pointwise"
     assert env == expected
@@ -131,7 +124,7 @@ def test_cli_device_index(monkeypatch, tmp_path) -> None:
 )
 def test_split_routing(monkeypatch, shape, epilogue, expected) -> None:
     h, w, m = shape
-    monkeypatch.setattr(os, "environ", gpu_policy.recommended_gpu_env((9, 0)))
+    monkeypatch.setattr(os, "environ", gpu_policy.recommended_gpu_env((9, 0), allow_fp8=True))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
     packed = MagicMock(shape=(1, h, w, 2 * m))
     packed.__getitem__.return_value = MagicMock(
@@ -170,3 +163,49 @@ def test_device_capability(monkeypatch, device, index) -> None:
     capability.assert_called_once_with(index)
     assert gpu_policy.apply_gpu_policy("cpu") == {}
     capability.assert_called_once_with(index)
+
+
+def test_hopper_opt_in_and_reset(monkeypatch) -> None:
+    monkeypatch.setattr(gpu_policy, "device_capability", lambda _: (9, 0))
+    env = {"ALPHABET_ALLOW_FP8": "1"}
+    fp8 = bench_h200.benchmark_arm_env("hopper_fp8_resident")
+    assert gpu_policy.apply_gpu_policy(env=env) == fp8
+    del env["ALPHABET_ALLOW_FP8"]
+    assert gpu_policy.apply_gpu_policy(env=env, overwrite=True) == env
+    assert env == bench_h200.benchmark_arm_env("hopper_bf16_split")
+    assert gpu_policy.apply_gpu_policy(env=env, allow_fp8=True) == fp8
+
+
+@pytest.mark.parametrize("poles", [None, (32, 64, 64, 64), (64, 128, 192, 256)])
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_auto_hopper_graph(monkeypatch, tmp_path, poles, opt_in) -> None:
+    monkeypatch.setattr(os, "environ", {"CUDA_VISIBLE_DEVICES": ""})
+    if opt_in:
+        monkeypatch.setenv("ALPHABET_ALLOW_FP8", "1")
+    monkeypatch.setattr(gpu_policy, "device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(sys, "argv", ["bench", "--arm", "auto", "--out", str(tmp_path)])
+    monkeypatch.setattr(bench_h200, "measure_arm", lambda *_args, **_kw: 0)
+    assert bench_h200.main() == 0
+    ops = trace_model_scans(monkeypatch, poles)
+    suffix = "_split_fp8.default" if opt_in else "_split_bf16.default"
+    assert len(ops) == 11
+    assert all(name.endswith(suffix) for name, _, _ in ops)
+
+
+@pytest.mark.parametrize(
+    ("arm", "allow", "fp8"),
+    [("auto", "0", False), ("auto", "1", True),
+     ("hopper_bf16_split", "1", False), ("hopper_fp8_resident", "0", True)],
+)
+def test_ablation_hopper_arm(monkeypatch, tmp_path, arm, allow, fp8) -> None:
+    monkeypatch.setattr(os, "environ", {"ALPHABET_ALLOW_FP8": allow, "CUDA_VISIBLE_DEVICES": ""})
+    monkeypatch.setattr(gpu_policy, "device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(runtime, "main", MagicMock())
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--arm", arm, "--device", "cuda:1", "--root", str(tmp_path),
+        "--data-root", str(tmp_path),
+    ])
+    ablations.main()
+    assert os.environ["ALPHABET_SCAN_SPLIT_BF16"] == "1"
+    for flag in ("ALPHABET_SCAN_SPLIT_FP8", "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS"):
+        assert os.environ.get(flag) == ("1" if fp8 else None)

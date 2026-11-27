@@ -68,6 +68,7 @@ class RunnerBindings:
 def parse_args(*, variants: tuple[str, ...], seeds: tuple[int, ...]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=torch.device, default=torch.device("cuda"))
+    parser.add_argument("--arm", choices=("auto", "hopper_fp8_resident", "hopper_bf16_split"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--variants", choices=variants, nargs="+", default=list(variants))

@@ -347,3 +347,24 @@ def test_storage_graph_target(monkeypatch):
         name = "product_scan_pipeline_storage_v2"  # CPU inputs use the standard op.
         assert result.graph_count == 1
         assert getattr(torch.ops.alphabet, name).default in result.ops_per_graph[0]
+
+
+@pytest.mark.parametrize("poles", [None, (32, 64, 64, 64), (64, 128, 192, 256)])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_fixed_hopper_arm_graph(monkeypatch, poles, fp8):
+    from test_split_bf16_scan import trace_model_scans
+
+    from alphabet.gpu_policy import apply_fixed_arm
+
+    # Start in the opposite mode to catch stale policy flags on arm changes.
+    monkeypatch.setattr(os, "environ", {
+        "CUDA_VISIBLE_DEVICES": "",
+        "ALPHABET_ALLOW_FP8": "0" if fp8 else "1",
+        "ALPHABET_SCAN_SPLIT_FP8": "0" if fp8 else "1",
+    })
+    apply_fixed_arm("hopper_fp8_resident" if fp8 else "hopper_bf16_split")
+    assert os.environ.get("ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS") == ("1" if fp8 else None)
+    ops = trace_model_scans(monkeypatch, poles)
+    assert len(ops) == 11
+    suffix = "_split_fp8.default" if fp8 else "_split_bf16.default"
+    assert all(name.endswith(suffix) for name, _, _ in ops)
