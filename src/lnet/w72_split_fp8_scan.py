@@ -304,8 +304,59 @@ def _fp16x2_hidden(src):
     return src.replace("out_i[t].add(wj * act);", "out_i[t].add(wj * act);\n            }", 1)
 
 
-def _dq_tile(src, key, height):
-    rows = 46 if height == 56 and not key.coarse else height
+def _reg_wobi(key, height):
+    return (
+        key.vertical
+        and key.backward
+        and height in (7, 14, 56)
+        and os.environ.get("VA_W76_REG_WOBI", os.environ.get("VA_W72_SPLIT_FP8", "0")) == "1"
+    )
+
+
+def _resident_weights(src, packed):
+    subst = w66.replace
+    src = subst(src, "matrix < (BACKWARD ? 3 : 4)", "matrix < 1")
+    src = subst(src, "weight_fields = 11 * I(size)", "weight_fields = 8 * I(size)")
+    fields = "__nv_bfloat162 resident[12];" if packed else "float resident[24];"
+    src = subst(src, "int size,lane;", "int size,lane; " + fields)
+    for offset, base in ((8, 0), (9, 8)):
+        value = f"resident[{base}+j]"
+        src = subst(
+            src,
+            f"read(cache[({offset}*size+j)*32+lane])",
+            f"((j&1) ? __high2float(resident[({base}+j)/2]) : __low2float(resident[({base}+j)/2]))"
+            if packed
+            else value,
+        )
+    init = """
+            #pragma unroll
+            for (int j=0; j<24; ++j) {
+                const bool bias = j<8;
+                const int index = bias ? m*8+j : m*16+j-8;
+                result.resident[j] = active ? rounded<T>(load_scalar(
+                    bias ? bi : wo, index, (types >> (bias ? 2 : 4)) & 3)) : 0.f;
+            }"""
+    if packed:
+        init = """
+            #pragma unroll
+            for (int j=0; j<12; ++j) {
+                const bool bias = j<4;
+                const int index = bias ? m*8+2*j : m*16+2*j-8;
+                const void* src = bias ? bi : wo;
+                const int dtype = (types >> (bias ? 2 : 4)) & 3;
+                result.resident[j] = __floats2bfloat162_rn(
+                    active ? load_scalar(src,index,dtype) : 0.f,
+                    active ? load_scalar(src,index+1,dtype) : 0.f);
+            }"""
+    return subst(
+        src,
+        "return NativeWeights<T>{weights_shared, size, lane};",
+        "NativeWeights<T> result{weights_shared, size, lane};" + init + "return result;",
+    )
+
+
+def _dq_tile(src, key, height, resident):
+    rows = (49 if resident else 46) if height == 56 and not key.coarse else height
     src = src.replace("Quad<T> positive = {}", "E5m2Quad positive = {}")
     for field in ("a", "b"):
         src = src.replace(f"positive.{field}.unpack()", f"positive.{field}.unpack(c.inv)")
@@ -329,7 +380,11 @@ def _dq_tile(src, key, height):
     return src
 
 
-def kernel_source(key, width, height, modes):
+def kernel_source(key, width, height, modes, resident=None):
+    if resident is None:
+        resident = _reg_wobi(key, height)
+    if resident and height == 7:
+        key = with_fields(key, vertical_w55="v55_bf16x2_bf16w")
     small = height in (7, 14)
     vertical_source = _small_vertical if small else _vertical
     src = vertical_source(key) if key.vertical else _horizontal(key)
@@ -349,9 +404,11 @@ def kernel_source(key, width, height, modes):
     if key.vertical and not small:
         src = _upgrade_vertical(src, key, width, height, modes)
         if key.backward:
-            src = _dq_tile(src, key, height)
+            src = _dq_tile(src, key, height, resident)
         elif height == 56 and not key.coarse:
             src = _fp16x2_hidden(src)
+    if resident:
+        src = _resident_weights(src, height == 56)
     return src + SCALE_KERNEL if key.vertical and key.backward else src
 
 
@@ -364,15 +421,18 @@ def _small_shared_bytes(launch, height):
         if k.cache_weights
         else 0
     )
+    if _reg_wobi(k, height):
+        weights = 8 * 8 * 32 * 2
     return weights + k.warps * 32 * (16 * height + 4 * (height // (1 + k.coarse)))
 
 
 def _tile_shared_bytes(key, height):
     if key.chunk or key.warps != 4 or not (key.cache_source and key.cache_weights and key.seg16):
         raise ValueError("expected the cached four-warp vertical tile plan")
-    rows = 46 if height == 56 and not key.coarse else height
+    resident = _reg_wobi(key, height)
+    rows = (49 if resident else 46) if height == 56 and not key.coarse else height
     segment = 4 if height == 56 else 8
-    return 5632 + 32 * key.warps * (
+    return (4096 if resident else 5632) + 32 * key.warps * (
         height * (segment + 4) + 4 * (height // (1 + key.coarse) + rows)
     )
 
@@ -411,10 +471,10 @@ extern "C" __global__ void va_profile_scale__w72_split_fp8(
 
 
 @lru_cache(maxsize=256)
-def _function(device, key, width, height, modes, smem):
+def _function(device, key, width, height, modes, smem, resident):
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "packed.cu"
-        path.write_text(kernel_source(key, width, height, modes))
+        path.write_text(kernel_source(key, width, height, modes, resident))
         cubin = path.with_suffix(".cubin")
         subprocess.run(
             [
@@ -462,6 +522,7 @@ def _dispatch(real, launch, width, args, scale_args=()):
         real.shape[1],
         real.shape[-1],
         shared_bytes(launch, real.shape[1]),
+        _reg_wobi(key, real.shape[1]),
     )
     grid = scans._ceil(real.shape[-1], 32 * (1 + key.horizontal_vec2)) * scans._ceil(
         launch.workers, key.warps

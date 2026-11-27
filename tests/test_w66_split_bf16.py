@@ -16,7 +16,7 @@ import torch
 from bench_wave66_split_bf16 import OPS, SHAPES, VARIANTS, fp, scans
 
 
-def offline_plans(shapes=SHAPES[:2]):
+def offline_plans(shapes=SHAPES[:2], *, plane_gradients=False):
     from contextlib import ExitStack
 
     with ExitStack() as stack:
@@ -71,7 +71,7 @@ def offline_plans(shapes=SHAPES[:2]):
                     hidden=8 if v else 0,
                     precise=v and not b,
                     compact=b and c,
-                    interleaved=(True, True),
+                    interleaved=(not (plane_gradients and v and b and h != 7),) * 2,
                 )
                 yield label, op, w, m, launch
 
@@ -94,9 +94,13 @@ def compile_source(src, folder, flags, symbol=None):
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode:
         raise RuntimeError(proc.stderr)
+    return cubin_resources(str(path) + ".cubin", symbol)
+
+
+def cubin_resources(cubin, symbol):
     select = ["-fun", symbol] if symbol else []
-    sass = subprocess.check_output(["cuobjdump", *select, "-sass", str(path) + ".cubin"], text=True)
-    resource = subprocess.check_output(["cuobjdump", "-res-usage", str(path) + ".cubin"], text=True)
+    sass = subprocess.check_output(["cuobjdump", *select, "-sass", cubin], text=True)
+    resource = subprocess.check_output(["cuobjdump", "-res-usage", cubin], text=True)
 
     if symbol:
         resource = resource.split(f"Function {symbol}:", 1)[1].splitlines()[1]

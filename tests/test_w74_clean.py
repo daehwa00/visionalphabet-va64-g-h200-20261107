@@ -81,6 +81,7 @@ def test_cuda_graph(monkeypatch, request, shape) -> None:
 
 
 def test_cubins(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VA_W76_REG_WOBI", "0")
     monkeypatch.setattr(fp.scans, "device_limits", lambda _: (132, 227 << 10, 64))
 
     def audit(job):
@@ -130,19 +131,23 @@ def test_cubins(tmp_path, monkeypatch) -> None:
             print(*row)  # noqa: T201
 
 
-@pytest.mark.parametrize("arm", ["w74_fp8_lockin", "w66_lockin", "w57_lockin", "w43_ref"])
+@pytest.mark.parametrize(
+    "arm", ["w76_fp8_lockin", "w74_fp8_lockin", "w66_lockin", "w57_lockin", "w43_ref"]
+)
 @pytest.mark.parametrize("suffix", ["", "_rev"])
 def test_arm_environment(monkeypatch, tmp_path, arm, suffix) -> None:
     monkeypatch.setattr(os, "environ", os.environ.copy())
     name = arm + suffix
-    for key in ("VA_W72_SPLIT_FP8", "VA_W74_SMALL_FP8", "VA_W66_SPLIT_BF16"):
+    for key in ("VA_W72_SPLIT_FP8", "VA_W74_SMALL_FP8", "VA_W66_SPLIT_BF16", "VA_W76_REG_WOBI"):
         monkeypatch.setenv(key, "0")
     monkeypatch.setattr(sys, "argv", ["bench", "--arm", name, "--out", str(tmp_path)])
     monkeypatch.setattr(bench_h200, "measure_arm", lambda *_args, **_kwargs: 0)
     assert bench_h200.main() == 0
-    if arm == "w74_fp8_lockin":
+    if arm in ("w74_fp8_lockin", "w76_fp8_lockin"):
+        assert os.environ["VA_W76_REG_WOBI"] == str(int(arm == "w76_fp8_lockin"))
         assert os.environ["VA_W66_SPLIT_BF16"] == os.environ["VA_W72_SPLIT_FP8"] == "1"
         assert os.environ["LNET_READER_EXEC_MODE"] == "dense_nhwc"
     else:
         assert "VA_W72_SPLIT_FP8" not in os.environ
+        assert "VA_W76_REG_WOBI" not in os.environ
         assert "VA_W74_SMALL_FP8" not in os.environ
