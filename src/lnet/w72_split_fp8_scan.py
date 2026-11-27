@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass, fields
 from dataclasses import replace as with_fields
 from functools import lru_cache
 from pathlib import Path
@@ -305,7 +306,7 @@ def _fp16x2_hidden(src):
 
 
 def _dq_tile(src, key, height):
-    rows = 46 if height == 56 and not key.coarse else height
+    rows = tile_rows(key, height)
     src = src.replace("Quad<T> positive = {}", "E5m2Quad positive = {}")
     for field in ("a", "b"):
         src = src.replace(f"positive.{field}.unpack()", f"positive.{field}.unpack(c.inv)")
@@ -367,14 +368,66 @@ def _small_shared_bytes(launch, height):
     return weights + k.warps * 32 * (16 * height + 4 * (height // (1 + k.coarse)))
 
 
-def _tile_shared_bytes(key, height):
-    if key.chunk or key.warps != 4 or not (key.cache_source and key.cache_weights and key.seg16):
-        raise ValueError("expected the cached four-warp vertical tile plan")
-    rows = 46 if height == 56 and not key.coarse else height
+@dataclass(frozen=True)
+class _VBKey(scans.Kernel):
+    tile_limit: int = 0
+
+
+VB_ARMS = {
+    "56d": ("w75_3w_kmax", "w75_3w_nocachew_kmax"),
+    "56c": ("w75_3w_k17_cachew", "w75_3w_kmax", "w75_3w_nocachew_full"),
+    "28d": ("w75_3w_full",),
+    "28c": ("w75_3w_full",),
+    "14d": ("w75_3w", "w75_2w"),
+    "14c": ("w75_3w",),
+    "7d": ("w75_3w",),
+}
+
+
+def _tile_base(key, height):
     segment = 4 if height == 56 else 8
-    return 5632 + 32 * key.warps * (
-        height * (segment + 4) + 4 * (height // (1 + key.coarse) + rows)
+    return 5632 * key.cache_weights + 32 * key.warps * (
+        height * (segment + 4) + 4 * (height // (1 + key.coarse))
     )
+
+
+def tile_rows(key, height):
+    # Coarse scans also differentiate every input row in the column.
+    if isinstance(key, _VBKey):
+        if key.tile_limit:
+            return key.tile_limit
+        return min(height, (76800 - _tile_base(key, height)) // (128 * key.warps))
+    return 46 if height == 56 and not key.coarse else height
+
+
+def _tile_shared_bytes(key, height):
+    if not isinstance(key, _VBKey) and (key.warps != 4 or not key.cache_weights):
+        raise ValueError("expected the cached four-warp vertical tile plan")
+    if key.chunk or not (key.cache_source and key.seg16):
+        raise ValueError("expected a full-height cached-source vertical tile")
+    return _tile_base(key, height) + 128 * key.warps * tile_rows(key, height)
+
+
+def vb_candidate(launch, height, arm):
+    if arm == "w74":
+        return launch
+    label = f"{height}{'c' if launch.key.coarse else 'd'}"
+    if arm not in VB_ARMS[label] or not (launch.key.vertical and launch.key.backward):
+        raise ValueError(f"unsupported VB candidate {label}/{arm}")
+    warps = 2 if arm == "w75_2w" else 3
+    cached = launch.key.cache_weights and "nocachew" not in arm
+    candidate = _VBKey(**{f.name: getattr(launch.key, f.name) for f in fields(launch.key)})
+    key = with_fields(
+        candidate,
+        warps=warps,
+        backward_reduce_warps=0,
+        cache_weights=cached,
+        tile_limit=17 if arm == "w75_3w_k17_cachew" else 0,
+        vector_weights=launch.key.vector_weights and cached,
+    )
+    launch = launch._replace(key=key, partials=scans._ceil(launch.workers, warps))
+    smem = _small_shared_bytes(launch, height) if height < 28 else _tile_shared_bytes(key, height)
+    return launch._replace(plan=launch.plan._replace(smem=smem))
 
 
 def shared_bytes(launch, height):
@@ -620,6 +673,7 @@ def vertical(
     *,
     planar=False,
     separate=False,
+    vb_arm="w74",
     epsilon=1e-6,
 ):
     _check_source(r)
@@ -657,7 +711,7 @@ def vertical(
     )
     if backward and h == 28:
         launch = scans._plan_w57(r.device.index or 0, launch, (b, h, w, m), "v57_bwd_seg16_2chunk")
-    launch = configure(launch, h)
+    launch = vb_candidate(configure(launch, h), h, vb_arm)
     outr = outi = dq = partial = scratch = checkpoints = None
     if backward:
         dq = _words(r, ow)
