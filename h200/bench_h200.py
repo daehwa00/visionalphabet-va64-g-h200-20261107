@@ -148,8 +148,7 @@ def lockin_arm_env(name: str) -> dict[str, str]:
     if arm == "w43_ref":
         return REFERENCE_ENV.copy()
     if arm == "w74_fp8_lockin":
-        return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1", "VA_W72_SPLIT_FP8": "1",
-                "LNET_READER_EXEC_MODE": "dense_nhwc_hybrid"}
+        return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1", "VA_W72_SPLIT_FP8": "1"}
     if arm == "w66_lockin":
         return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1"}
     if arm == "w57_lockin":

@@ -36,6 +36,10 @@ def model_scan_graph(monkeypatch, *, fp8, bf16=True) -> list:
     with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
         torch.compile(model, backend=backend, fullgraph=True)(torch.zeros(1, 3, 224, 224))
     assert len(graphs) == 1
+    assert sum(p.numel() for p in model.parameters()) == 2_988_260
+    assert all(
+        node.target != torch.ops.aten.convolution.default for node in graphs[0].graph.nodes
+    )
     return [
         (str(node.target), tuple(node.args[0][8].meta["example_value"].shape[1:3]), node.args[2])
         for node in graphs[0].graph.nodes

@@ -48,16 +48,11 @@ def test_model(monkeypatch, fp8, small, bf16, counts) -> None:
 
 
 def test_reader(monkeypatch) -> None:
-    for mode in ("dense_nhwc", "dense_nhwc_hybrid"):
-        monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
-        for h in (7, 14, 28, 56):
-            expected = (
-                "dense_nhwc_inductor" if mode.endswith("hybrid") and h <= 14 else "dense_nhwc"
-            )
-            assert (
-                FactorizedMemoryReader._reader_execution_mode(None, torch.empty(1, h, h, 1))
-                == expected
-            )
+    mode = bench_h200.lockin_arm_env("w74_fp8_lockin")["LNET_READER_EXEC_MODE"]
+    assert mode == "dense_nhwc"
+    monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
+    for h in (7, 14, 28, 56):
+        assert FactorizedMemoryReader._reader_execution_mode(None, torch.empty(1, h, h, 1)) == mode
 
 
 @pytest.mark.parametrize(
@@ -147,7 +142,7 @@ def test_arm_environment(monkeypatch, tmp_path, arm, suffix) -> None:
     assert bench_h200.main() == 0
     if arm == "w74_fp8_lockin":
         assert os.environ["VA_W66_SPLIT_BF16"] == os.environ["VA_W72_SPLIT_FP8"] == "1"
-        assert os.environ["LNET_READER_EXEC_MODE"] == "dense_nhwc_hybrid"
+        assert os.environ["LNET_READER_EXEC_MODE"] == "dense_nhwc"
     else:
         assert "VA_W72_SPLIT_FP8" not in os.environ
         assert "VA_W74_SMALL_FP8" not in os.environ

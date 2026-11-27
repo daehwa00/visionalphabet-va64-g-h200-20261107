@@ -12,6 +12,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from lnet import product_scan_pipeline as pipeline
 from lnet import w72_split_fp8_scan as fp
+from lnet.model_w36b import count_cudagraph_replays
 
 
 def test_model_graph(monkeypatch) -> None:
@@ -226,28 +227,38 @@ def check_compiled_training(monkeypatch, request, height, coarse, *, planes=Fals
 
     monkeypatch.setenv("VA_W72_SPLIT_FP8", "0")
     ref = run(*operands)
-    compiled = torch.compile(run, fullgraph=True)
     monkeypatch.setenv("VA_W72_SPLIT_FP8", "1")
-    factors = (1.0, 1e-5) if height in (14, 56) and not coarse else (1.0,)
-    gradients = [torch.randn_like(ref) * factor for factor in factors]
-    stream = torch.cuda.Stream()
-    for dy in gradients:
-        expected = (ref, *torch.autograd.grad(ref, operands, dy, retain_graph=True))
+    check_training_replays(run, operands, ref)
 
-        def step(dy=dy):
+
+def check_training_replays(run, operands, ref) -> None:
+    for operand in operands:
+        torch._dynamo.mark_static_address(operand)
+    compiled = torch.compile(run, mode="reduce-overhead", fullgraph=True, dynamic=False)
+    dy_buf = torch.randn_like(ref)
+
+    def begin_step():
+        for operand in operands:
+            operand.grad = None
+        torch.compiler.cudagraph_mark_step_begin()
+
+    for _ in range(3):
+        begin_step()
+        (compiled(*operands) * dy_buf).sum().backward()
+
+    for factor in (1.0, 1e-5):
+        dy_buf.copy_(torch.randn_like(ref) * factor)
+        expected = (ref, *torch.autograd.grad(ref, operands, dy_buf, retain_graph=True))
+        begin_step()
+        with count_cudagraph_replays() as fwd_replays:
             out = compiled(*operands)
-            return (out, *torch.autograd.grad(out, operands, dy))
-
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            step()
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            observed = step()
-        graph.replay()
-        torch.cuda.synchronize()
-        for lhs, rhs in zip(expected, observed, strict=True):
+        loss = (out * dy_buf).sum()
+        with count_cudagraph_replays() as bwd_replays:
+            loss.backward()
+        assert len(fwd_replays) >= 1
+        assert len(bwd_replays) >= 1
+        for lhs, rhs in zip(expected, (out, *(p.grad for p in operands)), strict=True):
+            assert rhs is not None
             assert torch.isfinite(rhs).all()
             assert bench.metrics(lhs, rhs)["rel_l2"] < 0.12
+        del out, loss, rhs
