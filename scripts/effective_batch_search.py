@@ -89,8 +89,8 @@ def worker(jobfile: Path) -> None:
 
 
 def _benchmark(work: Path, microbatch: int) -> tuple[dict[str, Any], TensorCapture]:
+    from alphabet_imagenet100_runtime import _build_runtime
     from effective_batch_update import run_update
-    from va_imagenet100_runtime import _build_runtime
 
     snapshot = torch.load(work / "snapshot.pt", map_location="cpu", weights_only=False)
     device = torch.device("cuda", snapshot["index"])
@@ -169,7 +169,7 @@ def _run_arm(
     job = work / (label + ".job")
     atomic_json(job, {"microbatch": microbatch})
     env = dict(os.environ, WANDB_MODE="disabled")
-    env.pop("VA_IN100_PROGRESS_PATH", None)
+    env.pop("ALPHABET_IMAGENET100_PROGRESS_PATH", None)
     env["PYTHONPATH"] = os.pathsep.join(
         (str(MODULE.parent), str(PROJECT / "src"), env.get("PYTHONPATH", ""))
     )

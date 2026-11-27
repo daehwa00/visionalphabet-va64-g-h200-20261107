@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn.utils.parametrizations import orthogonal
 
-from lnet.capture_safe_orthogonal import (
+from alphabet.capture_safe_orthogonal import (
     CaptureSafeMatrixExpOrthogonal,
     fixed_taylor_matrix_exp,
     prepare_capture_safe_orthogonal_,
@@ -252,7 +252,7 @@ def test_ps14_gradcheck() -> None:
 def test_capture_safe_toggle(
     monkeypatch: pytest.MonkeyPatch, policy: str, auto: bool, enabled: bool,
 ) -> None:
-    monkeypatch.setenv("LNET_CAPTURE_SAFE_ORTHOGONAL", policy)
+    monkeypatch.setenv("ALPHABET_CAPTURE_SAFE_ORTHOGONAL", policy)
     layer = _orthogonal_linear(8, 8)
     assert bool(prepare_capture_safe_orthogonal_(layer, auto=auto)) is enabled
 

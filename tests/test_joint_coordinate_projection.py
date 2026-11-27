@@ -6,7 +6,7 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from lnet.complex_layers import ComplexLinear
+from alphabet.complex_layers import ComplexLinear
 
 
 @pytest.mark.parametrize("mode", ["cpu", "cuda", "cuda_compile"])

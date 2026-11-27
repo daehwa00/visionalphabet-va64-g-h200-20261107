@@ -33,7 +33,7 @@ def setup(batch: int) -> torch.Tensor:
 
     torch.manual_seed(501)
     torch.set_float32_matmul_precision("high")
-    torch.backends.cudnn.benchmark = os.getenv("LNET_CUDNN_BENCHMARK", "1") != "0"
+    torch.backends.cudnn.benchmark = os.getenv("ALPHABET_CUDNN_BENCHMARK", "1") != "0"
     return torch.randn(batch, 3, 224, 224, device="cuda").contiguous(
         memory_format=torch.channels_last
     )
@@ -41,12 +41,12 @@ def setup(batch: int) -> torch.Tensor:
 
 def build_model(variant: str) -> torch.nn.Module:
     import torch
-    from run_va_eight_ablations import build_variant
+    from run_alphabet_ablations import build_variant
 
-    from lnet.model_w36b import prepare_model_w36b_
+    from alphabet.training_compiler import prepare_training_model_
 
     model = build_variant(variant).to(device="cuda", memory_format=torch.channels_last)
-    return prepare_model_w36b_(model)
+    return prepare_training_model_(model)
 
 
 def measure(step: Callable, batch: int, *, warmup: int, count: int) -> tuple[dict, list]:
@@ -95,7 +95,7 @@ def kernel_bucket(name: str) -> str:
         "scan": "general_scan_shared",
         "general_vscan": "general_vscan",
         "general_hscan": "general_hscan",
-        "vscan_sgs": "general_vscan",
+        "vscan_grad_store": "general_vscan",
         "reduce_hscan_partials": "general_hscan",
         "reduce_vscan_partials": "general_vscan",
     }
@@ -109,7 +109,7 @@ def kernel_bucket(name: str) -> str:
         ("stem_", "fused_stem"),
         ("triton", "triton"),
         ("_terminal_vertical_scan", "triton"),
-        ("_nr4_correlation", "triton"),
+        ("_nonredundant_four_directions_correlation", "triton"),
     ):
         if name.startswith(prefix):
             return bucket
@@ -125,27 +125,27 @@ def kernel_bucket(name: str) -> str:
 def train_arm(  # noqa: C901, PLR0915 - keep the timing and diagnostic phases together
     args: argparse.Namespace, *, profiler: Callable[[Callable, Callable], dict],
 ) -> dict:
+    import alphabet_model_builder as builder
     import torch
-    import va_model_builder as builder
 
-    from lnet.model_w36b import (
+    from alphabet.training_compiler import (
         AUTOTUNE_FEATURES,
-        compile_model_w36b,
-        compile_model_w36b_update,
+        compile_training_model,
+        compile_training_update,
         count_cudagraph_replays,
-        mark_model_w36b_step_begin,
-        model_w36b_features,
+        mark_training_step_begin,
+        training_compiler_features,
     )
 
     inputs = setup(args.batch)
     labels = torch.arange(args.batch, device="cuda") % 100
     model = build_model(args.variant)
-    features = model_w36b_features()
+    features = training_compiler_features()
     if "cuda_graphs" in features:
         # The synthetic batch stays at this address for every timed iteration.
         torch._dynamo.mark_static_address(inputs)
     compiled = (
-        compile_model_w36b(model)
+        compile_training_model(model)
         if features & (AUTOTUNE_FEATURES | {"cuda_graphs"})
         else torch.compile(model, mode="default")
     )
@@ -161,7 +161,7 @@ def train_arm(  # noqa: C901, PLR0915 - keep the timing and diagnostic phases to
     )
 
     def forward() -> torch.Tensor:
-        mark_model_w36b_step_begin()
+        mark_training_step_begin()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             return torch.nn.functional.cross_entropy(compiled(inputs)[0], labels)
 
@@ -175,7 +175,7 @@ def train_arm(  # noqa: C901, PLR0915 - keep the timing and diagnostic phases to
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-    compiled_update = compile_model_w36b_update(model, optimizer)
+    compiled_update = compile_training_update(model, optimizer)
     update = compiled_update or eager_update
 
     def step() -> torch.Tensor:

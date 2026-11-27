@@ -19,8 +19,8 @@ from torch._functorch import config as aot_config
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from lnet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
-from lnet.memory_backbone import ChannelRMSNorm, FactorizedMemoryReader, reader_roofline_costs
+from alphabet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
+from alphabet.memory_backbone import ChannelRMSNorm, FactorizedMemoryReader, reader_roofline_costs
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ SHAPES = (
 )
 MODES = {
     "off": ("off", "off", False),
-    "proven_floor": ("off", "proven_floor", False),
+    "baseline_kernel": ("off", "baseline_kernel", False),
     "dense_nhwc": ("dense_nhwc", "off", False),
     "dense_nhwc_bench": ("dense_nhwc", "off", True),
     "dense_nhwc_bmm_bench": ("dense_nhwc_bmm", "off", True),
@@ -93,8 +93,8 @@ def make_reader(
 
 def set_mode(mode: str) -> None:
     execution, optimization, benchmark = MODES[mode]
-    os.environ["LNET_READER_EXEC_MODE"] = execution
-    os.environ["LNET_READER_OPT"] = optimization
+    os.environ["ALPHABET_READER_MODE"] = execution
+    os.environ["ALPHABET_READER_KERNEL_POLICY"] = optimization
     torch.backends.cudnn.benchmark = benchmark
 
 
@@ -325,9 +325,9 @@ def main() -> int:
         properties = (9, 0, 132)
         shapes = (Shape(2, 5, 7, 37, 29, 4, 3),)
     else:
-        os.environ["LNET_FUSED_FACTORIZED_READER"] = "1"
-        os.environ["LNET_READER_VEC"] = "auto"
-        os.environ["LNET_READER_W44"] = "off"
+        os.environ["ALPHABET_FUSED_FACTORIZED_READER"] = "1"
+        os.environ["ALPHABET_READER_VECTOR_WIDTH"] = "auto"
+        os.environ["ALPHABET_READER_GRADIENT_KERNEL"] = "off"
         props = torch.cuda.get_device_properties(device)
         properties = props.major, props.minor, props.multi_processor_count
         shapes = SHAPES
@@ -379,7 +379,7 @@ def main() -> int:
                     for key in ("fwd_ms", "bwd_ms", "total_ms")
                 }
             for values in totals.values():
-                for baseline in ("off", "off_bench", "proven_floor"):
+                for baseline in ("off", "off_bench", "baseline_kernel"):
                     if baseline in totals:
                         values[f"delta_vs_{baseline}_ms"] = {
                             key: values[key] - totals[baseline][key]

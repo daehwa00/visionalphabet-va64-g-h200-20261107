@@ -5,26 +5,26 @@ import torch
 import triton
 import triton.language as tl
 
-from lnet.product_scan_contracts import (
+from alphabet.product_scan_contracts import (
     supports_triton_product_scan_coarse4,
     supports_triton_product_scan_descriptor4,
 )
-from lnet.product_scan_normalization import (
+from alphabet.product_scan_normalization import (
     static_global_inverse_gain,
     static_variance_tables,
 )
-from lnet.product_scan_ops import (
+from alphabet.product_scan_ops import (
     BACKWARD_LAUNCH_NAME,
     FORWARD_LAUNCH_NAME,
     triton_product_scan_coarse4,
     triton_product_scan_descriptor4,
 )
-from lnet.product_scan_reference import (
+from alphabet.product_scan_reference import (
     product_scan_coarse4_reference,
     product_scan_descriptor4_reference,
     raw_product_descriptor_reference,
 )
-from lnet.triton_product_scan_kernels import _pack_same_resolution_paths, _unpack_path_gradient
+from alphabet.triton_product_scan_kernels import _pack_same_resolution_paths, _unpack_path_gradient
 
 
 @triton.jit
@@ -299,7 +299,7 @@ def _noncontiguous_sources(sources):
 
 def _force_vertical_grouping(monkeypatch: pytest.MonkeyPatch, block_lines: int) -> None:
     for name in (FORWARD_LAUNCH_NAME, BACKWARD_LAUNCH_NAME):
-        prefix = f"LNET_LAUNCH_{name.upper()}"
+        prefix = f"ALPHABET_LAUNCH_{name.upper()}"
         monkeypatch.setenv(f"{prefix}_BLOCK_LINES", str(block_lines))
         monkeypatch.setenv(f"{prefix}_BLOCK_MODES", "4")
         monkeypatch.setenv(f"{prefix}_WARPS", "4")
@@ -535,7 +535,9 @@ def test_cuda_fused_matches_reference(
 def test_deterministic_descriptor_repeats_and_preserves_gradients(
     monkeypatch: pytest.MonkeyPatch, block_lines: int
 ) -> None:
-    monkeypatch.setenv("LNET_LAUNCH_PRODUCT_SCAN_DESCRIPTOR4_FORWARD_BLOCK_LINES", str(block_lines))
+    monkeypatch.setenv(
+        "ALPHABET_LAUNCH_PRODUCT_SCAN_DESCRIPTOR4_FORWARD_BLOCK_LINES", str(block_lines)
+    )
     previous = torch.are_deterministic_algorithms_enabled()
     poles, sources = _inputs(torch.device("cuda"), modes=5, height=7, width=9)
     leaves = (*poles[1], *sources[0], *sources[1])

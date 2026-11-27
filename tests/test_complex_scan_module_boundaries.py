@@ -10,12 +10,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from lnet import complex_scan as facade
-from lnet import complex_scan_config as config_module
-from lnet import complex_scan_stage as bank
-from lnet import complex_scan_transitions as transitions
-from lnet import complex_scan_types as contracts
-from lnet.complex_scan import ComplexScanBackbone, ComplexScanConfig
+from alphabet import complex_scan as facade
+from alphabet import complex_scan_config as config_module
+from alphabet import complex_scan_stage as bank
+from alphabet import complex_scan_transitions as transitions
+from alphabet import complex_scan_types as contracts
+from alphabet.complex_scan import ComplexScanBackbone, ComplexScanConfig
 
 
 def _schema_digest(config: ComplexScanConfig) -> str:
@@ -103,7 +103,7 @@ def test_internal_modules_do_not_import_the_public_module() -> None:
         assert module_path is not None
         source = Path(module_path).read_text()
         assert "from .complex_scan import" not in source
-        assert "import lnet.complex_scan" not in source
+        assert "import alphabet.complex_scan" not in source
 
 
 @pytest.mark.parametrize(
@@ -114,7 +114,7 @@ def test_internal_modules_do_not_import_the_public_module() -> None:
     ],
 )
 def test_supported_import_orders_start_in_a_fresh_process(imports: str) -> None:
-    statements = "; ".join(f"import lnet.{name.strip()}" for name in imports.split(","))
+    statements = "; ".join(f"import alphabet.{name.strip()}" for name in imports.split(","))
     environment = os.environ | {"PYTHONPATH": str(Path(__file__).parents[1] / "src")}
     subprocess.run(
         [sys.executable, "-c", statements],
@@ -123,7 +123,7 @@ def test_supported_import_orders_start_in_a_fresh_process(imports: str) -> None:
     )
 
 
-def test_state_dict_strict_round_trip_preserves_output() -> None:
+def test_state_dict_full_coverage_round_trip_preserves_output() -> None:
     active = ComplexScanConfig(
         output_dim=5,
         stem_width=8,

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
-from lnet.model_w36b import mark_model_w36b_step_begin, model_w36b_features
+from alphabet.training_compiler import mark_training_step_begin, training_compiler_features
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -29,19 +29,19 @@ WANDB_MODEL_ALIASES = {"product_four": "Product4", "pole_free": "PoleFree"}
 
 def begin_cudagraph_step(device: torch.device) -> None:
     """Declare one model invocation boundary for compiled CUDA Graph runtimes."""
-    if device.type == "cuda" and "cuda_graphs" in model_w36b_features():
-        mark_model_w36b_step_begin()
+    if device.type == "cuda" and "cuda_graphs" in training_compiler_features():
+        mark_training_step_begin()
         return
     if (
         device.type == "cuda"
-        and os.environ.get("LNET_COMPILE_MODE") in CUDA_GRAPH_COMPILE_MODES
-        and os.environ.get("LNET_CUDAGRAPHS_ACTIVE", "1") == "1"
+        and os.environ.get("ALPHABET_COMPILE_MODE") in CUDA_GRAPH_COMPILE_MODES
+        and os.environ.get("ALPHABET_CUDAGRAPHS_ACTIVE", "1") == "1"
     ):
         torch.compiler.cudagraph_mark_step_begin()
 
 
 def active_loader_workers(requested: int) -> int:
-    workers = int(os.environ.get("LNET_DATALOADER_WORKERS", requested))
+    workers = int(os.environ.get("ALPHABET_DATALOADER_WORKERS", requested))
     if workers < 0:
         message = "DataLoader workers must be nonnegative"
         raise ValueError(message)
@@ -49,7 +49,7 @@ def active_loader_workers(requested: int) -> int:
 
 
 def persistent_loader_workers(active_workers: int) -> bool:
-    return active_workers > 0 and os.environ.get("LNET_PERSISTENT_WORKERS", "1") == "1"
+    return active_workers > 0 and os.environ.get("ALPHABET_PERSISTENT_WORKERS", "1") == "1"
 
 
 def parse_cpu_set(value: str) -> set[int]:
@@ -115,7 +115,7 @@ def partition_physical_cores(
 def configure_cpu_affinity() -> set[int]:
     """Give a single-GPU run a stable, disjoint physical-core partition."""
     allowed = set(os.sched_getaffinity(0))
-    explicit = os.environ.get("LNET_CPU_AFFINITY")
+    explicit = os.environ.get("ALPHABET_CPU_AFFINITY")
     if explicit:
         selected = parse_cpu_set(explicit)
         if not selected <= allowed:
@@ -140,7 +140,7 @@ def configure_cpu_affinity() -> set[int]:
         message = "automatic GPU CPU partition is empty"
         raise RuntimeError(message)
     os.sched_setaffinity(0, selected)
-    os.environ["LNET_CPU_AFFINITY_ACTIVE"] = format_cpu_set(selected)
+    os.environ["ALPHABET_CPU_AFFINITY_ACTIVE"] = format_cpu_set(selected)
     return selected
 
 

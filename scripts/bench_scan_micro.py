@@ -19,7 +19,7 @@ import torch
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from lnet import general_cuda_scans as scans
+from alphabet import general_cuda_scans as scans
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,16 +47,16 @@ EDGE_SHAPES = (
 EDGE_LABELS = {shape[0] for shape in EDGE_SHAPES}
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 OPS = {
-    "vscan_bwd": ("LNET_SCAN_SGS", scans.SGS_MODES),
-    "vscan_fwd": ("LNET_SCAN_VFWD", scans.VFWD_MODES),
-    "hscan_fwd": ("LNET_SCAN_HSCAN", scans.HSCAN_MODES),
-    "hscan_bwd": ("LNET_SCAN_HSCAN", scans.HSCAN_MODES),
+    "vscan_bwd": ("ALPHABET_VERTICAL_GRAD_STORE_MODE", scans.GRAD_STORE_MODES),
+    "vscan_fwd": ("ALPHABET_VERTICAL_FORWARD_MODE", scans.VERTICAL_FORWARD_MODES),
+    "hscan_fwd": ("ALPHABET_HORIZONTAL_SCAN_MODE", scans.HORIZONTAL_SCAN_MODES),
+    "hscan_bwd": ("ALPHABET_HORIZONTAL_SCAN_MODE", scans.HORIZONTAL_SCAN_MODES),
 }
-W43_MODES = {
-    "vscan_bwd": "strict_ro",
-    "vscan_fwd": "batch4_w2",
-    "hscan_fwd": "bwd_opt",
-    "hscan_bwd": "bwd_opt",
+REFERENCE_SCAN_MODES = {
+    "vscan_bwd": "full_coverage_ro",
+    "vscan_fwd": "batch4_2warp",
+    "hscan_fwd": "optimized_backward",
+    "hscan_bwd": "optimized_backward",
 }
 POLE_NAMES = ("decay_real", "decay_imag", "gain_real", "gain_imag")
 TENSOR_NAMES = {
@@ -220,7 +220,7 @@ def _describe(launch: scans.Launch) -> dict[str, int | bool]:
         "batch_path": key.batch_path,
         "register_batch2": key.register_batch2,
         "unroll": key.horizontal_unroll or (8 if key.horizontal_unroll8 else 0),
-        "sgs_rows": plan.sgs_rows,
+        "grad_store_rows": plan.grad_store_rows,
         "smem": plan.smem,
         "workers": workers,
         "partials": partials,
@@ -357,11 +357,11 @@ def _screen(
             totals[mode] += calls * ms
             results[mode][label] = {"median_ms": ms, "calls": calls, "plan": details}
         del run, plan
-    winner = W43_MODES[op]
+    winner = REFERENCE_SCAN_MODES[op]
     for shapes in results.values():
         for label, sample in shapes.items():
             sample["delta_vs_off_ms"] = sample["median_ms"] - results["off"][label]["median_ms"]
-            sample["delta_vs_w43_ms"] = sample["median_ms"] - results[winner][label]["median_ms"]
+            sample["delta_vs_reference_ms"] = sample["median_ms"] - results[winner][label]["median_ms"]
     diagnostics = _parity(op, modes, args, timed_keys) if args.parity else {}
     passes = {
         field: {
@@ -403,7 +403,7 @@ def _screen(
         "timing_kernel_covered": covered,
         "weighted_ms": totals,
         "delta_vs_off_ms": {mode: ms - totals["off"] for mode, ms in totals.items()},
-        "delta_vs_w43_ms": {mode: ms - totals[winner] for mode, ms in totals.items()},
+        "delta_vs_reference_ms": {mode: ms - totals[winner] for mode, ms in totals.items()},
         "parity_pass": passes["exact_match"],
         "parity_mismatches": {
             mode: [
@@ -422,7 +422,7 @@ def _screen(
 
 
 def _combined_projection(report: dict) -> dict[str, float]:
-    winners = W43_MODES
+    winners = REFERENCE_SCAN_MODES
     totals = {op: report[op]["weighted_ms"] for op in winners}
     projected = sum(totals[op][mode] for op, mode in winners.items())
     off = sum(times["off"] for times in totals.values())
@@ -435,11 +435,10 @@ def _combined_projection(report: dict) -> dict[str, float]:
 
 
 def _e2e_case(data: Inputs, coarse: bool) -> tuple[Callable, Callable]:
-    def forward() -> tuple[Tensor, Tensor, None]:
-        r, i = scans.vertical_forward(data.pole, data.states, data.gains, data.path, coarse)
-        return r, i, None
+    def forward() -> tuple[Tensor, Tensor]:
+        return scans.vertical_forward(data.pole, data.states, data.gains, data.path, coarse)
 
-    def backward(saved: Tensor | None) -> list[Tensor]:
+    def backward() -> list[Tensor]:
         return scans.vertical_backward(
             data.pole,
             data.states,
@@ -449,7 +448,6 @@ def _e2e_case(data: Inputs, coarse: bool) -> tuple[Callable, Callable]:
             data.gi,
             coarse=coarse,
             compact=coarse,
-            saved_features=saved,
         )
 
     return forward, backward
@@ -464,20 +462,17 @@ def _e2e_sample(
     forward, backward = _e2e_case(data, coarse)
 
     def full_step() -> list[Tensor]:
-        _, _, saved = forward()
-        return backward(saved)
+        forward()
+        return backward()
 
     torch.cuda.reset_peak_memory_stats()
     total_ms = _time(full_step, args.warmup, args.iters, flush, graph=True)
     peak = torch.cuda.max_memory_allocated() / 1024**3
-    _, _, trajectory = forward()
     return {
         "fwd_ms": _time(forward, args.warmup, args.iters, flush, graph=True),
-        "bwd_ms": _time(lambda: backward(trajectory), args.warmup, args.iters, flush, graph=True),
+        "bwd_ms": _time(backward, args.warmup, args.iters, flush, graph=True),
         "total_ms": total_ms,
         "peak_vram_gib": peak,
-        "selected_saved_path": trajectory is not None,
-        "saved_traj_gib": trajectory.nbytes / 1024**3 if trajectory is not None else 0.0,
         "cuda_graph_ok": True,
     }
 
@@ -492,8 +487,9 @@ def _e2e_parity(shapes: tuple, modes: tuple[str, ...], batch: int) -> dict:
             expected = None
             for mode in modes:
                 forward, backward = _e2e_case(inputs, coarse)
-                real, imag, trajectory = forward()
-                values = [real, imag, *backward(trajectory)]
+                os.environ["ALPHABET_VERTICAL_GRAD_STORE_MODE"] = mode
+                real, imag = forward()
+                values = [real, imag, *backward()]
                 if expected is None:
                     expected = values
                 names = ("real", "imag", *TENSOR_NAMES["vscan_bwd"])
@@ -514,34 +510,18 @@ def _e2e_parity(shapes: tuple, modes: tuple[str, ...], batch: int) -> dict:
 
 
 def _screen_e2e(args: argparse.Namespace, modes: tuple[str, ...], flush: Tensor | None) -> dict:
-    check_auto = "auto_vram" in modes
-    modes = tuple(mode for mode in modes if mode != "auto_vram")
-    auto = {}
-    saved_weighted = dict.fromkeys(modes, 0.0)
     weighted = dict.fromkeys(modes, 0.0)
     fwd_weighted = dict.fromkeys(modes, 0.0)
     bwd_weighted = dict.fromkeys(modes, 0.0)
     results = {}
     for label, h, w, m, coarse, weight in MODEL_SHAPES:
-        if check_auto:
-            device = torch.device("cuda", torch.cuda.current_device())
-            # Policy only inspects tensor metadata. Expanded placeholders avoid allocating full inputs.
-            placeholder = torch.empty((), device=device, dtype=DTYPES[args.dtype])
-            states = placeholder.expand(4, args.batch, h, w, m)
-            path = [placeholder.expand(m, 8, 8)]
-            free, total = torch.cuda.mem_get_info(device)
-            auto[label] = {
-                "resolved_mode": scans._vscan_saved_policy(states, path, coarse, "auto_vram"),
-                "free_gib": free / 1024**3,
-                "total_gib": total / 1024**3,
-            }
         data = make_inputs(args.batch, h, w, m, coarse, DTYPES[args.dtype])
         cases = {}
         for mode in modes:
+            os.environ["ALPHABET_VERTICAL_GRAD_STORE_MODE"] = mode
             print(f"timing vscan {label} {mode}", flush=True)
             result = _e2e_sample(data, coarse, args, flush)
             cases[mode] = result
-            saved_weighted[mode] += weight * result["saved_traj_gib"]
             weighted[mode] += weight * result["total_ms"]
             fwd_weighted[mode] += weight * result["fwd_ms"]
             bwd_weighted[mode] += weight * result["bwd_ms"]
@@ -552,8 +532,6 @@ def _screen_e2e(args: argparse.Namespace, modes: tuple[str, ...], flush: Tensor 
         "shapes": results,
         "weighted_ms": weighted,
         "weighted_total_ms": weighted,
-        "auto_vram_decisions": auto,
-        "total_saved_traj_gib": saved_weighted,
         "call_weights": {label: weight for label, *_, weight in MODEL_SHAPES},
         "weighted_fwd_ms": fwd_weighted,
         "weighted_bwd_ms": bwd_weighted,
@@ -601,23 +579,15 @@ def main() -> None:
     if set(ops).difference(available):
         parser.error(f"--ops must contain names from {', '.join(available)}")
     requested = (
-        tuple(token.strip() for token in args.modes.split(",")) if args.modes else scans.SGS_MODES
+        tuple(token.strip() for token in args.modes.split(",")) if args.modes else scans.GRAD_STORE_MODES
     )
-    e2e_modes = ("off", "saved_fused", "saved_split", "auto_vram")
-    if args.modes and "vscan_e2e" in ops:
-        if "vscan_bwd" in ops:
-            parser.error("--modes applies to one VScan operation at a time")
-        if set(requested).difference(e2e_modes):
-            parser.error("--modes must contain valid LNET_SCAN_VSCAN_SAVED tokens")
-        e2e_modes = tuple(dict.fromkeys(("off", *requested)))
-    elif set(requested).difference(scans.SGS_MODES):
-        parser.error("--modes must contain valid LNET_SCAN_SGS tokens")
+    if set(requested).difference(scans.GRAD_STORE_MODES):
+        parser.error("--modes must contain valid ALPHABET_VERTICAL_GRAD_STORE_MODE tokens")
     if min(args.batch, args.parity_batch) < 1 or args.iters < 1 or args.warmup < 0:
         parser.error("--batch and --iters must be positive and --warmup cannot be negative")
     if not torch.cuda.is_available():
         parser.error("CUDA is required")
-    os.environ["LNET_VSCAN_DECOUPLED"] = "off"
-    os.environ["LNET_SCAN_VSCAN_SAVED"] = "off"
+    os.environ["ALPHABET_VSCAN_DECOUPLED"] = "off"
     started = perf_counter()
     torch.manual_seed(141)
     report = {"batch": args.batch, "dtype": args.dtype, "warmup": args.warmup, "iters": args.iters}
@@ -635,13 +605,13 @@ def main() -> None:
         for op in ops:
             if op == "vscan_e2e":
                 report["scan_flags"] = {env: os.environ.get(env, "off") for env, _ in OPS.values()}
-                report[op] = _screen_e2e(args, e2e_modes, flush_buffer)
+                report[op] = _screen_e2e(args, tuple(dict.fromkeys(("off", *requested))), flush_buffer)
                 continue
             for env, _ in OPS.values():
                 os.environ[env] = "off"
             modes = OPS[op][1]
             if op == "vscan_bwd" and args.modes:
-                modes = tuple(dict.fromkeys(("off", W43_MODES[op], *requested)))
+                modes = tuple(dict.fromkeys(("off", REFERENCE_SCAN_MODES[op], *requested)))
             report[op] = _screen(op, args, modes, flush_buffer)
     if ops == ("vscan_bwd",):
         report.update(report["vscan_bwd"])

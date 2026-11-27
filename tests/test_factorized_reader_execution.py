@@ -7,7 +7,7 @@ from copy import deepcopy
 import pytest
 import torch
 
-from lnet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
+from alphabet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
 
 
 @pytest.mark.parametrize(("rank", "kernel"), [(1, 1), (2, 3), (3, 5)])

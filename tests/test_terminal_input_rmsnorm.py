@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import run_va_eight_ablations as candidate
+import run_alphabet_ablations as candidate
 import torch
-from va_model_builder import model_config
+from alphabet_model_builder import model_config
 
 
 def test_terminal_input_rmsnorm_build_and_scale_invariance() -> None:

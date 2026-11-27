@@ -8,23 +8,23 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
+import alphabet_augmentation as augment
+import alphabet_imagenet100_runtime as runtime
 import automatic_training_layout as layout
 import calibrated_evaluation
 import effective_batch_runtime as effective_rt
 import numpy as np
 import pytest
-import run_va_eight_ablations as base_runner
-import run_va_rawg_bn_calibrated as wrapper_runner
+import run_alphabet_ablations as base_runner
+import run_alphabet_calibrated_bn as wrapper_runner
 import torch
-import va_ablation_augment as augment
-import va_imagenet100_runtime as runtime
 from torch import nn
 from torch.nn import functional
 from torch.utils.data import DataLoader, TensorDataset
 
-from lnet.classifier_heads import AffineCorrelationClassifier
-from lnet.complex_scan_config import ComplexScanConfig
-from lnet.image_layers import StandardizedAffineModalHead
+from alphabet.classifier_heads import AffineCorrelationClassifier
+from alphabet.complex_scan_config import ComplexScanConfig
+from alphabet.image_layers import StandardizedAffineModalHead
 
 
 class _ToyRawGModel(nn.Module):
@@ -51,8 +51,8 @@ def test_wrapper_preserves_exact_layout_and_effective_cache_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.delenv("LNET_GENERAL_SCANS", raising=False)
-    monkeypatch.delenv("LNET_FUSED_FACTORIZED_READER", raising=False)
+    monkeypatch.delenv("ALPHABET_GENERAL_SCANS", raising=False)
+    monkeypatch.delenv("ALPHABET_FUSED_FACTORIZED_READER", raising=False)
 
     model = _ToyRawGModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.05)
@@ -119,8 +119,8 @@ def test_wrapper_preserves_exact_layout_and_effective_cache_identity(
         assert wrap_rt.identity == base_rt.identity
         assert layout.digest(wrap_rt.identity) == layout.digest(base_rt.identity)
         assert wrap_rt.identity["scan_env"] == {
-            "LNET_GENERAL_SCANS": "1",
-            "LNET_FUSED_FACTORIZED_READER": "1",
+            "ALPHABET_GENERAL_SCANS": "1",
+            "ALPHABET_FUSED_FACTORIZED_READER": "1",
         }
 
 
@@ -213,7 +213,7 @@ def test_wrapper_cli_help_and_contract_metadata(
     tmp_path: Path,
 ) -> None:
     repo = Path(__file__).resolve().parents[1]
-    script = repo / "scripts" / "run_va_rawg_bn_calibrated.py"
+    script = repo / "scripts" / "run_alphabet_calibrated_bn.py"
     proc = subprocess.run(
         [sys.executable, str(script), "--help"],
         cwd=repo,

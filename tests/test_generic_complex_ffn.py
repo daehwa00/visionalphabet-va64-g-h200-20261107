@@ -6,8 +6,8 @@ import copy
 import pytest
 import torch
 
-from lnet.complex_ffn import complex_ffn, packed_cartesian_cffn
-from lnet.complex_layers import WidelyLinear
+from alphabet.complex_ffn import complex_ffn, packed_cartesian_cffn
+from alphabet.complex_layers import WidelyLinear
 
 
 def _layers(

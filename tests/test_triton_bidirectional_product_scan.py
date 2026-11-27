@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from lnet.product_scan_reference import bidirectional_product_scan_reference
-from lnet.triton_bidirectional_product_scan import (
+from alphabet.product_scan_reference import bidirectional_product_scan_reference
+from alphabet.triton_bidirectional_product_scan import (
     triton_bidirectional_product_scan,
 )
 

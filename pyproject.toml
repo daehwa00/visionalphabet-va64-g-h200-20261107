@@ -19,7 +19,7 @@ baselines = ["timm==1.0.26", "einops==0.8.1", "PyYAML==6.0.3", "opencv-python-he
 tracking = ["wandb==0.22.3"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/lnet"]
+packages = ["src/alphabet"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/scripts", "/tests", "/docs", "/h200", "/side_experiments", "/figures", "/README.md", "/pyproject.toml"]
@@ -50,12 +50,15 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Triton infers device operand types and uses uppercase compile-time parameters.
+"src/alphabet/triton_product_scan_kernels.py" = ["ANN001", "ANN202", "N803"]
+"src/alphabet/triton_bidirectional_product_scan.py" = ["ANN001", "ANN202", "N803"]
 "scripts/*.py" = [
   "ANN401", "C901", "E501", "PERF401", "PLC0415", "PLR0912", "PLR0915",
   "RUF007", "S603", "S607", "SLF001", "T201", "TC003",
 ]
-"src/lnet/complex_scan.py" = ["PLR0915"]
-"src/lnet/complex_scan_stage.py" = ["C901", "PLR0912", "PLR0915"]
+"src/alphabet/complex_scan.py" = ["PLR0915"]
+"src/alphabet/complex_scan_stage.py" = ["C901", "PLR0912", "PLR0915"]
 "tests/*.py" = [
   "ANN001", "ANN202", "FBT001", "N803", "PLR2004", "S101", "S603", "SLF001",
 ]

@@ -10,8 +10,8 @@ from bench_scan_micro import (
     EDGE_SHAPES,
     MODEL_SHAPES,
     OPS,
+    REFERENCE_SCAN_MODES,
     TENSOR_NAMES,
-    W43_MODES,
     _case,
     _layouts,
     _time,
@@ -22,14 +22,14 @@ from torch import Tensor
 from torch._inductor import config as inductor_config
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from lnet import general_cuda_scans as scans
-from lnet import terminal_imaginary_correlation as terminal
-from lnet.general_cuda_scans import general_scans_enabled
-from lnet.product_scan_pipeline import (
+from alphabet import general_cuda_scans as scans
+from alphabet import terminal_imaginary_correlation as terminal
+from alphabet.general_cuda_scans import general_scans_enabled
+from alphabet.product_scan_pipeline import (
     run_product_scan_coarse_path_collapse_packed,
     run_product_scan_coarse_path_collapse_planes_packed,
 )
-from lnet.product_scan_reference import (
+from alphabet.product_scan_reference import (
     _product_coarse4_reference,
     _product_full4_reference,
     _product_scans_from_tables_reference,
@@ -53,30 +53,30 @@ _DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 
 @inductor_config.patch(emulate_precision_casts=False)
 def test_general_scans_default_and_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("LNET_GENERAL_SCANS", raising=False)
-    monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
+    monkeypatch.delenv("ALPHABET_GENERAL_SCANS", raising=False)
+    monkeypatch.delenv("ALPHABET_GENERAL_SCAN_REF_FWD", raising=False)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
     assert general_scans_enabled()
     assert general_scans_enabled(forward=True)
 
-    monkeypatch.setenv("LNET_GENERAL_SCAN_REF_FWD", "1")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCAN_REF_FWD", "1")
     assert general_scans_enabled()
     assert not general_scans_enabled(forward=True)
 
-    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "0")
     assert not general_scans_enabled()
 
 
-def test_wave51a_modes(monkeypatch: pytest.MonkeyPatch) -> None:
-    env = "LNET_SCAN_W51A"
+def test_fp32_scan_path_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = "ALPHABET_SCAN_FP32_PATH"
     monkeypatch.delenv(env, raising=False)
-    assert scans._scan_mode(env, scans.W51A_MODES) == "off"
-    for mode in scans.W51A_MODES:
+    assert scans._scan_mode(env, scans.FP32_PATH_MODES) == "off"
+    for mode in scans.FP32_PATH_MODES:
         monkeypatch.setenv(env, mode)
-        assert scans._scan_mode(env, scans.W51A_MODES) == mode
+        assert scans._scan_mode(env, scans.FP32_PATH_MODES) == mode
     monkeypatch.setenv(env, "unknown")
     with pytest.raises(ValueError, match=env):
-        scans._scan_mode(env, scans.W51A_MODES)
+        scans._scan_mode(env, scans.FP32_PATH_MODES)
 
 
 @pytest.mark.parametrize("kb", [48, 100, 228])
@@ -517,12 +517,12 @@ def _reference_vscan(
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(("h", "w", "m", "coarse"), [(7, 13, 1, False), (28, 56, 48, True)])
-@pytest.mark.parametrize("mode", scans.SGS_MODES)
+@pytest.mark.parametrize("mode", scans.GRAD_STORE_MODES)
 def test_fake_shapes_and_autograd(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, w: int, m: int,
     coarse: bool, mode: str,
 ) -> None:
-    monkeypatch.setenv("LNET_SCAN_SGS", mode)
+    monkeypatch.setenv("ALPHABET_VERTICAL_GRAD_STORE_MODE", mode)
     with FakeTensorMode():
         px, py, r, i, aux, path = _inputs(h, w, m, 5, dtype, "cpu", batch=2)
         states = scans.horizontal_forward(px, r, i)
@@ -630,7 +630,7 @@ def test_index_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_packed_vertical_index_bound(
     monkeypatch: pytest.MonkeyPatch, batch: int, index32: bool
 ) -> None:
-    monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", "off")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCAN_OPT", "off")
     monkeypatch.setattr(scans, "device_limits", lambda _: (132, 232448, 64))
     monkeypatch.setattr(scans, "_resident", lambda *_: 3)
     monkeypatch.setattr(scans, "_scan_workspace_budget", lambda _: scans._DEFAULT_WORKSPACE_BYTES)
@@ -692,9 +692,9 @@ def _pipeline(
 _compiled_pipeline = torch.compile(_pipeline, fullgraph=True, dynamic=True)
 
 
-@pytest.mark.parametrize("mode", scans.SGS_MODES)
-def test_sgs_aot_eager(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-    monkeypatch.setenv("LNET_SCAN_SGS", mode)
+@pytest.mark.parametrize("mode", scans.GRAD_STORE_MODES)
+def test_grad_store_aot_eager(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    monkeypatch.setenv("ALPHABET_VERTICAL_GRAD_STORE_MODE", mode)
     args = _inputs(4, 6, 3, 8, torch.bfloat16, "cpu")
     px, py, real, imag, _, path = args
     params = [real, imag, *px, *py, *path]
@@ -761,7 +761,7 @@ def test_cuda_batched_forward_path(
     torch.manual_seed(791)
     px, py, real, imag, auxiliary, path = _inputs(h, w, 35, 8, dtype, "cuda")
     states = scans.horizontal_forward(px, real, imag)
-    monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", "off")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCAN_OPT", "off")
     reference = scans._vscan(py, states, auxiliary, path, coarse, 1e-6, precise=True, packed=True)
     dispatch = scans._dispatch
 
@@ -811,7 +811,7 @@ def test_cuda_horizontal_unroll_exact(
             scans.ScanPlan(warps, smem, cache_line=True), key, 2 * h, scans._ceil(2 * h, warps),
         )
 
-    monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", "off")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCAN_OPT", "off")
     monkeypatch.setattr(scans, "_plan_launch", plan)
     expected = scans.horizontal_forward(px, real, imag)
     grad = torch.randn(
@@ -841,7 +841,7 @@ def test_auto_odd_modes_against_fp32_reference(
     reference_grads = torch.autograd.grad(reference, params, dy, retain_graph=True)
     results = []
     for policy in ("off", "auto"):
-        monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", policy)
+        monkeypatch.setenv("ALPHABET_GENERAL_SCAN_OPT", policy)
         actual = _pipeline(px, py, real, imag, aux, path, coarse, "cuda")
         grads = torch.autograd.grad(actual, params, dy, retain_graph=True)
         results.append((*actual, *grads))
@@ -922,7 +922,7 @@ def test_cuda_full_trajectory_reference(
 def test_cuda_trajectory_replay_preserves_gradients(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, h: int, coarse: bool
 ) -> None:
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", "0")
     torch.manual_seed(719)
     px, py, real, imag, auxiliary, path = _inputs(h, 8, 35, 8, dtype, "cuda", batch=3)
     states = scans.horizontal_forward(px, real, imag).detach()
@@ -982,7 +982,7 @@ def test_cuda_reference_forward_cuda_backward(
 def test_cuda_dense_scratch_fallback(
     monkeypatch: pytest.MonkeyPatch, compiled: bool, h: int, w: int, m: int, coarse: bool,
 ) -> None:
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", "0")
     sms, _, max_warps = scans.device_limits(0)
     monkeypatch.setattr(scans, "device_limits", lambda _: (sms, 16 * 1024, max_warps))
     original_plans = scans._scan_plans
@@ -1069,8 +1069,8 @@ def test_cuda_mixed_parameter_storage_and_packed_outputs(hidden: int) -> None:
 @pytest.mark.parametrize("compiled", [False, _COMPILED])
 @inductor_config.patch(emulate_precision_casts=False)
 def test_cuda_terminal_dispatch(monkeypatch: pytest.MonkeyPatch, compiled: bool) -> None:
-    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
-    monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
+    monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "0")
+    monkeypatch.delenv("ALPHABET_GENERAL_SCAN_REF_FWD", raising=False)
     px, py, real, imag, _, _ = _inputs(7, 7, 35, 8, torch.float32, "cuda", batch=2)
     px, py = ([p.reshape(1, 1, 1, -1) for p in pole] for pole in (px, py))
     drive = torch.cat((real, imag), dim=-1)
@@ -1083,7 +1083,7 @@ def test_cuda_terminal_dispatch(monkeypatch: pytest.MonkeyPatch, compiled: bool)
         pytest.fail("Terminal scan fell back to Triton")
 
     monkeypatch.setattr(terminal, "triton_bidirectional_product_scan", unexpected_legacy)
-    monkeypatch.delenv("LNET_GENERAL_SCANS")
+    monkeypatch.delenv("ALPHABET_GENERAL_SCANS")
     descriptor = terminal.complex_correlation_descriptor
     if compiled:
         descriptor = torch.compile(descriptor, fullgraph=True)
@@ -1099,8 +1099,8 @@ def test_cuda_terminal_dispatch(monkeypatch: pytest.MonkeyPatch, compiled: bool)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @inductor_config.patch(emulate_precision_casts=False)
 def test_cuda_coarse_drive_dtypes(monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype) -> None:
-    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
-    monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
+    monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "0")
+    monkeypatch.delenv("ALPHABET_GENERAL_SCAN_REF_FWD", raising=False)
     torch.manual_seed(218)
     px, py, real, imag, auxiliary, path = _inputs(8, 10, 35, 8, dtype, "cuda", batch=2)
     px, py = ([p.reshape(1, 1, 1, -1) for p in pole] for pole in (px, py))
@@ -1112,7 +1112,7 @@ def test_cuda_coarse_drive_dtypes(monkeypatch: pytest.MonkeyPatch, dtype: torch.
         with pytest.raises(TypeError, match="requires a BF16 CUDA drive"):
             run(tuple(px), tuple(py), drive, tuple(path), gain_normalization="pointwise")
 
-    monkeypatch.delenv("LNET_GENERAL_SCANS")
+    monkeypatch.delenv("ALPHABET_GENERAL_SCANS")
     out = run_product_scan_coarse_path_collapse_packed(
         tuple(px), tuple(py), drive, tuple(path), gain_normalization="pointwise", epsilon=1e-6,
     )
@@ -1147,12 +1147,12 @@ def test_decoupled_chunk_budget(monkeypatch: pytest.MonkeyPatch) -> None:
         torch.cuda, "get_device_properties", lambda _: SimpleNamespace(total_memory=24 * 1024**3)
     )
     states = States()
-    monkeypatch.delenv("LNET_VSCAN_DECOUPLED", raising=False)
+    monkeypatch.delenv("ALPHABET_VSCAN_DECOUPLED", raising=False)
     assert scans._decoupled_chunk(states, coarse=False) == 0
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "chunk")
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", "chunk")
     assert 0 < scans._decoupled_chunk(states, coarse=False) < states.shape[1]
     assert 0 < scans._decoupled_chunk(states, coarse=True) < states.shape[1]
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", "0")
     assert scans._decoupled_chunk(states, coarse=True) == 0
     monkeypatch.setattr(scans, "_l2_size", lambda _: 48 * 1024**2)
     assert scans._saved_backward_chunk(states, coarse=False) == scans._workspace_vscan_chunk(
@@ -1186,14 +1186,14 @@ def test_cuda_decoupled_vscan(  # noqa: C901
     path[1] = path[1].to(torch.float16)
     path[3] = path[3].to(torch.bfloat16)
     states = torch.stack([real] * 4)
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "0")
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", "0")
     expected = scans.vertical_forward(pole, states, auxiliary, path, coarse)
     dy = tuple(torch.randn_like(value) for value in expected)
     expected_grads = scans.vertical_backward(
         pole, states, auxiliary, path, *dy, coarse, compact=compact
     )
 
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", policy)
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", policy)
     plan_chunk = scans._decoupled_chunk
     monkeypatch.setattr(scans, "_decoupled_chunk", lambda *args: min(2, plan_chunk(*args)))
     monkeypatch.setattr(scans, "_saved_backward_chunk", lambda *_: 2)
@@ -1271,9 +1271,9 @@ def test_scan_auto_backward(
         numel=lambda: 4 * torch.Size(shape).numel(),
     )
     options = {"backward": True, "vertical": True, "coarse": coarse, "hidden": 8, "precise": False}
-    monkeypatch.setenv("LNET_GENERAL_SCAN_OPT", "off")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCAN_OPT", "off")
     assert scans._plan_launch(source, shape, **options) == base
-    monkeypatch.delenv("LNET_GENERAL_SCAN_OPT")
+    monkeypatch.delenv("ALPHABET_GENERAL_SCAN_OPT")
     actual = scans._plan_launch(source, shape, **options)
     assert actual is not None
     assert actual.plan.chunk == span
@@ -1338,7 +1338,7 @@ def test_odd_coarse_bf16_reference_rounding_and_tail() -> None:
 
 
 @pytest.mark.parametrize("allow_wider", [False, True])
-def test_sgs_readonly_preserves_occupancy_and_partial_order(
+def test_grad_store_readonly_preserves_occupancy_and_partial_order(
     monkeypatch: pytest.MonkeyPatch, allow_wider: bool,
 ) -> None:
     shape = (1024, 56, 56, 160)
@@ -1349,7 +1349,7 @@ def test_sgs_readonly_preserves_occupancy_and_partial_order(
     plan = scans.ScanPlan(2, 57344, 14, cache_weights=True, cache_source=True)
     base = scans.Launch(plan, key, 1690, 845)
     monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
-    monkeypatch.setattr(scans, "_sgs_device_limits", lambda _: (228 * 1024, 65536, 1024))
+    monkeypatch.setattr(scans, "_grad_store_device_limits", lambda _: (228 * 1024, 65536, 1024))
     probes = []
 
     def resident(_, candidate, smem):
@@ -1357,10 +1357,10 @@ def test_sgs_readonly_preserves_occupancy_and_partial_order(
         return 4 if candidate.warps == 2 else 2 if allow_wider else 0
 
     monkeypatch.setattr(scans, "_resident", resident)
-    scans._plan_sgs.cache_clear()
+    scans._plan_grad_store.cache_clear()
     try:
-        assert scans._plan_sgs(0, base, shape, "off") == base
-        result = scans._plan_sgs(0, base, shape, "strict_ro")
+        assert scans._plan_grad_store(0, base, shape, "off") == base
+        result = scans._plan_grad_store(0, base, shape, "full_coverage_ro")
         assert result.key.backward_readonly
         assert result[2:] == base[2:]
         assert len(probes) == 3
@@ -1368,37 +1368,39 @@ def test_sgs_readonly_preserves_occupancy_and_partial_order(
             assert result.key == replace(
                 key, warps=4, chunk=20, backward_readonly=True, backward_reduce_warps=2,
             )
-            assert result.plan.smem == scans._sgs_smem(result.key, shape[1])
+            assert result.plan.smem == scans._grad_store_smem(result.key, shape[1])
             source = scans._kernel_source(result.key)
             assert "row += I(worker / 2) * fields * M + m;" in source
             assert "(threadIdx.x / 32) % 2 == 0 && active" in source
             assert "k < 2; ++k) sum += staged" in source
         else:
             assert result == base._replace(key=replace(key, backward_readonly=True))
-        assert scans._plan_sgs(0, base, shape, "strict_ro") == result
+        assert scans._plan_grad_store(0, base, shape, "full_coverage_ro") == result
         assert len(probes) == 3
 
         small = base._replace(workers=112, partials=56)
-        result = scans._plan_sgs(0, small, (2, *shape[1:]), "strict_ro")
+        result = scans._plan_grad_store(0, small, (2, *shape[1:]), "full_coverage_ro")
         assert result == small._replace(key=replace(key, backward_readonly=True))
 
         odd = base._replace(key=replace(key, backward_batch_tail=True))
-        result = scans._plan_sgs(0, odd, (1024, 57, 56, 160), "strict_ro")
+        result = scans._plan_grad_store(0, odd, (1024, 57, 56, 160), "full_coverage_ro")
         assert result == odd._replace(key=replace(odd.key, backward_readonly=True))
     finally:
-        scans._plan_sgs.cache_clear()
+        scans._plan_grad_store.cache_clear()
 
 
-def test_sgs_strict_and_probe_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_grad_store_strict_and_probe_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     key = scans.Kernel(
         torch.float16, 4, backward=True, vertical=True, hidden8=True, chunk=0,
         cache_weights=True, cache_source=True, cache_line=True, vector_weights=True,
     )
     height = 14
     shape = (1024, height, 14, 160)
-    base = scans.Launch(scans.ScanPlan(4, scans._sgs_smem(key, height), height), key, 128, 32)
+    base = scans.Launch(
+        scans.ScanPlan(4, scans._grad_store_smem(key, height), height), key, 128, 32
+    )
     monkeypatch.setattr(scans, "device_limits", lambda _: (132, 227 * 1024, 64))
-    monkeypatch.setattr(scans, "_sgs_device_limits", lambda _: (228 * 1024, 65536, 1024))
+    monkeypatch.setattr(scans, "_grad_store_device_limits", lambda _: (228 * 1024, 65536, 1024))
     calls = []
 
     @scans.cache
@@ -1407,26 +1409,26 @@ def test_sgs_strict_and_probe_limit(monkeypatch: pytest.MonkeyPatch) -> None:
         return 1 if candidate.backward_readonly else 2
 
     monkeypatch.setattr(scans, "_resident", resident)
-    scans._plan_sgs.cache_clear()
+    scans._plan_grad_store.cache_clear()
     try:
-        result = scans._plan_sgs(0, base, shape, "strict_ro")
-        assert result.plan.sgs_rows == height
-        assert result.key == replace(key, sgs=1)
+        result = scans._plan_grad_store(0, base, shape, "full_coverage_ro")
+        assert result.plan.grad_store_rows == height
+        assert result.key == replace(key, grad_store=1)
         assert result.plan.smem == base.plan.smem + height * 4 * 32 * 8
-        assert scans._plan_sgs(0, base, shape, "strict_ro") == result
+        assert scans._plan_grad_store(0, base, shape, "full_coverage_ro") == result
         assert len(calls) == 3
         source = scans._kernel_source(result.key)
-        assert "SGS_PARTIAL" not in source
+        assert "VERTICAL_GRAD_STORE_MODE_PARTIAL" not in source
         assert source.count("pos_grad[I(y) * THREADS]") == 2
     finally:
-        scans._plan_sgs.cache_clear()
+        scans._plan_grad_store.cache_clear()
 
 
 def test_scan_micro_selection() -> None:
-    totals = {"off": 12.0, "strict": 11.86, "strict_ro": 11.8}
+    totals = {"off": 12.0, "strict": 11.86, "full_coverage_ro": 11.8}
     assert best_mode(totals, {}) == "off"
-    assert best_mode(totals, {"strict": True, "strict_ro": False}) == "off"
-    assert best_mode(totals, {"strict": True, "strict_ro": True}) == "strict_ro"
+    assert best_mode(totals, {"strict": True, "full_coverage_ro": False}) == "off"
+    assert best_mode(totals, {"strict": True, "full_coverage_ro": True}) == "full_coverage_ro"
 
 
 @_cuda
@@ -1436,12 +1438,12 @@ def test_scan_micro_selection() -> None:
 @pytest.mark.parametrize(
     ("label", "h", "w", "m", "coarse", "_calls"), [*MODEL_SHAPES, *EDGE_SHAPES],
 )
-def test_cuda_sgs_parity(
+def test_cuda_grad_store_parity(
     monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype,
     label: str, h: int, w: int, m: int, coarse: bool, _calls: int,
 ) -> None:
     torch.manual_seed(141)
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", "off")
     # Queue enough 56d CTAs to exercise widening on high-SM devices.
     batch = 2
     if label == "56d":
@@ -1450,21 +1452,21 @@ def test_cuda_sgs_parity(
         batch = max(batch, scans._ceil(max_warps * sms, w * tiles))
     shape = (label, h, w, m, coarse, _calls)
     for compact in _layouts("vscan_bwd", label, coarse, w):
-        monkeypatch.setenv("LNET_SCAN_SGS", "off")
+        monkeypatch.setenv("ALPHABET_VERTICAL_GRAD_STORE_MODE", "off")
         run, plan = _case("vscan_bwd", shape, batch, dtype, compact=compact)
         expected = run()
         outputs = {plan(): expected}
-        for mode in scans.SGS_MODES[1:]:
-            monkeypatch.setenv("LNET_SCAN_SGS", mode)
+        for mode in scans.GRAD_STORE_MODES[1:]:
+            monkeypatch.setenv("ALPHABET_VERTICAL_GRAD_STORE_MODE", mode)
             launch = plan()
             if launch not in outputs:
                 outputs[launch] = run()
             actual = outputs[launch]
-            diagnosed = mode == "strict_ro" and label == "56d" and dtype == torch.bfloat16
+            diagnosed = mode == "full_coverage_ro" and label == "56d" and dtype == torch.bfloat16
             if diagnosed:
                 key = plan().key
                 assert key.chunk > 0
-                assert key.sgs == 0
+                assert key.grad_store == 0
             names = TENSOR_NAMES["vscan_bwd"]
             for name, value, reference in zip(names, actual, expected, strict=True):
                 if diagnosed and not name.startswith("decay_"):
@@ -1498,8 +1500,8 @@ def test_cuda_vfwd_hscan_parity(
         tiles = scans._ceil(shape[3], scans._WARP_SIZE)
         batch = max(batch, scans._ceil(2 * sms * max_warps, h * tiles))
     env, _ = OPS[op]
-    mode = W43_MODES[op]
-    monkeypatch.setenv("LNET_VSCAN_DECOUPLED", "off")
+    mode = REFERENCE_SCAN_MODES[op]
+    monkeypatch.setenv("ALPHABET_VSCAN_DECOUPLED", "off")
     for compact in _layouts(op, label, coarse, w):
         monkeypatch.setenv(env, "off")
         run, _ = _case(op, shape, batch, dtype, compact=compact)
@@ -1534,7 +1536,7 @@ def test_vfwd_batch4_resource_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scans, "_resident", resident)
     scans._plan_vfwd.cache_clear()
     try:
-        result = scans._plan_vfwd(0, baseline, 56, "batch4_w2")
+        result = scans._plan_vfwd(0, baseline, 56, "batch4_2warp")
         assert result.key.forward_readonly
         assert result.key.register_path
         assert result.key.register_batch2

@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
+from alphabet_imagenet100_runtime import training_objective
 from imagenet100_data_runtime import begin_cudagraph_step
-from va_imagenet100_runtime import training_objective
 
 if TYPE_CHECKING:
     from collections.abc import Callable

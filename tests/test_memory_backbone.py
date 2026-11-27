@@ -2,9 +2,9 @@ import pytest
 import torch
 from torch.nn import functional
 
-from lnet.memory_backbone import ChannelRMSNorm
+from alphabet.memory_backbone import ChannelRMSNorm
 
-_FAST_FLAGS = ("LNET_FUSED_FACTORIZED_READER", "LNET_GENERAL_SCANS")
+_FAST_FLAGS = ("ALPHABET_FUSED_FACTORIZED_READER", "ALPHABET_GENERAL_SCANS")
 
 
 @pytest.mark.parametrize(
@@ -66,7 +66,7 @@ def test_channel_rms_norm_forward_backward_fullgraph(device, dtype, fast_flag, m
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_channel_rms_norm_dense_compiled_gradients(dtype, monkeypatch) -> None:
-    monkeypatch.setenv("LNET_GENERAL_SCANS", "1")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "1")
     rng = torch.Generator(device="cuda").manual_seed(41)
     x = torch.randn(13, 17, 67, device="cuda", dtype=dtype, generator=rng).requires_grad_()
     grad = torch.randn(x.shape, device="cuda", dtype=dtype, generator=rng)

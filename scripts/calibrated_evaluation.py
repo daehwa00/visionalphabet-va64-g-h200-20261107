@@ -8,15 +8,15 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import alphabet_imagenet100_runtime as runtime
 import imagenet100_data_runtime as data
 import torch
-import va_imagenet100_runtime as runtime
 from torch.nn import functional
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import ImageFolder
 
-from lnet.classifier_heads import expected_calibration_error
-from lnet.image_layers import LivePolewiseComplexRMS
+from alphabet.classifier_heads import expected_calibration_error
+from alphabet.image_layers import LivePolewiseComplexRMS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -230,8 +230,8 @@ def _log_dual_evaluation(
 ) -> None:
     backbone = getattr(model, "backbone", None)
     terminal = getattr(backbone, "terminal", None)
-    path = os.environ.get("VA_DUAL_EVAL_LOG")
-    if os.environ.get("VA_DUAL_EVAL_LOG_SKIP") == "1" or (path is None and terminal is None):
+    path = os.environ.get("ALPHABET_DUAL_EVAL_LOG")
+    if os.environ.get("ALPHABET_DUAL_EVAL_LOG_SKIP") == "1" or (path is None and terminal is None):
         return
     clean_rms = clean_ms.sqrt()
     record = {

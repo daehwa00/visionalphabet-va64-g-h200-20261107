@@ -12,8 +12,8 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from lnet import factorized_reader_kernels as kernels
-from lnet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
+from alphabet import factorized_reader_kernels as kernels
+from alphabet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -26,9 +26,9 @@ requires_cuda = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def isolate_reader_options(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("LNET_READER_OPT", raising=False)
-    monkeypatch.delenv("LNET_READER_VEC", raising=False)
-    monkeypatch.delenv("LNET_READER_W44", raising=False)
+    monkeypatch.delenv("ALPHABET_READER_KERNEL_POLICY", raising=False)
+    monkeypatch.delenv("ALPHABET_READER_VECTOR_WIDTH", raising=False)
+    monkeypatch.delenv("ALPHABET_READER_GRADIENT_KERNEL", raising=False)
 
 
 @pytest.fixture
@@ -40,23 +40,23 @@ def isolated_dynamo() -> Iterator[None]:
         torch._dynamo.reset()
 
 
-def test_w44_options(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert kernels._reader_w44() == "off"
+def test_reader_gradient_kernel_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert kernels._reader_gradient_mode() == "off"
     assert kernels._lane_utilization(160, 1) == 1
     assert kernels._lane_utilization(160, 2) == 160 / 192
     assert kernels._lane_utilization(128, 2) == 1
     assert kernels._halo_extent(13, 4, 3) == 19
-    monkeypatch.setenv("LNET_READER_W44", "unknown")
-    with pytest.raises(ValueError, match="LNET_READER_W44"):
+    monkeypatch.setenv("ALPHABET_READER_GRADIENT_KERNEL", "unknown")
+    with pytest.raises(ValueError, match="ALPHABET_READER_GRADIENT_KERNEL"):
         kernels.real_packed_spatial(torch.empty(1, 1, 1, 1), torch.empty(1, 2, 1, 1, 1))
 
 
-@pytest.mark.parametrize("mode", kernels._W44_MODES[1:])
+@pytest.mark.parametrize("mode", kernels._READER_GRADIENT_MODES[1:])
 @pytest.mark.parametrize(("height", "modes"), [(56, 160), (7, 128)])
-def test_w44_plans_reject_local_memory(
+def test_reader_gradient_kernel_plans_reject_local_memory(
     monkeypatch: pytest.MonkeyPatch, mode: str, height: int, modes: int,
 ) -> None:
-    monkeypatch.setenv("LNET_READER_W44", mode)
+    monkeypatch.setenv("ALPHABET_READER_GRADIENT_KERNEL", mode)
     props = SimpleNamespace(major=9, multi_processor_count=132, shared_memory_per_block=49152,
                             max_threads_per_multi_processor=2048, total_memory=140 * 2**30)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
@@ -79,13 +79,13 @@ def test_w44_plans_reject_local_memory(
     p = torch.empty((1024, height, height, modes * 4), device="meta", dtype=torch.bfloat16)
     w = torch.empty((modes, 4, 3, 3), device="meta", dtype=p.dtype)
     g = torch.empty((1024, height, height, modes * 2), device="meta", dtype=p.dtype)
-    if mode in ("dw_fullrank", "dw_fullrank_cvt"):
+    if mode in ("full_rank_weight_gradient", "full_rank_weight_gradient_convert"):
         launch = kernels._reader_weight_plan(p, w, g, strict=False)
         assert launch.module["weight_geometry"][0] == 4
         assert launch.module["weight_vec"] == 1
         assert launch.operation == "dweight"
         assert len(compilations) == 1
-    if mode == "dinput_wide":
+    if mode == "wide_input_gradient":
         launch, module = kernels._reader_spatial_plan(p, w, g, strict=False)
         assert launch.vec == 1
         assert launch.columns == height
@@ -94,12 +94,12 @@ def test_w44_plans_reject_local_memory(
 
 
 @requires_cuda
-@pytest.mark.parametrize("mode", kernels._W44_MODES[1:])
+@pytest.mark.parametrize("mode", kernels._READER_GRADIENT_MODES[1:])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     ("h", "w", "modes", "rank"), [(14, 14, 160, 4), (13, 19, 63, 4), (9, 11, 34, 4)],
 )
-def test_w44_cuda_parity(monkeypatch, mode, dtype, h, w, modes, rank) -> None:
+def test_reader_gradient_kernel_cuda_parity(monkeypatch, mode, dtype, h, w, modes, rank) -> None:
     torch.manual_seed(44)
     options = {"device": "cuda", "dtype": dtype}
     p = torch.randn(16, h, w, modes * rank, **options).mul_(0.125)
@@ -110,9 +110,9 @@ def test_w44_cuda_parity(monkeypatch, mode, dtype, h, w, modes, rank) -> None:
         return (kernels.real_packed_spatial(p, filters, component_first=True),
                 *kernels._packed_spatial_backward(g, p, *filters.unbind(), strict_complex=False))
 
-    monkeypatch.setenv("LNET_READER_W44", "off")
+    monkeypatch.setenv("ALPHABET_READER_GRADIENT_KERNEL", "off")
     expected = run()
-    monkeypatch.setenv("LNET_READER_W44", mode)
+    monkeypatch.setenv("ALPHABET_READER_GRADIENT_KERNEL", mode)
     for actual, reference in zip(run(), expected, strict=True):
         torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.005)
 
@@ -121,7 +121,7 @@ def test_w44_cuda_parity(monkeypatch, mode, dtype, h, w, modes, rank) -> None:
 @pytest.mark.parametrize("modes", [23, 34, 40])
 @pytest.mark.parametrize("resident", [0, 16])
 def test_regslide_alignment_and_pass_selection(monkeypatch, mode, modes, resident) -> None:
-    monkeypatch.setenv("LNET_READER_OPT", mode)
+    monkeypatch.setenv("ALPHABET_READER_KERNEL_POLICY", mode)
     props = SimpleNamespace(major=9, max_threads_per_multi_processor=2048)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
     monkeypatch.setattr(kernels, "_reader_cuda_module", lambda *args, **kw: (args, kw))
@@ -130,10 +130,10 @@ def test_regslide_alignment_and_pass_selection(monkeypatch, mode, modes, residen
     real = torch.empty((modes, 4, 3, 3), device="meta", dtype=projected.dtype)
     grad = torch.empty((1, 9, 11, 2 * modes), device="meta", dtype=projected.dtype)
     vectors = {
-        "dinput_vec2": {"dinput": 2}, "dinput_vec4": {"dinput": 4},
-        "fwd_vec2_r4": {"forward": 2}, "fwd_vec4": {"forward": 4},
-        "dw_vec2_fullrank": {"dweight": 2},
-        "regslide_all": {"forward": 2, "dinput": 2, "dweight": 2},
+        "input_gradient_vec2": {"dinput": 2}, "input_gradient_vec4": {"dinput": 4},
+        "forward_vec2_rank4": {"forward": 2}, "forward_vec4": {"forward": 4},
+        "full_rank_weight_gradient_vec2": {"dweight": 2},
+        "register_sliding_window_all": {"forward": 2, "dinput": 2, "dweight": 2},
     }
     for op, value in (("forward", None), ("dinput", grad), ("dweight", grad)):
         candidate = kernels._regslide_candidate(projected, real, value, strict=False, op=op)
@@ -168,9 +168,9 @@ def test_regslide_cuda_parity(monkeypatch, mode, dtype, batch, h, w, modes, rank
             *kernels._packed_spatial_backward(grad, projected, real, imag, strict_complex=False),
         )
 
-    monkeypatch.setenv("LNET_READER_OPT", "off")
+    monkeypatch.setenv("ALPHABET_READER_KERNEL_POLICY", "off")
     expected = run()
-    monkeypatch.setenv("LNET_READER_OPT", mode)
+    monkeypatch.setenv("ALPHABET_READER_KERNEL_POLICY", mode)
     for actual, reference in zip(run(), expected, strict=True):
         torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.005)
 
@@ -272,7 +272,7 @@ def test_cpu_reduced_precision(dtype: torch.dtype) -> None:
 
 @pytest.mark.parametrize("option", ["auto", "off"])
 def test_fake_custom_op_and_autograd_metadata(monkeypatch, option) -> None:
-    monkeypatch.setenv("LNET_READER_OPT", option)
+    monkeypatch.setenv("ALPHABET_READER_KERNEL_POLICY", option)
     with FakeTensorMode():
         projected = torch.empty(2, 3, 7, 2 * 2 * 5, dtype=torch.float16, requires_grad=True)
         weights = tuple(torch.empty(5, 2, 3, 3, requires_grad=True) for _ in range(2))
@@ -290,7 +290,7 @@ def test_fake_custom_op_and_autograd_metadata(monkeypatch, option) -> None:
 @pytest.mark.parametrize("option", ["auto", "off"])
 @pytest.mark.usefixtures("isolated_dynamo")
 def test_compile_cpu_dynamic_fullgraph_forward_and_backward(monkeypatch, option) -> None:
-    monkeypatch.setenv("LNET_READER_OPT", option)
+    monkeypatch.setenv("ALPHABET_READER_KERNEL_POLICY", option)
     torch.manual_seed(37)
     reader, reference = _reader_pair(3, 5, 2, 3, rms=True, device="cpu")
     compiled = torch.compile(reader, fullgraph=True, dynamic=True)
@@ -404,7 +404,7 @@ def test_cuda_reader_fullgraph_autocast_and_gradients(dtype: torch.dtype) -> Non
 def test_free_real_memory_reader_matches_grouped_cuda(
     compiled: bool, dtype: torch.dtype, fused: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from lnet.memory_backbone import FactorizedMemoryReader  # noqa: PLC0415
+    from alphabet.memory_backbone import FactorizedMemoryReader  # noqa: PLC0415
 
     torch.manual_seed(972)
     legacy = FactorizedComplexConv2dReader(
@@ -419,9 +419,9 @@ def test_free_real_memory_reader_matches_grouped_cuda(
         reader.spatial_weight.normal_(std=0.15)
     reference.load_state_dict(reader.state_dict())
     if fused:
-        monkeypatch.delenv("LNET_FUSED_FACTORIZED_READER", raising=False)
+        monkeypatch.delenv("ALPHABET_FUSED_FACTORIZED_READER", raising=False)
     else:
-        monkeypatch.setenv("LNET_FUSED_FACTORIZED_READER", "0")
+        monkeypatch.setenv("ALPHABET_FUSED_FACTORIZED_READER", "0")
     run = torch.compile(reader, fullgraph=True) if compiled else reader
     x = torch.randn(2, 7, 11, 26, device="cuda", requires_grad=True)
     y = x.detach().clone().requires_grad_()
@@ -435,7 +435,9 @@ def test_free_real_memory_reader_matches_grouped_cuda(
     if fused:
         monkeypatch.setattr(reader, "synthesized_kernel", unexpected_synthesis)
     else:
-        monkeypatch.setattr("lnet.memory_backbone.real_packed_spatial", unexpected_fused_spatial)
+        monkeypatch.setattr(
+            "alphabet.memory_backbone.real_packed_spatial", unexpected_fused_spatial
+        )
     autocast_dtype = torch.bfloat16 if dtype == torch.float32 else dtype
     with torch.autocast("cuda", dtype=autocast_dtype, enabled=dtype != torch.float32):
         expected = reference(y)
@@ -720,7 +722,7 @@ def test_reader_vector_plan(
     choice: str, sm: int, modes: int, dtype: torch.dtype, strict: bool,
     offset: int, expected: int, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("LNET_READER_VEC", choice)
+    monkeypatch.setenv("ALPHABET_READER_VECTOR_WIDTH", choice)
     props = SimpleNamespace(
         major=sm // 10, minor=sm % 10, multi_processor_count=132, shared_memory_per_block=49152,
         shared_memory_per_multiprocessor=229376, max_threads_per_multi_processor=2048,
@@ -743,7 +745,7 @@ def test_reader_vector_parity(
 ) -> None:
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("native BF16 requires SM80 or newer")
-    monkeypatch.setenv("LNET_READER_VEC", str(vec))
+    monkeypatch.setenv("ALPHABET_READER_VECTOR_WIDTH", str(vec))
     torch.manual_seed(52)
     modes, shape = 64 + vec, (2, 7, 11)
     kwargs = {"device": "cuda", "dtype": dtype}
@@ -768,7 +770,7 @@ def test_reader_vector_parity(
 def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("native BF16 requires SM80 or newer")
-    monkeypatch.setenv("LNET_READER_VEC", "4")
+    monkeypatch.setenv("ALPHABET_READER_VECTOR_WIDTH", "4")
     torch.manual_seed(231)
     kwargs = {"device": "cuda", "dtype": torch.bfloat16}
     p = torch.randn((2, 7, 11, 4 * 48), **kwargs).requires_grad_()
@@ -787,7 +789,7 @@ def test_reader_weight_vector_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None
 )
 def test_reader_spatial_auto_dispatch(monkeypatch, option, width, modes, rank, strict, vec) -> None:
     if option is not None:
-        monkeypatch.setenv("LNET_READER_OPT", option)
+        monkeypatch.setenv("ALPHABET_READER_KERNEL_POLICY", option)
     props = SimpleNamespace(major=8, multi_processor_count=80, shared_memory_per_block=49152,
                             max_threads_per_multi_processor=1536)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
@@ -853,7 +855,7 @@ def test_reader_auto_and_off_cuda_parity(monkeypatch, shape, modes, rank, strict
     grad = torch.randn((*shape, 2 * modes), **kwargs) * 0.125
     outputs = []
     for option in ("auto", "off"):
-        monkeypatch.setenv("LNET_READER_OPT", option)
+        monkeypatch.setenv("ALPHABET_READER_KERNEL_POLICY", option)
         outputs.append((
             kernels._packed_spatial(projected, *filters, strict_complex=strict),
             *kernels._packed_spatial_backward(grad, projected, *filters, strict_complex=strict),

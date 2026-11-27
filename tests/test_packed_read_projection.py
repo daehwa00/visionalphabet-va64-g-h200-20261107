@@ -4,11 +4,11 @@ import copy
 
 import pytest
 import torch
+from alphabet_model_builder import build_dw_terminal_rmsnorm
 from torch._inductor import config as inductor_config
-from va_model_builder import build_dw_terminal_rmsnorm
 
-from lnet.complex_layers import ComplexLinear
-from lnet.memory_backbone import MemoryReadProjection
+from alphabet.complex_layers import ComplexLinear
+from alphabet.memory_backbone import MemoryReadProjection
 
 
 class _CustomProjection(MemoryReadProjection):
@@ -54,8 +54,8 @@ def topology() -> torch.nn.Module:
 )
 def test_planar_projection_fullgraph_training(topology, device, coarse, monkeypatch) -> None:
     torch.compiler.reset()
-    monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
-    monkeypatch.setenv("LNET_FUSED_FACTORIZED_READER", "1")
+    monkeypatch.delenv("ALPHABET_GENERAL_SCAN_REF_FWD", raising=False)
+    monkeypatch.setenv("ALPHABET_FUSED_FACTORIZED_READER", "1")
     if coarse:
         module = copy.deepcopy(topology.stage1).to(device)
         projection = module.augmented.memory_projection
@@ -90,10 +90,10 @@ def test_planar_projection_fullgraph_training(topology, device, coarse, monkeypa
 
     with inductor_config.patch(emulate_precision_casts=False):
         hook = projection.register_forward_pre_hook(observe, with_kwargs=True)
-        monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+        monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "0")
         seed_state = generator.get_state()
         expected, expected_grad = run(forward)
-        monkeypatch.setenv("LNET_GENERAL_SCANS", "1")
+        monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "1")
         generator.set_state(seed_state)
         eager, eager_grad = run(forward)
         hook.remove()
@@ -141,10 +141,10 @@ def test_other_projections_keep_planar_call(topology, coarse, projection_type, m
     inputs = torch.randn(1, 4, 6, reader.input_channels)
     kwargs = {"emit_descriptor": False} if coarse else {}
     with torch.no_grad(), inductor_config.patch(emulate_precision_casts=False):
-        monkeypatch.delenv("LNET_GENERAL_SCAN_REF_FWD", raising=False)
-        monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+        monkeypatch.delenv("ALPHABET_GENERAL_SCAN_REF_FWD", raising=False)
+        monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "0")
         expected = module(inputs, **kwargs)
-        monkeypatch.setenv("LNET_GENERAL_SCANS", "1")
+        monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "1")
         actual = module(inputs, **kwargs)
     hook.remove()
     assert calls == [2, 2]

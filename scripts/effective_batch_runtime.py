@@ -22,7 +22,7 @@ from effective_batch_search import baseline_microbatches, measure, valid_receipt
 from effective_batch_update import run_update
 from imagenet100_checkpoint_runtime import atomic_json
 
-from lnet.model_w36b import compile_model_w36b_update
+from alphabet.training_compiler import compile_training_update
 
 Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor, float | torch.Tensor]
 
@@ -32,7 +32,7 @@ class EffectiveTrainingRuntime(AutomaticTrainingRuntime):
         super().__init__(*args, **kwargs)
         self.decisions = {}
         self.fallbacks = {}
-        self.compiled_update = compile_model_w36b_update(self.model, self.optimizer)
+        self.compiled_update = compile_training_update(self.model, self.optimizer)
 
     def saved(self, key: str) -> dict[str, Any] | None:
         doc = read_json(self.base / (key + ".json"))

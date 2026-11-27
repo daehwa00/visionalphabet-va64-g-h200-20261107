@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import run_va_eight_ablations as runner
+import run_alphabet_ablations as runner
 import torch
+from alphabet_model_builder import model_config
 from torch.nn import functional
-from va_model_builder import model_config
 
-from lnet.depthwise_memory_reader import DepthwiseMemoryReader
-from lnet.memory_backbone import FactorizedMemoryReader
+from alphabet.depthwise_memory_reader import DepthwiseMemoryReader
+from alphabet.memory_backbone import FactorizedMemoryReader
 
 
 def test_model_inventory_and_preserved_initialization() -> None:

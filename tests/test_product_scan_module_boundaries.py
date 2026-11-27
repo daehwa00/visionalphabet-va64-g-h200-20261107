@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-PACKAGE = ROOT / "src/lnet"
+PACKAGE = ROOT / "src/alphabet"
 
 
 def _source(name: str) -> str:

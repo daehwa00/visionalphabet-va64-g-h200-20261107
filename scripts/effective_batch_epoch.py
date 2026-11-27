@@ -1,14 +1,26 @@
 """Retain data ordering and augmentation while choosing activation batches independently."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    import numpy as np
+    from effective_batch_runtime import Batch, EffectiveTrainingRuntime
+    from torch.utils.data import DataLoader
 
 from imagenet100_data_runtime import device_batches
 
 
-def prepare(inputs, targets, generator, alpha, cutmix_alpha=None):
+def prepare(
+    inputs: torch.Tensor, targets: torch.Tensor, generator: np.random.Generator,
+    alpha: float, cutmix_alpha: float | None = None,
+) -> Batch:
     perm = torch.randperm(len(targets), device=inputs.device)
     if cutmix_alpha is not None and float(generator.random()) < 0.5:
-        from va_ablation_augment import _cutmix_box
+        from alphabet_augmentation import _cutmix_box
 
         lam = float(generator.beta(cutmix_alpha, cutmix_alpha))
         y0, y1, x0, x1 = _cutmix_box(inputs.shape[-1], inputs.shape[-2], lam, generator)
@@ -21,7 +33,7 @@ def prepare(inputs, targets, generator, alpha, cutmix_alpha=None):
     return mixed, targets, targets[perm], lam
 
 
-def combine(pieces):
+def combine(pieces: list[Batch]) -> Batch:
     if len(pieces) == 1:
         return pieces[0]
     xs, ys, others, weights = zip(*pieces, strict=True)
@@ -35,17 +47,17 @@ def combine(pieces):
 
 
 def train_epoch(
-    model,
-    runtime,
-    loader,
+    model: torch.nn.Module,
+    runtime: EffectiveTrainingRuntime,
+    loader: DataLoader,
     *,
-    device,
-    mixup_generator,
-    mixup_alpha,
-    group_size,
-    channels_last,
-    cutmix_alpha=None,
-):
+    device: torch.device,
+    mixup_generator: np.random.Generator,
+    mixup_alpha: float,
+    group_size: int,
+    channels_last: bool,
+    cutmix_alpha: float | None = None,
+) -> dict[str, float]:
     model.train()
     runtime.train()
     groups = []
@@ -69,7 +81,7 @@ def train_epoch(
     model._latest_training_diagnostics = {
         k: float(torch.stack(v).double().sum()) / count for k, v in diagnostics.items()
     }
-    return dict(
-        loss=float(torch.stack(losses).double().sum()) / count,
-        mixed_accuracy=float(torch.stack(correct).sum()) / count,
-    )
+    return {
+        "loss": float(torch.stack(losses).double().sum()) / count,
+        "mixed_accuracy": float(torch.stack(correct).sum()) / count,
+    }

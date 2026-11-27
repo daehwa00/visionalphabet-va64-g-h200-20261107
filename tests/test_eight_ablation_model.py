@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from va_model_builder import (
+from alphabet_model_builder import (
     PARAMETERS,
     VisionAlphabetIN100,
     build_dw_terminal_rmsnorm,
     model_config,
 )
 
-from lnet.terminal_imaginary_correlation import _vertical_correlations
+from alphabet.terminal_imaginary_correlation import _vertical_correlations
 
 
 def test_normalized_correlation_value_and_detached_gradient() -> None:

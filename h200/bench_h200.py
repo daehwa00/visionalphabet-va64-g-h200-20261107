@@ -7,15 +7,15 @@ from collections.abc import Callable
 from pathlib import Path
 from time import perf_counter
 
-from h200 import runner
-from lnet.gpu_policy import (
-    LOCKIN_ENV,
+from alphabet.gpu_policy import (
+    COMPILED_ENV,
     REFERENCE_ENV,
     apply_gpu_policy,
     device_capability,
     gpu_policy_environment,
     recommended_gpu_env,
 )
+from h200 import runner
 
 VARIANT = "17-p1-nr4-1024d-v3"
 BUCKETS = (
@@ -25,8 +25,8 @@ BUCKETS = (
 
 
 def profile_bucket(name: str) -> str:
-    bucket = (name.removeprefix("va_profile_").split("__", 1)[0]
-              if name.startswith("va_profile_") else runner.kernel_bucket(name))
+    bucket = (name.removeprefix("alphabet_profile_").split("__", 1)[0]
+              if name.startswith("alphabet_profile_") else runner.kernel_bucket(name))
     return bucket if bucket in BUCKETS else "other"
 
 
@@ -69,7 +69,7 @@ def measure_arm(
 ) -> int:
     from torch._dynamo.utils import counters
 
-    from lnet import general_cuda_scans as scans
+    from alphabet import general_cuda_scans as scans
 
     original_kernel_name = scans._kernel_name  # noqa: SLF001
 
@@ -80,7 +80,7 @@ def measure_arm(
         ):
             axis = "vscan" if key.vertical else "hscan"
             phase = "bwd" if key.backward or key.reduction else "fwd"
-            return f"va_profile_{axis}_{phase}__{name}"
+            return f"alphabet_profile_{axis}_{phase}__{name}"
         return name
 
     # CUDA graph replay retains kernel symbols but bypasses Python launch hooks.
@@ -115,50 +115,60 @@ def measure_arm(
             for key in ("hit", "miss", "bypass")
         },
         "arm_env": {key: os.environ[key] for key in arm_env_keys},
-        "preset": os.environ["LNET_MODEL_W36B"],
+        "preset": os.environ["ALPHABET_COMPILER_FEATURES"],
         **{key: result[key] for key in ("profiler", "profiler_error") if key in result},
     })
     return 0
 
 
-def lockin_arm_env(name: str) -> dict[str, str]:
+def benchmark_arm_env(name: str) -> dict[str, str]:
     arm = name.removesuffix("_rev")
-    if arm == "auto_lockin":
+    if arm == "auto":
         return recommended_gpu_env(device_capability())
-    if arm == "w43_ref":
+    if arm == "reference":
         return REFERENCE_ENV.copy()
-    if arm == "w76_fp8_lockin":
+    if arm == "hopper_fp8_resident":
         return recommended_gpu_env((9, 0))
-    if arm == "w74_fp8_lockin":
+    if arm == "hopper_fp8_split":
         return {
-            **LOCKIN_ENV,
-            "VA_W66_SPLIT_BF16": "1",
-            "VA_W72_SPLIT_FP8": "1",
-            "VA_W76_REG_WOBI": "0",
+            **COMPILED_ENV,
+            "ALPHABET_SCAN_SPLIT_BF16": "1",
+            "ALPHABET_SCAN_SPLIT_FP8": "1",
+            "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS": "0",
         }
-    if arm == "w66_lockin":
-        return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1"}
-    if arm == "w57_lockin":
-        return LOCKIN_ENV.copy()
+    if arm == "hopper_bf16_split":
+        return {**COMPILED_ENV, "ALPHABET_SCAN_SPLIT_BF16": "1"}
+    if arm == "bf16_compiled":
+        return COMPILED_ENV.copy()
     raise ValueError(f"Unknown arm {name!r}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    arms = ("w43_ref", "w57_lockin", "w66_lockin", "w74_fp8_lockin", "w76_fp8_lockin")
-    choices = ("auto_lockin", *arms, *(arm + "_rev" for arm in arms))
+    arms = (
+        "reference",
+        "bf16_compiled",
+        "hopper_bf16_split",
+        "hopper_fp8_split",
+        "hopper_fp8_resident",
+    )
+    choices = ("auto", *arms, *(arm + "_rev" for arm in arms))
     parser.add_argument("--arm", required=True, choices=choices)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
-    if args.arm == "auto_lockin":
+    if args.arm == "auto":
         apply_gpu_policy()
         keys = tuple(gpu_policy_environment())
         return measure_arm(args.out, profile=args.profile, arm_env_keys=keys)
-    env = lockin_arm_env(args.arm)
-    if "VA_W72_SPLIT_FP8" not in env:
-        os.environ.pop("VA_W74_SMALL_FP8", None)
-    for flag in ("VA_W66_SPLIT_BF16", "VA_W72_SPLIT_FP8", "VA_W76_REG_WOBI"):
+    env = benchmark_arm_env(args.arm)
+    if "ALPHABET_SCAN_SPLIT_FP8" not in env:
+        os.environ.pop("ALPHABET_SCAN_SMALL_SPATIAL_FP8", None)
+    for flag in (
+        "ALPHABET_SCAN_SPLIT_BF16",
+        "ALPHABET_SCAN_SPLIT_FP8",
+        "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS",
+    ):
         if flag not in env:
             os.environ.pop(flag, None)
     os.environ.update(env)

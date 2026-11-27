@@ -7,21 +7,21 @@ from copy import deepcopy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+import alphabet_imagenet100_runtime as runtime
+import alphabet_model_builder as builder
 import calibrated_evaluation as calibrated
 import pytest
 import torch
-import va_imagenet100_runtime as runtime
-import va_model_builder as builder
 from torch import Tensor, nn
 from torch.nn import functional
 from torch.utils.data import DataLoader, TensorDataset
 
-from lnet.image_layers import (
+from alphabet.image_layers import (
     LivePolewiseComplexRMS,
     StandardizedAffineModalHead,
     fold_terminal_rms_for_inference,
 )
-from lnet.terminal_imaginary_correlation import complex_correlation_descriptor
+from alphabet.terminal_imaginary_correlation import complex_correlation_descriptor
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -193,8 +193,8 @@ def test_dual_evaluate_and_full_freeze(monkeypatch: pytest.MonkeyPatch, tmp_path
     expected_stored = runtime.evaluate(model, model, val_loader, device, precision="float32")
     _mock_clean_split(monkeypatch, tmp_path, train)
     log_path = tmp_path / "dual.jsonl"
-    monkeypatch.setenv("VA_DUAL_EVAL_LOG", str(log_path))
-    monkeypatch.delenv("VA_DUAL_EVAL_LOG_SKIP", raising=False)
+    monkeypatch.setenv("ALPHABET_DUAL_EVAL_LOG", str(log_path))
+    monkeypatch.delenv("ALPHABET_DUAL_EVAL_LOG_SKIP", raising=False)
 
     def dual_evaluate() -> dict[str, float]:
         return calibrated.evaluate(
@@ -215,15 +215,15 @@ def test_dual_evaluate_and_full_freeze(monkeypatch: pytest.MonkeyPatch, tmp_path
         assert torch.equal(value, saved[name])
 
     # Logging fails after the temporary moments have been installed.
-    monkeypatch.setenv("VA_DUAL_EVAL_LOG", str(tmp_path / "missing" / "dual.jsonl"))
+    monkeypatch.setenv("ALPHABET_DUAL_EVAL_LOG", str(tmp_path / "missing" / "dual.jsonl"))
     with pytest.raises(FileNotFoundError):
         dual_evaluate()
     for name, value in std.named_buffers():
         assert torch.equal(value, saved[name])
-    monkeypatch.setenv("VA_DUAL_EVAL_LOG_SKIP", "1")
+    monkeypatch.setenv("ALPHABET_DUAL_EVAL_LOG_SKIP", "1")
     assert dual_evaluate() == metrics
-    monkeypatch.delenv("VA_DUAL_EVAL_LOG_SKIP")
-    monkeypatch.delenv("VA_DUAL_EVAL_LOG")
+    monkeypatch.delenv("ALPHABET_DUAL_EVAL_LOG_SKIP")
+    monkeypatch.delenv("ALPHABET_DUAL_EVAL_LOG")
     monkeypatch.chdir(tmp_path)
     assert dual_evaluate() == metrics
     assert not (tmp_path / "dual-eval.jsonl").exists()
@@ -255,7 +255,7 @@ def test_final_epoch_rms_exports_on_cpu(monkeypatch: pytest.MonkeyPatch, tmp_pat
     loaders = DataLoader(train, batch_size=7), DataLoader(validation, batch_size=2)
     _mock_clean_split(monkeypatch, tmp_path, train)
     monkeypatch.setattr(runtime.data_runtime, "loaders", lambda *_args, **_kwargs: loaders)
-    monkeypatch.delenv("LNET_COMPILE_MODE", raising=False)
+    monkeypatch.delenv("ALPHABET_COMPILE_MODE", raising=False)
     summary: dict[str, Any] = {}
     tracking = SimpleNamespace(summary=summary, log=lambda *_a, **_kw: None, finish=lambda: None)
     monkeypatch.setattr(runtime, "_initialize_wandb_run", lambda *_args, **_kwargs: tracking)

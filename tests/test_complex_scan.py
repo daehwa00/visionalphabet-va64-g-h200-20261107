@@ -9,8 +9,8 @@ from typing import Literal
 import pytest
 import torch
 
-from lnet import complex_scan_stage
-from lnet.complex_scan import (
+from alphabet import complex_scan_stage
+from alphabet.complex_scan import (
     AugmentedComplexTransition,
     CifarConvOnlyStem,
     CifarNormalizedLinearStem,
@@ -28,8 +28,8 @@ from lnet.complex_scan import (
     complex_carry_coordinates,
     pole_aligned_complex_downsample,
 )
-from lnet.directional import direction_aligned_endpoints
-from lnet.image_layers import LayerNorm2d
+from alphabet.directional import direction_aligned_endpoints
+from alphabet.image_layers import LayerNorm2d
 
 
 def _rotate(

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import Tensor, nn
 
-from lnet.model_w36b import model_w36b_features
+from alphabet.training_compiler import training_compiler_features
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -157,7 +157,7 @@ def train_epoch_with_step_count(
 
     record = (
         torch.compiler.disable(record_step)
-        if "compiled_update" in model_w36b_features()
+        if "compiled_update" in training_compiler_features()
         else record_step
     )
 

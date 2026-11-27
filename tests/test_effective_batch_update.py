@@ -4,12 +4,12 @@ import sys
 from copy import deepcopy
 from types import SimpleNamespace
 
+import alphabet_imagenet100_runtime as va
 import effective_batch_epoch as epoch
 import effective_batch_update as update
 import numpy as np
 import pytest
 import torch
-import va_imagenet100_runtime as va
 from torch import nn
 from torch.nn import functional
 
@@ -258,13 +258,13 @@ def test_replayed_stages_keep_cudagraph_trees_with_general_scans(
 ) -> None:
     model = ToyHeads()
     if scan_flag is None:
-        monkeypatch.delenv("LNET_GENERAL_SCANS", raising=False)
+        monkeypatch.delenv("ALPHABET_GENERAL_SCANS", raising=False)
     else:
-        monkeypatch.setenv("LNET_GENERAL_SCANS", scan_flag)
-    monkeypatch.delenv("LNET_COMPILE_MODE", raising=False)
-    monkeypatch.setenv("LNET_COMPILE_PROFILE", "")
-    monkeypatch.setenv("LNET_CUDAGRAPHS_ACTIVE", "")
-    monkeypatch.setenv("LNET_LAUNCH_CACHE", "")
+        monkeypatch.setenv("ALPHABET_GENERAL_SCANS", scan_flag)
+    monkeypatch.delenv("ALPHABET_COMPILE_MODE", raising=False)
+    monkeypatch.setenv("ALPHABET_COMPILE_PROFILE", "")
+    monkeypatch.setenv("ALPHABET_CUDAGRAPHS_ACTIVE", "")
+    monkeypatch.setenv("ALPHABET_LAUNCH_CACHE", "")
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
     monkeypatch.setattr(va, "_has_replayed_cudagraph_stages", lambda _: True)
     options_seen: dict[str, object] = {}

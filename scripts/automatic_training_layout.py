@@ -20,12 +20,12 @@ from imagenet100_checkpoint_runtime import atomic_json
 from torch import nn
 from torch.utils._pytree import tree_map
 
-from lnet.gpu_policy import gpu_policy_environment
+from alphabet.gpu_policy import gpu_policy_environment
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from va_imagenet100_runtime import RunnerBindings
+    from alphabet_imagenet100_runtime import RunnerBindings
 
 T = TypeVar("T")
 TensorCapture = dict[str, dict[str, torch.Tensor]]
@@ -181,7 +181,7 @@ class AutomaticTrainingRuntime(nn.Module):
         }
         self.factories = {name: ident(fn) for name, fn in factories.items()}
         self.base = (
-            Path(os.environ.get("LNET_LAUNCH_CACHE") or Path.home() / ".cache/lnet")
+            Path(os.environ.get("ALPHABET_LAUNCH_CACHE") or Path.home() / ".cache/alphabet")
             / "effective-updates"
         )
         self.audit = root / "effective-update-calibration"
@@ -224,10 +224,10 @@ class AutomaticTrainingRuntime(nn.Module):
             *(
                 MODULE.with_name(name + ".py")
                 for name in (
-                    "va_imagenet100_runtime",
-                    "va_ablation_augment",
-                    "va_model_builder",
-                    "va_packed_backbone",
+                    "alphabet_imagenet100_runtime",
+                    "alphabet_augmentation",
+                    "alphabet_model_builder",
+                    "alphabet_packed_backbone",
                     "effective_batch_runtime",
                     "effective_batch_search",
                     "effective_batch_update",
@@ -235,7 +235,7 @@ class AutomaticTrainingRuntime(nn.Module):
                     "imagenet100_data_runtime",
                 )
             ),
-            *(PROJECT / "src/lnet").glob("*.py"),
+            *(PROJECT / "src/alphabet").glob("*.py"),
             *(Path(inspect.getfile(fn)) for fn in (*factories.values(), train_fn)),
         }
         revision = hashlib.sha256()
@@ -265,21 +265,21 @@ class AutomaticTrainingRuntime(nn.Module):
             "cuda": torch.version.cuda,
             "model": digest(self.schema),
             "training_code": revision.hexdigest(),
-            "compile_mode": os.environ.get("LNET_COMPILE_MODE") or recipe.get("compile_mode"),
+            "compile_mode": os.environ.get("ALPHABET_COMPILE_MODE") or recipe.get("compile_mode"),
             "precision": recipe["precision"],
             "channels_last": recipe.get("channels_last", False),
             "settings": self.settings,
             "mixup_alpha": recipe.get("mixup_alpha"),
-            "reference_scan_forward": os.environ.get("LNET_GENERAL_SCAN_REF_FWD") == "1",
+            "reference_scan_forward": os.environ.get("ALPHABET_GENERAL_SCAN_REF_FWD") == "1",
             "gpu_policy_env": gpu_policy_environment(),
             "scan_env": {
                 name: "0" if os.environ.get(name) == "0" else "1"
-                for name in ("LNET_GENERAL_SCANS", "LNET_FUSED_FACTORIZED_READER")
+                for name in ("ALPHABET_GENERAL_SCANS", "ALPHABET_FUSED_FACTORIZED_READER")
             },
         }
 
     def runtime_for(self, key: str | int) -> nn.Module:
-        from va_imagenet100_runtime import _build_runtime
+        from alphabet_imagenet100_runtime import _build_runtime
 
         if key not in self.runtimes:
             self.runtimes[key] = _build_runtime(self.model, self.recipe)

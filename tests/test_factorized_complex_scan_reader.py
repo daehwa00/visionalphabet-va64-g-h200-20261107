@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
-from lnet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
+from alphabet.factorized_complex_scan_reader import FactorizedComplexConv2dReader
 
 
 def _dense_reference(

@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from torch.nn.utils import parametrize
 from torch.nn.utils.parametrizations import orthogonal
 
-from lnet.complex_scan import (
+from alphabet.complex_scan import (
     ComplexScanBackbone,
     ComplexScanConfig,
     bake_parametrizations_,

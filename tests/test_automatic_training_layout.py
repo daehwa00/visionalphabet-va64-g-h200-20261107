@@ -6,15 +6,15 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Never
 
+import alphabet_imagenet100_runtime as va
 import automatic_training_layout as layout
 import effective_batch_runtime as effective
 import effective_batch_search as search
 import numpy as np
 import pytest
 import torch
-import va_imagenet100_runtime as va
+from alphabet_model_builder import model_config
 from torch import nn
-from va_model_builder import model_config
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -45,16 +45,16 @@ def make_runtime[Runtime: layout.AutomaticTrainingRuntime](
 
 
 def test_workload_normalizes_scan_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    for name in ("LNET_GENERAL_SCANS", "LNET_FUSED_FACTORIZED_READER"):
+    for name in ("ALPHABET_GENERAL_SCANS", "ALPHABET_FUSED_FACTORIZED_READER"):
         monkeypatch.delenv(name, raising=False)
     default = make_runtime(tmp_path)
-    monkeypatch.setenv("LNET_GENERAL_SCANS", "1")
-    monkeypatch.setenv("LNET_FUSED_FACTORIZED_READER", "1")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "1")
+    monkeypatch.setenv("ALPHABET_FUSED_FACTORIZED_READER", "1")
     assert make_runtime(tmp_path).identity == default.identity
-    monkeypatch.setenv("LNET_GENERAL_SCANS", "0")
+    monkeypatch.setenv("ALPHABET_GENERAL_SCANS", "0")
     assert make_runtime(tmp_path).identity["scan_env"] == {
-        "LNET_GENERAL_SCANS": "0",
-        "LNET_FUSED_FACTORIZED_READER": "1",
+        "ALPHABET_GENERAL_SCANS": "0",
+        "ALPHABET_FUSED_FACTORIZED_READER": "1",
     }
 
 
@@ -101,7 +101,7 @@ def test_cpu_snapshots_are_independent_and_rng_round_trips(tmp_path: Path) -> No
 
 @pytest.fixture
 def mock_calibration_gpu(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("LNET_LAUNCH_CACHE", str(tmp_path))
+    monkeypatch.setenv("ALPHABET_LAUNCH_CACHE", str(tmp_path))
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda _: SimpleNamespace(name="test GPU")
     )

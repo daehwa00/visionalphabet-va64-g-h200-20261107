@@ -7,15 +7,15 @@ import pytest
 import torch
 from torch import Tensor
 
-from lnet.pole_gamma_math import discrete_pole
-from lnet.product_scan_pipeline import (
+from alphabet.pole_gamma_math import discrete_pole
+from alphabet.product_scan_pipeline import (
     ProductScanEpilogue,
     ScanMemoryPolicy,
     run_product_scan_pipeline,
 )
 
 if TYPE_CHECKING:
-    from lnet.product_scan_contracts import ProductGainNormalization
+    from alphabet.product_scan_contracts import ProductGainNormalization
 
 
 def _inputs(

@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional
 
-from lnet.image_layers import LayerNorm2d, _fused_stem_block
+from alphabet.image_layers import LayerNorm2d, _fused_stem_block
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -39,7 +39,7 @@ def test_conv_stem(
     dy = torch.randn((2, co, (hw[0] + 1) // 2, (hw[1] + 1) // 2), device="cuda")
     results = {}
     for mode in ("off", "on", "fp32"):
-        monkeypatch.setenv("LNET_FUSED_STEM_CONV", "off" if mode == "off" else "on")
+        monkeypatch.setenv("ALPHABET_FUSED_STEM_CONV", "off" if mode == "off" else "on")
         if mode == "fp32":
             y = functional.gelu(norm(conv(x)))
         else:
@@ -61,7 +61,7 @@ def test_conv_stem(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_conv_stem_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LNET_FUSED_STEM_CONV", "on")
+    monkeypatch.setenv("ALPHABET_FUSED_STEM_CONV", "on")
     conv = nn.Conv2d(3, 32, 3, 2, 1, device="cuda")
     norm = LayerNorm2d(32).cuda()
     x = torch.randn(2, 3, 33, 35, device="cuda")
@@ -72,7 +72,7 @@ def test_conv_stem_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
 
     explained = torch._dynamo.explain(forward)(x)
     assert (explained.graph_count, explained.graph_break_count) == (1, 0)
-    assert "va_stem.conv_forward" in explained.graphs[0].code
+    assert "alphabet_stem.conv_forward" in explained.graphs[0].code
     expected = forward(x)
     compiled = torch.compile(forward, fullgraph=True)(x)
     torch.testing.assert_close(compiled, expected)

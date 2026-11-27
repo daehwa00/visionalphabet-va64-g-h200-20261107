@@ -3,16 +3,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from alphabet_model_builder import build_dw_terminal_rmsnorm
 from bench_reader_e2e_micro import SHAPES, Shape, make_reader
 from torch._functorch import config as aot_config
 from torch.nn import functional
 from torch.utils._pytree import tree_leaves
-from va_model_builder import build_dw_terminal_rmsnorm
 
-from lnet import memory_backbone
-from lnet.factorized_reader_kernels import real_packed_spatial
-from lnet.memory_backbone import FactorizedMemoryReader, reader_roofline_costs
-from lnet.memory_training import enable_memory_training_
+from alphabet import memory_backbone
+from alphabet.factorized_reader_kernels import real_packed_spatial
+from alphabet.memory_backbone import FactorizedMemoryReader, reader_roofline_costs
+from alphabet.memory_training import enable_memory_training_
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -83,7 +83,7 @@ def test_output_and_all_gradients(shape, normalize, match, dtype, monkeypatch) -
     fact = evaluate(reader, x, dy, lambda s: reference(reader, s, factorized=True), dtype)
     results = {}
     for mode in ("off", "dense_nhwc", "dense_nhwc_inductor", "dense_nhwc_bmm"):
-        monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
+        monkeypatch.setenv("ALPHABET_READER_MODE", mode)
         results[mode] = evaluate(reader, x, dy, reader, dtype)
         assert results[mode][0].is_contiguous()
         for value, dense, factorized in zip(results[mode], fp32, fact, strict=True):
@@ -126,7 +126,7 @@ def test_channels_last_views(monkeypatch, strided, dtype) -> None:
         pointers["output"] = output.data_ptr()
         return output
 
-    monkeypatch.setenv("LNET_READER_EXEC_MODE", "dense_nhwc")
+    monkeypatch.setenv("ALPHABET_READER_MODE", "dense_nhwc")
     monkeypatch.setattr(functional, "conv2d", check_conv)
     y = reader(x)
     assert y.is_contiguous()
@@ -203,7 +203,7 @@ def test_auto_roofline_dispatch_uses_runtime_properties(shape, expected, monkeyp
         return SimpleNamespace(major=sm[0], minor=sm[1], multi_processor_count=sm[2])
 
     monkeypatch.setattr(memory_backbone, "_reader_cuda_device_properties", properties)
-    monkeypatch.setenv("LNET_READER_EXEC_MODE", "auto_roofline")
+    monkeypatch.setenv("ALPHABET_READER_MODE", "auto_roofline")
     assert reader._reader_execution_mode(source) == expected
 
     def dispatch(value):
@@ -217,7 +217,7 @@ def test_auto_roofline_dispatch_uses_runtime_properties(shape, expected, monkeyp
     assert reader._reader_execution_mode(source) == "factorized_triton"
     torch._dynamo.reset()
     assert torch.compile(dispatch, backend="aot_eager", fullgraph=True)(torch.zeros(())) == 2
-    monkeypatch.setenv("LNET_READER_EXEC_MODE", "off")
+    monkeypatch.setenv("ALPHABET_READER_MODE", "off")
     assert reader._reader_execution_mode(source) == "dense"
 
 
@@ -227,7 +227,7 @@ def test_auto_roofline_dispatch_uses_runtime_properties(shape, expected, monkeyp
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.usefixtures("isolated_dynamo")
 def test_reader_fullgraph(mode, dtype, monkeypatch) -> None:
-    monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
+    monkeypatch.setenv("ALPHABET_READER_MODE", mode)
     torch.manual_seed(168)
     reader = make_reader(SHAPES[5], torch.device("cpu"))
     x = torch.randn(2, 5, 7, 37, requires_grad=True)
@@ -243,10 +243,10 @@ def test_default_and_off_are_bit_identical(monkeypatch) -> None:
     reader = make_reader(SHAPES[5], torch.device("cpu"))
     x = torch.randn(2, 5, 7, 37, requires_grad=True)
     dy = torch.randn(2, 5, 7, 58)
-    monkeypatch.delenv("LNET_READER_EXEC_MODE", raising=False)
+    monkeypatch.delenv("ALPHABET_READER_MODE", raising=False)
     default = evaluate(reader, x, dy, reader, torch.float32)
     for mode in ("", "off"):
-        monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
+        monkeypatch.setenv("ALPHABET_READER_MODE", mode)
         actual = evaluate(reader, x, dy, reader, torch.float32)
         torch.testing.assert_close(actual, default, rtol=0, atol=0)
 
@@ -266,7 +266,7 @@ def test_ablation17_full_model_aot_eager(monkeypatch) -> None:
     x = torch.randn(1, 3, 224, 224)
     reference = None
     for mode in ("off", "dense_nhwc", "dense_nhwc_inductor", "dense_nhwc_bmm"):
-        monkeypatch.setenv("LNET_READER_EXEC_MODE", mode)
+        monkeypatch.setenv("ALPHABET_READER_MODE", mode)
         assert enable_memory_training_(model) == {"readers": len(readers)}
         assert all(reader.execution_mode == "factorized_triton" for reader in readers)
         assert {key: value.shape for key, value in model.state_dict().items()} == before

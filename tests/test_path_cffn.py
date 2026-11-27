@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from lnet.path_cffn import FactorizedQuadrantPathModeCFFNCombiner
+from alphabet.path_cffn import FactorizedQuadrantPathModeCFFNCombiner
 
 
 def test_factorized_path_cffn_preserves_the_four_path_contract() -> None:
