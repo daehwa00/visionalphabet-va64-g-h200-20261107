@@ -4,7 +4,7 @@ import bench_wave66_split_bf16 as bench
 import torch
 from run_va_eight_ablations import build_variant
 
-from lnet import product_scan_pipeline, w72_split_fp8_scan
+from lnet import product_scan_pipeline, w66_split_bf16_scan, w72_split_fp8_scan
 
 
 def model_scan_graph(monkeypatch, *, fp8, bf16=True) -> list:
@@ -12,6 +12,7 @@ def model_scan_graph(monkeypatch, *, fp8, bf16=True) -> list:
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("VA_W66_SPLIT_BF16", str(int(bf16)))
     monkeypatch.setenv("VA_W72_SPLIT_FP8", str(int(fp8)))
+    monkeypatch.setattr(w66_split_bf16_scan, "_is_hopper", lambda _: True)
     monkeypatch.setattr(w72_split_fp8_scan, "_is_hopper", lambda _: True)
 
     def reference(inputs, _path, epilogue, _eps, _kind, _swiglu, planar):

@@ -199,18 +199,17 @@ def compile_flags(key, variant, width):
     return ["--fmad=" + str(not key.vertical or key.backward or key.vector_weights).lower()]
 
 
-@lru_cache(maxsize=256)
-def _function(device, key, variant, width, height, modes, full_rows, smem):
+def compile_sm90a(source, flags):
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "packed.cu"
-        path.write_text(kernel_source(key, variant, width, height, modes, full_rows))
+        path.write_text(source)
         cubin = path.with_suffix(".cubin")
         subprocess.run(
             [
                 "nvcc",
                 "-std=c++17",
                 "-arch=sm_90a",
-                *compile_flags(key, variant, width),
+                *flags,
                 "-cubin",
                 str(path),
                 "-o",
@@ -219,7 +218,13 @@ def _function(device, key, variant, width, height, modes, full_rows, smem):
             check=True,
             capture_output=True,
         )
-        image = ct.create_string_buffer(cubin.read_bytes())
+        return ct.create_string_buffer(cubin.read_bytes())
+
+
+@lru_cache(maxsize=256)
+def _function(device, key, variant, width, height, modes, full_rows, smem):
+    image = compile_sm90a(kernel_source(key, variant, width, height, modes, full_rows),
+                          compile_flags(key, variant, width))
     with torch.cuda.device(device):
         driver = scans._load_cuda_driver()
         scans._ensure_context(driver, device)
@@ -447,15 +452,19 @@ def pipeline(pole, r, i, aux, path, coarse, grad):
     return [out, *v[:4], *v[5:], *h]
 
 
+def _is_hopper(real):
+    return real.is_cuda and torch.cuda.get_device_capability(real.device) == (9, 0)
+
+
 def enabled(real, path, epilogue, kind, swiglu):
     return (
         os.environ.get("VA_W66_SPLIT_BF16") == "1"
-        and real.is_cuda and real.dtype == torch.bfloat16 and real.ndim == 4
+        and real.dtype == torch.bfloat16 and real.ndim == 4
         and real.shape[1:] in ((56, 56, 160), (28, 28, 160))
         and epilogue in ("full16", "coarse_path") and kind == 0 and not swiglu
         and len(path) == 4 and path[0].shape == (160, 8, 8)
         and scans.general_scans_enabled(forward=True)
-        and torch.cuda.get_device_capability(real.device) == (9, 0)
+        and _is_hopper(real)
     )
 
 

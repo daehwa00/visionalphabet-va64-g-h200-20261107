@@ -344,6 +344,6 @@ def test_storage_graph_target(monkeypatch):
             path,
             gain_normalization="pointwise",
         )
-        name = "product_scan_pipeline_storage_v2" + ("_w66" if flag == "1" else "")
+        name = "product_scan_pipeline_storage_v2"  # CPU inputs use the standard op.
         assert result.graph_count == 1
         assert getattr(torch.ops.lnet, name).default in result.ops_per_graph[0]

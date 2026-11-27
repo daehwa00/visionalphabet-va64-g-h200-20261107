@@ -6,7 +6,6 @@ from __future__ import annotations
 # The composition boundary intentionally uses package-private primitive ops so
 # their intermediate autograd contexts do not retain horizontal scan states.
 # pyright: reportPrivateUsage=false
-import os
 from functools import partial
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
@@ -1842,10 +1841,6 @@ torch.library.register_autograd(
 )
 
 
-def _w66_requested() -> bool:
-    return os.environ.get("VA_W66_SPLIT_BF16") == "1"
-
-
 def run_product_scan_pipeline_packed(
     pole_x: tuple[Tensor, Tensor, Tensor, Tensor],
     pole_y: tuple[Tensor, Tensor, Tensor, Tensor],
@@ -1865,8 +1860,8 @@ def run_product_scan_pipeline_packed(
         raise ValueError(f"unsupported scan memory policy: {memory_policy}")
     if not emit_descriptor and epilogue != "coarse":
         raise ValueError("descriptor omission requires the coarse epilogue")
-    op = _packed_pipeline_op_w66 if _w66_requested() else _packed_pipeline_op
-    output = op(
+    # Split kernels require path-collapse weights. This entry point has none.
+    output = _packed_pipeline_op(
         [*pole_x, *pole_y, source_packed],
         [],
         epilogue if emit_descriptor else "coarse_no_descriptor",

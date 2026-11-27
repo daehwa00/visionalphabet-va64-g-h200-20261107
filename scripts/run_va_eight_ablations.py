@@ -237,8 +237,12 @@ def main() -> None:
 
     from lnet.complex_scan_config import ComplexScanConfig
 
+    if os.environ.get("VA_AUTO_GPU_POLICY") == "1":
+        from lnet.gpu_policy import apply_gpu_policy
+
+        apply_gpu_policy()
     torch.set_float32_matmul_precision("high")
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = os.environ.get("LNET_CUDNN_BENCHMARK", "1") != "0"
     runtime.main(
         runtime.RunnerBindings(
             variants=VARIANTS,

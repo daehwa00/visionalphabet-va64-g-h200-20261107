@@ -3,18 +3,18 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
 import statistics
 import time
 import traceback
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import argparse
     from collections.abc import Callable
+    from pathlib import Path
 
     import torch
 

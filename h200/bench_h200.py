@@ -8,39 +8,16 @@ from pathlib import Path
 from time import perf_counter
 
 from h200 import runner
+from lnet.gpu_policy import (
+    LOCKIN_ENV,
+    REFERENCE_ENV,
+    apply_gpu_policy,
+    device_capability,
+    gpu_policy_environment,
+    recommended_gpu_env,
+)
 
 VARIANT = "17-p1-nr4-1024d-v3"
-REFERENCE_ENV = {
-    "LNET_SCAN_SGS": "strict_ro",
-    "LNET_SCAN_VFWD": "batch4_w2",
-    "LNET_SCAN_HSCAN": "bwd_opt",
-    "LNET_SCAN_VSCAN_SAVED": "off",
-    "LNET_STEM_STAGE0_MODE": "off",
-    "VA_READER_OPT_MODE": "off",
-    "LNET_MODEL_W36B": "cuda_graphs,tma_gemm,max_autotune_pointwise",
-    "LNET_READER_DENSE_NHWC": "off",
-    "LNET_READER_EXEC_MODE": "off",
-    "LNET_NORM_W50_MODE": "off",
-    "LNET_CUDNN_BENCHMARK": "0",
-    "LNET_SCAN_W51A": "off",
-    "LNET_SCAN_W51B": "off",
-    "LNET_SCAN_W52A": "off",
-    "LNET_SCAN_W53A": "off",
-    "LNET_FUSED_STEM_CONV": "auto"
-}
-LOCKIN_ENV = {
-    **REFERENCE_ENV,
-    "LNET_SCAN_HSCAN": "h55_lockin",
-    "LNET_STEM_STAGE0_MODE": "triton_v3_m64_w4",
-    "LNET_READER_DENSE_NHWC": "dense_nhwc",
-    "LNET_READER_EXEC_MODE": "dense_nhwc",
-    "LNET_CUDNN_BENCHMARK": "1",
-    "LNET_SCAN_W51A": "fp32",
-    "LNET_SCAN_W53A": "w57_lockin",
-    "LNET_FUSED_STEM_CONV": "on",
-    "LNET_MODEL_W56B": "swiglu_vec8_tanh",
-    "LNET_MODEL_W57B_RMS": "cuda_sp_vec8_4cta"
-}
 BUCKETS = (
     "vscan_bwd", "vscan_fwd", "hscan_bwd", "hscan_fwd", "factorized_reader",
     "cudnn_conv", "cublas_gemm", "triton", "fused_stem", "other",
@@ -143,16 +120,21 @@ def measure_arm(
     })
     return 0
 
+
 def lockin_arm_env(name: str) -> dict[str, str]:
     arm = name.removesuffix("_rev")
+    if arm == "auto_lockin":
+        return recommended_gpu_env(device_capability())
     if arm == "w43_ref":
         return REFERENCE_ENV.copy()
-    if arm in ("w74_fp8_lockin", "w76_fp8_lockin"):
+    if arm == "w76_fp8_lockin":
+        return recommended_gpu_env((9, 0))
+    if arm == "w74_fp8_lockin":
         return {
             **LOCKIN_ENV,
             "VA_W66_SPLIT_BF16": "1",
             "VA_W72_SPLIT_FP8": "1",
-            "VA_W76_REG_WOBI": "1" if arm == "w76_fp8_lockin" else "0",
+            "VA_W76_REG_WOBI": "0",
         }
     if arm == "w66_lockin":
         return {**LOCKIN_ENV, "VA_W66_SPLIT_BF16": "1"}
@@ -164,10 +146,15 @@ def lockin_arm_env(name: str) -> dict[str, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     arms = ("w43_ref", "w57_lockin", "w66_lockin", "w74_fp8_lockin", "w76_fp8_lockin")
-    parser.add_argument("--arm", required=True, choices=(*arms, *(arm + "_rev" for arm in arms)))
+    choices = ("auto_lockin", *arms, *(arm + "_rev" for arm in arms))
+    parser.add_argument("--arm", required=True, choices=choices)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
+    if args.arm == "auto_lockin":
+        apply_gpu_policy()
+        keys = tuple(gpu_policy_environment())
+        return measure_arm(args.out, profile=args.profile, arm_env_keys=keys)
     env = lockin_arm_env(args.arm)
     if "VA_W72_SPLIT_FP8" not in env:
         os.environ.pop("VA_W74_SMALL_FP8", None)

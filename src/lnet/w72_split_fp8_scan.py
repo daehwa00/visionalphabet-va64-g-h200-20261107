@@ -1,14 +1,11 @@
-# ruff: noqa: ANN001, ANN201, ANN202, ARG001, FBT001, FBT002, RUF059, S603, S607, SLF001
+# ruff: noqa: ANN001, ANN201, ANN202, ARG001, FBT001, FBT002, RUF059, SLF001
 """Shape-selected SM90 split-plane scans with E4M3 states and E5M2 adjoints."""
 
 import ctypes as ct
 import os
 import re
-import subprocess
-import tempfile
 from dataclasses import replace as with_fields
 from functools import lru_cache
-from pathlib import Path
 
 import torch
 
@@ -472,25 +469,8 @@ extern "C" __global__ void va_profile_scale__w72_split_fp8(
 
 @lru_cache(maxsize=256)
 def _function(device, key, width, height, modes, smem, resident):
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / "packed.cu"
-        path.write_text(kernel_source(key, width, height, modes, resident))
-        cubin = path.with_suffix(".cubin")
-        subprocess.run(
-            [
-                "nvcc",
-                "-std=c++17",
-                "-arch=sm_90a",
-                *compile_flags(key, width),
-                "-cubin",
-                str(path),
-                "-o",
-                str(cubin),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        image = ct.create_string_buffer(cubin.read_bytes())
+    image = w66.compile_sm90a(kernel_source(key, width, height, modes, resident),
+                              compile_flags(key, width))
     with torch.cuda.device(device):
         driver = scans._load_cuda_driver()
         scans._ensure_context(driver, device)
@@ -771,8 +751,7 @@ def vertical(
     return out
 
 
-def _is_hopper(real):
-    return real.is_cuda and torch.cuda.get_device_capability(real.device) == (9, 0)
+_is_hopper = w66._is_hopper
 
 
 def enabled(real, path, epilogue, kind, swiglu):

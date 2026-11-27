@@ -20,6 +20,8 @@ from imagenet100_checkpoint_runtime import atomic_json
 from torch import nn
 from torch.utils._pytree import tree_map
 
+from lnet.gpu_policy import gpu_policy_environment
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
@@ -269,6 +271,7 @@ class AutomaticTrainingRuntime(nn.Module):
             "settings": self.settings,
             "mixup_alpha": recipe.get("mixup_alpha"),
             "reference_scan_forward": os.environ.get("LNET_GENERAL_SCAN_REF_FWD") == "1",
+            "gpu_policy_env": gpu_policy_environment(),
             "scan_env": {
                 name: "0" if os.environ.get(name) == "0" else "1"
                 for name in ("LNET_GENERAL_SCANS", "LNET_FUSED_FACTORIZED_READER")

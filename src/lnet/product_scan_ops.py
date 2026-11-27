@@ -20,6 +20,7 @@ import triton
 from torch import Tensor
 from torch.library import triton_op, wrap_triton
 
+from . import w66_split_bf16_scan as w66
 from . import w72_split_fp8_scan as w72
 from .general_cuda_scans import (
     general_scans_enabled,
@@ -65,9 +66,10 @@ def select_split_scan_op(
     if os.environ.get("VA_W72_SPLIT_FP8") == "1":
         real = packed[..., : packed.shape[-1] // 2]
         return fp8 if w72.enabled(real, path, epilogue, kind, swiglu) else standard
-    if packed.shape[1:3] in ((14, 14), (7, 7)):
-        return standard
-    return bf16 if os.environ.get("VA_W66_SPLIT_BF16") == "1" else standard
+    if os.environ.get("VA_W66_SPLIT_BF16") == "1":
+        real = packed[..., : packed.shape[-1] // 2]
+        return bf16 if w66.enabled(real, path, epilogue, kind, swiglu) else standard
+    return standard
 
 
 FORWARD_LAUNCH_NAME = "product_scan_coarse4_forward"
