@@ -257,7 +257,7 @@ def test_dispatch(monkeypatch):
             for _, h, w, m, coarse in [*SHAPES, ("odd", 55, 56, 160, False)]:
                 source = SimpleNamespace(shape=(1,h,w,m), device="cuda", dtype=dtype, is_cuda=True, ndim=4)
                 assert fp.enabled(source, path, "coarse_path" if coarse else "full16", 0, swiglu=False) == (
-                    flag == "1" and dtype == torch.bfloat16 and h in (28, 56)
+                    flag == "1" and dtype == torch.bfloat16 and m == path[0].shape[0]
                 )
 
 

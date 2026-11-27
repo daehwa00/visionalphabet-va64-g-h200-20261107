@@ -67,6 +67,7 @@ class RunnerBindings:
 
 def parse_args(*, variants: tuple[str, ...], seeds: tuple[int, ...]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=torch.device, default=torch.device("cuda"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--variants", choices=variants, nargs="+", default=list(variants))
@@ -891,10 +892,14 @@ def _run_job_with_loaders(
         wandb_run.finish()
 
 
-def main(bindings: RunnerBindings) -> None:
-    args = parse_args(variants=bindings.variants, seeds=bindings.seeds)
-    if not torch.cuda.is_available():
+def main(bindings: RunnerBindings, *, args: argparse.Namespace | None = None) -> None:
+    if args is None:
+        args = parse_args(variants=bindings.variants, seeds=bindings.seeds)
+    device = args.device
+    if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("ImageNet-100 runner requires CUDA")
+    if device.index is not None:
+        torch.cuda.set_device(device)
     data_runtime.configure_cpu_affinity()
     if not set(args.run_seeds) <= set(bindings.seeds):
         raise ValueError("run seeds fall outside the configured contract")
@@ -904,7 +909,6 @@ def main(bindings: RunnerBindings) -> None:
     _initialize(args.root, contract)
     if args.initialize_only:
         return
-    device = torch.device("cuda")
     for variant in args.variants:
         for seed in args.run_seeds:
             _run_job(

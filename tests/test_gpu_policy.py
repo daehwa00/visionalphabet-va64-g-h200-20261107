@@ -4,7 +4,9 @@ import os
 import sys
 from unittest.mock import MagicMock
 
+import alphabet_imagenet100_runtime as runtime
 import pytest
+import run_alphabet_ablations as ablations
 import torch
 
 from alphabet import gpu_policy, product_scan_ops
@@ -15,6 +17,8 @@ from h200 import bench_h200
     ("capability", "reader", "scan", "tma", "split"),
     [
         ((9, 0), "dense_nhwc", "hopper_specialized", True, True),
+        ((10, 0), "dense_nhwc", "optimized_backward", False, False),
+        ((12, 0), "dense_nhwc", "optimized_backward", False, False),
         ((8, 9), "dense_nhwc", "optimized_backward", True, False),
         ((8, 0), "dense_nhwc", "optimized_backward", True, False),
         ((8, 6), "off", "optimized_backward", False, False),
@@ -96,3 +100,73 @@ def test_non_hopper_guard(monkeypatch, flag) -> None:
         )
         == "standard"
     )
+
+
+def test_cli_device_index(monkeypatch, tmp_path) -> None:
+    capability = MagicMock(return_value=(10, 0))
+    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    monkeypatch.setattr(torch.cuda, "set_device", MagicMock())
+    monkeypatch.setattr(bench_h200, "measure_arm", lambda *_args, **_kw: 0)
+    monkeypatch.setattr(
+        sys, "argv", ["bench", "--device", "cuda:1", "--arm", "auto", "--out", str(tmp_path)]
+    )
+    assert bench_h200.main() == 0
+    capability.assert_called_once_with(1)
+
+
+@pytest.mark.parametrize(
+    ("shape", "epilogue", "expected"),
+    [
+        ((56, 56, 32), "coarse_path", "fp8"),
+        ((28, 28, 192), "full16", "fp8"),
+        ((32, 48, 64), "coarse_path", "fp8"),
+        ((7, 7, 64), "full16", "fp8"),
+        ((7, 7, 64), "coarse_path", "standard"),
+        ((32, 47, 64), "coarse_path", "standard"),
+        ((32, 32, 33), "full16", "fp8"),
+        ((256, 256, 64), "full16", "standard"),
+    ],
+)
+def test_split_routing(monkeypatch, shape, epilogue, expected) -> None:
+    h, w, m = shape
+    monkeypatch.setattr(os, "environ", gpu_policy.recommended_gpu_env((9, 0)))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    packed = MagicMock(shape=(1, h, w, 2 * m))
+    packed.__getitem__.return_value = MagicMock(
+        shape=(1, h, w, m), ndim=4, dtype=torch.bfloat16, is_cuda=True
+    )
+    assert product_scan_ops.select_split_scan_op(
+        packed, [MagicMock(shape=(m, 8, 8))] * 4, epilogue, 0, swiglu=False,
+        standard="standard", bf16="bf16", fp8="fp8",
+    ) == expected
+
+
+def test_ablation_device_index(monkeypatch, tmp_path) -> None:
+    capability = MagicMock(return_value=(12, 0))
+    runner = MagicMock()
+    monkeypatch.setattr(os, "environ", {"ALPHABET_AUTO_GPU_POLICY": "1"})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    monkeypatch.setattr(runtime, "main", runner)
+    monkeypatch.setattr(
+        sys, "argv", ["train", "--device", "cuda:1", "--root", str(tmp_path),
+                      "--data-root", str(tmp_path)],
+    )
+    ablations.main()
+    capability.assert_called_once_with(1)
+    assert runner.call_args.kwargs["args"].device == torch.device("cuda:1")
+
+@pytest.mark.parametrize(
+    ("device", "index"),
+    [(None, None), ("cuda", None), (2, 2), (torch.device("cuda:1"), 1)],
+)
+def test_device_capability(monkeypatch, device, index) -> None:
+    capability = MagicMock(return_value=(9, 0))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    assert gpu_policy.device_capability(device) == (9, 0)
+    capability.assert_called_once_with(index)
+    assert gpu_policy.apply_gpu_policy("cpu") == {}
+    capability.assert_called_once_with(index)

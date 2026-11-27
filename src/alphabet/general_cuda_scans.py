@@ -3487,15 +3487,20 @@ def _plan_vertical_segmented_backward(
 ) -> Launch:
     _, h, w, m = shape
     key = launch.key
-    if (
-        key.odd_coarse_backward
-        or h != w
-        or h not in (56, 28, 14, 7)
-        or m != (128 if h == 7 else 160)
-    ):
+    if key.odd_coarse_backward or min(h, w, m) <= 0 or h > 96:
+        # The segmented template carries one boundary between at most two chunks.
         return launch
     if mode != "low_warp_backward":
-        chunk = 48 if h == 56 else 0
+        threads = 4 * _WARP_SIZE
+        line_rows = h // (1 + key.coarse) if key.cache_line else 0
+        fixed_bytes = 5632 + threads * 8 * (h + line_rows + launch.plan.grad_store_rows)
+        available = (device_limits(device)[1] - fixed_bytes) // (threads * 8)
+        chunk = 0
+        if h > 48:
+            pair_rows = 2 * (1 + key.coarse)
+            chunk = min(48, available) // pair_rows * pair_rows
+            if 2 * chunk < h:
+                return launch
         key = replace(
             key,
             seg16=True,
@@ -3511,10 +3516,7 @@ def _plan_vertical_segmented_backward(
             backward_batch_tail=bool(h % (2 * (1 + key.coarse))),
         )
         span = chunk or h
-        threads = key.warps * _WARP_SIZE
-        line_rows = h // (1 + key.coarse) if key.cache_line else 0
-        # NativeWeights plus packed source, snapshots, cached line and full-coverage gradient.
-        smem = 5632 + threads * 8 * (h + span + line_rows + launch.plan.grad_store_rows)
+        smem = fixed_bytes + threads * 8 * span
         if key.shared_acc or smem > device_limits(device)[1]:
             return launch
         group = key.backward_reduce_warps or key.warps
@@ -3543,11 +3545,10 @@ def _plan_vertical_segmented_backward(
 def _plan_vertical_skip_rounding(device: int, launch: Launch, shape: tuple) -> Launch:
     _b, h, w, m = shape
     key = launch.key
-    if key.odd_coarse_backward:
+    if key.odd_coarse_backward or min(h, w, m) <= 0:
         return launch
     key = replace(key, vertical_rounding_mode="skip_intermediate_rounding")
-    model_shape = h == w and h in (56, 28, 14, 7) and m == (128 if h == 7 else 160)
-    if model_shape and not key.backward:
+    if not key.backward:
         smem = launch.plan.smem + (0 if key.cache_weights and not key.register_path else 5632)
         if smem <= device_limits(device)[1]:
             key = replace(key, register_path=False, cache_weights=True, vector_weights=True,

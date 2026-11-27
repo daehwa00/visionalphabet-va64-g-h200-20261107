@@ -30,7 +30,7 @@ def replace(source, old, new):
     return source.replace(old, new)
 
 
-def horizontal_source(key, height, variant):
+def horizontal_source(key, variant, *, contiguous_pairs):
     source = scans._kernel_source(key)
     begin = source.rindex("template<", 0, source.index("void horizontal("))
     end = source.index("template<bool PRECISE>", begin)
@@ -68,7 +68,7 @@ def horizontal_source(key, height, variant):
             begin_io = body.index("                    if (!BACKWARD || pass) {")
             end_io = body.index("\n                    }", begin_io) + len("\n                    }")
             pack = "auto a=Pair<T>::pack(output[0]), b=Pair<T>::pack(output[1]);"
-            if height == 56:
+            if contiguous_pairs:
                 store = "__stcs(dst, pair);" if variant == HF_STREAMING else "*dst=pair;"
                 stores = """
                     auto words=reinterpret_cast<Pair<T>*>(out);
@@ -167,7 +167,7 @@ def reuse_source_rows(source, key):
 def shared_bytes(launch, height):
     key = launch.key
     extra = 0
-    if key.vertical and key.backward and height != 56 and not key.cache_source:
+    if key.vertical and key.backward and height != 56 and not key.chunk and not key.cache_source:
         extra = max(0, height-(key.chunk or height))*key.warps*32*8
     return launch.plan.smem + extra
 
@@ -179,9 +179,13 @@ def profile_name(key):
 
 
 def kernel_source(key, variant, width, height=None, modes=None, full_rows=False):
-    source = vertical_source(key) if key.vertical else horizontal_source(key, height, variant)
+    # Partial mode tiles use the contiguous pair store. The shuffle schedule
+    # assumes 16 or 32 participating lanes. Odd mode counts use the scalar planner.
+    source = vertical_source(key) if key.vertical else horizontal_source(
+        key, variant, contiguous_pairs=height == 56 or bool(modes and modes % 32),
+    )
     if key.vertical and key.backward and variant == ARM:
-        if height != 56:
+        if height != 56 and not key.chunk:
             source = reuse_source_rows(source, key)
         elif not (key.grad_store or key.l2_single_write):
             source = scans._grad_store_source(source, persistent=True)
@@ -265,11 +269,33 @@ def _dispatch(real, launch, variant, width, args):
         )
 
 
+def _supports_shape(batch, height, width, modes, *, fp8=False):
+    # Packed state storage pads its final mode tile to a full warp.
+    # Budget four warps for the horizontal pair cache and the vertical row buffers.
+    limit = 227 << 10
+    vertical_bytes = 11264 + 128 * height * 24
+    if fp8 and height > 48:
+        # Four-byte snapshot and source, then packed line and adjoint tiles.
+        # Full scans retain at most 49 adjoint rows. Coarse scans retain H.
+        full = 12 * height + 4 * min(height, 49)
+        coarse = 12 * height + 4 * (height // 2)
+        vertical_bytes = 5632 + 128 * max(full, coarse)
+    return (
+        min(batch, height, width, modes) > 0
+        and 4 * batch * height * width * ((modes + 31) // 32) * 32 < 2**31
+        and 94 * modes < 2**31
+        and 128 * width * 8 <= limit
+        and vertical_bytes <= limit
+    )
+
+
 def _check_source(real, variant):
     if variant not in (ARM, HF_STREAMING):
         raise ValueError("unknown packed representation")
     if real.ndim != 4 or not real.is_cuda or real.dtype != torch.bfloat16:
         raise ValueError("expected CUDA BF16 [B,H,W,M] source")
+    if not _supports_shape(*real.shape):
+        raise ValueError("unsupported packed scan tile")
     if torch.cuda.get_device_capability(real.device) != (9, 0):
         raise ValueError("packed kernels require SM90a")
 
@@ -367,6 +393,8 @@ def horizontal(pole, r, i, variant=ARM, states=None, adjoints=None, compact=Fals
 def vertical(pole, r, states, aux, path, coarse, variant=ARM, grad=None, *, planar=False, separate=False, epsilon=1e-6):  # noqa: C901
     _check_source(r, variant)
     b, h, w, m = r.shape
+    if coarse and (h % 2 or w % 2):
+        raise ValueError("coarse packed scans require even height and width")
     _check_storage(r, states, w)
     logical = r.unsqueeze(0).expand(4, -1, -1, -1, -1)
     if (
@@ -405,7 +433,7 @@ def vertical(pole, r, states, aux, path, coarse, variant=ARM, grad=None, *, plan
     else:
         out = r.new_empty((2, b, oh, ow, m) if planar else (b, oh, ow, 2 * m))
         outr, outi = out.unbind(0) if planar else out.split(m, -1)
-    if backward and h == 56:
+    if backward and (h == 56 or launch.key.chunk):
         positive = h if launch.key.l2_single_write or not launch.key.grad_store else 0
         rows = positive + (0 if launch.plan.cache_line else oh)
         if rows:
@@ -460,9 +488,10 @@ def enabled(real, path, epilogue, kind, swiglu):
     return (
         os.environ.get("ALPHABET_SCAN_SPLIT_BF16") == "1"
         and real.dtype == torch.bfloat16 and real.ndim == 4
-        and real.shape[1:] in ((56, 56, 160), (28, 28, 160))
+        and _supports_shape(*real.shape)
+        and (epilogue != "coarse_path" or not (real.shape[1] % 2 or real.shape[2] % 2))
         and epilogue in ("full16", "coarse_path") and kind == 0 and not swiglu
-        and len(path) == 4 and path[0].shape == (160, 8, 8)
+        and len(path) == 4 and path[0].shape == (real.shape[-1], 8, 8)
         and scans.general_scans_enabled(forward=True)
         and _is_hopper(real)
     )

@@ -52,13 +52,13 @@ FP8 += FP8.replace("Fp8", "E5m2").replace("e4m3x2", "e5m2x2")
 def profile_name(key, height=56):
     axis = "vscan" if key.vertical else "hscan"
     direction = "bwd" if key.backward else "fwd"
-    suffix = "small_spatial_fp8" if height in (7, 14) else "split_fp8"
+    suffix = "small_spatial_fp8" if height <= 14 else "split_fp8"
     return f"alphabet_profile_{axis}_{direction}__{suffix}"
 
 
 def _horizontal(key):
-    # Use the contiguous two-mode store on both heights.
-    src = split_bf16.horizontal_source(key, 56, split_bf16.ARM)
+    # Adjacent FP8 mode pairs share one aligned four-byte store.
+    src = split_bf16.horizontal_source(key, split_bf16.ARM, contiguous_pairs=True)
     src = src.replace("int M, int workers\n", "int M, int workers, const float* scales\n")
     src = src.replace("M, workers);", "M, workers, scales);")
     # split_bf16 passes literal booleans to both read helpers. Specialize their packed types.
@@ -150,11 +150,14 @@ def _configure_small(launch):
 
 
 def configure(launch, height):
-    if height in (7, 14):
+    if height <= 14:
         return _configure_small(launch)
     key = launch.key
     if key.backward:
-        if height != 56:
+        if (
+            height <= 48 and key.warps == 4 and not key.chunk and key.seg16
+            and key.cache_source and key.cache_weights and not key.shared_acc
+        ):
             return launch._replace(plan=launch.plan._replace(smem=_tile_shared_bytes(key, height)))
         key = with_fields(
             key,
@@ -171,7 +174,7 @@ def configure(launch, height):
             tanh_gain=True,
             path_bwd_pipe=0,
             backward_batch2=True,
-            backward_batch_tail=False,
+            backward_batch_tail=bool(height % (2 * (1 + key.coarse))),
             grad_store=0,
             l2_single_write=False,
             vector_weights=True,
@@ -194,7 +197,7 @@ def configure(launch, height):
 
 def _upgrade_vertical(src, key, width, height, modes):
     if not key.backward:
-        if height == 56 or not key.coarse:
+        if height != 28 or not key.coarse:
             src = src.replace(
                 "auto* buf = CACHE_LINE ? line_buf + threadIdx.x : scratch + I(worker) * M + m;",
                 "auto* buf = reinterpret_cast<Fp8Quad*>(line_buf) + threadIdx.x;",
@@ -204,7 +207,7 @@ def _upgrade_vertical(src, key, width, height, modes):
                 "Fp8Quad::pack(normalize_packed<T>(state, c.gain(y, false)).unpack());",
             )
         return src
-    if height != 56:
+    if height <= 48:
         return src
     src = src.replace("Quad<T>* seg,", "Fp8Quad* seg,").replace(
         "auto* seg = reinterpret_cast<Quad<T>*>", "auto* seg = reinterpret_cast<Fp8Quad*>"
@@ -305,7 +308,7 @@ def _use_register_resident_backward_weights(key, height):
     return (
         key.vertical
         and key.backward
-        and height in (7, 14, 56)
+        and (height <= 14 or height == 56)
         and os.environ.get(
             "ALPHABET_SCAN_RESIDENT_BACKWARD_WEIGHTS",
             os.environ.get("ALPHABET_SCAN_SPLIT_FP8", "0"),
@@ -356,8 +359,18 @@ def _resident_weights(src, packed):
     )
 
 
+def _adjoint_tile_rows(key, height, resident):
+    if height <= 48 or key.coarse:
+        return height
+    # Leave room for two CTAs at the tuned 112.5 KiB dynamic budget.
+    threads = 32 * key.warps
+    weights = 4096 if resident else 5632
+    available = 115200 - weights - threads * height * 12
+    return max(0, min(height, available // (threads * 4)))
+
+
 def _dq_tile(src, key, height, resident):
-    rows = (49 if resident else 46) if height == 56 and not key.coarse else height
+    rows = _adjoint_tile_rows(key, height, resident)
     src = src.replace("Quad<T> positive = {}", "E5m2Quad positive = {}")
     for field in ("a", "b"):
         src = src.replace(f"positive.{field}.unpack()", f"positive.{field}.unpack(c.inv)")
@@ -384,9 +397,9 @@ def _dq_tile(src, key, height, resident):
 def kernel_source(key, width, height, modes, resident=None):
     if resident is None:
         resident = _use_register_resident_backward_weights(key, height)
-    if resident and height == 7:
+    if resident and height <= 8 and not key.coarse:
         key = with_fields(key, vertical_weight_mode="packed_bfloat16_pair_bfloat16_weights")
-    small = height in (7, 14)
+    small = height <= 14
     vertical_source = _small_vertical if small else _vertical
     src = vertical_source(key) if key.vertical else _horizontal(key)
     pos = src.index("template<class T> struct alignas")
@@ -406,7 +419,7 @@ def kernel_source(key, width, height, modes, resident=None):
         src = _upgrade_vertical(src, key, width, height, modes)
         if key.backward:
             src = _dq_tile(src, key, height, resident)
-        elif height == 56 and not key.coarse:
+        elif height > 28 and not key.coarse:
             src = _fp16x2_hidden(src)
     if resident:
         src = _resident_weights(src, height == 56)
@@ -439,8 +452,8 @@ def _tile_shared_bytes(key, height):
     if key.chunk or key.warps != 4 or not (key.cache_source and key.cache_weights and key.seg16):
         raise ValueError("expected the cached four-warp vertical tile plan")
     resident = _use_register_resident_backward_weights(key, height)
-    rows = (49 if resident else 46) if height == 56 and not key.coarse else height
-    segment = 4 if height == 56 else 8
+    rows = _adjoint_tile_rows(key, height, resident)
+    segment = 4 if height > 48 else 8
     return (4096 if resident else 5632) + 32 * key.warps * (
         height * (segment + 4) + 4 * (height // (1 + key.coarse) + rows)
     )
@@ -448,7 +461,7 @@ def _tile_shared_bytes(key, height):
 
 def shared_bytes(launch, height):
     key = launch.key
-    if key.vertical and key.backward and height in (7, 14):
+    if key.vertical and key.backward and height <= 14:
         return _small_shared_bytes(launch, height)
     return launch.plan.smem
 
@@ -549,7 +562,7 @@ def _dispatch(real, launch, width, args, scale_args=()):
 def _check_source(real):
     if real.ndim != 4 or not real.is_cuda or real.dtype != torch.bfloat16:
         raise ValueError("expected CUDA BF16 [B,H,W,M] source")
-    if real.shape[1:] not in ((56, 56, 160), (28, 28, 160), (14, 14, 160), (7, 7, 128)):
+    if not split_bf16._supports_shape(*real.shape, fp8=True):
         raise ValueError("unsupported packed scan shape")
     if torch.cuda.get_device_capability(real.device) != (9, 0):
         raise ValueError("packed kernels require SM90a")
@@ -677,8 +690,8 @@ def vertical(
 ):
     _check_source(r)
     b, h, w, m = r.shape
-    if h == 7 and coarse:
-        raise ValueError("unsupported coarse 7x7 scan")
+    if coarse and (h % 2 or w % 2):
+        raise ValueError("coarse packed scans require even height and width")
     _check_storage(r, states, w)
     logical = r.unsqueeze(0).expand(4, -1, -1, -1, -1)
     if (
@@ -708,7 +721,7 @@ def vertical(
         compact=backward and coarse,
         interleaved=interleaved,
     )
-    if backward and h == 28:
+    if backward and 14 < h <= 48:
         launch = scans._plan_vertical_segmented_backward(
             r.device.index or 0, launch, (b, h, w, m), "backward_segment16_two_chunks"
         )
@@ -773,16 +786,9 @@ def enabled(real, path, epilogue, kind, swiglu):
         os.environ.get("ALPHABET_SCAN_SPLIT_FP8") == "1"
         and real.dtype == torch.bfloat16
         and real.ndim == 4
-        and (
-            real.shape[1:] in ((56, 56, 160), (28, 28, 160))
-            or (
-                os.environ.get("ALPHABET_SCAN_SMALL_SPATIAL_FP8", "1") == "1"
-                and (
-                    real.shape[1:] == (14, 14, 160)
-                    or (real.shape[1:] == (7, 7, 128) and epilogue == "full16")
-                )
-            )
-        )
+        and split_bf16._supports_shape(*real.shape, fp8=True)
+        and (real.shape[1] > 14 or os.environ.get("ALPHABET_SCAN_SMALL_SPATIAL_FP8", "1") == "1")
+        and (epilogue != "coarse_path" or not (real.shape[1] % 2 or real.shape[2] % 2))
         and epilogue in ("full16", "coarse_path")
         and kind == 0
         and not swiglu

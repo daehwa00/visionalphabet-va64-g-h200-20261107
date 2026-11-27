@@ -1,4 +1,4 @@
-"""Numerical checks for the Wave 28C model kernels."""
+"""Numerical checks for the model kernels."""
 
 import pytest
 import torch

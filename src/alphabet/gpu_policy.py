@@ -49,9 +49,11 @@ def gpu_policy_environment() -> dict[str, str]:
 def recommended_gpu_env(capability: tuple[int, int] | None) -> dict[str, str]:
     if capability is None:
         return {}
-    if capability >= (9, 0):
+    if capability == (9, 0):
         return {**COMPILED_ENV, **_SPLIT}
     env = {**COMPILED_ENV, "ALPHABET_HORIZONTAL_SCAN_MODE": "optimized_backward"}
+    if capability > (9, 0):
+        env["ALPHABET_COMPILER_FEATURES"] = "cuda_graphs,max_autotune_pointwise"
     if capability != (8, 0) and capability < (8, 9):
         env.update(
             ALPHABET_READER_MODE="off",
@@ -63,8 +65,11 @@ def recommended_gpu_env(capability: tuple[int, int] | None) -> dict[str, str]:
 def device_capability(device: torch.device | str | int | None = None) -> tuple[int, int] | None:
     import torch  # noqa: PLC0415 -- defer runtime initialization until detection
 
-    if device is not None and not isinstance(device, int) and torch.device(device).type != "cuda":
-        return None
+    if device is not None and not isinstance(device, int):
+        selected = torch.device(device)
+        if selected.type != "cuda":
+            return None
+        device = selected.index
     return torch.cuda.get_device_capability(device) if torch.cuda.is_available() else None
 
 

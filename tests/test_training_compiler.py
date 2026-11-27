@@ -1,4 +1,4 @@
-"""Wave 36B compiler policy, CUDA Graph regression checks."""
+"""Compiler policy, CUDA Graph regression checks."""
 
 from __future__ import annotations
 

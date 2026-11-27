@@ -22,7 +22,7 @@ from h200.bench_h200 import profile_bucket
     [
         (True, None, True, (11, 0, 0)),
         (True, "0", True, (4, 0, 7)),
-        (False, "1", True, (0, 4, 7)),
+        (False, "1", True, (0, 11, 0)),
         (False, "1", False, (0, 0, 11)),
     ],
 )

@@ -231,8 +231,10 @@ class _FourStageBackbone(ComplexScanBackbone):
             )
             setattr(self, name, stage)
         install_pole_initialization(self, STAGE_NAMES)
-        self.descriptor_dim = 1024
-        self.classifier = TerminalAffineClassifier(1024, 1024, config.output_dim)
+        self.descriptor_dim = 8 * poles[-1]
+        self.classifier = TerminalAffineClassifier(
+            self.descriptor_dim, self.descriptor_dim, config.output_dim
+        )
 
 
 def _make_reader(

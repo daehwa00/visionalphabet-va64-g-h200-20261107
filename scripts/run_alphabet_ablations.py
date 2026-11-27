@@ -237,10 +237,11 @@ def main() -> None:
 
     from alphabet.complex_scan_config import ComplexScanConfig
 
+    args = runtime.parse_args(variants=VARIANTS, seeds=SEEDS)
     if os.environ.get("ALPHABET_AUTO_GPU_POLICY") == "1":
         from alphabet.gpu_policy import apply_gpu_policy
 
-        apply_gpu_policy()
+        apply_gpu_policy(device=args.device)
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = os.environ.get("ALPHABET_CUDNN_BENCHMARK", "1") != "0"
     runtime.main(
@@ -256,7 +257,8 @@ def main() -> None:
             evaluate=runtime.evaluate,
             wandb_model_metrics=runtime.wandb_model_metrics,
             summarize=runtime.summarize,
-        )
+        ),
+        args=args,
     )
 
 

@@ -1,4 +1,4 @@
-"""Wave 25C Stage 0 accuracy, layout, and input-gradient fallback."""
+"""Stage 0 accuracy, layout, and input-gradient fallback."""
 
 # ruff: noqa: T201
 import pytest

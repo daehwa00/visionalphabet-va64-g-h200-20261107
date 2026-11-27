@@ -1,4 +1,4 @@
-"""Wave 72 full-model routing, offline Hopper audit and training checks."""
+"""Full-model routing, offline Hopper audit and training checks."""
 
 import concurrent.futures
 

@@ -155,10 +155,18 @@ def main() -> int:
     choices = ("auto", *arms, *(arm + "_rev" for arm in arms))
     parser.add_argument("--arm", required=True, choices=choices)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
+    import torch
+
+    device = torch.device(args.device)
+    if device.type != "cuda":
+        parser.error("the benchmark requires a CUDA device")
+    if device.index is not None:
+        torch.cuda.set_device(device)
     if args.arm == "auto":
-        apply_gpu_policy()
+        apply_gpu_policy(device=device)
         keys = tuple(gpu_policy_environment())
         return measure_arm(args.out, profile=args.profile, arm_env_keys=keys)
     env = benchmark_arm_env(args.arm)

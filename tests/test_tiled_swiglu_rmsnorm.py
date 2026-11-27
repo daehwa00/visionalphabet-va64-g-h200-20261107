@@ -1,4 +1,4 @@
-"""Parity, layout handling, and capture for the Wave 29C kernels."""
+"""Parity, layout handling, and capture for the kernels."""
 
 import ast
 from pathlib import Path
