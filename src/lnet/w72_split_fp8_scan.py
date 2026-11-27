@@ -411,10 +411,10 @@ extern "C" __global__ void va_profile_scale__w72_split_fp8(
 
 
 @lru_cache(maxsize=256)
-def _function(device, key, width, height, modes, smem):
+def _function(device, key, width, height, modes, smem, source_fn=kernel_source):
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "packed.cu"
-        path.write_text(kernel_source(key, width, height, modes))
+        path.write_text(source_fn(key, width, height, modes))
         cubin = path.with_suffix(".cubin")
         subprocess.run(
             [
@@ -452,16 +452,19 @@ def _function(device, key, width, height, modes, smem):
         return driver, module, fn, scale_fn
 
 
-def _dispatch(real, launch, width, args, scale_args=()):
+def _dispatch(real, launch, width, args, scale_args=(), *, source_fn=kernel_source, smem=None):
     device = real.device.index or 0
     key = launch.key
+    if smem is None:
+        smem = shared_bytes(launch, real.shape[1])
     driver, module, fn, scale_fn = _function(
         device,
         key,
         width,
         real.shape[1],
         real.shape[-1],
-        shared_bytes(launch, real.shape[1]),
+        smem,
+        source_fn,
     )
     grid = scans._ceil(real.shape[-1], 32 * (1 + key.horizontal_vec2)) * scans._ceil(
         launch.workers, key.warps
@@ -484,7 +487,7 @@ def _dispatch(real, launch, width, args, scale_args=()):
                 32 * key.warps,
                 1,
                 1,
-                shared_bytes(launch, real.shape[1]),
+                smem,
                 stream,
                 argv,
                 None,
@@ -621,6 +624,7 @@ def vertical(
     planar=False,
     separate=False,
     epsilon=1e-6,
+    dispatch=None,
 ):
     _check_source(r)
     b, h, w, m = r.shape
@@ -703,7 +707,7 @@ def vertical(
             ct.c_longlong(gr.numel()),
             *map(ct.c_int, (m, gr.stride(-2), gi.stride(-2))),
         )
-    _dispatch(r, launch, w, args, scale_args)
+    (dispatch or _dispatch)(r, launch, w, args, scale_args)
     if backward:
         params = scans._reduce_partials(partial, [*pole, *path], 8)
         return [*params[:4], dq, *params[4:], scales]

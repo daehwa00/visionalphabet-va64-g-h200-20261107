@@ -16,7 +16,7 @@ import torch
 from bench_wave66_split_bf16 import OPS, SHAPES, VARIANTS, fp, scans
 
 
-def offline_plans(shapes=SHAPES[:2]):
+def offline_plans(shapes=SHAPES[:2], *, plane_outputs=False):
     from contextlib import ExitStack
 
     with ExitStack() as stack:
@@ -71,7 +71,7 @@ def offline_plans(shapes=SHAPES[:2]):
                     hidden=8 if v else 0,
                     precise=v and not b,
                     compact=b and c,
-                    interleaved=(True, True),
+                    interleaved=(not (plane_outputs and v and not b and h != 7),) * 2,
                 )
                 yield label, op, w, m, launch
 
