@@ -89,6 +89,7 @@ def parse_args(*, variants: tuple[str, ...], seeds: tuple[int, ...]) -> argparse
     )
     if len(variants) == 1 and variants[0] in {
         "pico-600-opt",
+        "pico-600-lightA-lr40-wd02",
         "VA-Ablation-pico-v11-in1k",
         "VA-Ablation-pico-v11-in1k-lightA",
         "VA-Ablation-pico-v11-in1k-lightB",

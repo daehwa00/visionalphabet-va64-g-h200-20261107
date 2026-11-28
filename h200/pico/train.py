@@ -12,7 +12,7 @@ import va_imagenet100_runtime as runtime
 
 from alphabet.gpu_policy import apply_gpu_policy
 
-VARIANT = "pico-600-opt"
+VARIANT = "pico-600-lightA-lr40-wd02"
 INIT = Path(__file__).with_name("pico_v11_seed501_init.pt")
 INIT_SHA = "c49edc4755ddeffaca127863dd709f890212395a5ec49f1036bcee4d12fb13dd"
 
@@ -43,10 +43,10 @@ def contract(args: Namespace) -> dict:
     result = runtime.base_contract(args, variants=(VARIANT,), seeds=(501,), num_classes=1000)
     result["schema"] = "alphabet.pico-v11.in1k.v1"
     result["recipe"].update(
-        learning_rate=0.0025,
+        learning_rate=0.004,
         min_lr=1e-6,
         warmup_epochs=20,
-        weight_decay=0.035,
+        weight_decay=0.02,
         modal_learning_rate_multiplier=1 / 3,
         pole_geometry_learning_rate_multiplier=1.0,
         drop_path_rate=0.0,
@@ -54,11 +54,11 @@ def contract(args: Namespace) -> dict:
         ema_warmup=True,
         evaluate_first_epoch=True,
         label_smoothing=0.05,
-        mixup_alpha=0.2,
-        mix_prob=0.5,
+        mixup_alpha=0.1,
+        mix_prob=0.3,
         cutmix=False,
         randaugment_num_ops=2,
-        randaugment_magnitude=5,
+        randaugment_magnitude=3,
         color_jitter=0.0,
         random_erasing_prob=0.0,
         gpu_randaugment=args.gpu_randaugment,
@@ -88,7 +88,7 @@ if __name__ == "__main__":
             contract=contract,
             build_optimizer=builder.build_optimizer,
             prepare_model=runtime.prepare_model,
-            train_epoch=partial(augment.train_epoch, mix_prob=0.5),
+            train_epoch=partial(augment.train_epoch, mix_prob=0.3),
             evaluate=runtime.evaluate,
             wandb_model_metrics=runtime.wandb_model_metrics,
             summarize=runtime.summarize,
